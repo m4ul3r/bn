@@ -548,7 +548,7 @@ def test_function_info_uses_active_target_and_text_renderer(fake_transport, caps
             "prototype": "int32_t sub_401000(int32_t arg1)",
             "return_type": "int32_t",
             "calling_convention": "__cdecl",
-            "size": 24,
+            "size": 24, "code_ref_count": 3, "data_ref_count": 1,
             "parameters": [{"name": "arg1", "type": "int32_t", "storage": 0, "is_parameter": True, "local_id": "0x401000:param:stack:0:0:1"}],
             "locals": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False, "local_id": "0x401000:local:stack:-4:1:2"}],
         },
@@ -563,10 +563,46 @@ def test_function_info_uses_active_target_and_text_renderer(fake_transport, caps
     assert "sub_401000 @ 0x401000" in output
     assert "calling convention: __cdecl" in output
     assert "size: 24" in output
-    assert "xrefs: 0" in output
+    assert "xrefs: 3 code, 1 data" in output
     assert "locals: 1 variables" in output
     # compact mode should NOT show full parameter/local details
     assert "id=0x401000:param:stack:0:0:1" not in output
+
+
+_THUMB_INFO = {
+    "function": {"name": "parse_frame", "address": "0x8000"},
+    "prototype": "char* parse_frame(int kind)", "return_type": "char*",
+    "calling_convention": "cdecl", "size": 42,
+    "has_user_type": False, "type_source": "auto", "prototype_confidence": 96,
+    "return_type_confidence": 128,
+    "span_start": "0x8000", "span_end": "0x8030", "contiguous": False,
+    "code_ref_count": 2, "data_ref_count": 0,
+    "resolved_from": {"requested_address": "0x8001", "normalized": "0x8000", "offset": "+0x0"},
+}
+
+
+def test_function_info_text_shows_provenance_span_and_thumb_entry(fake_transport, capsys):
+    fake_transport({"function_info": {"ok": True, "result": dict(_THUMB_INFO)}})
+
+    assert bn.cli.main(["function", "info", "--target", "active", "0x8001"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    # The odd request is disclosed as the Thumb-tagged exact entry it names.
+    assert lines[0].startswith("// bn: 0x8001 ") and "0x8000" in lines[0]
+    assert "Thumb" in lines[0] and "inside" not in lines[0]
+    assert "type: auto, confidence 96 (return type 128)" in lines
+    assert "size: 42  span 0x8000..0x8030 (discontiguous)" in lines
+
+
+def test_proto_get_text_shows_provenance_line(fake_transport, capsys):
+    fake_transport({"get_prototype": {"ok": True, "result": dict(_THUMB_INFO)}})
+
+    assert bn.cli.main(["proto", "get", "--target", "active", "0x8001"]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1] == "char* parse_frame(int kind)"
+    assert lines[2] == "type: auto, confidence 96 (return type 128)"
+
 
 
 def test_xrefs_field_routes_to_field_xrefs(fake_transport, capsys):
@@ -608,7 +644,6 @@ def test_function_list_text_warns_when_quick_loaded(fake_transport, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "WARNING: target is quick-loaded" in out
-    assert "bn refresh" in out
 
 
 def test_function_count_text_warns_when_quick_loaded(fake_transport, capsys):
@@ -2507,6 +2542,15 @@ def test_disasm_linear_defaults_count_when_flag_given_alone(fake_transport):
     assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 32}
 
 
+def test_disasm_length_is_an_alias_of_linear(fake_transport):
+    # W10-09: `--length N` was rejected as an unrecognized argument.
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "linear": True, "function": None, "address": "0x402020", "note": "n", "text": "t"}}})
+    rc = bn.cli.main(["disasm", "0x402020", "--target", "active", "--length", "4"])
+    assert rc == 0
+    assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 4}
+
+
 def test_disasm_linear_works_in_json_format(fake_transport, capsys):
     # unlike --count/--lines (text-only client slicing), --linear is a bridge mode
     # and must work in JSON.
@@ -2913,7 +2957,7 @@ def test_function_info_blocks_lists_ranges_653(fake_transport, capsys):
     calls = fake_transport({"function_info": {"ok": True, "result": {
         "function": {"name": "dispatch", "address": "0x401000"},
         "prototype": "void dispatch(uint32_t cmd)",
-        "size": 0x5c00, "xref_count": 3,
+        "size": 0x5c00, "code_ref_count": 3, "data_ref_count": 0,
         "blocks": [
             {"index": 0, "start": "0x401000", "end": "0x401020", "length": 0x20,
              "outgoing": ["0x401020", "0x401100"], "incoming": []},
@@ -2936,7 +2980,7 @@ def test_function_info_blocks_lists_ranges_653(fake_transport, capsys):
 def test_function_info_omits_blocks_by_default_653(fake_transport, capsys):
     calls = fake_transport({"function_info": {"ok": True, "result": {
         "function": {"name": "dispatch", "address": "0x401000"},
-        "prototype": "void dispatch()", "size": 16, "xref_count": 0}}})
+        "prototype": "void dispatch()", "size": 16, "code_ref_count": 0, "data_ref_count": 0}}})
     assert bn.cli.main(["function", "info", "dispatch", "--target", "active"]) == 0
     assert calls[-1]["params"]["blocks"] is False
     assert "basic blocks" not in capsys.readouterr().out
@@ -3132,7 +3176,6 @@ def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "WARNING: target is quick-loaded; decompile is partial." in out
-    assert "bn refresh" in out
     assert out.index("WARNING") < out.index("int32_t sub_401000()")
 
     # A fully-analyzed view says nothing extra: no spurious warning, and the body
@@ -3674,7 +3717,7 @@ def _info_row(name: str, address: str) -> dict:
         "function": {"name": name, "address": address, "raw_name": name,
                      "display_name": name},
         "prototype": f"int32_t {name}()", "parameters": [], "locals": [],
-        "xref_count": 1}}
+        "code_ref_count": 1, "data_ref_count": 0}}
 
 
 def test_function_info_several_identifiers_is_one_request_with_rows_in_place_1042(
@@ -3770,3 +3813,32 @@ def test_function_search_count_still_accepts_an_explicit_address_sort_1048(fake_
                                                     "total": 1}},
     })
     assert bn.cli.main(["function", "search", "main", "--count", "--sort", "address"]) == 0
+
+
+def test_function_cfg_slices_by_block_and_names_the_flag(fake_transport, capsys):
+    # P2-04: the graph is sliced bridge-side, the text says which slice it is,
+    # and `--estimate-output` names the flag that bounds it -- not `--out`.
+    page = {"ok": True, "result": {
+        "kind": "cfg", "function": {"name": "dispatch", "address": "0x401000"},
+        "view": "asm", "warnings": [],
+        "blocks": [{"start": "0x401010", "insns": [{"address": "0x401010", "text": "nop"}],
+                    "edges": []}],
+        "total_blocks": 4, "matched_blocks": 4, "offset": 1, "limit": 1,
+        "returned": 1, "has_more": True}}
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "cfg": page,
+    })
+
+    assert bn.cli.main(["function", "cfg", "dispatch", "--offset", "1", "--limit", "1",
+                        "--address-window", "0x401000:0x402000"]) == 0
+    assert calls[-1]["params"] == {"identifier": "dispatch", "view": "asm", "offset": 1,
+                                   "limit": 1, "address_window": "0x401000:0x402000"}
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith("// showing 1 block(s) from offset 1 of 4 (function has 4)")
+    assert "--offset 2" in last
+
+    assert bn.cli.main(["function", "cfg", "dispatch", "--estimate-output"]) == 0
+    [rerun] = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("rerun: ")]
+    assert "--limit" in rerun and "--address-window" in rerun

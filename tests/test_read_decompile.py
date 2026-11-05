@@ -762,6 +762,28 @@ def test_function_info_includes_metadata(monkeypatch):
     assert result["size"] is None
 
 
+def test_function_info_counts_code_and_data_refs_by_the_xrefs_definitions(monkeypatch):
+    """`function info` reports the two counts `xrefs` reports, by its
+    definitions: a function reached only through a stored pointer must not
+    read as unreferenced in the summary while `xrefs` lists the pointer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x402000, "dispatch_loop")
+    handler = _FakeFunction(0x401000, "on_packet")
+    bv = _FakeBV(functions=[handler, caller],
+                 code_refs={0x401000: [_FakeCodeRef(0x402010, caller)]},
+                 data_refs={0x401000: [0x404000, 0x404008]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    info = instance._function_info("active", "on_packet")
+    xrefs = instance._xrefs("active", "on_packet")
+
+    assert (info["code_ref_count"], info["data_ref_count"]) == (1, 2)
+    assert (info["code_ref_count"], info["data_ref_count"]) == (
+        xrefs["code_ref_count"], xrefs["data_ref_count"])
+    assert "xref_count" not in info
+
+
 def test_disasm_linear_walks_arbitrary_non_function_address(monkeypatch):
     # #314: linear disasm reads N instructions from a MAPPED address that BN never
     # made part of a function (a missed handler / vtable slot left as data), which
@@ -4052,6 +4074,139 @@ def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
     assert "resolved_from" not in result
 
 
+def _thumb_bv():
+    fn = _FakeFunction(0x8000, "parse_frame", arch=_FakeArch(name="thumb2"))
+    # Two blocks with a literal pool between them: 10 + 32 summed bytes over a
+    # 0x30-byte span.
+    fn.basic_blocks = [_FakeBasicBlock(0x8010, 0x8030), _FakeBasicBlock(0x8000, 0x800a)]
+    return _FakeBV(functions=[fn], memory={0x8000: b"\x00" * 0x30}), fn
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst, ident: inst._function_info("active", ident), id="function_info"),
+    pytest.param(lambda inst, ident: inst._get_prototype("active", ident), id="proto_get"),
+])
+def test_an_odd_thumb_address_reports_its_normalization_in_json(monkeypatch, call):
+    """An odd address in a Thumb function carries the interworking bit, not an
+    instruction byte: the read says so in `normalized` and measures `offset`
+    from it, so an odd entry pointer is the function's exact start (+0x0), not
+    a byte one past it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _thumb_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    entry = call(instance, "0x8001")
+    assert entry["function"]["address"] == "0x8000"
+    assert entry["resolved_from"] == {
+        "requested_address": "0x8001", "normalized": "0x8000", "offset": "+0x0"}
+
+    interior = call(instance, "0x8013")
+    assert interior["resolved_from"] == {
+        "requested_address": "0x8013", "normalized": "0x8012", "offset": "+0x12"}
+
+
+def test_an_odd_address_outside_thumb_code_is_not_normalized(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info("active", "0x401011")
+
+    assert result["resolved_from"] == {"requested_address": "0x401011", "offset": "+0x11"}
+
+
+class _Confident(str):
+    """A BN type/convention stand-in: renders as text, carries a confidence."""
+
+    def __new__(cls, text: str, confidence: int):
+        obj = super().__new__(cls, text)
+        obj.confidence = confidence
+        return obj
+
+
+class _ConfidentParams(list):
+    confidence = 255
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._function_info("active", "parse_frame"), id="function_info"),
+    pytest.param(lambda inst: inst._get_prototype("active", "parse_frame"), id="proto_get"),
+])
+@pytest.mark.parametrize("flag, written_here, source", [
+    (False, False, "auto"),
+    # The flag alone proves no origin: BN sets it on nearly every function of
+    # a database reopened after save (D4-04).
+    (True, False, "unknown"),
+    # This bridge's own verified `set_prototype` is the proof.
+    (True, True, "user"),
+], ids=["flag-clear", "flag-set-origin-unknown", "set-by-this-bridge"])
+def test_prototype_reads_report_source_confidence_and_address_span(
+        monkeypatch, call, flag, written_here, source):
+    """BN's provenance travels with the prototype: `has_user_type` is BN's
+    flag, `type_source` only the origin that can be proven, and the address
+    span is reported apart from the summed block `size`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _thumb_bv()
+    fn.return_type = _Confident("char*", 128)
+    fn.calling_convention = _Confident("cdecl", 96)
+    fn.parameter_vars = _ConfidentParams()
+    fn._has_user_type = flag
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "_stable_view_id", lambda view: "1")
+    if written_here:
+        instance.targets.note_session_annotations(bv, [
+            {"op": "set_prototype", "status": "verified", "address": hex(fn.start)}])
+
+    result = call(instance)
+
+    assert (result["has_user_type"], result["type_source"]) == (flag, source)
+    assert result["return_type_confidence"] == 128
+    assert result["prototype_confidence"] == 96
+    assert (result["span_start"], result["span_end"], result["contiguous"]) == (
+        "0x8000", "0x8030", False)
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._function_info("active", "parse_frame"), id="function_info"),
+    pytest.param(lambda inst: inst._get_prototype("active", "parse_frame"), id="proto_get"),
+])
+def test_prototype_confidence_includes_each_parameter_types_own(monkeypatch, call):
+    # D4-03: BN keeps a parameter TYPE's confidence apart from the parameter
+    # list's; a 42-confidence parameter type hid behind three 255s.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _thumb_bv()
+    fn.return_type = _Confident("char*", 255)
+    fn.calling_convention = _Confident("cdecl", 255)
+    fn.parameter_vars = _ConfidentParams()
+    fn._type = types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(name="len", type=_Confident("uint32_t", 255)),
+        types.SimpleNamespace(name="buf", type=_Confident("uint8_t*", 42)),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = call(instance)
+
+    assert result["return_type_confidence"] == 255
+    assert result["prototype_confidence"] == 42
+
+
+def test_address_span_is_contiguous_when_blocks_abut(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _mid_function_bv()
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401010), _FakeBasicBlock(0x401010, 0x401040)]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info("active", "parse_packet")
+
+    assert (result["span_start"], result["span_end"], result["contiguous"]) == (
+        "0x401000", "0x401040", True)
+
+
 def test_containment_meta_decimal_matches_hex(monkeypatch):
     # #626 review round 2 (Finding 1): _containment_meta gated the disclosure on a
     # 0x prefix, so a DECIMAL interior address -- which _find_function already
@@ -6026,6 +6181,22 @@ def test_split_body_notes_are_silent_on_an_ordinary_function_end_966(tail):
     assert read_decompile._fallthrough_successor(bv, head) is None
 
 
+@pytest.mark.parametrize("stub", ["head", "tail"])
+def test_a_plt_entry_is_never_a_split_body(stub):
+    # W06-06: armv7 PLT stubs end in `ldr pc, [r12, #x]!` and sit back to
+    # back, so each "ran into" the next and the note advised
+    # `bn function delete` on a PLT entry. A linker stub is never a split.
+    bv, head, tail = _split_view(tail_mnemonics=["str"])
+    plt = head if stub == "head" else tail
+    bv.get_symbol_at = lambda a: None
+    bv.get_sections_at = lambda a: (
+        [types.SimpleNamespace(name=".plt")] if a == plt.start else
+        [types.SimpleNamespace(name=".text")])
+    for fn in (head, tail):
+        notes = [n["detail"] for n in read_decompile._split_body_notes(bv, fn)]
+        assert not any("runs straight into" in n or "function delete" in n for n in notes), notes
+
+
 def test_disasm_discloses_where_execution_continues_966(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -7465,3 +7636,89 @@ def test_proto_get_flags_undefined_named_types_with_a_declare_command_1013(monke
     assert "spell a `::`-qualified name in backticks" in note
     defined = _proto_instance(monkeypatch, [param], [], defined=True)
     assert "undefined_types" not in defined._get_prototype("active", "0x401000")
+
+
+def _cfg_four_block_bv():
+    """`dispatch` with four asm blocks at 0x401000, 0x401010, 0x401020, 0x401030."""
+    fn = _FakeFunction(0x401000, "dispatch", "void dispatch(int32_t op)")
+    blocks = [
+        _FakeCFGBlock(start, lines=[_FakeCFGLine(start, "nop"), _FakeCFGLine(start + 8, "jmp")],
+                      end=start + 0x10)
+        for start in (0x401000, 0x401010, 0x401020, 0x401030)
+    ]
+    for here, nxt in zip(blocks, blocks[1:]):
+        here.outgoing_edges = [_FakeCFGEdge(nxt, "UnconditionalBranch")]
+    fn.basic_blocks = list(reversed(blocks))      # BN's own order is not address order
+    return _FakeBV(functions=[fn]), fn
+
+
+def test_cfg_pages_blocks_and_states_the_page(monkeypatch):
+    # P2-04: `function cfg` produced the whole graph; `--out` only moved it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_four_block_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm", offset=1, limit=2)
+
+    assert [b["start"] for b in result["blocks"]] == ["0x401010", "0x401020"]
+    assert (result["total_blocks"], result["matched_blocks"], result["offset"],
+            result["limit"], result["returned"], result["has_more"]) == (4, 4, 1, 2, 2, True)
+    # An edge leaving the page still names its target.
+    assert result["blocks"][1]["edges"] == [{"to": "0x401030", "branch_type": "UnconditionalBranch"}]
+
+
+def test_cfg_address_window_keeps_blocks_holding_an_address_in_it(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_four_block_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm", address_window=(0x401018, 0x401021))
+
+    assert [b["start"] for b in result["blocks"]] == ["0x401010", "0x401020"]
+    assert (result["total_blocks"], result["matched_blocks"], result["has_more"]) == (4, 2, False)
+    assert result["address_window"] == ["0x401018", "0x401021"]
+
+
+@pytest.mark.parametrize("window, starts", [
+    ((0x401001, 0x401004), []),                 # strictly inside the 5-byte call
+    ((0x401001, 0x401006), ["0x401005"]),       # reaches only the next block's start
+    ((0x401000, 0x401001), ["0x401000"]),       # the call's own start
+])
+def test_cfg_asm_window_matches_instruction_starts_not_block_bytes(monkeypatch, window, starts):
+    # D3-01: the asm window intersected the block's byte range, so a window
+    # inside one multi-byte instruction kept a block holding no instruction
+    # that starts in it; the documented contract is instruction START addresses.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "entry_stub", "void entry_stub(void)")
+    call = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "call 0x402000")],
+                         end=0x401005)
+    ret = _FakeCFGBlock(0x401005, lines=[_FakeCFGLine(0x401005, "ret")], end=0x401006)
+    call.outgoing_edges = [_FakeCFGEdge(ret, "UnconditionalBranch")]
+    fn.basic_blocks = [call, ret]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "entry_stub", view="asm", address_window=window)
+
+    assert [b["start"] for b in result["blocks"]] == starts
+    assert (result["total_blocks"], result["matched_blocks"]) == (2, len(starts))
+
+
+def test_cfg_address_window_at_an_il_level_reads_instruction_addresses(monkeypatch):
+    # IL block `start` is an index, so the window is matched on the addresses
+    # of the block's instructions, never on the index.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "checked_div", "int32_t checked_div(int32_t a, int32_t b)")
+    early = _FakeCFGBlock(0, lines=[_FakeCFGLine(0x401000, "if (b == 0) trap")])
+    late = _FakeCFGBlock(2, lines=[_FakeCFGLine(0x401040, "return a / b")])
+    fn.mlil = _FakeILCFGFunction([early, late])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "checked_div", view="mlil", address_window=(0x401040, 0x401041))
+
+    assert [b["start"] for b in result["blocks"]] == ["0x2"]

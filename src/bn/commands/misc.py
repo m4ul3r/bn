@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
+from ..cli import (_call, _effective_limit, _int_or_hex, _mutate, _resolve_output_format,
                    _mutation_exit_code, _mutation_preflight, _non_negative_int, _out_path_is_process_local, _pick,
                    _positive_int, _refuse_count_only_slices, arg, blank_selector, command,
                    decode_json_input, mangled_arg, mutex, mutation_output_args, preview_arg,
@@ -35,7 +35,8 @@ from ..formatters import (
     _render_strings_text,
     _stated_count,
 )
-from ..transport import BridgeError, unwrap_result
+from ..output import RawBytes
+from ..transport import BridgeError
 from ..wire_limits import MAX_OPS_ENV, batch_apply_max_ops
 
 
@@ -171,8 +172,6 @@ def _strings(args: argparse.Namespace) -> int:
         paged_spill=True,
         stem="strings",
         regex_hint_query=args.query,
-        # #1037 review: the clipped row's `bn read` must run as printed.
-        route_rendered_commands=True,
     )
 
 
@@ -218,7 +217,13 @@ def _plain_count_text(label: str, value: Any) -> str:
 
 @_discloses
 def _exports_count_text(value: Any) -> str:
-    return _plain_count_text("Total exports", value)
+    line = _plain_count_text("Total exports", value)
+    # P2-06: the count is of rows (one per address + name + kind); the
+    # duplicate symbol records folded into them are stated, not dropped.
+    collapsed = _stated_count(value, "duplicates_collapsed")
+    if collapsed != "0":
+        line += f" ({collapsed} duplicate symbol record(s) collapsed)"
+    return line
 
 
 @_discloses
@@ -559,28 +564,6 @@ def _go_rename(args: argparse.Namespace) -> int:
     )
 
 
-def _resolved_out_format(args: argparse.Namespace) -> str:
-    """``cli._resolve_output_format``'s decision without its stderr side effects.
-
-    The real resolver PRINTS the inference note (or the disagreement warning),
-    and ``_call`` invokes it again a few lines below, so calling it here would
-    emit the note twice. Its precedence -- an explicit ``--format`` wins,
-    otherwise a recognised ``--out`` suffix is inferred -- is mirrored instead,
-    and the two are pinned together over every ``--format`` x ``--out`` suffix
-    combination by
-    ``tests/test_cli_misc.py::test_bundle_delegation_format_tracks_the_cli_resolver``
-    so the copies cannot drift (#670).
-    """
-    out = getattr(args, "out", None)
-    fmt = getattr(args, "format", "text")
-    if out is None:
-        return fmt
-    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
-    if inferred is None or getattr(args, "_format_explicit", False):
-        return fmt
-    return inferred
-
-
 @command("bundle", "function", help="Export a function bundle", fmt="json", target=True,
          args=[arg("identifier"),
                arg("--include-annotations", action="store_true", default=False,
@@ -613,7 +596,7 @@ def _bundle_function(args: argparse.Namespace) -> int:
     bridge_writes = (
         bool(args.out)
         and not _out_path_is_process_local(args.out)
-        and _resolved_out_format(args) == bridge_format
+        and _resolve_output_format(args) == bridge_format
     )
     return _call(
         args,
@@ -643,8 +626,11 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Byte payload encoding: hex hexdump (default); escaped, the bytes "
                       "as a quoted C-escaped string (\\0, \\n, \\xHH; one unambiguous "
                       "escape per byte, octal before a digit), so the NULs between short "
-                      "strings stay visible; or raw "
-                      "bytes, for redirection or --out (NULs are invisible on a terminal)"),
+                      "strings stay visible; or bytes: under --format text the raw "
+                      "bytes themselves, for redirection or --out (NULs are invisible on "
+                      "a terminal), and under --format json/ndjson a structured envelope "
+                      "{encoding: base64, data, address, length, short_read}. Either way "
+                      "BN_SPILL_TOKENS, --out and --estimate-output apply as to any read"),
          ],
          estimable=True)
 def _read(args: argparse.Namespace) -> int:
@@ -656,7 +642,19 @@ def _read(args: argparse.Namespace) -> int:
     length = _pick(args.length_pos, args.length, "read length", required=False)
     args.length = 16 if length is None else length
     if args.encoding == "bytes":
-        return _read_raw_bytes(args, address)
+        # P1-03: one emit path. Under a machine format the payload is a JSON
+        # envelope; under text it is the raw bytes -- and both go through
+        # `_call`'s output layer, so spill, --out, the estimate and the
+        # target/instance provenance mean what they mean for every other read.
+        machine = _resolve_output_format(args) != "text"
+        return _call(
+            args,
+            "read",
+            {"address": address, "length": args.length},
+            require_target=True,
+            result_transform=(_read_bytes_envelope if machine else _read_raw_payload),
+            stem="read",
+        )
     return _call(
         args,
         "read",
@@ -670,17 +668,10 @@ def _read(args: argparse.Namespace) -> int:
     )
 
 
-def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
-    from .. import cli
-
-    target = cli._resolve_target(args, require_target=True, allow_implicit_target=True)
-    response = cli.send_request(
-        "read",
-        params={"address": address, "length": args.length},
-        target=target,
-        instance_id=getattr(args, "instance", None),
-    )
-    result = unwrap_result(response, "read")
+def _read_bytes_and_summary(result: Any) -> tuple[bytes, dict[str, Any]]:
+    """The bytes a ``read`` result carries and the summary every bytes envelope
+    states: where they came from, how many there are, and whether the window
+    is partial. A bridge that sent no or invalid ``hex`` is refused."""
     hex_payload = result.get("hex") if isinstance(result, dict) else None
     if not isinstance(hex_payload, str):
         raise BridgeError("bridge returned malformed read response (missing 'hex' payload)")
@@ -688,72 +679,53 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         data = bytes.fromhex(hex_payload)
     except ValueError:
         raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
-    # #827 item 4 review: the bridge marks a PARTIAL read in the payload
-    # (`capped` and/or `short_read`, plus `requested_length` and a `note`). The
-    # hex renderer prints that note, but THIS path returns the bytes themselves
-    # -- and a dump quietly shorter than the window the caller asked for is the
-    # "bounded read that reads as the whole window" failure the note exists to
-    # prevent, on the one path documented for piping a blob into another tool.
-    # Both markers, not just the cap: a short read is the same dump with the
-    # same consequence, and disclosing one of the two taught a reader that
-    # silence here means a complete window. Disclose on stderr (stdout IS the
-    # payload) and carry the markers into the --out summary.
-    partial_fields: dict[str, Any] = {}
-    # `result` is known to be a dict here: a non-dict one cannot carry the
-    # string `hex` the refusal above requires.
-    if result.get("capped") or result.get("short_read"):
-        partial_fields = {key: True for key in ("capped", "short_read") if result.get(key)}
-        if result.get("requested_length") is not None:
-            # Absent rather than `null`: the summary states what the caller
-            # asked for, and a bridge that did not send it has nothing to state.
-            partial_fields["requested_length"] = result["requested_length"]
-        note = str(result.get("note") or f"partial read: {len(data)} bytes returned")
-        print(f"note: {note}", file=sys.stderr)
     # #1042 review: `address` is the ADDRESS the bytes were read from -- the
     # bridge's resolved hex -- never the name the caller typed; that name is in
-    # `resolved_symbol` below.
+    # `resolved_symbol`.
     resolved_address = result.get("address")
-    summary = {"kind": "bytes",
-               "address": resolved_address if isinstance(resolved_address, str) else address,
-               "length": len(data), **partial_fields}
-    # #1042 item 2: stdout IS the payload here, so how a name resolved goes to
-    # stderr, beside the partial-read note, and into the --out summary.
+    summary: dict[str, Any] = {
+        "kind": "bytes",
+        "address": resolved_address if isinstance(resolved_address, str) else None,
+        "length": len(data),
+        # #827 item 4 review: a window shorter than the one asked for must
+        # never read as the whole window -- `short_read`/`capped` and the
+        # requested length travel with the bytes.
+        "short_read": bool(result.get("short_read")),
+    }
+    if result.get("capped"):
+        summary["capped"] = True
+    if result.get("requested_length") is not None:
+        summary["requested_length"] = result["requested_length"]
+    if isinstance(result.get("resolved_symbol"), dict):
+        summary["resolved_symbol"] = result["resolved_symbol"]
+    return data, summary
+
+
+def _read_bytes_envelope(result: Any) -> dict[str, Any]:
+    """``read --encoding bytes`` under ``--format json``/``ndjson``: the bytes
+    as base64 inside a structured envelope, never raw bytes in a JSON stream."""
+    import base64
+
+    data, summary = _read_bytes_and_summary(result)
+    envelope = {**summary, "encoding": "base64",
+                "data": base64.b64encode(data).decode("ascii")}
+    if result.get("note"):
+        envelope["note"] = str(result["note"])
+    return envelope
+
+
+def _read_raw_payload(result: Any) -> RawBytes:
+    """``read --encoding bytes`` under ``--format text``: stdout IS the payload,
+    so how a name resolved and a partial window are disclosed on stderr, and
+    travel in the summary of an ``--out``, spill or estimate envelope."""
+    data, summary = _read_bytes_and_summary(result)
+    if summary["short_read"] or summary.get("capped"):
+        print(f"note: {result.get('note') or f'partial read: {len(data)} bytes returned'}",
+              file=sys.stderr)
     resolved_notes = _render_resolved_symbol_notes(result)
     if resolved_notes:
         print(resolved_notes, file=sys.stderr)
-    if isinstance(result.get("resolved_symbol"), dict):
-        summary["resolved_symbol"] = result["resolved_symbol"]
-    if getattr(args, "estimate_output", False):
-        # #796: this is `read`'s SECOND emit path, and the flag has to mean the
-        # same thing on it. `_call` -> `_render_result` implements the preflight
-        # for the `--encoding hex` half; this branch returns above that call, so
-        # asking here is the only place the raw-byte payload can be measured
-        # instead of written. `--out` is refused beside the flag by the parser's
-        # own mutually exclusive group, so there is no destination to resolve.
-        from ..output import estimate_bytes_result
-
-        estimate = estimate_bytes_result(
-            data,
-            fmt=args.format,
-            summary=summary,
-            rerun_hint=cli._slice_hint_for_args(args, args.format),
-        )
-        sys.stdout.write(estimate.rendered)
-        return 0
-    if args.out:
-        from ..output import write_bytes_result
-
-        result = write_bytes_result(
-            data,
-            out_path=args.out,
-            fmt=args.format,
-            summary=summary,
-        )
-        sys.stdout.write(result.rendered)
-    else:
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
-    return 0
+    return RawBytes(data, summary)
 
 
 @command("py", "exec", help="Execute a Python snippet", target=True,

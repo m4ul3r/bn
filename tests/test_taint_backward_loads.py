@@ -19,6 +19,7 @@ from test_taint_engine import (
     FExpr,
     FFunc,
     FInstr,
+    FSite,
     FSSAFunc,
     FVar,
     _addr_of,
@@ -116,13 +117,16 @@ class _FieldProgram:
                                           FExpr("MLIL_VAR_SSA", "s", reads=[]),
                                           FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]))
 
-    def run(self, *, writable=None, segment_writable=None):
+    def run(self, *, writable=None, segment_writable=None, self_call_at=None):
         """*writable*: ``bv.is_offset_writable``'s answer. *segment_writable*:
         a BN segment over 0x402000..0x403000 with that write flag (None: no
-        segment information)."""
+        segment information). *self_call_at*: the address of `f`'s call to
+        itself, its only caller site."""
         func = FFunc("f", 0x10, FSSAFunc(self.instrs, mem_defs=self.mem_defs),
                      params=[self.m, self.n, self.src])
-        bv = FBV(_NAMES)
+        if self_call_at is not None:
+            func.caller_sites = [FSite(func, self_call_at)]
+        bv = FBV({**_NAMES, 0x10: "f"}, {0x10: func})
         if writable is not None:
             bv.is_offset_writable = lambda addr: writable
         if segment_writable is not None:
@@ -134,6 +138,22 @@ class _FieldProgram:
         reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
         fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
         return result, origins, reasons, fields
+
+    def recv_behind_may_store(self):
+        """``r#1 = recv(src#0, d, 8, 0); [n#0].1 = r#1``: a modeled source's
+        return stored through a pointer the walk cannot prove disjoint from
+        any global. Returns the recv call's address."""
+        r1 = FSSA(FVar("r", ident=6), 1)
+        i, a = self._at()
+        self.instrs.append(FInstr(i, a, "MLIL_CALL_SSA", "r#1 = recv(src#0, d, 8, 0)",
+                                  reads=[self.src0], writes=[r1],
+                                  dest=FExpr("MLIL_CONST_PTR", hex(_RECV), constant=_RECV),
+                                  params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[self.src0]),
+                                          FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                                          FExpr("MLIL_CONST", "8", constant=8),
+                                          FExpr("MLIL_CONST", "0", constant=0)]))
+        self.store(self.addr(self.n0, 0), 1, FExpr("MLIL_VAR_SSA", "r#1", reads=[r1]))
+        return a
 
 
 @pytest.mark.parametrize("writable", [False, True])
@@ -162,7 +182,7 @@ def test_constant_table_at_a_scaled_index_is_a_frontier_with_the_index(writable)
         ranges=[SimpleNamespace(start=0x402020, end=0x402038, step=8)])
     p.sink(p.load(addr, 8))
     result, origins, _, fields = p.run(writable=writable, segment_writable=writable)
-    assert {"kind": "parameter", "index": 1, "var": "n#0"} in origins, origins
+    assert any((o["kind"], o.get("index"), o.get("var")) == ("parameter", 1, "n#0") for o in origins), origins
     if writable:
         assert not fields, fields
         assert any(lf.get("global") == "0x402020" for lf in result["leaves"]), result["leaves"]
@@ -186,9 +206,10 @@ def test_sign_extended_upper_half_load_follows_the_bytes_not_the_pointer(stored)
         p.store(p.addr(p.m0, 8), 8)
     p.sink(_sx(p.load(p.addr(p.m0, 0xc), 4)))
     result, origins, reasons, fields = p.run()
-    assert {"kind": "parameter", "index": 0, "var": "m#0"} not in origins
+    assert not any(o["kind"] == "parameter" and o.get("index") == 0 and o.get("var") == "m#0"
+                   for o in origins)
     if stored:
-        assert {"kind": "call", "callee": "read_u32"} in origins, origins
+        assert any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins), origins
         assert any("reaching store to field" in r for r in reasons), reasons
         assert not fields
     else:
@@ -204,7 +225,7 @@ def test_field_stored_on_one_path_only_is_a_frontier():
     p.phi(0, 1)
     p.sink(p.load(p.addr(p.m0, 8), 4))
     result, origins, reasons, fields = p.run()
-    assert {"kind": "call", "callee": "read_u32"} in origins or any(
+    assert any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins) or any(
         "reaching store" in r for r in reasons)
     assert fields and "stored before this function ran" in fields[0]["detail"], fields
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -220,7 +241,7 @@ def test_store_through_another_pointer_may_write_the_loaded_field(second):
     p.store(p.addr(base, off), 4, FExpr("MLIL_CONST", "0", constant=0))
     p.sink(p.load(p.addr(p.m0, 8), 4))
     result, origins, _, fields = p.run()
-    assert {"kind": "call", "callee": "read_u32"} in origins or fields
+    assert any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins) or fields
     if second == "other_pointer":
         assert fields and "cannot prove disjoint" in fields[0]["detail"], fields
         assert result["diagnostics"]["safe_to_report_complete_slice"] is False
@@ -240,7 +261,7 @@ def test_struct_field_offsets_key_the_loaded_slot(store_offset, covers):
     p.sink(p.load(FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0]), 4,
                   op="MLIL_LOAD_STRUCT_SSA", offset=8))
     result, origins, _, fields = p.run()
-    assert ({"kind": "call", "callee": "read_u32"} in origins) is covers, origins
+    assert (any(o.get("kind") == "call" and o.get("callee") == "read_u32" for o in origins)) is covers, origins
     assert bool(fields) is not covers
     assert result["diagnostics"]["safe_to_report_complete_slice"] is covers
 
@@ -494,11 +515,12 @@ def test_discovery_cut_keeps_loop_carried_escaped_call_frontier():
 
 
 @pytest.mark.parametrize("leaf, command", [
-    ({"buffer": "buf", "function": "0x401136"},
+    ({"buffer": "buf", "function": {"name": "read_line", "address": "0x401136"}},
      "`bn taint forward -f 0x401136 --source var:buf`"),
-    ({"buffer": "line buf", "function": "0x401136"},
+    ({"buffer": "line buf", "function": {"name": "read_line", "address": "0x401136"}},
      "`bn taint forward -f 0x401136 --source 'var:line buf'`"),
-    ({"buffer": "rdi#1", "function": "0x401136", "global": "0x404060"}, None),
+    ({"buffer": "rdi#1", "function": {"name": "read_line", "address": "0x401136"},
+      "global": "0x404060"}, None),
     ({"buffer": "buf"}, None),
 ])
 def test_backward_next_action_prints_only_a_complete_forward_command(leaf, command):
@@ -515,3 +537,269 @@ def test_backward_next_action_prints_only_a_complete_forward_command(leaf, comma
         assert "`bn " not in text, text
     else:
         assert command in text, text
+
+
+@pytest.mark.parametrize("stored", ["pointer_load", "modeled_source"])
+def test_a_global_load_behind_a_may_alias_store_is_the_origin(stored):
+    # W02-10: the length is a byte loaded from a writable global; a later
+    # store through a pointer the walk cannot prove disjoint MAY have written
+    # it. What that store wrote -- another unresolved load, or a modeled
+    # source's return (R2-03) -- used to represent the slice, naming the
+    # store's value instead of the global the sink actually read.
+    g = 0x402010
+    p = _FieldProgram()
+    if stored == "modeled_source":
+        recv_at = p.recv_behind_may_store()
+    else:
+        p.store(p.addr(p.n0, 0), 1, p.load(p.addr(p.m0, 0x28), 8))
+    p.sink(p.load(FExpr("MLIL_CONST_PTR", hex(g), constant=g), 1))
+    result, origins, reasons, fields = p.run(writable=True)
+    assert any("may write the loaded bytes" in r for r in reasons), reasons
+    assert [(o["kind"], o.get("base")) for o in origins] == [("field_load_unresolved", hex(g))]
+    # The may-alias store's own provenance stays disclosed: the pointer
+    # load as its frontier; the source as a structured step of the slice
+    # (D5b-02), never its root.
+    if stored == "modeled_source":
+        steps = [st for sl in result["slices"] for st in sl["slice"]]
+        want = {"address": hex(recv_at), "op": "MLIL_CALL_SSA", "callee": "recv", "model": "recv"}
+        assert any(want.items() <= st.items() for st in steps), steps
+    else:
+        assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
+    assert hex(g) in {lf["base"] for lf in fields}, fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_a_source_behind_a_may_alias_store_is_no_origin_on_a_recursive_back_edge():
+    # D5b-01: `f(m, n, src)` passes `[g].1 + m` to itself, and `g` is behind
+    # a may-alias store of recv's return. The self-call is a back edge: its
+    # `m` is answered by the enclosing frame, and the producers it reached
+    # each keep a slice -- which made the may-written source an origin again.
+    g = 0x402010
+    p = _FieldProgram()
+    recv_at = p.recv_behind_may_store()
+    v1 = FSSA(FVar("v", ident=7), 1)
+    loaded = p.load(FExpr("MLIL_CONST_PTR", hex(g), constant=g), 1)
+    total = FExpr("MLIL_ADD", f"{loaded} + m#0", reads=[p.m0])
+    total.left, total.right = loaded, FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
+    i, a = p._at()
+    p.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", f"v#1 = {total}", reads=[p.m0],
+                           writes=[v1], src=total))
+    i, call_at = p._at()
+    p.instrs.append(FInstr(i, call_at, "MLIL_CALL_SSA", "f(v#1, n#0, src#0)",
+                           reads=[v1, p.n0, p.src0],
+                           dest=FExpr("MLIL_CONST_PTR", "0x10", constant=0x10),
+                           params=[FExpr("MLIL_VAR_SSA", "v#1", reads=[v1]),
+                                   FExpr("MLIL_VAR_SSA", "n#0", reads=[p.n0]),
+                                   FExpr("MLIL_VAR_SSA", "src#0", reads=[p.src0])]))
+    p.sink(FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0]))
+    result, origins, _reasons, fields = p.run(writable=True, self_call_at=call_at)
+    assert not any(o["kind"] == "source" for o in origins), origins
+    assert ("field_load_unresolved", hex(g)) in {(o["kind"], o.get("base")) for o in origins}
+    steps = [st for sl in result["slices"] for st in sl["slice"]]
+    want = {"address": hex(recv_at), "op": "MLIL_CALL_SSA", "callee": "recv", "model": "recv"}
+    assert any(want.items() <= st.items() for st in steps), steps
+    assert hex(g) in {lf["base"] for lf in fields}, fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+_STRLEN, _NTOHS, _STRCHR, _APP_LEN = 0xa90, 0xaa0, 0xab0, 0xac0
+_LENGTH_NAMES = {**_NAMES, _B_READ: "read", _STRLEN: "strlen", _NTOHS: "ntohs",
+                 _STRCHR: "strchr", _APP_LEN: "app_len"}
+
+
+def _length_of(callee, *, local=None, caller=False):
+    """`dup_label(dst, src)`: `n#1 = <callee>(src#0)`, `n#2 = n#1 + 1`,
+    `memcpy(dst#0, src#0, n#2)` -- for `strchr`, `p#1 = strchr(src#0, 0x2c)`
+    and `n#1 = p#1 - src#0`. With *local* (a list of `(offset, byte)` stores
+    and `"read"` calls, in order) the length is measured over a local
+    `tmp[0x40]` they write first. With *caller*, `relay(out, s)` calls
+    `dup_label(out#0, s#0)` at 0x210. Returns the function, the view, and
+    the addresses of the measuring call and of the copy."""
+    dst, src = FVar("dst", ident=11, typ="char*"), FVar("src", ident=12, typ="char*")
+    dst0, src0 = FSSA(dst, 0), FSSA(src, 0)
+    nv = FVar("n", ident=13)
+    n1, n2 = FSSA(nv, 1), FSSA(nv, 2)
+    tmp = FVar("tmp", ident=14, typ="char[0x40]")
+    fd0 = FSSA(FVar("fd", ident=16), 0)
+    instrs, mem_defs = [], {}
+
+    def add(ins, *, defines_memory):
+        mem = len(mem_defs)
+        if ins.operation.name == "MLIL_SET_VAR_ALIASED_FIELD":
+            ins.ssa_memory_version = mem      # BN gives a named store no src_memory
+        else:
+            ins.src_memory = mem
+        if defines_memory:
+            mem_defs[mem + 1] = ins
+            ins.dest_memory = mem + 1
+        instrs.append(ins)
+        return ins
+
+    def at():
+        return len(instrs), 0x10 + 4 * len(instrs)
+
+    def call(text, target, params, *, reads=(), writes=()):
+        i, a = at()
+        return add(FInstr(i, a, "MLIL_CALL_SSA", text, reads=list(reads), writes=list(writes),
+                          dest=FExpr("MLIL_CONST_PTR", hex(target), constant=target),
+                          params=params), defines_memory=True)
+
+    for w in local or ():
+        if w == "read":
+            call("read(fd#0, &tmp, 0x3f)", _B_READ,
+                 [FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]), _addr_of(tmp),
+                  FExpr("MLIL_CONST", "0x3f", constant=0x3f)], reads=[fd0])
+            continue
+        off, byte = w
+        i, a = at()
+        t = FSSA(tmp, len(mem_defs) + 1)
+        ins = add(FInstr(i, a, "MLIL_SET_VAR_ALIASED_FIELD", f"tmp[{off:#x}] = {byte:#x}",
+                         writes=[t], dest=t, src=FExpr("MLIL_CONST", hex(byte), constant=byte),
+                         offset=off), defines_memory=True)
+        ins.size = 1
+    arg = _addr_of(tmp) if local is not None else FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    if callee == "strchr":
+        p1 = FSSA(FVar("p", ident=15, typ="char*"), 1)
+        measured = call("p#1 = strchr(src#0, 0x2c)", _STRCHR,
+                        [arg, FExpr("MLIL_CONST", "0x2c", constant=0x2c)],
+                        reads=list(arg.vars_read), writes=[p1])
+        i, a = at()
+        add(FInstr(i, a, "MLIL_SET_VAR_SSA", "n#1 = p#1 - src#0", reads=[p1, src0], writes=[n1],
+                   src=FExpr("MLIL_SUB", "p#1 - src#0", reads=[p1, src0],
+                             left=FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]),
+                             right=FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]))),
+            defines_memory=False)
+    else:
+        target = {"strlen": _STRLEN, "ntohs": _NTOHS, "app_len": _APP_LEN}[callee]
+        measured = call(f"n#1 = {callee}({arg})", target, [arg],
+                        reads=list(arg.vars_read), writes=[n1])
+    i, a = at()
+    add(FInstr(i, a, "MLIL_SET_VAR_SSA", "n#2 = n#1 + 1", reads=[n1], writes=[n2],
+               src=FExpr("MLIL_ADD", "n#1 + 1", reads=[n1],
+                         left=FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]),
+                         right=FExpr("MLIL_CONST", "1", constant=1))),
+        defines_memory=False)
+    copy = call("memcpy(dst#0, src#0, n#2)", _MEMCPY,
+                [FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                 FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                 FExpr("MLIL_VAR_SSA", "n#2", reads=[n2])], reads=[dst0, src0, n2])
+    sites = []
+    if caller:
+        out, s = FVar("out", ident=21, typ="char*"), FVar("s", ident=22, typ="char*")
+        out0, s0 = FSSA(out, 0), FSSA(s, 0)
+        hop = FInstr(0, 0x210, "MLIL_CALL_SSA", "dup_label(out#0, s#0)", reads=[out0, s0],
+                     dest=FExpr("MLIL_CONST_PTR", "0x10", constant=0x10),
+                     params=[FExpr("MLIL_VAR_SSA", "out#0", reads=[out0]),
+                             FExpr("MLIL_VAR_SSA", "s#0", reads=[s0])])
+        hop.src_memory, hop.dest_memory = 0, 1
+        relay = FFunc("relay", 0x200, FSSAFunc([hop], mem_defs={1: hop}), params=[out, s])
+        sites = [FSite(relay, 0x210)]
+    func = FFunc("dup_label", 0x10, FSSAFunc(instrs, mem_defs=mem_defs), params=[dst, src],
+                 caller_sites=sites)
+    return func, FBV(_LENGTH_NAMES), measured.address, copy.address
+
+
+def _slice(func, bv, sink, models=None):
+    result = te.TaintEngine(bv, models or te.load_models()).backward(
+        func, [te.parse_locator(sink)])
+    kinds = {lf["kind"] for lf in result["leaves"]}
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
+    return result, kinds, origins
+
+
+def _objects(result):
+    """`(pointer, address)` of every pointer-object frontier leaf."""
+    return sorted((lf["pointer"], lf["address"]) for lf in result["leaves"]
+                  if lf["kind"] == "pointer_object_unresolved")
+
+
+def test_a_strlen_length_names_its_content_boundary_never_the_pointer():
+    # IC06: `memcpy(dst, src, strlen(src) + 1)`. The length is COMPUTED from
+    # the bytes `src` points at: its origin is the boundary where the walk
+    # stopped accounting for them -- at strlen, which read them -- and never
+    # `src#0` itself, which only locates them. The copy's own source operand
+    # (control) IS the pointer: its origin is the formal, its frontier at the
+    # copy, plus the per-sink `pointer_demand_not_certified` row.
+    func, bv, len_at, copy_at = _length_of("strlen")
+    result, kinds, origins = _slice(func, bv, "arg:memcpy:2")
+    assert [(o["kind"], o.get("pointer"), o.get("address")) for o in origins] == [
+        ("pointer_object_unresolved", "src#0", hex(len_at))], origins
+    assert _objects(result) == [("src#0", hex(len_at))]
+    assert "pointer_demand_not_certified" not in kinds
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    src, src_kinds, src_origins = _slice(func, bv, "arg:memcpy:1")
+    assert [(o["kind"], o.get("index")) for o in src_origins] == [("parameter", 1)]
+    assert _objects(src) == [("src#0", hex(copy_at))]
+    assert "pointer_demand_not_certified" in src_kinds
+
+
+def test_a_content_demand_ascends_into_the_caller_as_one():
+    # The formal still ascends -- the caller's object holds the bytes -- and
+    # the caller reads them the same way: the boundary there is the call
+    # site that handed `s` on, never the caller's formal `s` as the length.
+    func, bv, len_at, _copy_at = _length_of("strlen", caller=True)
+    result, _kinds, origins = _slice(func, bv, "arg:memcpy:2")
+    assert {(o["kind"], o.get("pointer"), o.get("address")) for o in origins} == {
+        ("pointer_object_unresolved", "src#0", hex(len_at)),
+        ("pointer_object_unresolved", "s#0", "0x210")}, origins
+    assert _objects(result) == [("s#0", "0x210"), ("src#0", hex(len_at))]
+
+
+def test_a_pointer_return_consumed_as_a_value_follows_the_argument_value():
+    # `n = strchr(src, ',') - src`: strchr RETURNS A POINTER into src's bytes
+    # (`returns: "pointer"`), so a value consumer follows the argument value,
+    # as before IC06 -- no byte of src's object is demanded.
+    func, bv, _len_at, _copy_at = _length_of("strchr")
+    result, kinds, origins = _slice(func, bv, "arg:memcpy:2")
+    assert {(o["kind"], o.get("index")) for o in origins} == {("parameter", 1)}, origins
+    assert "pointer_object_unresolved" not in kinds, result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
+@pytest.mark.parametrize("returns, origin", [
+    ("scalar", ("pointer_object_unresolved", None)),
+    ("pointer", ("parameter", 1)),
+])
+def test_the_model_s_returns_decides_the_demand_not_the_callee_name(returns, origin):
+    # One unknown callee, two overlays: only `returns` differs.
+    func, bv, _len_at, _copy_at = _length_of("app_len")
+    models = te.load_models(extra={"app_len": {
+        "propagates": [{"from": "*arg:0", "to": "ret"}], "returns": returns}})
+    _result, _kinds, origins = _slice(func, bv, "arg:memcpy:2", models)
+    assert [(o["kind"], o.get("index")) for o in origins] == [origin], origins
+
+
+@pytest.mark.parametrize("writes, kind, region, unproven, terminator", [
+    # `tmp[0] = 0`: strlen reads one byte, the NUL -- not the 64-byte capacity.
+    ([(0, 0)], "region_store_proof_not_certified", 1, [], 0),
+    # "ok\0": the three bytes up to the NUL.
+    ([(0, 0x6f), (1, 0x6b), (2, 0)], "region_store_proof_not_certified", 3, [], 2),
+    # A NUL at 2 with bytes 0-1 unwritten: those bytes are still demanded.
+    ([(2, 0)], "address_of_local_unresolved", 3, [[0, 2]], 2),
+    # The NUL is overwritten (a store, a call that may write it): no bound.
+    ([(0, 0), (0, 0x41)], "address_of_local_unresolved", 0x40, [[1, 0x40]], None),
+    ([(0, 0), "read"], "address_of_local_unresolved", 0x40, [[1, 0x40]], None),
+    ([], "address_of_local_unresolved", 0x40, [[0, 0x40]], None),
+])
+def test_a_string_length_demands_its_local_only_up_to_a_proven_nul(
+        writes, kind, region, unproven, terminator):
+    # IC06: a string reader stops at its first NUL. A store-covered region
+    # is still a fact, never certified (#931): the slice stays incomplete.
+    func, bv, len_at, _copy_at = _length_of("strlen", local=writes)
+    result, _kinds, _origins = _slice(func, bv, "arg:memcpy:2")
+    [leaf] = [lf for lf in result["leaves"] if lf.get("buffer") == "tmp"]
+    assert (leaf["kind"], leaf["region"], leaf["unproven"], leaf["terminator"]) == (
+        kind, {"offset": 0, "size": region}, unproven, terminator), leaf
+    assert leaf["address"] == hex(len_at)
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_a_by_value_return_rule_follows_the_argument_value_only():
+    # `n = ntohs(src)` returns a function of the argument VALUE (`arg:0 ->
+    # ret`): the formal is the origin, and no byte of any object is demanded.
+    func, bv, _len_at, _copy_at = _length_of("ntohs")
+    result, kinds, origins = _slice(func, bv, "arg:memcpy:2")
+    assert [(o["kind"], o.get("index")) for o in origins] == [("parameter", 1)], origins
+    assert not kinds & {"pointer_object_unresolved", "pointer_demand_not_certified"}, kinds
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True

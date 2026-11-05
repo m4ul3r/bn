@@ -379,7 +379,7 @@ def test_render_arg_under_recovered_leaf():
     leaf = {"kind": "arg_under_recovered", "address": "0x40130a",
             "callee": {"name": "_M_create", "address": "0x3000"},
             "recovered_params": 1, "dropped_args": [1],
-            "note": 'tainted arg(s) [1] ... apply `bn proto set _M_create "<prototype>"` ...'}
+            "detail": 'tainted arg(s) [1] ... apply `bn proto set _M_create "<prototype>"` ...'}
     out = "\n".join(_render_grouped_leaves([leaf]))
     assert "arg_under_recovered @ 0x40130a" in out
     assert "_M_create" in out
@@ -391,7 +391,7 @@ def test_arg_under_recovered_leaves_group_per_callee():
     from bn.formatters import _render_grouped_leaves
     mk = lambda addr: {"kind": "arg_under_recovered", "address": addr,
                        "callee": {"name": "f", "address": "0x3000"},
-                       "recovered_params": 1, "dropped_args": [1], "note": "n"}
+                       "recovered_params": 1, "dropped_args": [1], "detail": "n"}
     out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
     assert "[2 leaves]" in out                             # two call sites of f collapse
 
@@ -405,12 +405,12 @@ _CXX_TAINT = {
     "sources": ["arg:recv:1"],
     "reached_sinks": [{
         "sink": {"class": "path_injection",
-                 "callee": "ZN5store4openEPKc", "callee_symbol": "_ZN5store4openEPKc",
+                 "callee": "_ZN5store4openEPKc", "callee_symbol": "_ZN5store4openEPKc",
                  "callee_display_name": "store::open",
                  "address": "0x402080", "tainted_arg_index": 1},
         "path": [],
         "metrics": {"steps": 4, "fns_spanned": 2, "traverses_unresolved": False},
-        "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc",
+        "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc",
                       "rendered_display": "arg:recv:1 → read_key → [path_injection] store::open",
                       "rendered_symbol": "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc"},
     }],
@@ -2357,6 +2357,10 @@ _PROBE_EXCLUSIONS = {
         "a context manager the CLI enters around a render to bind the -i/-t that "
         "commands the renderer prints must carry (#1037 review); it reads no "
         "payload and renders nothing"),
+    "CODE_SPAN_RE": (
+        "not-callable",
+        "a compiled regex, not a callable renderer: the CLI's routing reads the "
+        "command spans a renderer printed through `code_span` (R4-02) with it"),
     "_slice_text_lines": (
         "takes-more-than-a-payload",
         "its first argument is ALREADY-RENDERED TEXT plus a required line range, "
@@ -3014,15 +3018,16 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
     # emptiness claim over an oracle that witnessed nothing is free. The
     # WITNESSES are pinned exactly -- they are what the module actually did, so
     # a driving loop that stops reaching a live surface goes red here instead of
-    # quietly making the two checks above trivially true. Nine of the walk's 17
-    # boundary-free names are witnessed; the other eight sit on branches these
+    # quietly making the two checks above trivially true. Some of the walk's
+    # boundary-free names are witnessed (`_bn_command` and `code_span` by the
+    # quick-view warning's routed refresh, V7-02); the rest sit on branches these
     # payloads do not open, which is the stated limit of a live witness and the
     # reason the conservative static walk is kept beside it rather than
     # replaced by it.
     assert sorted(live_bare) == [
-        "_as_dict", "_field_dict", "_field_list", "_operation_row",
+        "_as_dict", "_bn_command", "_field_dict", "_field_list", "_operation_row",
         "_record_skew", "_render_fallback_text", "_render_target_choice",
-        "_skew_note", "_unknown_ref_label"], (
+        "_skew_note", "_unknown_ref_label", "code_span"], (
         "the runtime oracle no longer witnesses the same set running bare, so "
         "its emptiness claims above are over different evidence than the ones "
         f"that were checked: {sorted(live_bare)}")
@@ -4473,9 +4478,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # paging, so `_render_function_evidence_text(offset)` is now checked below
     # instead of skipped as unstated.
     # Merged with #1037: 63 + #1040/#1049's four + #1037's four.
-    assert len(sites) == 71, (
+    # R2-16-05 adds the backward frontier's `dropped_callers_unmeasured`.
+    # P2-04 adds the `function cfg` slice line's `offset`, `returned`,
+    # `matched_blocks` and `total_blocks`; P2-06 the exports listing's
+    # `duplicates_collapsed`.
+    assert len(sites) == 77, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 71. A "
+        "count helper, not 77. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 
@@ -4592,8 +4601,17 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "context]",
         "_render_backward_diagnostics(dropped_callers) [count not stated in "
         "this context]",
+        "_render_backward_diagnostics(dropped_callers_unmeasured) [count not "
+        "stated in this context]",
         "_render_backward_diagnostics(unresolved) [count not stated in this "
         "context]",
+        # P3: the page footer now comes from `_paging_footer` (covered there),
+        # so the renderer's own `offset`/`total` reads are only the past-the-end
+        # note of an EMPTY page, which a probe that fills the page never opens.
+        # Covered by
+        # test_render_data_symbols_empty_page_past_the_end_discloses_the_total.
+        "_render_data_symbols_text(offset) [count not stated in this context]",
+        "_render_data_symbols_text(total) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # The same branch for the #818 skip buckets: the recorded context opens
         # the detail branch (`go_renamed_candidates` readable and non-zero), and
@@ -4621,6 +4639,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         # from the body it renders for a payload that claimed nothing, so the
         # exemption fails with the branch it exempts.
         "_render_name_address_list_text(self_defined_excluded) [count not "
+        "stated in this context]",
+        # P2-06: the same harness cut -- the inner paged-list boundary
+        # discloses first. The line itself is pinned in
+        # `test_exports_text_states_the_collapsed_duplicate_records`.
+        "_render_name_address_list_text(duplicates_collapsed) [count not "
         "stated in this context]",
         # #969: the same harness cut as `self_defined_excluded` above -- the
         # inner paged-list boundary discloses first. The footer's own wording
@@ -4825,7 +4848,9 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
 # 38 -> 37 (#1036 item 5): `_render_orient_text`'s
 # `ea.get('analysis_cache_restored', False)` matched as a count spelling
 # (`False == 0`); the split database flags now read through `_flag_field`.
-_RAW_COUNT_SPELLINGS = 37
+# 37 -> 36: `function info`'s `value.get('xref_count', 0)` is gone; its two
+# counts render `<unknown>` when absent instead of a fabricated 0.
+_RAW_COUNT_SPELLINGS = 36
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -5305,11 +5330,9 @@ def test_class_show_skewed_primary_vtable_slots_say_more_than_the_empty_case():
     assert skewed != empty
 
 
-def test_class_show_discloses_a_skewed_method_list_on_both_paths():
-    # `methods`/`bases` are coerced in the single-class helper, which the
-    # renderer calls with its own payload on the non-ambiguous path and with a
-    # match ROW on the ambiguous one. A class whose method list arrives skewed
-    # must not render as a class that simply has no methods.
+def test_class_show_discloses_a_skewed_method_list():
+    # A class whose method list arrives skewed must not render as a class that
+    # simply has no methods.
     from bn.formatters import _render_class_show_text
     direct = _render_class_show_text(
         {"name": "Widget", "confidence": "rtti", "methods": "bad", "bases": "bad"})
@@ -5317,21 +5340,6 @@ def test_class_show_discloses_a_skewed_method_list_on_both_paths():
     assert "malformed bases, methods fields" in direct
     assert direct != _render_class_show_text(
         {"name": "Widget", "confidence": "rtti", "methods": [], "bases": []})
-
-    ambiguous = _render_class_show_text(
-        {"ambiguous": True, "query": "W",
-         "matches": [{"name": "Widget", "confidence": "rtti", "methods": "bad"}]})
-    assert "malformed methods field" in ambiguous
-
-
-def test_class_show_ambiguous_count_is_the_rows_rendered_not_the_raw_field():
-    # A skewed `matches` counted one match per CHARACTER of the string: invented
-    # data in the one line a reader uses to judge how ambiguous the query was.
-    from bn.formatters import _render_class_show_text
-    out = _render_class_show_text({"ambiguous": True, "query": "W", "matches": "bad"})
-    assert "0 matches" in out
-    assert "3 matches" not in out
-    assert "malformed matches field" in out
 
 
 def test_class_show_discloses_a_skewed_secondary_vtable_slot_list():
@@ -6320,7 +6328,7 @@ def test_save_text_says_an_export_is_not_the_targets_database():
         "default_save_path": "/ro/demod.bndb", "restart_path": "/ro/demod",
         "restart_path_is_database": False,
     })
-    assert out.splitlines()[0] == "saved: /out/demod.bndb"
+    assert out.splitlines()[0] == "saved: /out/demod.bndb  (export)"
     assert "an export, not this target's own database" in out
     assert "a plain `bn save` writes /ro/demod.bndb" in out
     assert "reopens /ro/demod (the raw file, without this analysis)" in out
@@ -10394,7 +10402,7 @@ def test_compact_flow_line_keeps_full_names_under_mangled_1041():
     from bn.formatters import _render_flow_line
     sig = {"rendered": "call:recv → _ZN3fooIiE3barEv → [alloc_size] _Znam",
            "rendered_display": "call:recv → foo<int>::bar() → [alloc_size] operator new[]"}
-    flow = {"sink": {"class": "alloc_size", "callee": "Znam", "address": "0x10",
+    flow = {"sink": {"class": "alloc_size", "callee": "_Znam", "model": "Znam", "address": "0x10",
                      "tainted_arg_index": 0}, "signature": sig, "metrics": {}}
     assert "foo<…>::bar()" in _render_flow_line(flow)
     assert "_ZN3fooIiE3barEv" in _render_flow_line(flow, mangled=True)
@@ -10476,3 +10484,33 @@ def test_proto_text_prints_entry_value_and_undefined_type_notes_1013():
     })
     assert "\n\nnote: At 2 of 2 direct call sites ..." in text
     assert "\n\nnote: run `bn types declare 'struct `ns::Cls`;'` first." in text
+
+
+def test_data_symbols_footer_states_the_rows_shown_and_the_next_offset():
+    # P3: the second page of three printed "showing 6 of 21" -- the next
+    # offset where the row count belongs. The footer is the shared one.
+    from bn.formatters import _render_data_symbols_text
+    page = {"kind": "data_symbols", "items": [{"a": "0x404010", "n": f"g_slot{i}"}
+                                              for i in range(3)],
+            "total": 21, "offset": 3, "limit": 3, "returned": 3, "has_more": True}
+    assert _render_data_symbols_text(page).splitlines()[-1] == (
+        "// showing 3 of 21 (15 more); rerun with --offset 6 or a larger --limit")
+
+
+@pytest.mark.parametrize("unsaved, expected", [
+    (True, "unsaved: yes"), (False, "unsaved: no"),
+])
+def test_save_text_states_what_an_export_left_unchanged(unsaved, expected):
+    # P2-03: an export persisted nothing for the target; the text must say
+    # which database still backs it and that its unsaved state is as it was.
+    from bn.formatters import _render_save_text
+
+    out = _render_save_text({
+        "ok": True, "saved": True, "path": "/out/copy.bndb", "export": True,
+        "default_save_path": "/work/demod.bndb", "restart_path": "/work/demod.bndb",
+        "restart_path_is_database": True, "backing_database": "/work/demod.bndb",
+        "unsaved": unsaved,
+    })
+    lines = out.splitlines()
+    assert "backing database: /work/demod.bndb" in lines
+    assert any(line.startswith(expected) for line in lines)

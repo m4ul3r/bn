@@ -25,12 +25,20 @@ from __future__ import annotations
 
 import ast
 import importlib
+import itertools
 import re
 import sys
 import types
 from pathlib import Path
 
 import pytest
+
+from bn.taint_vocabulary import (
+    kind_rows,
+    origin_constructors,
+    overlay_constructors,
+    pointer_object_constructors,
+)
 
 REFERENCE = Path(__file__).resolve().parent.parent / "skills" / "bn" / "reference"
 READING = REFERENCE / "reading.md"
@@ -1455,3 +1463,85 @@ def test_go_rename_reference_lists_exactly_the_flags_it_takes():
         f"all of them; the parser defines {sorted(own)} beyond the shared flags "
         f"and the aliases the document declares ({aliases})"
     )
+
+
+def test_reading_names_every_taint_leaf_kind_and_truncation_cause():
+    """Every blocking frontier leaf kind and every truncation cause the engine
+    can emit is documented in `reading.md`, and no doc still promises the
+    `sink_status` `bounded` key the backward engine no longer emits (P2-13).
+
+    An undocumented leaf kind is a frontier an agent cannot interpret, so it
+    reads the result as noise; an undocumented cause sends it to `--max-depth`
+    for a bound that flag does not move."""
+    from bn.taint_truncation import TRUNCATION_CAUSES
+    from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
+
+    reading = READING.read_text(encoding="utf-8")
+    # R4-05: the "Blocking leaf kinds" table both ways -- a row per registered
+    # kind, and no row for a kind the registry (whose every member the engine
+    # constructs, see test_every_engine_leaf_kind_is_classified_for_propagation)
+    # does not have: a stale row passed when only the first direction was asked.
+    section = reading[reading.index("**Blocking leaf kinds**"):]
+    rows = list(itertools.takewhile(
+        lambda line: line.startswith("|"),
+        itertools.dropwhile(lambda line: not line.startswith("|"), section.splitlines())))
+    documented = {kind for row in rows[2:] for kind in re.findall(r"`([a-z_]+)`", row.split("|")[1])}
+    assert documented == set(BLOCKING_LEAF_KINDS), (
+        f"undocumented: {sorted(set(BLOCKING_LEAF_KINDS) - documented)}, "
+        f"documented but never emitted: {sorted(documented - set(BLOCKING_LEAF_KINDS))}")
+    missing_causes = sorted(c for c in TRUNCATION_CAUSES if f"`{c}`" not in reading)
+    assert not missing_causes, f"reading.md never names truncation cause(s) {missing_causes}"
+
+    vr = REFERENCE.parent.parent / "bn-vr" / "SKILL.md"
+    stale = re.compile(r"`sink_status(?:\[\])?`[^.\n]*`bounded`")
+    for doc in (READING, SKILL, vr):
+        text = doc.read_text(encoding="utf-8")
+        assert "`bounded: true`" not in text, f"{doc.name} documents `bounded: true`"
+        assert not stale.search(text), f"{doc.name} documents a sink_status `bounded` key"
+
+
+SRC = Path(__file__).resolve().parent.parent / "src"
+
+
+def _doc_table(header: str) -> dict[str, str]:
+    """``{kind: row}`` for the reading.md table whose header line is *header*:
+    every backticked name in a row's first cell, mapped to the whole row."""
+    lines = READING.read_text(encoding="utf-8").splitlines()
+    assert header in lines, f"reading.md has no table headed {header!r}"
+    rows: dict[str, str] = {}
+    for line in lines[lines.index(header) + 2:]:
+        if not line.startswith("|"):
+            break
+        for kind in re.findall(r"`([^`]+)`", line.split("|")[1]):
+            rows[kind] = line
+    return rows
+
+
+ORIGIN_TABLE = "| origin `kind` | meaning and fields |"
+OVERLAY_TABLE = "| overlay row `kind` | meaning | fields |"
+POINTER_OBJECT_TABLE = "| pointer object `kind` | meaning and fields |"
+
+
+@pytest.mark.parametrize(("source", "constructors", "header"), [
+    (SRC / "bn_agent_bridge" / "taint_engine.py", origin_constructors, ORIGIN_TABLE),
+    (SRC / "bn" / "taint_models.py", overlay_constructors, OVERLAY_TABLE),
+    (SRC / "bn_agent_bridge" / "taint_engine.py", pointer_object_constructors,
+     POINTER_OBJECT_TABLE),
+], ids=["backward_origin_kinds", "model_overlay_row_kinds", "pointer_object_kinds"])
+def test_reading_tables_name_exactly_the_kinds_the_code_builds(source, constructors, header):
+    """P2-13: an origin `kind` (`slices[].origin` / `origins[]`) or a model
+    overlay row `kind` (`model_sources` / `overlays`) an agent finds in no
+    table is one it cannot interpret. Each table lists exactly the kinds the
+    code constructs -- a new kind fails until it has a row, a removed one
+    until its row goes -- and each row names every literal field a
+    constructor of that kind sets."""
+    built = kind_rows(source, constructors)
+    assert built, f"no {header} constructors found in {source.name}"
+    documented = _doc_table(header)
+    assert set(documented) == set(built), (
+        f"{header}: undocumented {sorted(set(built) - set(documented))}, "
+        f"stale {sorted(set(documented) - set(built))}")
+    missing = {k: sorted(f for f in fields if f"`{f}`" not in documented[k])
+               for k, fields in built.items()}
+    missing = {k: v for k, v in missing.items() if v}
+    assert not missing, f"{header}: rows omit field(s) {missing}"

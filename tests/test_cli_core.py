@@ -199,12 +199,30 @@ def test_every_command_with_a_size_lever_names_it_instead_of_only_out():
     the write-to-a-file fallback.
     """
     for path in (
-        ("read",), ("trace",), ("taint", "forward"), ("taint", "backward"),
+        ("read",), ("trace",),
         ("evidence", "orient"), ("evidence", "surface"), ("evidence", "table"),
     ):
         hint = bn.cli._slice_hint_for_command(path, True) or ""
         assert "smaller" in hint, (path, hint)
         assert hint != "rerun with --out <path> to write it to a file", (path, hint)
+
+
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+def test_taint_max_depth_is_never_offered_as_the_output_slice(direction):
+    """W07-09: taint's `--max-depth` changes which calls the walk descends, and
+    a tighter cap can GROW the frontier list, so the estimate and spill advice
+    must not name it as the way to bound the read. Taint has no slicing flag;
+    the advice is the file, and the depth flag is named only as not-a-slice."""
+    path = ("taint", direction)
+    for text_format in (True, False):
+        hint = bn.cli._slice_hint_for_command(path, text_format) or ""
+        assert "--out" in hint and "smaller" not in hint, hint
+    locator = "--source" if direction == "forward" else "--sink"
+    args = bn.cli.build_parser().parse_args(
+        ["taint", direction, "-f", "parse_frame", locator, "param:0",
+         "--max-depth", "3", "--estimate-output"])
+    hint = bn.cli._slice_hint_for_args(args, "text") or ""
+    assert "--out" in hint and "smaller" not in hint, hint
 
 
 def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tmp_path):
@@ -218,7 +236,7 @@ def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tm
     value = {"kind": "instances",
              "items": [{"instance_id": f"i{n}", "pid": n} for n in range(400)]}
 
-    bn.cli._emit_result(args, value, stem="instances")
+    assert bn.cli._emit_result(args, value, exit_code=0, stem="instances") == 0
 
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["spilled"] is True
@@ -307,20 +325,24 @@ def test_a_value_after_regex_names_the_switch_and_prints_the_fix_1042(capsys, fa
     assert other == "--with-xrefs is a switch and takes no value; 'stray' is left over"
 
 
-def test_estimate_output_on_a_dual_role_node_prints_the_alias_form_1037(capsys):
-    """#1037 item 10: the flag is withheld on `exports` on purpose (#796 r2);
-    the refusal now says so and prints the `exports list` form, which parses
-    with the flag set."""
-    hint = _parser_hint(capsys, ["-t", "exports", "exports", "--estimate-output"])
-    assert "not accepted on `bn exports` itself" in hint
+def test_a_dual_role_node_takes_every_flag_its_alias_takes(capsys):
+    """P3: root `exports` refused `--estimate-output` while its alias `exports
+    list` took it, and a flag given BEFORE the alias subcommand was clobbered
+    by the subcommand's default (`exports --count list` listed, `exports
+    --limit 2 list` returned every row)."""
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["exports", "--estimate-output"])
+    assert ns.estimate_output is True and ns._command_path == ("exports",)
 
-    argv = _printed_command(hint)
-    # The `-t exports` VALUE is not mistaken for the command path.
-    assert argv == ["-t", "exports", "exports", "list", "--estimate-output"]
-    ns = bn.cli.build_parser().parse_args(argv)
-    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
+    carried = parser.parse_args(["exports", "--count", "--limit", "2",
+                                 "--estimate-output", "list"])
+    assert (carried.count, carried.limit, carried.estimate_output,
+            carried._command_path) == (True, 2, True, ("exports", "list"))
+    root, alias = parser.parse_args(["exports"]), parser.parse_args(["exports", "list"])
+    assert (alias.count, alias.limit, alias.offset, alias.estimate_output) == (
+        root.count, root.limit, root.offset, root.estimate_output)
 
-    # `types` has no alias leaf: the refusal explains, and prints no command.
+    # `types` has a mutating subcommand, so the flag stays off the node.
     types_hint = _parser_hint(capsys, ["types", "--estimate-output"])
     assert "not accepted on `bn types` itself" in types_hint and "bn types " not in types_hint
 
@@ -398,16 +420,6 @@ def test_fanout_rows_the_default_page_cut_short_each_get_a_stderr_note_1037(
         "FILE for every row"], err
     assert sorted(target for target, _ in asked) == ["1:1:1", "1:2:2"]
     assert all(params["limit"] == 100 for _, params in asked)
-
-
-def test_abbreviated_routing_option_does_not_bend_the_exports_hint_1037(capsys):
-    """#1048 review nit: `--targ exports` is the abbreviated `--target`, so its
-    value is not the command path; the printed command must parse."""
-    hint = _parser_hint(capsys, ["--targ", "exports", "exports", "--estimate-output"])
-    argv = _printed_command(hint)
-    assert argv == ["--targ", "exports", "exports", "list", "--estimate-output"]
-    ns = bn.cli.build_parser().parse_args(argv)
-    assert ns.estimate_output is True and ns._command_path == ("exports", "list")
 
 
 def test_local_list_text_is_slim(fake_transport, capsys):
@@ -842,16 +854,32 @@ def test_class_and_go_subcommand_groups_have_help():
     assert "Go binary symbol recovery" in help_text
 
 
-def test_class_show_ambiguous_exits_nonzero_keeping_matches(fake_transport, capsys):
-    # #413: an ambiguous leaf still returns the informative matches, but with a
-    # NON-zero exit so a shell/agent can't read it as a clean single-class result.
-    fake_transport({"class_show": {"ok": True, "result": {
-        "ambiguous": True, "query": "Foo",
-        "matches": [{"name": "a::Foo"}, {"name": "b::Foo"}]}}})
+def test_class_show_ambiguous_is_the_uniform_exit_2_refusal_envelope(monkeypatch, capsys):
+    # An ambiguous leaf is refused like every other exit-2 read: under JSON the
+    # stdout object is `ok: false` with `status` and `error`, and the candidate
+    # cards ride in `observed.matches` (the transport raises what the bridge's
+    # `ambiguous_class` OperationFailure serialises to).
+    from bn.transport import BridgeError
+
+    def refuse(op, **_kwargs):
+        raise BridgeError("'Foo' names 2 classes: a::Foo, b::Foo.",
+                          status="ambiguous_class", requested={"name": "Foo"},
+                          observed={"matches": [{"name": "a::Foo"}, {"name": "b::Foo"}]})
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
     rc = bn.cli.main(["class", "show", "--target", "active", "Foo", "--format", "json"])
     assert rc == 2
-    out = capsys.readouterr().out
-    assert "a::Foo" in out and "b::Foo" in out
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["status"] == "ambiguous_class"
+    assert envelope["requested"] == {"name": "Foo"}
+    assert [m["name"] for m in envelope["observed"]["matches"]] == ["a::Foo", "b::Foo"]
+
+    rc = bn.cli.main(["class", "show", "--target", "active", "Foo"])
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "a::Foo" in err and "b::Foo" in err
 
 
 def test_missing_subcommand_prints_exact_help(capsys):
@@ -2126,3 +2154,45 @@ def test_machine_error_format_does_not_leak_into_the_next_parse(capsys):
     second = capsys.readouterr()
     assert second.out == ""
     assert "--definitely-not-a-flag" in second.err
+
+
+def test_taint_leaf_reseed_command_is_bound_to_this_invocation():
+    """BN23-ADVICE-01: a leaf's `reseed` is an executable `bn taint forward …`,
+    so with several bridges open the structured field exited 2 while the same
+    command quoted in `detail` prose ran."""
+    value = {"leaves": [{
+        "reseed": "`bn taint forward -f 0x401100 --source arg:system:0`",
+        "suggested_source": "arg:system:0",
+        "seed": "0x401100",
+    }]}
+    bn.cli._contextualize_diagnostic_hints(value, target="-local sample", instance="X1")
+    leaf = value["leaves"][0]
+    assert leaf["reseed"] == (
+        "`bn -i X1 '--target=-local sample' taint forward -f 0x401100"
+        " --source arg:system:0`")
+    assert leaf["suggested_source"] == "arg:system:0"
+    assert leaf["seed"] == "0x401100"
+
+
+@pytest.mark.parametrize(("command", "expected"), [
+    ("taint forward -f 0x401100 -i other",
+     "'--target=-local sample' taint forward -f 0x401100 -i other"),
+    ("taint forward -f 0x401100 --target='other target'",
+     "-i X1 taint forward -f 0x401100 --target='other target'"),
+    ("taint forward -f 0x401100 -i other -t 'other target'",
+     "taint forward -f 0x401100 -i other -t 'other target'"),
+])
+def test_reseed_that_already_routes_keeps_one_selector_each(command, expected):
+    value = {"leaves": [{"reseed": f"`bn {command}`",
+                         "detail": f"Reseed with `bn {command}`."}]}
+    bn.cli._contextualize_diagnostic_hints(value, target="-local sample", instance="X1")
+    leaf = value["leaves"][0]
+    assert leaf["reseed"] == f"`bn {expected}`"
+    assert leaf["detail"] == f"Reseed with `bn {expected}`."
+
+
+def test_reseed_is_untouched_when_the_call_routed_nothing():
+    reseed = "`bn taint forward -f 0x401100 --source arg:system:0`"
+    value = {"leaves": [{"reseed": reseed}]}
+    bn.cli._contextualize_diagnostic_hints(value, target=None, instance=None)
+    assert value["leaves"][0]["reseed"] == reseed

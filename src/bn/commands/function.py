@@ -454,8 +454,6 @@ def _decompile_many(
         op,
         {"identifiers": identifiers, **shared},
         require_target=True,
-        # #1045 review: the warnings print concrete `bn` commands.
-        contextual_hints=True,
         text_renderer=_render_batch_text,
         result_exit_code=_batch_exit_code,
         result_transform=_respell_row_errors,
@@ -540,7 +538,6 @@ def _decompile(args: argparse.Namespace) -> int:
             "decompile",
             {"identifier": identifiers[0], **shared},
             require_target=True,
-            contextual_hints=True,
             text_renderer=_render_decompile_text,
             stem="decompile",
         )
@@ -597,6 +594,7 @@ def _il(args: argparse.Namespace) -> int:
                       "json/ndjson do not produce, so passing it with --format "
                       "json is REFUSED rather than ignored. For a structured "
                       "slice, take the payload's text and slice it (#675 item 3)."),
+             mangled_arg(),
          ],
          estimable=True)
 def _function_structured_il(args: argparse.Namespace) -> int:
@@ -609,7 +607,8 @@ def _function_structured_il(args: argparse.Namespace) -> int:
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
         text_renderer=lambda value: _resolution_note(value)
-        + _slice_text_lines(_render_structured_il_text(value), lines_range),
+        + _slice_text_lines(_render_structured_il_text(value, mangled=bool(args.mangled)),
+                            lines_range),
         stem="structured-il",
     )
 
@@ -685,10 +684,12 @@ def _render_disasm_text(value: Any) -> str:
                    # linearly disassembles N units from any mapped address,
                    # even one BN left as data (a missed handler / vtable slot), so
                    # you can inspect the bytes before `function create` (#314).
-                   arg("--linear", nargs="?", const=32, type=_positive_int, default=None, metavar="N",
+                   arg("--linear", "--length", nargs="?", const=32, type=_positive_int,
+                       default=None, metavar="N", dest="linear",
                        help="Linear-disassemble up to N units (default 32): one physical "
                             "instruction or one undecodable byte (.byte) per unit, from "
-                            "any mapped address, independent of function membership")),
+                            "any mapped address, independent of function membership "
+                            "(--length is an accepted alias)")),
          ],
          estimable=True)
 def _disasm(args: argparse.Namespace) -> int:
@@ -755,13 +756,28 @@ def _disasm(args: argparse.Namespace) -> int:
                       "targets are IL instruction indexes (hex), not addresses -- "
                       "first-line addresses collide when one instruction expands to "
                       "several IL blocks; per-line addresses stay real at every level"),
+             arg("--limit", type=_positive_int, default=None, metavar="N",
+                 help="Return at most N blocks (in block-start order) -- slice a large graph"),
+             arg("--offset", type=_non_negative_int, default=0,
+                 help="Skip the first OFFSET blocks (pagination, with --limit)"),
+             arg("--address-window", dest="address_window", default=None, metavar="A:B",
+                 help="Only blocks holding an instruction whose start address is in [A, B) "
+                      "(hex 0x.. or decimal), e.g. 0x402000:0x402200"),
          ],
          estimable=True)
 def _function_cfg(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"identifier": args.identifier, "view": args.view}
+    # Forwarded only when given, so an unsliced request is unchanged.
+    if args.offset:
+        params["offset"] = args.offset
+    if args.limit is not None:
+        params["limit"] = args.limit
+    if args.address_window:
+        params["address_window"] = args.address_window
     return _call(
         args,
         "cfg",
-        {"identifier": args.identifier, "view": args.view},
+        params,
         require_target=True,
         text_renderer=lambda value: _resolution_note(value) + _render_cfg_text(value),
         stem="cfg",
@@ -980,8 +996,6 @@ def _callsites(args: argparse.Namespace) -> int:
         "callsites",
         params,
         require_target=True,
-        # #1033 item 6: the variadic note's commands carry this call's -i/-t.
-        contextual_hints=True,
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),
@@ -1236,8 +1250,6 @@ def _evidence_surface(args: argparse.Namespace) -> int:
         "hidden_surface",
         params,
         require_target=True,
-        # #1046 review: the verify command in `next_action` carries -i/-t.
-        contextual_hints=True,
         text_renderer=_render_surface_text,
         stem="evidence-surface",
     )
@@ -1357,7 +1369,6 @@ def _trace(args: argparse.Namespace) -> int:
             "mangled": args.mangled,
         },
         require_target=True,
-        contextual_hints=True,
         text_renderer=lambda v: _render_trace_text(v, mangled=args.mangled),
         stem="trace",
     )

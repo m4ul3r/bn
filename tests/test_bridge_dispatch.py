@@ -1406,16 +1406,110 @@ def test_cancel_request_marks_only_active_requests(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
 
     inactive = instance._cancel_request("missing")
-    assert inactive == {"kind": "cancel_request", "request_id": "missing", "cancelled": False}
+    assert inactive == {"kind": "cancel_request", "request_id": "missing", "cancelled": False,
+                        "polls_cancel": False}
     assert instance._is_request_cancelled("missing") is False
 
     instance._begin_request("req-1")
     active = instance._cancel_request("req-1")
-    assert active == {"kind": "cancel_request", "request_id": "req-1", "cancelled": True}
+    assert active == {"kind": "cancel_request", "request_id": "req-1", "cancelled": True,
+                      "polls_cancel": False}
     assert instance._is_request_cancelled("req-1") is True
 
     instance._end_request("req-1")
     assert instance._is_request_cancelled("req-1") is False
+
+
+@pytest.mark.parametrize("op, polls", [("taint", True), ("go_rename", True),
+                                       ("list_targets", False), ("py_exec", False)])
+def test_a_cancel_says_whether_the_running_op_checks_for_it(monkeypatch, op, polls):
+    # A client that timed out waits for the outcome only when the op will
+    # look at the flag; a `list_targets` queued behind a write lock never
+    # does, and waiting on it spent a `session stop` probe's budget (P1-07).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance._begin_request("req-1", op)
+    ack = instance._cancel_request("req-1")
+    assert (ack["cancelled"], ack["polls_cancel"]) == (True, polls)
+    instance._end_request("req-1")
+    assert instance._cancel_request("req-1")["polls_cancel"] is False
+
+
+def _taint_one_call_program(monkeypatch, instance):
+    """`main(argv) { system(argv); }` behind the bridge's taint op."""
+    from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar
+
+    argv = FVar("argv")
+    argv0 = FSSA(argv, 0)
+    func = FFunc("main", 0x401100, FSSAFunc([
+        FInstr(0, 0x401104, "MLIL_CALL_SSA", "system(argv#0)", reads=[argv0],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "argv#0", reads=[argv0])])]), params=[argv])
+    bv = FBV({0x401070: "system"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda view, ident, **kw: func)
+    return {"op": "taint", "target": "t",
+            "params": {"function": "main", "direction": "forward", "sources": ["param:0"]}}
+
+
+def test_a_cancelled_taint_request_answers_with_a_cancelled_status(monkeypatch):
+    # P1-07: the walk polls the request's cancel flag (a cancel_request, or
+    # a client that hung up) and stops with a structured outcome, so a client
+    # still listening can tell the cancel was honoured.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    payload = _taint_one_call_program(monkeypatch, instance)
+
+    with bridge._request_cancel_context(lambda: True):
+        cancelled = instance.dispatch(payload)
+    assert cancelled["ok"] is False, cancelled
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["observed"] == {"cancelled": True, "functions_visited": 1}
+
+    with bridge._request_cancel_context(lambda: False):
+        completed = instance.dispatch(payload)
+    assert completed["ok"] is True, completed
+    assert [f["sink"]["callee"] for f in completed["result"]["reached_sinks"]] == ["system"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="POLLHUP on a Unix socket is Linux-specified")
+def test_only_a_client_that_hung_up_reads_as_cancelled(monkeypatch):
+    # A SIGTERM'd or timed-out client sends no cancel; its hang-up is the
+    # signal. The CLI's own half-close while it waits must not read as one.
+    bridge = _load_bridge(monkeypatch)
+    waiting, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with waiting:
+        client.sendall(b"{}\n")
+        client.shutdown(socket.SHUT_WR)
+        assert bridge._peer_hung_up(waiting) is False
+        client.close()
+        assert bridge._peer_hung_up(waiting) is True
+
+
+def test_an_unexpected_op_exception_is_logged_with_its_traceback(monkeypatch, capsys):
+    # P1-03: the client sees `internal error: <class>: <message>` only; the
+    # bridge log must say where it was raised.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    payload = _taint_one_call_program(monkeypatch, instance)
+
+    def float_to_address(*_a, **_k):
+        return int(float("inf"))
+
+    monkeypatch.setattr(instance, "_taint", float_to_address)
+    response = instance.dispatch(payload)
+    assert response["error"].startswith("internal error: OverflowError"), response
+    logged = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in logged
+    assert "float_to_address" in logged and "OverflowError" in logged
+
+    # A user-facing refusal is the expected answer to a bad request: no trace.
+    def refuse(*_a, **_k):
+        raise bridge.OperationFailure("unsupported", "no such source")
+
+    monkeypatch.setattr(instance, "_taint", refuse)
+    assert instance.dispatch(payload)["error"] == "no such source"
+    assert "Traceback" not in capsys.readouterr().err
 
 
 def _cancel_through_handler(bridge, inst, request_id, identity, op="cancel_request"):
@@ -6520,7 +6614,8 @@ def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
                       "export": True, "default_save_path": orig + ".bndb",
                       "default_cache_fallback": str(bridge._cache_bndb_path(orig)),
                       "default_cache_fallback_refused": False,
-                      "restart_path": orig, "restart_path_is_database": False}
+                      "restart_path": orig, "restart_path_is_database": False,
+                      "backing_database": None, "unsaved": False}
     assert out.exists()
     assert bv.created_with == str(out.resolve())   # the copy WAS written
     assert bv.file.filename == orig                # ...but identity is preserved
@@ -8900,3 +8995,30 @@ def test_raw_target_row_filename_cannot_execute_shell_metadata(tmp_path, shell, 
     assert not any((tmp_path / name).exists() for name in (
         "SELECTOR_MARKER", "FILENAME_MARKER", "SUBSTITUTION_MARKER",
     ))
+
+
+def test_empty_local_pages_and_nested_collections_carry_their_row_fields():
+    """P3: an empty `local list` (or `--frame`) page had no `row_fields`,
+    because no declaration stood in for its rows, and the `strings`/`sections`
+    envelopes `evidence orient` embeds had none at all."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    empty = _annotate_row_fields({"kind": "locals", "function": {"name": "f"}, "items": []})
+    assert empty["row_fields"] == ["name", "storage", "type", "is_parameter", "index",
+                                   "identifier", "source_type", "local_id"]
+    assert set(empty["row_fields_optional"]) == {"distance_to_next_slot", "span_to_next"}
+    frame = _annotate_row_fields({"kind": "frame", "items": []})
+    assert frame["row_fields"] == ["storage", "kind", "names", "types",
+                                   "distance_to_next_slot", "to_canary", "variables"]
+
+    orient = _annotate_row_fields({
+        "kind": "orientation",
+        "strings_sample": {"kind": "strings", "items": [
+            {"address": "0x1", "value": "a", "chars": 1, "length": 1, "type": "ascii",
+             "section": ".rodata"}]},
+        "sections": {"kind": "sections", "items": []},
+        "target": {"arch": "x86_64"}})
+    assert orient["strings_sample"]["row_fields"] == [
+        "address", "value", "chars", "length", "type", "section"]
+    assert orient["sections"]["row_fields"] == ["name", "start", "end", "length", "semantics"]
+    assert "row_fields" not in orient and "row_fields" not in orient["target"]

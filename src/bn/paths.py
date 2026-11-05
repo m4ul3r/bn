@@ -274,15 +274,16 @@ def spill_root() -> Path:
     return ensure_private_dir(cache_home() / "spills")
 
 
-def taint_models_path() -> Path:
+def taint_models_path(*, honor_env: bool = True) -> Path:
     """User-override file for taint function-models, merged over the builtin DB.
 
     The builtin models ship beside the bridge (``taint_models.json``); this
     optional file lets a user or agent add/override source/propagate/sink
     semantics without editing the plugin. Honoured by the taint engine when it
-    exists; missing is fine.
+    exists; missing is fine. ``honor_env=False`` ignores ``$BN_TAINT_MODELS``
+    and names the default file.
     """
-    env = os.environ.get("BN_TAINT_MODELS")
+    env = os.environ.get("BN_TAINT_MODELS") if honor_env else None
     if env:
         return Path(env).expanduser()
     return cache_home() / "taint_models.json"

@@ -8,7 +8,12 @@ from typing import Any
 from ..cli import (
     _call,
     _depth_int,
+    _guarded_transform,
     _int_at_least,
+    _render_result,
+    _resolve_output_format,
+    _resolve_target,
+    _slice_hint_for_args,
     arg,
     command,
     decode_json_input,
@@ -23,6 +28,9 @@ from ..formatters import (
     _render_values_text,
     _resolution_note,
 )
+from ..read_taint_models import model_catalog
+from ..taint_models import TaintError, model_file_map, user_models_source
+from ..transport import BridgeError
 
 
 # #812: the fixpoint remediation string ("raise --max-iters", taint_result.py
@@ -59,32 +67,43 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     #615 review (New finding 2 / F9 correction): the path is expanduser()'d, same
     as the bridge's own `taint_models_path()` (paths.py) -- an unexpanded ``~`` in
     a BN_TAINT_MODELS set from a shell profile/config file used to work at spawn
-    time and must keep working per-invocation. And a MISSING $BN_TAINT_MODELS
-    file silently degrades to "no override" here, matching the bridge's own
-    spawn-time handling of the identical variable (`taint_models_path()`,
-    `if override_path.exists()`) -- only an EXPLICIT --models typo is a loud
-    error; a malformed file is loud regardless of which knob supplied it (#669)."""
+    time and must keep working per-invocation.
+
+    A missing or unreadable file is refused the same way whichever knob named it:
+    an env-sourced typo used to degrade silently to "builtin only" at exit 0,
+    which is the no-silent-model-failure case #97 exists to refuse.
+
+    ``--models`` wins when both are set (the option's documented contract), so
+    the env file is not read; its path is forwarded as
+    ``user_models_env_overridden`` so the overlay disclosure says it was not
+    loaded instead of dropping it."""
     flag = getattr(args, "models", None)
-    path = flag or os.environ.get("BN_TAINT_MODELS")
+    env = os.environ.get("BN_TAINT_MODELS")
+    path = flag or env
     if not path:
         return
     source = "--models" if flag else "$BN_TAINT_MODELS"
     resolved = Path(path).expanduser()
-    if not flag and not resolved.exists():
-        return
-    # #864: the shared reader already refused a missing, unreadable or blocking
-    # path by name (a FIFO here hung with no envelope at all), and the shared
-    # decoder refuses a body the parser cannot take -- malformed, nested past
-    # its stack, or too large to build. #669's silent-degrade above keeps an
-    # env-sourced missing file out of here entirely.
+    # #864: the shared reader refuses a missing, unreadable or blocking path by
+    # name (a FIFO here hung with no envelope at all), and the shared decoder
+    # refuses a body the parser cannot take -- malformed, nested past its
+    # stack, or too large to build.
     params["user_models"] = decode_json_input(
         read_text_input(resolved, what=f"{source} file"),
         refusal=f"could not read {source} {path}")
+    # P2-09: a document that is not an object (`[]` and `null` included) is
+    # refused here, by the bridge's own shape rule, before anything is sent.
+    try:
+        model_file_map(params["user_models"], source=user_models_source(source, str(resolved)))
+    except TaintError as exc:
+        raise BridgeError(str(exc)) from exc
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
     params["user_models_path"] = str(resolved)
     params["user_models_via"] = source
+    if flag and env:
+        params["user_models_env_overridden"] = str(Path(env).expanduser())
 
 
 def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
@@ -126,6 +145,7 @@ def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
                       "stack-passed arguments from the call model; `uses` still lists "
                       "the argument stores, and the result carries the same "
                       "`hints` disclosure `trace` prints (`bn proto set` fixes it)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _dataflow_defuse(args: argparse.Namespace) -> int:
@@ -134,8 +154,8 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         "defuse",
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
-        contextual_hints=True,
-        text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(value),
+        text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(
+            value, mangled=bool(args.mangled)),
         stem="defuse",
     )
 
@@ -175,8 +195,13 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--at", dest="at", required=True,
-                 help="Instruction start address (hex 0x.. or decimal) within the function; "
-                      "call destinations are reported separately, not as return values"),
+                 help="Instruction start address (hex 0x.. or decimal) within the function, "
+                      "optionally ADDR:IL_INDEX to pick one of several MLIL SSA instructions "
+                      "at one address (the [N] `bn function structured-il` prints); an "
+                      "address where two instructions compute a value is refused with the "
+                      "candidates listed. Call destinations are reported separately, not as "
+                      "return values"),
+             mangled_arg(),
          ],
          estimable=True)
 def _dataflow_values(args: argparse.Namespace) -> int:
@@ -185,9 +210,8 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         "possible_values",
         {"identifier": args.identifier, "at": args.at},
         require_target=True,
-        # #1033 item 8: the `--at` refusal prints a `bn il` command.
-        contextual_hints=True,
-        text_renderer=lambda value: _resolution_note(value) + _render_values_text(value),
+        text_renderer=lambda value: _resolution_note(value) + _render_values_text(
+            value, mangled=bool(args.mangled)),
         stem="values",
     )
 
@@ -238,13 +262,17 @@ _SINK_LOCATOR_HELP = (
                       "recv_overflow (read/recv/recvfrom length -> undersized buffer). "
                       "Use when auditing persistence / file-corruption / exfiltration, or "
                       "recv-into-fixed-buffer overflows. recv_overflow is high-FP on the "
-                      "read-loop idiom (#499) -- enable it only when deliberately hunting."),
+                      "read-loop idiom (#499) -- enable it only when deliberately hunting. "
+                      "Without it, calls of file_write/net_write that taint reaches are "
+                      "listed in `opt_in_sinks_reached`, not reported, and the all-clear "
+                      "covers only the enabled classes."),
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
              mangled_arg(),
          ],
-         estimable=True)
+         estimable=True,
+         analysis_bounds=("--max-depth",))
 def _taint_forward(args: argparse.Namespace) -> int:
     # --source is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -264,7 +292,6 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        contextual_hints=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-forward",
@@ -284,8 +311,12 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help=f"Sink to slice from (repeatable, at least one required). {_SINK_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural depth to follow slices up into callers (default: 8; "
-                      "0 = intraprocedural only). The in-function def-chain walk caps at 64 "
-                      "steps; truncation is recorded under assumptions."),
+                      "0 = intraprocedural only); callers it stops short of are named in a "
+                      "caller_sites_truncated leaf (reason max_depth) and the cut sets "
+                      "stats.truncated (truncation_cause max_depth, stats.max_depth the depth "
+                      "reached), never an assumption. The "
+                      "in-function def-chain walk caps at 64 steps, and a cut there ends the "
+                      "value at an `unresolved` slice origin with cause def_chain_budget."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists; a "
                       "target is an address or a function name (resolved as -f is): "
@@ -295,7 +326,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
              mangled_arg(),
          ],
-         estimable=True)
+         estimable=True,
+         analysis_bounds=("--max-depth",))
 def _taint_backward(args: argparse.Namespace) -> int:
     # --sink is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
@@ -312,7 +344,6 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        contextual_hints=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-backward",
@@ -334,7 +365,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
              arg("--callsites", action="store_true", default=False,
                  help="With --present: expand each present model's call sites (application callers only)"),
              arg("--all-sites", action="store_true", default=False,
-                 help="With --callsites: also list the self-stub and constant-argument "
+                 help="With --callsites: also list the self-stub and fixed-length "
                       "inline-builtin rows that are otherwise only counted (implies --callsites)"),
              arg("--callsite-limit", dest="callsite_limit", type=_callsite_limit_int, default=10,
                  metavar="N",
@@ -366,12 +397,56 @@ def _taint_models(args: argparse.Namespace) -> int:
     # target like every other read command (no spurious "need a target" when one is
     # open and only --instance is given). Catalog-only mode needs no target.
     needs_target = bool(args.present or args.callsites or args.all_sites)
+    render = (lambda value: _render_taint_models_text(
+        value, mangled=args.mangled, callsite_limit=args.callsite_limit))
+    if (not needs_target and getattr(args, "instance", None) is None
+            and not getattr(args, "all_instances", False)
+            and not getattr(args, "all_targets", False)
+            and _resolve_target(args, require_target=False) is None):
+        return _serve_catalog_locally(args, params, render)
     return _call(
         args,
         "taint_models",
         params,
         require_target=needs_target,
-        text_renderer=lambda value: _render_taint_models_text(
-            value, mangled=args.mangled, callsite_limit=args.callsite_limit),
+        text_renderer=render,
         stem="taint-models",
     )
+
+
+def _serve_catalog_locally(args: argparse.Namespace, params: dict[str, Any],
+                           render: Any) -> int:
+    """Answer a target-free, instance-free `taint models` without a bridge.
+
+    That catalog is the static model DB plus the user overlay, so routing it
+    through a bridge only added ways to fail: with several instances registered
+    and no `-i` it refused outright, and with none it spawned a headless BN to
+    print a JSON file. `model_catalog` is the same function the bridge op runs
+    (the module is shared by symlink, and imports no BN), so the keys, overlay
+    disclosure and refusals match the bridge path. `honor_env=False`: this
+    process's `$BN_TAINT_MODELS` was already resolved into ``params`` by
+    `_add_user_models` (where `--models` wins) and must not load a second time
+    as an override layer. An explicit `-i` still asks that bridge, whose own
+    spawn-time override is part of its answer."""
+    try:
+        result, _models = model_catalog(params, honor_env=False)
+    except TaintError as exc:
+        raise BridgeError(str(exc)) from exc
+    fmt = _resolve_output_format(args)
+    shown = result
+    if fmt == "text":
+        shown = _guarded_transform(
+            render, "render the taint_models result as text",
+            advice="Rerun with --format json to see the raw result.")(result)
+    _render_result(
+        shown,
+        fmt=fmt,
+        out_path=args.out,
+        stem="taint-models",
+        spill_label="taint models",
+        spill_context=result,
+        provenance={"target": None, "instance": None},
+        slice_hint=_slice_hint_for_args(args, fmt),
+        estimate_only=bool(getattr(args, "estimate_output", False)),
+    )
+    return 0

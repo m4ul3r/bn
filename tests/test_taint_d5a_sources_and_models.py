@@ -1,0 +1,294 @@
+"""Copy-source and model-role corrections from the forward-engine review:
+an ELF image's declared object sizes in a rebased view (R1-Q5), a fill's
+return that only bounds a copy once proven non-negative (R3-01), and the
+register fallback for every argument position a model declares (R3-03)."""
+from __future__ import annotations
+
+import struct
+from types import SimpleNamespace
+
+import pytest
+
+from test_taint_engine import FBV, FExpr, FFunc, FInstr, FPVS, FSSA, FSSAFunc, FVar, te
+from test_taint_forward_global_frontier import (
+    FExtentBV, FGlobalBV, FRawView, FRef, GFunc, _elf_with_object_sizes, _gptr,
+)
+from test_taint_width_and_relabel import _memcpy_sink, _recv_then_dup
+
+
+@pytest.fixture
+def models():
+    return te.load_models()
+
+
+# ---------------------------------------------------------------------------
+# R1-Q5: declared object sizes in the view's address space
+# ---------------------------------------------------------------------------
+
+ET_EXEC, ET_DYN = 2, 3
+
+
+def _image_engine(models, *, e_type, link_base, view_start, view_end, objects):
+    """A 64-bit ELF whose only `PT_LOAD` is linked at *link_base*, loaded by
+    a view spanning ``[view_start, view_end)``."""
+    image = bytearray(_elf_with_object_sizes(objects))
+    struct.pack_into("<H", image, 0x10, e_type)
+    struct.pack_into("<Q", image, 0x20, 0x40)              # e_phoff
+    struct.pack_into("<HH", image, 0x36, 56, 1)            # e_phentsize, e_phnum
+    image[0x40:0x40 + 56] = struct.pack("<IIQQQQQQ", 1, 6, 0, link_base, link_base,
+                                        0x6000, 0x6000, 0x1000)
+    bv = FGlobalBV({})
+    bv.parent_view = FRawView(bytes(image))
+    bv.start, bv.end = view_start, view_end
+    return te.TaintEngine(bv, models)
+
+
+def test_a_rebased_fixed_address_image_keys_one_object_at_both_spellings(models):
+    # Linked at 0x400000, the view rebased to 0x500000: BN moves the symbol to
+    # 0x504060, while the image's absolute references (no relocations) still
+    # name 0x404060. Both spellings are the one 8-byte object at its view
+    # address; neither sizes past it.
+    eng = _image_engine(models, e_type=ET_EXEC, link_base=0x400000, view_start=0x500000,
+                        view_end=0x506000, objects={"g": (0x404060, 8)})
+    assert eng._declared_object_table() == [(0x504060, 8)]
+    assert eng._authoritative_width(0x504060) == eng._authoritative_width(0x404060) == 8
+    assert eng._declared_object(0x404067) == eng._declared_object(0x504067) == (0x504060, 8)
+    assert eng._declared_object(0x404068) is None
+    assert eng._declared_object(0x504068) is None
+    assert eng._same_storage(0x404060, 0x504060)
+    assert eng._canon_global(0x404060) == 0x504060
+
+
+MEMCPY_AT, SYSTEM_AT, MAIN_AT, READER_AT = 0x501060, 0x501070, 0x501100, 0x501200
+READ_INS = READER_AT + 0x10      # `mov edi, imm32` before the `system` call
+
+
+class FRebasedBV(FExtentBV):
+    """A fixed-address image linked at 0x400000 that BN rebased to 0x500000;
+    its 8-byte object `g` is at 0x504060 in the view. BN records code
+    references only at mapped addresses, so a reader whose immediate still
+    holds the link address 0x404060 appears in no reference list -- only in
+    the bytes of its instruction (measured on BN)."""
+
+    def __init__(self, funcs, refs, read_at):
+        super().__init__({MEMCPY_AT: "memcpy", SYSTEM_AT: "system",
+                          **{start: fn.name for start, fn in funcs.items()}},
+                         funcs=funcs, refs=refs, objects={0x504060: 8},
+                         section=(0x504000, 0x505000))
+        image = bytearray(_elf_with_object_sizes({"g": (0x404060, 8)}))
+        struct.pack_into("<H", image, 0x10, ET_EXEC)
+        struct.pack_into("<Q", image, 0x20, 0x40)
+        struct.pack_into("<HH", image, 0x36, 56, 1)
+        image[0x40:0x40 + 56] = struct.pack("<IIQQQQQQ", 1, 6, 0, 0x400000, 0x400000,
+                                            0x6000, 0x6000, 0x1000)
+        self.parent_view = FRawView(bytes(image))
+        self.start, self.end = 0x500000, 0x506000
+        self.segments = [SimpleNamespace(start=0x501000, end=0x502000, executable=True),
+                         SimpleNamespace(start=0x504000, end=0x505000, executable=False)]
+        code = bytearray(0x1000)
+        code[READ_INS - 0x501000:READ_INS - 0x501000 + 5] = b"\xbf" + struct.pack("<I", read_at)
+        self._code = bytes(code)
+
+    def read(self, addr, length):
+        lo = int(addr) - 0x501000
+        return self._code[lo:lo + int(length)] if 0 <= lo < len(self._code) else b""
+
+    def get_instruction_length(self, addr):
+        return 5 if int(addr) == READ_INS else 0
+
+    def get_functions_containing(self, addr):
+        return [fn for fn in self._funcs.values() if fn.start <= int(addr) < fn.start + 0x40]
+
+
+def _copy_then_reader(write_at, read_at):
+    """`main(argv)`: `memcpy(<write_at>, argv, 8)` then `reader()`, which runs
+    `system(<read_at>)` -- one spelling of `g` each."""
+    reader = GFunc("reader", READER_AT, FSSAFunc([
+        FInstr(0, READ_INS + 5, "MLIL_CALL_SSA", f"system({hex(read_at)})",
+               dest=_gptr(SYSTEM_AT), params=[_gptr(read_at)]),
+    ]), params=[])
+    argv0 = FSSA(FVar("argv"), 0)
+    main = GFunc("main", MAIN_AT, FSSAFunc([
+        FInstr(0, MAIN_AT + 4, "MLIL_CALL_SSA", f"memcpy({hex(write_at)}, argv#0, 8)",
+               reads=[argv0], dest=_gptr(MEMCPY_AT),
+               params=[_gptr(write_at), FExpr("MLIL_VAR_SSA", "argv#0", reads=[argv0]),
+                       FExpr("MLIL_CONST", "8", constant=8)]),
+        FInstr(1, MAIN_AT + 8, "MLIL_CALL_SSA", "reader()", dest=_gptr(READER_AT), params=[]),
+    ]), params=[argv0.var], callees=[reader])
+    return main, reader
+
+
+@pytest.mark.parametrize("write_at, read_at", [
+    (0x404060, 0x504060),   # an absolute (link) write, a reader BN refers at the view
+    (0x504060, 0x404060),   # a write at the view, a reader naming the link address
+], ids=["link-write", "view-write"])
+def test_a_write_through_one_spelling_reaches_a_reader_of_the_other(models, write_at, read_at):
+    # D5a-01: the two spellings were two unrelated objects, so the write's
+    # taint and the reader's reference never met.
+    main, reader = _copy_then_reader(write_at, read_at)
+    refs = {read_at: [FRef(reader, READ_INS)]} if read_at == 0x504060 else {}
+    bv = FRebasedBV({READER_AT: reader}, refs, read_at)
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["global"]["address"] == hex(0x504060), leaf["global"]
+    assert [(r["display_name"], r["access"], r["offset"]) for r in leaf["references"]] == [
+        ("reader", "call_arg", 0)], leaf["references"]
+
+
+def test_a_fixed_address_image_at_its_link_base_declares_one_address(models):
+    eng = _image_engine(models, e_type=ET_EXEC, link_base=0x400000, view_start=0x400000,
+                        view_end=0x406000, objects={"g": (0x404060, 8)})
+    assert eng._declared_object_table() == [(0x404060, 8)]
+
+
+def test_a_rebased_pie_declares_its_object_only_where_the_view_has_it(models):
+    # A PIE reaches its objects PC-relatively or through relocations BN
+    # applies, so its link-time address names nothing in the view.
+    eng = _image_engine(models, e_type=ET_DYN, link_base=0, view_start=0x400000,
+                        view_end=0x406000, objects={"g": (0x4060, 8)})
+    assert eng._declared_object_table() == [(0x404060, 8)]
+    assert eng._authoritative_width(0x4060) == 0
+
+
+def test_a_link_address_the_view_maps_is_not_claimed_for_the_moved_object(models):
+    # Rebased by one page: 0x404060 is now inside the view, where it is some
+    # other storage's address, so only the moved object is declared.
+    eng = _image_engine(models, e_type=ET_EXEC, link_base=0x400000, view_start=0x401000,
+                        view_end=0x407000, objects={"g": (0x404060, 8)})
+    assert eng._declared_object_table() == [(0x405060, 8)]
+
+
+# ---------------------------------------------------------------------------
+# R3-01: a fill's return bounds the copy only once it is a byte count
+# ---------------------------------------------------------------------------
+
+def _values(kind, start, end):
+    pvs = FPVS(kind)
+    pvs.ranges = [SimpleNamespace(start=start, end=end, step=1)]
+    return pvs
+
+
+@pytest.mark.parametrize("at_copy", [
+    None,                                                  # BN states nothing
+    _values("SignedRangeValue", -0x80000000, 0x7fffffff),  # no guard: -1 possible
+    _values("UnsignedRangeValue", 0, 0xffffffff),          # zx of a 32-bit -1
+], ids=["no-value-set", "unguarded", "zero-extended"])
+def test_an_unchecked_fill_return_still_overreads_its_source(models, at_copy):
+    # `n = recv(fd, buf, 0x40, 0); memcpy(malloc(n), buf, n)` with no
+    # success check: recv's -1 is SIZE_MAX at the copy.
+    sink = _memcpy_sink(models, *_recv_then_dup(count="const", length="sx", src="same",
+                                                at_copy=at_copy))
+    assert sink["class"] == "overread_len", sink
+    assert "src_fill" not in sink
+    assert sink["src_capacity"] == 0x40
+
+
+def test_a_non_negative_guard_proves_the_fill_return(models):
+    # `if (n < 0) return;` leaves 0..0x7fffffff: a zero-byte copy is a count too.
+    sink = _memcpy_sink(models, *_recv_then_dup(
+        count="const", length="sx", src="same",
+        at_copy=_values("SignedRangeValue", 0, 0x7fffffff)))
+    assert sink["class"] == "bounded_len"
+    assert sink["src_fill"] == {"callee": "recv", "at": "0x1010"}
+
+
+# ---------------------------------------------------------------------------
+# R3-03: every declared argument role is recoverable from its register
+# ---------------------------------------------------------------------------
+
+def _underrecovered_chk_program():
+    """``guard#1 = n#0; __strcpy_chk(dst#1, src#0)`` -- BN recovered two of
+    the call's three arguments and dropped the guard (arg 2)."""
+    n0 = FSSA(FVar("n"), 0); src0 = FSSA(FVar("src"), 0)
+    guard1 = FSSA(FVar("guard"), 1); dst1 = FSSA(FVar("dst"), 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "guard#1 = n#0", reads=[n0], writes=[guard1],
+               src=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &buf", writes=[dst1]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "0x900(dst#1, src#0)", reads=[dst1, src0],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]
+    return FFunc("stamp", 0x10, FSSAFunc(instrs), params=[FVar("n"), FVar("src")]), guard1
+
+
+def _spy(seed, call_ins, reg):
+    calls = []
+
+    def recover(func, sites, idx):
+        calls.append(idx)
+        return reg, [(seed, call_ins)]
+    return recover, calls
+
+
+def test_a_dropped_fortify_guard_is_recovered_from_its_register(models, monkeypatch):
+    func, guard1 = _underrecovered_chk_program()
+    engine = te.TaintEngine(FBV({0x900: "__strcpy_chk"}), models)
+    recover, calls = _spy(guard1, func.mlil.ssa_form.instructions[2], "rdx")
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", recover, raising=False)
+    result = engine.backward(func, [te.parse_locator("arg:__strcpy_chk:2")])
+    assert calls == [2]
+    assert any(s["sink"]["seed"] == "guard#1" and s["origin"].get("var") == "n#0"
+               for s in result["slices"]), result["slices"]
+
+
+def test_a_position_no_role_names_is_still_refused(models, monkeypatch):
+    # Arg 3 is no role of `__strcpy_chk`: the register fallback is never
+    # consulted for it and nothing is seeded.
+    func, guard1 = _underrecovered_chk_program()
+    engine = te.TaintEngine(FBV({0x900: "__strcpy_chk"}), models)
+    recover, calls = _spy(guard1, func.mlil.ssa_form.instructions[2], "rcx")
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", recover, raising=False)
+    with pytest.raises(te.TaintError):
+        engine.backward(func, [te.parse_locator("arg:__strcpy_chk:3")])
+    assert calls == []
+
+
+def _underrecovered_recvmsg_program():
+    """``hdr#1 = &msg; recvmsg(fd#0)`` -- BN recovered only the socket of a
+    `recvmsg(fd, &msg, 0)` and dropped the msghdr (arg 1)."""
+    fd0 = FSSA(FVar("fd"), 0); hdr1 = FSSA(FVar("hdr"), 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "hdr#1 = &msg", writes=[hdr1]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "0x910(fd#0)", reads=[fd0],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])]),
+    ]
+    return FFunc("pump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), hdr1
+
+
+def test_a_dropped_recvmsg_header_is_recovered_from_its_register(models, monkeypatch):
+    # D5a-02: `recvmsg`'s model names its msghdr only as a source `*iovec:1`;
+    # that position was not collected, so an under-recovered arg 1 was refused.
+    func, hdr1 = _underrecovered_recvmsg_program()
+    engine = te.TaintEngine(FBV({0x910: "recvmsg"}), models)
+    recover, calls = _spy(hdr1, func.mlil.ssa_form.instructions[1], "rsi")
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", recover, raising=False)
+    result = engine.backward(func, [te.parse_locator("arg:recvmsg:1")])
+    assert calls == [1]
+    assert [s["sink"]["seed"] for s in result["slices"]] == ["hdr#1"], result["slices"]
+
+
+def test_every_indexed_model_field_is_a_recoverable_position():
+    # One position per field the model grammar accepts, each distinct --
+    # including a source's `*iovec:N` (D5a-02).
+    model = {
+        "sources": [{"to": "*arg:0"}, {"to": "*iovec:24"}],
+        "propagates": [{"from": "arg:1", "to": "*arg:2"}],
+        "varargs": {"first_index": 3, "to": "*arg:4"},
+        "sink": {"class": "overflow_len", "tainted_args": [5], "pointer_args": [6],
+                 "len_arg": 7, "buf_arg": 8, "format_arg": 9, "first_dest": 10,
+                 "dest_size_arg": 11},
+        "continuation": {"null_arg": 12},
+        "return_bound": {"max_from_arg": 13},
+        "string_args": [14],
+        "append": {"dest": 15, "src": 16},
+        "ret_offset": {"count_arg": 17, "string_length_arg": 18, "scan_arg": 19,
+                       "stop_arg": 20, "count_arg_limit": 21},
+        "writes": ["*arg:22"],
+        "reads_dest": ["*arg:23"],
+    }
+    models = {"every_role": model}
+    te.validate_model_arguments(models, source="test")
+    assert te.model_arg_indices(models, "every_role") == set(range(25))

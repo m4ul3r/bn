@@ -1553,6 +1553,120 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel
         assert "until it checks for cancellation" in message
 
 
+@pytest.mark.parametrize("polls, late_answer, outcome", [
+    (True, b'{"ok": false, "status": "cancelled", "error": "taint walk cancelled", '
+           b'"observed": {"cancelled": true, "functions_visited": 7}}', "cancelled"),
+    (True, b'{"ok": true, "result": {}}', "finished"),
+    (True, None, "no_answer"),
+    # An op that never checks the flag: nothing to wait for (the wait spent a
+    # `session stop` probe's own budget behind a write lock).
+    (False, b'{"ok": true, "result": {}}', None),
+    # A bridge that did not say: no wait either.
+    (None, b'{"ok": true, "result": {}}', None),
+])
+def test_a_timed_out_request_says_whether_its_cancel_was_honoured(
+        tmp_path, monkeypatch, polls, late_answer, outcome):
+    # P1-07: after the cancel is sent the CLI keeps listening on the request's
+    # own connection -- only when the bridge says the op checks for
+    # cancellation -- so it can say whether the bridge actually stopped.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a, **k: None)
+    monkeypatch.setattr(transport, "_send_cancel_request",
+                        lambda inst, rid: transport._CancelAck(True, polls))
+    monkeypatch.setattr(transport, "CANCEL_OUTCOME_WAIT", 0.05)
+    sockets = []
+
+    class _RequestSocket:
+        def __init__(self):
+            self.reads = 0
+            sockets.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            self.reads += 1
+            if self.reads == 1 or late_answer is None:
+                raise socket.timeout("timed out")
+            return late_answer if self.reads == 2 else b""
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: _RequestSocket())
+    with pytest.raises(transport.BridgeError, match="Timed out") as caught:
+        transport._send_request_to_instance(instance, "taint", timeout=1.0)
+    err = caught.value
+    assert err.status == ("cancelled" if outcome == "cancelled" else None)
+    assert err.observed["timed_out"] is True
+    assert err.observed["request_sent"] is True
+    assert err.observed["cancel_sent"] is True
+    assert err.observed["polls_cancel"] is polls
+    assert err.observed["cancel_outcome"] == outcome
+    assert err.observed["cancelled"] is (outcome == "cancelled")
+    # The bridge's own account of the stop is kept.
+    assert err.observed.get("functions_visited") == (7 if outcome == "cancelled" else None)
+    [request] = sockets
+    # Listened past the timeout only for an op that can honour the cancel.
+    assert (request.reads > 1) is bool(polls)
+
+
+def test_a_cancel_ack_reports_whether_the_op_polls(tmp_path, monkeypatch):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a, **k: None)
+    answers = iter([
+        b'{"ok": true, "result": {"cancelled": true, "polls_cancel": true}}',
+        b'{"ok": true, "result": {"cancelled": true, "polls_cancel": false}}',
+        b'{"ok": true, "result": {"cancelled": true}}',
+    ])
+
+    class _CancelSocket:
+        def __init__(self):
+            self.answer = next(answers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            answer, self.answer = self.answer, b""
+            return answer
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: _CancelSocket())
+    assert [transport._send_cancel_request(instance, "rid") for _ in range(3)] == [
+        (True, True), (True, False), (True, None)]
+
+
 @pytest.mark.parametrize("cancel_sent", [False, True])
 @pytest.mark.parametrize("transmit_json", [False, True])
 def test_sendall_timeout_preserves_delivery_uncertainty(
@@ -1593,7 +1707,7 @@ def test_sendall_timeout_preserves_delivery_uncertainty(
     def cancel(inst, request_id):
         assert inst is instance
         cancellations.append(request_id)
-        return cancel_sent
+        return transport._CancelAck(cancel_sent)
 
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: SendTimeoutSocket())
     monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a: None)
@@ -3470,7 +3584,7 @@ def test_named_spawn_uses_the_spawn_budget(monkeypatch):
     monkeypatch.setattr(
         transport,
         "spawn_instance",
-        lambda instance_id=None, timeout=None: seen.append(timeout) or "named",
+        lambda instance_id=None, timeout=None, **_kw: seen.append(timeout) or "named",
     )
 
     assert choose_instance("wanted", spawn_missing_named=True, timeout=3600.0) == "named"
@@ -3509,7 +3623,7 @@ def test_spawn_instance_still_resolves_its_own_env_budget(monkeypatch):
     monkeypatch.setattr(
         transport,
         "_spawn_instance_unlocked",
-        lambda instance_id=None, timeout=None, poll_interval=0.2: seen.append(timeout)
+        lambda instance_id=None, timeout=None, poll_interval=0.2, **_kw: seen.append(timeout)
         or "spawned",
     )
 
@@ -4280,10 +4394,9 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 # sense 1 and 2 are -- `path_has_bound_socket`'s exact-byte fast path (can
 # only weaken a `True` to a `None`, and only `False` authorises an unlink),
 # `_socket_probe`'s `nothing_bound=True` on `ENOENT` (there is nothing left to
-# unlink), `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
+# unlink), and `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
 # already answers `None` for a `.json`, so the condition is redundant rather
-# than load-bearing), and `src/bn/commands/misc.py::_resolved_out_format`'s
-# `if out is None` short circuit.
+# than load-bearing).
 #
 # UNREACHABLE DEFENSIVE CODE — one category, rather than notes scattered
 # across two files. No mutation can redden these because no input on this
@@ -7189,3 +7302,80 @@ def test_a_live_owner_whose_state_cannot_be_read_is_not_litter(tmp_path, monkeyp
     assert summary["logs_removed"] == 0
     assert record.exists()
     assert log.read_text(encoding="utf-8") == "bridge output\n"
+
+
+def _recording_spawn_env(monkeypatch, tmp_path, instance_id):
+    """Fake the child of a spawn under *instance_id*; return its Popen calls."""
+    from bn.transport import BridgeInstance
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    created = BridgeInstance(
+        pid=456, socket_path=tmp_path / "new.sock",
+        registry_path=bridge_registry_path(instance_id), plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0", started_at=None, meta={}, instance_id=instance_id,
+    )
+    bridge_registry_path(instance_id).parent.mkdir(parents=True, exist_ok=True)
+    bridge_registry_path(instance_id).write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("bn.transport.list_instances", lambda **kwargs: [])
+    monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
+    monkeypatch.setattr("bn.transport._load_instance", lambda path, **kwargs: created)
+    monkeypatch.setattr("bn.transport.secrets.token_hex", lambda n: instance_id)
+    popen_calls = []
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            popen_calls.append({"cmd": cmd, **kwargs})
+
+    monkeypatch.setattr("bn.transport.subprocess.Popen", _FakePopen)
+    return popen_calls
+
+
+@pytest.mark.parametrize("env_value, expected", [
+    (None, "1800"),     # unset: the auto-start default
+    ("90", "90"),       # an explicit value wins
+    ("0", "0"),         # ...including "never"
+])
+def test_an_auto_started_bridge_gets_a_finite_idle_timeout(monkeypatch, tmp_path,
+                                                           env_value, expected):
+    # P2-09: a bridge a command starts on its own has no owner who will stop
+    # it; it lived until killed while holding its targets' memory.
+    from bn.transport import choose_instance
+
+    if env_value is None:
+        monkeypatch.delenv("BN_IDLE_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("BN_IDLE_TIMEOUT", env_value)
+    popen_calls = _recording_spawn_env(monkeypatch, tmp_path, "auto1")
+
+    assert choose_instance().instance_id == "auto1"
+    assert popen_calls[0]["env"].get("BN_IDLE_TIMEOUT") == expected
+
+
+def test_a_session_start_spawn_keeps_the_idle_reaper_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("BN_IDLE_TIMEOUT", raising=False)
+    popen_calls = _recording_spawn_env(monkeypatch, tmp_path, "owned1")
+
+    spawn_instance("owned1")
+
+    assert "BN_IDLE_TIMEOUT" not in popen_calls[0]["env"]
+
+
+def test_a_restart_spawn_seeds_the_first_view_id(monkeypatch, tmp_path):
+    # P1-02: the respawned bridge must number its views above the old ones.
+    popen_calls = _recording_spawn_env(monkeypatch, tmp_path, "again1")
+
+    spawn_instance("again1", first_view_id=12)
+
+    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id=again1", "--first-view-id=12"]
+
+
+def test_a_restart_without_a_high_water_mark_spawns_with_numeric_ids_off(monkeypatch, tmp_path):
+    # D2-02: no seed and no numeric selectors when the predecessor recorded
+    # no next view id.
+    popen_calls = _recording_spawn_env(monkeypatch, tmp_path, "again2")
+
+    spawn_instance("again2", numeric_view_ids=False)
+
+    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id=again2", "--no-numeric-view-ids"]

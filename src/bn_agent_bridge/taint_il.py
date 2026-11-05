@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import il_format
+
 
 def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
     """Nearest dominating LLIL-SSA definition of register ``reg`` reaching
@@ -51,37 +53,268 @@ def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
     return None
 
 
+def _call_like_ops(bn: Any) -> set:
+    Op = bn.LowLevelILOperation
+    return {getattr(Op, n, None) for n in (
+        "LLIL_CALL_SSA", "LLIL_SYSCALL_SSA", "LLIL_INTRINSIC_SSA",
+        "LLIL_TAILCALL_SSA")} - {None}
+
+
+# A backwards CFG closure visits at most this many blocks. The key below makes
+# the walk terminate on its own; the cap is the belt to that braces, so a view
+# whose blocks answer no stable key at all still cannot spin.
+_CFG_CLOSURE_BLOCKS = 4096
+
+
+def _block_key(block: Any) -> tuple:
+    """Stable identity for a basic block ACROSS the wrappers BN hands out.
+
+    Binary Ninja materialises a fresh Python object for the same native basic
+    block on every access, so `id()` identifies the wrapper, not the block: a
+    closure that dedupes on it revisits one loop header forever (review F6).
+    The native identity is the owning function plus the block's own index /
+    instruction range; `id()` is the last resort, for the synthetic test fakes
+    that have neither.
+    """
+    owner = getattr(block, "function", None)
+    fn = getattr(owner, "source_function", None) or owner
+    home = getattr(fn, "start", None)
+    home = int(home) if isinstance(home, int) else None
+    index = getattr(block, "index", None)
+    if isinstance(index, int):
+        return ("index", home, index)
+    start, end = getattr(block, "start", None), getattr(block, "end", None)
+    if isinstance(start, int) and isinstance(end, int):
+        return ("range", home, start, end)
+    return ("id", id(block))
+
+
+def _reaching_blocks(call_bb: Any) -> tuple[list, bool, bool]:
+    """``(blocks, looped, complete)`` -- every block that can reach *call_bb*,
+    whether *call_bb* can reach ITSELF (it lies on a cycle, so its own later
+    instructions may also have run first), and whether the closure FINISHED.
+
+    ``complete`` is False when the block budget stopped the walk with work
+    still pending. A caller asserting what ran before this call must refuse on
+    that: an unexamined predecessor is exactly where the clobbering call would
+    be, so a capped scan proves nothing (review F10).
+    """
+    call_key = _block_key(call_bb)
+    out: list = []
+    seen: set = set()
+    frontier = [getattr(e, "source", None)
+                for e in (getattr(call_bb, "incoming_edges", None) or [])]
+    looped = False
+    while frontier:
+        if len(seen) >= _CFG_CLOSURE_BLOCKS:
+            return out, looped, False
+        block = frontier.pop()
+        if block is None:
+            continue
+        key = _block_key(block)
+        if key == call_key:
+            looped = True
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(block)
+        frontier += [getattr(e, "source", None)
+                     for e in (getattr(block, "incoming_edges", None) or [])]
+    return out, looped, True
+
+
+def _entry_value_state(call_ins: Any, bn: Any) -> str:
+    """``"entry"`` / ``"clobbered"`` / ``"budget"`` for the value an untouched
+    register holds where *call_ins* runs.
+
+    Used only after :func:`reaching_reg_def` has established that the register
+    has no definition at all reaching the call, which means it still holds the
+    value the function was entered with -- *unless* something ran in between
+    that the IL does not name as a definition. The one such thing is another
+    call: a callee may clobber any caller-saved register, and no definition in
+    this function records it.
+
+    So ``"clobbered"`` is answered whenever any call/syscall/intrinsic can
+    execute before this one. "Can execute before" is taken from the CFG, not
+    from instruction order: every block that REACHES the call's block may run
+    first, and a block on a cycle through the call reaches itself, so a loop
+    body's later call is caught too. Nothing is inferred from a calling
+    convention's clobber list.
+
+    ``"budget"`` is the third state (review F10): the predecessor closure ran
+    out of its block budget with work pending. What it did not look at is
+    exactly where a clobbering call would be, so the scan establishes nothing
+    either way -- and the caller is told that, rather than being handed a
+    positive it could not earn.
+    """
+    call_ops = _call_like_ops(bn)
+    call_bb = getattr(call_ins, "il_basic_block", None)
+    if call_bb is None:
+        return "clobbered"
+    call_idx = int(getattr(call_ins, "instr_index", -1))
+    earlier, looped, complete = _reaching_blocks(call_bb)
+    for block in earlier:
+        for ins in block:
+            if getattr(ins, "operation", None) in call_ops:
+                return "clobbered"
+    if not complete:
+        return "budget"
+    for ins in call_bb:
+        if getattr(ins, "operation", None) not in call_ops:
+            continue
+        idx = int(getattr(ins, "instr_index", -1))
+        if idx == call_idx:
+            continue
+        if idx < call_idx or looped:
+            return "clobbered"
+    return "entry"
+
+
+def _entry_value_survives(call_ins: Any, bn: Any) -> bool:
+    """Whether the register provably still carries the function's entry value.
+
+    The boolean face of :func:`_entry_value_state`: an exhausted scan is not a
+    survival, so it answers False for that too.
+    """
+    return _entry_value_state(call_ins, bn) == "entry"
+
+
+def argument_register_provenance(func: Any, addr: int, reg: str, bn: Any, *,
+                                 calls_at: dict[int, Any] | None = None,
+                                 ) -> tuple[str, list[tuple[Any, Any]]]:
+    """What the ABI argument register *reg* carries into the call at *addr*.
+
+    ``("defined", seeds)`` -- a dominating LLIL-SSA definition reaches the
+    call; ``seeds`` are its ``(mlil_ssa_var, mlil_instr)`` bridges, the values
+    a slice can follow. ``("entry", [])`` -- nothing defines the register and
+    nothing that can run first may have clobbered it, so it still holds the
+    value the function was ENTERED with (the ``rdi#0``-unchanged shape an
+    optimised build leaves when the callee has no prototype to recover
+    arguments from). ``("budget", [])`` -- the predecessor closure ran out of
+    its block budget, so whether anything clobbered the register was never
+    established (review F10). ``("unproven", [])`` -- there is no LLIL to read,
+    the call is not in it, or a call may have clobbered the register: nothing
+    is claimed.
+
+    ``calls_at`` is :func:`llil_call_sites` for *func*, when the caller keeps
+    one: finding the call is then a lookup instead of a scan of the whole
+    function's LLIL, which a walk asking about many calls in one body paid
+    once per question.
+    """
+    if calls_at is None:
+        calls_at = llil_call_sites(func, bn)
+    if calls_at is None:
+        return ("unproven", [])
+    # A TAIL call is a call: an optimised `return f(p)` leaves the
+    # arguments exactly where they already are, which is precisely
+    # the shape this answers for. Matching only `LLIL_CALL_SSA`
+    # left every tail call unrecovered (review F4).
+    ins = calls_at.get(int(addr))
+    if ins is None:
+        return ("unproven", [])
+    try:
+        definition = reaching_reg_def(ins, reg, bn)
+        if definition is None:
+            state = _entry_value_state(ins, bn)
+            return (state if state in ("entry", "budget") else "unproven", [])
+        if getattr(definition, "operation", None) in _call_like_ops(bn):
+            # The reaching "definition" is another CALL that lists this
+            # register among its outputs -- i.e. it CLOBBERED it. Its
+            # MLIL mapping writes the call's RESULT variable, which is
+            # the return register's value and says nothing about an
+            # ARGUMENT register. Bridging to it would hand the walk the
+            # wrong value entirely; a clobbered register is unproven.
+            return ("unproven", [])
+        defs = [definition]
+        if _mlil_seeds(definition) == [] and getattr(definition, "operation", None) \
+                == getattr(bn.LowLevelILOperation, "LLIL_REG_PHI", object()):
+            # A phi of the register's definitions on each incoming path --
+            # armv7 conditional execution (`itet hi; adds r2, ..; mov r2, ..`)
+            # leaves one -- has no MLIL instruction of its own: the value
+            # the call receives is one of its arms', so each arm bridges.
+            defs = _reg_phi_arms(definition, bn) or []
+        seeds: list[tuple[Any, Any]] = []
+        for d in defs:
+            arm = _mlil_seeds(d)
+            if not arm:
+                # One arm that bridges to nothing (an entry value, a call's
+                # clobber) leaves the argument's other values unknown: claim
+                # none rather than a subset.
+                return ("defined", [])
+            seeds.extend(arm)
+        return ("defined", seeds)
+    except Exception:
+        return ("unproven", [])
+
+
+def _mlil_seeds(definition: Any) -> list[tuple[Any, Any]]:
+    """``[(mlil_ssa_var, mlil_instr), ...]`` an LLIL-SSA register definition
+    maps to: the SSA variables its MLIL instruction writes."""
+    mapped = getattr(definition, "mlil", None)
+    mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
+    if mssa is None:
+        return []
+    return [(w, mssa) for w in (getattr(mssa, "vars_written", None) or []) if is_ssa_var(w)]
+
+
+def _reg_phi_arms(phi: Any, bn: Any, depth: int = 0, seen: set | None = None) -> list[Any] | None:
+    """The non-phi LLIL-SSA definitions an ``LLIL_REG_PHI`` merges, nested
+    phis flattened; None when an arm has no definition (the register's entry
+    value) or is a call that clobbered it -- the merged value is then not
+    only what the definitions wrote."""
+    seen = set() if seen is None else seen
+    lssa = getattr(phi, "function", None)
+    if lssa is None or depth > 8:
+        return None
+    Op = bn.LowLevelILOperation
+    out: list[Any] = []
+    for src in (getattr(phi, "src", None) or []):
+        key = (str(getattr(src, "reg", "")), getattr(src, "version", None))
+        if key in seen:
+            continue            # a loop back edge brings nothing new
+        seen.add(key)
+        d = lssa.get_ssa_reg_definition(src)
+        if d is None or getattr(d, "operation", None) in _call_like_ops(bn):
+            return None
+        if getattr(d, "operation", None) == Op.LLIL_REG_PHI:
+            nested = _reg_phi_arms(d, bn, depth + 1, seen)
+            if nested is None:
+                return None
+            out.extend(nested)
+        else:
+            out.append(d)
+    return out
+
+
+def llil_call_sites(func: Any, bn: Any) -> dict[int, Any] | None:
+    """``{address: the first call-like LLIL-SSA instruction there}`` for
+    *func*, from one scan; None when it has no readable LLIL-SSA."""
+    lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
+    if lssa is None:
+        return None
+    out: dict[int, Any] = {}
+    try:
+        site_ops = _call_like_ops(bn)
+        for block in lssa:
+            for ins in block:
+                if getattr(ins, "operation", None) in site_ops:
+                    out.setdefault(int(getattr(ins, "address", -1)), ins)
+    except Exception:
+        return None
+    return out
+
+
 def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
                            bn: Any) -> list[tuple[Any, Any]]:
     """Find the call at ``addr`` in *func*'s LLIL-SSA and recover ``reg``'s
     reaching definition (:func:`reaching_reg_def`), bridged to the MLIL SSA
     variable(s) that hold it -- the seeds a backward walk / trace can slice.
     Returns ``[(mlil_ssa_var, mlil_instr), ...]``; ``[]`` when not recoverable
-    (e.g. no LLIL, as in the unit fakes)."""
-    lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
-    if lssa is None:
-        return []
-    seeds: list[tuple[Any, Any]] = []
-    try:
-        for block in lssa:
-            for ins in block:
-                if int(getattr(ins, "address", -1)) != int(addr):
-                    continue
-                if getattr(ins, "operation", None) != bn.LowLevelILOperation.LLIL_CALL_SSA:
-                    continue
-                definition = reaching_reg_def(ins, reg, bn)
-                if definition is None:
-                    continue
-                mapped = getattr(definition, "mlil", None)
-                mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-                if mssa is None:
-                    continue
-                for w in (getattr(mssa, "vars_written", None) or []):
-                    if is_ssa_var(w):
-                        seeds.append((w, mssa))
-    except Exception:
-        return seeds
-    return seeds
+    (e.g. no LLIL, as in the unit fakes). A register carrying the function's
+    own ENTRY value has no definition to slice, so it is not one of these --
+    :func:`argument_register_provenance` is the caller that distinguishes it."""
+    return argument_register_provenance(func, addr, reg, bn)[1]
 
 
 # --------------------------------------------------------------------------
@@ -325,7 +558,7 @@ def targets_from_pvs(pvs: Any) -> list[int]:
     return sorted({a for a in out if a})
 
 
-def follow_thunk(bv: Any, fn: Any) -> Any | None:
+def follow_thunk(bv: Any, fn: Any, *, ssa_of: Any = _mlil_ssa) -> Any | None:
     """If *fn* is a single-instruction tailcall thunk, return its real target.
 
     Follows thunk chains (PLT stubs, GCC veneers) iteratively, guarding against
@@ -333,13 +566,15 @@ def follow_thunk(bv: Any, fn: Any) -> Any | None:
     recursive form only rejected a direct A->A self-loop, so a multi-step
     tailcall cycle in the binary (A->B->A, or longer) recursed without bound and
     raised ``RecursionError``. Returns the deepest resolved target, or None when
-    *fn* is not a thunk.
+    *fn* is not a thunk. *ssa_of* reads a body's MLIL SSA form; the taint
+    engine passes its per-request cache, so a hop it already lifted is not
+    lifted again.
     """
     seen: set[int] = {int(getattr(fn, "start", -1))}
     cur = fn
     result: Any | None = None
     while True:
-        ssa = _mlil_ssa(cur)
+        ssa = ssa_of(cur)
         if ssa is None:
             break
         instructions = _ssa_instructions(ssa)
@@ -428,3 +663,173 @@ def resolve_call_target(bv: Any, call_insn: Any, *, follow_thunks: bool = False)
 
     return ResolvedTarget(int(getattr(fn, "start", 0)), fn, via, thunk_chain)
 
+
+
+# An alignment clears at most this many low bits: `p & ~0xfff` aligns a pointer
+# to a page, a wider mask is not an alignment an inline expansion emits.
+_ALIGN_MASK_BITS = 12
+
+# How many nested operations/definitions the expansion-length walk follows; an
+# expansion's count is a handful of instructions from its pointer.
+_RESIDUE_DEPTH = 24
+
+
+# A masked operand the walk cannot reduce to one base: whatever it read is a
+# dependency the bound folds in, and it is not provably a pointer.
+_UNKNOWN_DEPENDENCY = ("unknown",)
+
+
+def inline_expansion_length(ssaf: Any, call: Any, length_index: int,
+                            ssa_def: Any) -> dict[str, Any] | None:
+    """What bounds the length operand *length_index* of *call* (MLIL SSA) when
+    the call is an inline string expansion
+    (:func:`il_format.inline_expansion_intrinsics`) -- else None; a real call
+    is never one, whatever it is named. *ssa_def* is ``(ssaf, var) ->
+    definition``.
+
+    ``{"intrinsic", "length_bound", "length_kind"}`` when the length is built
+    only from constants, low-bit masks, alignment masks, shifts and constant
+    offsets (None when any other value adds to it):
+
+    * ``alignment_split`` -- every value the arithmetic folded into the bound
+      is a pointer the expansion itself walks. gcc expands a constant-size
+      ``memset``/``memcpy`` into a head store, a tail store and a
+      ``rep stos``/``rep movs`` over the aligned middle, whose count is the
+      constant total corrected by how far the destination sits from its
+      alignment, ``(p - ((p + 8) & ~7) + TOTAL) >> 3``: the pointer cancels,
+      so taint on it cannot steer the length.
+    * ``masked_value`` -- some other value was masked or cancelled into the
+      bound (``n & 7``, ``n - (n & ~7)``): the length is that value's low bits,
+      at most ``length_bound``, still attacker-controlled when it is."""
+    intrinsics = il_format.inline_expansion_intrinsics(
+        getattr(ssaf, "source_function", None), int(getattr(call, "address", 0) or 0))
+    params = list(getattr(call, "params", None) or [])
+    if not intrinsics or not 0 <= length_index < len(params):
+        return None
+    memo: dict = {}
+    val = _residue_interval(ssaf, params[length_index], ssa_def, memo, 0)
+    if val is None:
+        return None
+    base, lo, hi, deps = val
+    if base is not None or lo < 0:
+        return None
+    pointers = set()
+    for i in il_format.intrinsic_pointer_operands(intrinsics, length_index):
+        if i < len(params):
+            pointer = _residue_interval(ssaf, params[i], ssa_def, memo, 0)
+            if pointer is not None and pointer[0] is not None:
+                pointers.add(pointer[0])
+    return {"intrinsic": il_format.intrinsic_name(intrinsics), "length_bound": hex(hi),
+            "length_kind": "alignment_split" if deps <= pointers else "masked_value"}
+
+
+def _residue_interval(ssaf: Any, expr: Any, ssa_def: Any, memo: dict,
+                      depth: int) -> tuple[Any, int, int, frozenset] | None:
+    """``(base, lo, hi, deps)``: *expr* is ``base + k`` with ``lo <= k <= hi``,
+    *base* an opaque value's identity (None for a pure constant), *deps* the
+    values whose bits the arithmetic folded into ``k`` (a cancelled
+    ``p - align(p)``, the operand of a low-bit mask). None when *expr* is not
+    built from one base, constants, masks and shifts (see
+    :func:`inline_expansion_length`). *memo* holds each variable's answer for
+    one evaluation."""
+    if expr is None or depth > _RESIDUE_DEPTH:
+        return None
+    op = op_name(expr)
+    if "CONST" in op:
+        c = getattr(expr, "constant", None)
+        return (None, int(c), int(c), frozenset()) if isinstance(c, int) else None
+    if op in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
+        return _residue_interval(ssaf, getattr(expr, "src", None), ssa_def, memo, depth + 1)
+    if op in ("MLIL_VAR_SSA", "MLIL_VAR_SSA_FIELD"):
+        if op == "MLIL_VAR_SSA_FIELD" and int(getattr(expr, "offset", 0) or 0) != 0:
+            return None
+        return _residue_of_var(ssaf, getattr(expr, "src", None), ssa_def, memo, depth + 1)
+    left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+    if op == "MLIL_AND":
+        width = 8 * int(getattr(expr, "size", 0) or 8)
+        for mask_side, other in ((right, left), (left, right)):
+            m = getattr(mask_side, "constant", None) if "CONST" in op_name(mask_side) else None
+            if not isinstance(m, int):
+                continue
+            # BN hands an alignment mask over signed (`& -8` for `& ~7`).
+            m &= (1 << width) - 1
+            limit = 1 << _ALIGN_MASK_BITS
+            if 0 < m < limit and m & (m + 1) == 0:
+                # A low-bit residue (`n & 7`, `-p & 7`) is at most the mask,
+                # and it still depends on what was masked -- through a
+                # negation or complement, whose low bits are the operand's.
+                while op_name(other) in ("MLIL_NEG", "MLIL_NOT"):
+                    other = getattr(other, "src", None)
+                val = _residue_interval(ssaf, other, ssa_def, memo, depth + 1)
+                if val is None:
+                    return (None, 0, m, frozenset({_UNKNOWN_DEPENDENCY}))
+                deps = val[3] | ({val[0]} if val[0] is not None else frozenset())
+                return (None, 0, m, frozenset(deps))
+            low = ~m & ((1 << width) - 1)
+            if 0 < low < limit and low & (low + 1) == 0:
+                val = _residue_interval(ssaf, other, ssa_def, memo, depth + 1)
+                # aligning down moves the value back by at most `low`
+                return None if val is None else (val[0], val[1] - low, val[2], val[3])
+        return None
+    if op in ("MLIL_ADD", "MLIL_SUB"):
+        a = _residue_interval(ssaf, left, ssa_def, memo, depth + 1)
+        b = _residue_interval(ssaf, right, ssa_def, memo, depth + 1)
+        if a is None or b is None:
+            return None
+        deps = a[3] | b[3]
+        if op == "MLIL_ADD":
+            if a[0] is not None and b[0] is not None:
+                return None
+            return (a[0] if a[0] is not None else b[0], a[1] + b[1], a[2] + b[2], deps)
+        if a[0] == b[0]:
+            # `p - align(p)` cancels p's value but keeps its low bits.
+            base = None
+            if a[0] is not None:
+                deps = deps | {a[0]}
+        elif b[0] is None:
+            base = a[0]
+        else:
+            return None
+        return (base, a[1] - b[2], a[2] - b[1], frozenset(deps))
+    if op in ("MLIL_LSR", "MLIL_ASR", "MLIL_LSL"):
+        k = getattr(right, "constant", None) if "CONST" in op_name(right) else None
+        val = _residue_interval(ssaf, left, ssa_def, memo, depth + 1)
+        if not isinstance(k, int) or val is None or val[0] is not None or val[1] < 0:
+            return None
+        if op == "MLIL_LSL":
+            return (None, val[1] << k, val[2] << k, val[3])
+        return (None, val[1] >> k, val[2] >> k, val[3])
+    return None
+
+
+def _residue_of_var(ssaf: Any, var: Any, ssa_def: Any, memo: dict,
+                    depth: int) -> tuple[Any, int, int, frozenset] | None:
+    """:func:`_residue_interval` of an SSA variable: its definition when that
+    is arithmetic the interval follows, every arm of a phi whose arms share one
+    base, else the variable itself as an opaque base (a parameter, a load, a
+    call result, a phi of unrelated values, a loop-carried value, a definition
+    past the depth bound). Memoised per evaluation, so every read of a variable
+    gets one answer -- two reads of one opaque value cancel, reads of different
+    ones never do -- and a variable on a loop is opaque, never revisited."""
+    if not is_ssa_var(var):
+        return None
+    key = (var_key(var), getattr(var, "version", None))
+    if key in memo:
+        return memo[key]
+    opaque = (key, 0, 0, frozenset())
+    memo[key] = opaque  # a cycle back to this variable sees it opaque
+    result = opaque
+    defn = ssa_def(ssaf, var) if depth <= _RESIDUE_DEPTH else None
+    dop = op_name(defn) if defn is not None else ""
+    if dop == "MLIL_VAR_PHI":
+        arms = [_residue_of_var(ssaf, v, ssa_def, memo, depth + 1)
+                for v in (getattr(defn, "src", None) or [])]
+        if arms and all(a is not None for a in arms) and len({a[0] for a in arms}) == 1:
+            result = (arms[0][0], min(a[1] for a in arms), max(a[2] for a in arms),
+                      frozenset().union(*(a[3] for a in arms)))
+    elif dop == "MLIL_SET_VAR_SSA":
+        val = _residue_interval(ssaf, getattr(defn, "src", None), ssa_def, memo, depth + 1)
+        if val is not None:
+            result = val
+    memo[key] = result
+    return result

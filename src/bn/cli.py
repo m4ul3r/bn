@@ -18,17 +18,21 @@ from typing import Any, Callable, Iterable
 
 from . import session_state
 from .formatters import (
+    CODE_SPAN_RE,
     FAILED_MUTATION_STATUSES,
     _add_mutation_ok,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
     _mutation_summary,
     _render_fanout_text,
+    _render_target_choices,
     _render_mutation_summary_text,
     _render_mutation_text,
+    code_span,
     command_routing,
 )
-from .output import (estimate_output_result, render_envelope, render_error, render_value,
-                     write_output_result)
+from .output import (RawBytes, estimate_bytes_result, estimate_output_result, exit_outcome,
+                     outcome_fields, render_envelope, render_error, render_value,
+                     write_bytes_result, write_output_result)
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -50,6 +54,7 @@ from .transport import (  # noqa: F401
     BridgeError,
     BridgeProcessSignal,
     DEFAULT_REQUEST_TIMEOUT,
+    MULTI_TARGET_HEADLINE,
     MultiTargetError,
     _resolve_timeout,
     _send_request_to_instance,
@@ -65,8 +70,10 @@ from .transport import (  # noqa: F401
     validate_instance_id,
     wait_for_teardown,
 )
-from .target_hint import instance_option, respell_for_option
-from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
+from .target_hint import SELECT_HINT_LINE, instance_option, respell_for_option
+from .version import (  # noqa: F401
+    VERSION, build_id_for_file, build_id_for_package, build_id_for_tree,
+)
 
 
 class _HelpFullAction(argparse.Action):
@@ -152,27 +159,30 @@ def _resolve_output_format(args: argparse.Namespace) -> str:
     none was given; when an explicit ``--format`` disagrees with the extension,
     honor the explicit choice but warn so it is not a silent footgun.
     """
+    resolved = getattr(args, "_resolved_format", None)
+    if resolved is not None:
+        return resolved     # resolved once per invocation: the note prints once
     fmt = getattr(args, "format", "text")
     out = getattr(args, "out", None)
-    if out is None:
-        return fmt
-    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
-    if inferred is None or inferred == fmt:
-        return fmt
-    suffix = Path(str(out)).suffix
-    if getattr(args, "_format_explicit", False):
-        print(
-            f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
-            f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
-            file=sys.stderr,
-        )
-        return fmt
-    print(
-        f"note: inferring --format {inferred} from the {suffix} --out path; "
-        f"pass an explicit --format to override.",
-        file=sys.stderr,
-    )
-    return inferred
+    inferred = (None if out is None
+                else _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower()))
+    if inferred is not None and inferred != fmt:
+        suffix = Path(str(out)).suffix
+        if getattr(args, "_format_explicit", False):
+            print(
+                f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
+                f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"note: inferring --format {inferred} from the {suffix} --out path; "
+                f"pass an explicit --format to override.",
+                file=sys.stderr,
+            )
+            fmt = inferred
+    args._resolved_format = fmt
+    return fmt
 
 
 class BnArgumentParser(argparse.ArgumentParser):
@@ -333,9 +343,9 @@ def _unrecognized_arguments_hint(
       value, not the switch, so the error reads as a bad pattern. Name the
       switch; when the command takes `--query` and none was given, print the
       corrected command.
-    * `--estimate-output` on a dual-role node (`exports`, `types`): the flag is
-      withheld there on purpose (#796 r2, see `_group_paths`), so say so, and
-      print the alias subcommand form when the node has one (`exports list`).
+    * `--estimate-output` on a dual-role node with a non-estimable subcommand
+      (`types`): the flag is withheld there on purpose (#796 r2, see
+      `_estimate_withheld_paths`), so say so.
 
     Printed commands are this argv with the one change applied, so they keep
     every other option the caller passed."""
@@ -358,29 +368,10 @@ def _unrecognized_arguments_hint(
                     f"with --query: {shlex.join(['bn', *fixed])}")
         return f"{switch} is a switch and takes no value; {token!r} is left over"
     path = tuple(getattr(parsed, "_command_path", ()) or ())
-    if "--estimate-output" in extras and path and path in _group_paths():
-        node = next((spec for spec in _COMMANDS if spec["path"] == path), None)
-        # The alias leaf is the child that takes the node's own arguments (the
-        # one registration list `exports`/`exports list` share), so the printed
-        # command keeps every option the caller already passed valid.
-        alias = next((spec["path"][-1] for spec in _COMMANDS
-                      if node is not None and spec["path"][:-1] == path
-                      and spec["args"] == node["args"] and spec.get("estimable")),
-                     None)
-        label = " ".join(path)
-        lead = (f"--estimate-output is not accepted on `bn {label}` itself: it is also "
-                f"a command group, and a flag there would reach its subcommands too")
-        if alias is None:
-            return f"{lead}."
-        for index in range(len(argv) - len(path) + 1):
-            if argv[index:index + len(path)] != list(path):
-                continue
-            if index and _option_takes_value(parsers, argv[index - 1]):
-                continue
-            at = index + len(path)
-            fixed = [*argv[:at], alias, *argv[at:]]
-            return f"{lead}; use the `{label} {alias}` form: {shlex.join(['bn', *fixed])}"
-        return f"{lead}; use `bn {label} {alias} --estimate-output`."
+    if "--estimate-output" in extras and path and path in _estimate_withheld_paths():
+        return (f"--estimate-output is not accepted on `bn {' '.join(path)}` itself: it "
+                "is also a command group with a subcommand that is not an estimable "
+                "read, and a flag there would reach that subcommand too.")
     return None
 
 
@@ -466,6 +457,7 @@ def _common_io_options(
     *,
     default_format: str = "text",
     estimable: bool = False,
+    analysis_bounds: tuple[str, ...] = (),
 ) -> None:
     parser.add_argument(
         "--format",
@@ -474,9 +466,10 @@ def _common_io_options(
         action=_RecordExplicitFormat,
         help="Output format",
     )
-    out_help = ("Write output to a file instead of stdout (a .json/.ndjson path "
-                "infers --format unless one is given). Relative paths are resolved "
-                "against the invoking shell's cwd, not the bridge's.")
+    out_help = ("Write output to a file instead of stdout; missing parent directories "
+                "are created (a .json/.ndjson path infers --format unless one is "
+                "given). Relative paths are resolved against the invoking shell's "
+                "cwd, not the bridge's.")
     # #796: the preflight half of #409's "bound the next read" -- the size of the
     # payload the caller would otherwise pay for, and the flag that slices it.
     # Advertised ONLY on the commands whose emit path implements it
@@ -496,24 +489,32 @@ def _common_io_options(
     # rather than one of them silently winning.
     exclusive = parser.add_mutually_exclusive_group()
     exclusive.add_argument("--out", type=_resolve_out_path, help=out_help)
+    # A command whose only bounds are ANALYSIS bounds (taint's --max-depth) has
+    # no flag that slices its output; the help says what the runtime advice
+    # (`_slice_hint`) says for it, never "the flag that slices it".
+    remedy = (f"; no flag slices this output ({', '.join(analysis_bounds)} bounds the "
+              "analysis, not the output) -- write it to a file with --out <path>"
+              if analysis_bounds else " and the flag that slices it")
     exclusive.add_argument(
         "--estimate-output", action="store_true", default=False,
         dest="estimate_output",
-        help="Report the estimated token/byte size of this command's output and "
-             "the flag that slices it, INSTEAD of printing or writing it (the read "
+        help="Report the estimated token/byte size of this command's output"
+             f"{remedy}, INSTEAD of printing or writing it (the read "
              "still runs; nothing is written to disk and no spill artifact is "
              "created). Mutually exclusive with --out.",
     )
 
 
-def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
+def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False,
+                     listed: bool = True) -> None:
     parser.add_argument(
         "-i",
         "--instance",
         default=os.environ.get("BN_INSTANCE") if is_root else argparse.SUPPRESS,
-        help="Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
-             "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
-             "BN_CACHE_DIR also scopes the instance registry and sticky session",
+        help=("Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
+              "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
+              "BN_CACHE_DIR also scopes the instance registry and sticky session")
+        if listed else argparse.SUPPRESS,
     )
 
 
@@ -686,6 +687,8 @@ def command(
     see_also: tuple[str, ...] = (),
     fanout: bool = False,
     estimable: bool = False,
+    analysis_bounds: tuple[str, ...] = (),
+    routes_instance: bool = True,
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -709,6 +712,17 @@ def command(
     ``_emit_result`` (capabilities/doctor/session/plugin/skill/pins) all leave it
     off, so the flag can neither replace an outcome with a byte count nor be
     accepted-and-ignored.
+
+    ``analysis_bounds`` names the flags this command accepts that share a
+    spelling with the slicing vocabulary but bound the ANALYSIS, not the
+    output: taint's ``--max-depth`` changes which calls are descended, and a
+    tighter cap can grow the result rather than shrink it. They are never
+    offered as the way to bound a read, and the hint says so by name.
+
+    ``routes_instance=False`` marks a command that does not run on an existing
+    bridge (`session start` creates one). Its own help then does not list
+    ``-i/--instance``; the option is still parsed so the handler can refuse it
+    and name the flag that does what was meant (W10).
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -738,6 +752,8 @@ def command(
             # silently ignore it (or, worse, on a command whose side effect the
             # estimate then replaces with a byte count).
             "estimable": estimable,
+            "analysis_bounds": tuple(analysis_bounds),
+            "routes_instance": routes_instance,
         })
         return fn
 
@@ -750,12 +766,9 @@ def _group_paths() -> frozenset[tuple[str, ...]]:
     Those are the nodes argparse builds as GROUP parsers -- and, for a DUAL-ROLE
     path like ``types``/``exports``, the very same parser object also serves as
     the node's own leaf. A flag attached there is therefore accepted BEFORE the
-    subcommand is dispatched, which is why the estimate flag cannot be advertised
-    on such a node: `bn types --estimate-output declare ...` ran the declaration
-    and printed a byte count over it, and `bn types --estimate-output show X` had
-    the flag clobbered back to ``False`` by the leaf default -- the #251 hazard
-    (a real default on an intermediate-level parser) landing on the one node
-    class where "intermediate" and "leaf" are the same object.
+    subcommand is dispatched (see `_estimate_withheld_paths` for what that
+    means for the estimate flag, and `_build_from_commands` for how a flag
+    given there reaches the subcommand).
 
     Derived from the registry rather than a second hand-kept list, so a new
     command or subcommand cannot reopen the hole silently.
@@ -764,11 +777,28 @@ def _group_paths() -> frozenset[tuple[str, ...]]:
                      for i in range(1, len(spec["path"])))
 
 
+def _estimate_withheld_paths() -> frozenset[tuple[str, ...]]:
+    """Group nodes that cannot carry ``--estimate-output`` (#796 r2).
+
+    A flag on a group parser is accepted BEFORE a subcommand dispatches, so it
+    is withheld from a node with any non-estimable descendant: `bn types
+    --estimate-output declare ...` would run the declaration and print a byte
+    count over it. A node whose every descendant is an estimable read
+    (`exports` and its alias `exports list`) takes the flag like its alias
+    does: it can reach only reads, and `_build_from_commands` carries it to
+    them instead of letting a leaf default clobber it (the #251 hazard)."""
+    return frozenset(
+        path for path in _group_paths()
+        if any(len(spec["path"]) > len(path) and spec["path"][:len(path)] == path
+               and not spec.get("estimable") for spec in _COMMANDS))
+
+
 def _build_from_commands(root: BnArgumentParser) -> None:
     """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
     subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
     group_paths = _group_paths()
+    estimate_withheld = _estimate_withheld_paths()
 
     def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
         if parent not in subparser_actions:
@@ -819,13 +849,13 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                 path[-1], help=spec["help"], description=spec["help"])
             node_parsers[path] = cmd
 
-        # A group node never carries the estimate flag, even when the node is also
-        # registered as a leaf (the dual-role `types`/`exports`): see `_group_paths`
-        # for the two live failure shapes that buys.
+        # A group node carries the estimate flag only when every subcommand under
+        # it is an estimable read: see `_estimate_withheld_paths`.
         _common_io_options(cmd, default_format=spec["fmt"],
                            estimable=(bool(spec.get("estimable"))
-                                      and path not in group_paths))
-        _instance_option(cmd)
+                                      and path not in estimate_withheld),
+                           analysis_bounds=tuple(spec.get("analysis_bounds", ())))
+        _instance_option(cmd, listed=spec["routes_instance"])
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting
         # commands (save/close/refresh/py exec/load) also default to text, so a
@@ -851,7 +881,8 @@ def _build_from_commands(root: BnArgumentParser) -> None:
         # parser is built: the hint derivation then needs no parser walk (one
         # build per invocation instead of two) and cannot resolve the wrong
         # subparser. Option strings plus their dest, so a caller's own flag can be
-        # told from an alias pair (`--count`/`--limit` share a dest).
+        # told from an alias pair (`--count`/`--limit` share a dest). A flag the
+        # command declares an ANALYSIS bound is not a slice, whatever its name.
         cmd.set_defaults(
             handler=spec["handler"],
             _command_path=path,
@@ -860,8 +891,29 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                 for action in cmd._actions
                 for option in action.option_strings
                 if option in _SLICE_VOCABULARY_SET
+                and option not in spec["analysis_bounds"]
             ),
+            _analysis_bounds=spec["analysis_bounds"],
         )
+
+    # A DUAL-ROLE node (registered as a command AND a group: `exports`, `types`)
+    # parses its own options before argparse dispatches a subcommand, and the
+    # subcommand's parser then writes its defaults over the namespace -- so
+    # `bn exports --count list` silently listed and `bn exports --limit 2 list`
+    # silently returned every row (#251's hazard on the node where group and
+    # leaf are one parser). A child option the node defines identically (same
+    # strings, same dest, same default) gets a SUPPRESS default: absent, the
+    # node's identical default stands; given at either level, it is kept.
+    for path in group_paths & {spec["path"] for spec in _COMMANDS}:
+        node_defaults = {(tuple(action.option_strings), action.dest): action.default
+                         for action in node_parsers[path]._actions if action.option_strings}
+        for child_path, child in node_parsers.items():
+            if child_path[:-1] != path:
+                continue
+            for action in child._actions:
+                key = (tuple(action.option_strings), action.dest)
+                if key in node_defaults and node_defaults[key] == action.default:
+                    action.default = argparse.SUPPRESS
 
 
 def _render_result(
@@ -877,6 +929,7 @@ def _render_result(
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
     estimate_only: bool = False,
+    outcome: dict[str, Any] | None = None,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
@@ -889,11 +942,20 @@ def _render_result(
     nothing is written and there is nothing to spill. It sits ABOVE the
     ``artifact_path`` passthrough because an already-materialized artifact
     envelope is a payload like any other -- a caller asking what it costs gets
-    its size, not a re-render of a file it may not have."""
+    its size, not a re-render of a file it may not have.
+
+    *outcome* is the operation outcome an envelope states (see
+    :func:`write_output_result`): the rendered text no longer carries it."""
     if estimate_only:
-        result = _apply_result_transform(
-            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
-            value, f"estimate the {stem} output size as {fmt}")
+        if isinstance(value, RawBytes):
+            result = estimate_bytes_result(
+                value.data, fmt=fmt, summary=value.summary, rerun_hint=slice_hint,
+                outcome=outcome_fields(value) if outcome is None else outcome)
+        else:
+            result = _apply_result_transform(
+                lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint,
+                                                       outcome=outcome),
+                value, f"estimate the {stem} output size as {fmt}")
         sys.stdout.write(result.rendered)
         return False
     # Serializing the bridge result parses and walks it too: `json.dumps` on a
@@ -904,7 +966,10 @@ def _render_result(
     # precisely because of this site.
     if out_path is None and isinstance(value, dict) and isinstance(value.get("artifact_path"), str):
         artifact = dict(value)
+        # The bridge wrote this file itself (its `--out`), so delivery happened;
+        # `ok` is the read's own outcome, which the bridge states.
         artifact.setdefault("ok", True)
+        artifact.setdefault("written", True)
         artifact.setdefault("spilled", False)
         for key, val in (provenance or {}).items():   # #653.8
             if val is not None:
@@ -914,11 +979,19 @@ def _render_result(
             f"serialize the {stem} artifact envelope as {fmt}"))
         return bool(artifact.get("spilled"))
 
-    result = _apply_result_transform(
-        lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
-                                           stem=stem, provenance=provenance,
-                                           rerun_hint=slice_hint),
-        value, f"serialize the {stem} result as {fmt}")
+    if isinstance(value, RawBytes):
+        # P1-03: a raw byte payload takes the same --out / spill / provenance
+        # decisions as a rendered one; only the final stdout write differs.
+        result = write_bytes_result(
+            value, out_path=out_path, fmt=fmt, stem=stem, provenance=provenance,
+            rerun_hint=slice_hint,
+            outcome=outcome_fields(value) if outcome is None else outcome)
+    else:
+        result = _apply_result_transform(
+            lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
+                                               stem=stem, provenance=provenance,
+                                               rerun_hint=slice_hint, outcome=outcome),
+            value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
         # spills is recoverable (re-read the artifact); an atomic write whose result
@@ -983,7 +1056,11 @@ def _render_result(
                 file=sys.stderr,
             )
         return True
-    sys.stdout.write(result.rendered)
+    if result.raw is not None:
+        sys.stdout.buffer.write(result.raw)
+        sys.stdout.buffer.flush()
+    else:
+        sys.stdout.write(result.rendered)
     if result.near_spill:
         # #409: fit this time, but close to the threshold -- warn so the agent slices
         # the next (larger) read pre-emptively instead of discovering the spill after
@@ -1104,10 +1181,12 @@ def _emit_result(
     args: argparse.Namespace,
     result: Any,
     *,
+    exit_code: int,
     text_renderer: Callable[[Any], str] | None = None,
     stem: str,
-) -> None:
-    """Render a locally-built result for handlers that can't go through :func:`_call`.
+) -> int:
+    """Render a locally-built result for handlers that can't go through :func:`_call`;
+    return *exit_code*.
 
     The admin commands (doctor, session/instance/target management) orchestrate
     several bridge requests, so they assemble the result themselves instead of
@@ -1117,15 +1196,20 @@ def _emit_result(
     bridge response becomes a clean :class:`BridgeError` pointing at ``--format
     json``, never a raw traceback), then writes via :func:`_render_result`. With no
     *text_renderer* the value renders as-is in every format.
+
+    *exit_code* is the command's outcome: an ``--out``/spill/estimate envelope
+    states ``ok`` as exit 0 (:func:`exit_outcome`), so the envelope and the exit
+    status can never disagree (D4-01). Handlers ``return`` this call.
     """
     text_renderer = _guarded_transform(
         text_renderer, f"render the {stem} result as text",
         advice="Rerun with --format json to see the raw result.")
     fmt = _resolve_output_format(args)
+    shown = result
     if text_renderer is not None and fmt == "text":
-        result = text_renderer(result)
+        shown = text_renderer(result)
     _render_result(
-        result,
+        shown,
         fmt=fmt,
         out_path=args.out,
         stem=stem,
@@ -1134,7 +1218,9 @@ def _emit_result(
         # envelope falls back to the stem guesses while their stderr note uses the
         # derived one, and one run offers two different remedies (dogfood pass 4).
         slice_hint=_slice_hint_for_args(args, fmt),
+        outcome=exit_outcome(result, exit_code),
     )
+    return exit_code
 
 
 # Regex metacharacters that make a literal substring query likely to be a
@@ -1321,7 +1407,7 @@ _JSON_ONLY_SLICE_FLAGS: dict[tuple[str, ...], frozenset[str]] = {
 
 def _derive_slice_hint(
     accepted: Iterable[str], text_format: bool, used: Iterable[str] = (),
-    path: tuple[str, ...] = (),
+    path: tuple[str, ...] = (), analysis_bounds: Iterable[str] = (),
 ) -> str | None:
     """The bounding remedy for the flags one command ACCEPTS. Pure; no parser.
 
@@ -1336,9 +1422,13 @@ def _derive_slice_hint(
       told to write a file while their own bound shrank the read by up to 195x.
 
     Returns ``None`` when the command has no bound at all; the caller then prints
-    a flag-free hint rather than inventing one.
+    a flag-free hint rather than inventing one. ``analysis_bounds`` (declared on
+    the command) are dropped from ``accepted`` and, when nothing else slices the
+    read, named as NOT slicing it: a reader looking for a lever reaches for the
+    one in sight, and taint's ``--max-depth`` reshapes the analysis instead.
     """
-    accepted = set(accepted)
+    analysis_bounds = list(analysis_bounds)
+    accepted = set(accepted) - set(analysis_bounds)
     # #889c finding 3: drop the flags this command refuses in text mode, so
     # the hint cannot advise the thing that exits 2.
     if text_format:
@@ -1397,6 +1487,10 @@ def _derive_slice_hint(
         return hint
 
     if "--out" in accepted:
+        if analysis_bounds:
+            return (f"no flag slices this output ({', '.join(analysis_bounds)} bounds "
+                    "the analysis, not the output); rerun with --out <path> to write "
+                    "it to a file")
         return "rerun with --out <path> to write it to a file"
     return None
 
@@ -1405,6 +1499,15 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
     """The derived remedy for the invocation in *args* -- no parser walk."""
     flags = tuple(getattr(args, "_slice_flags", ()))
     accepted = {option for option, _ in flags}
+    mode = getattr(args, "_aggregate_mode", None)
+    if mode is not None:
+        # P3: an aggregate run (`--count`, `imports --summary`) answers once for
+        # the whole target. It refuses the paging flags
+        # (`_refuse_count_only_slices`), `--count` is its mode switch rather
+        # than a size, and a filter (`--min-size`) changes the answer, not the
+        # output's size -- so no slice flag bounds it and the only remedy left
+        # is the file.
+        accepted &= {"--out"}
     used = {
         option for option, dest in flags
         # A store_true default (False) and an unset value (None) both mean "the
@@ -1414,7 +1517,8 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
         if getattr(args, dest, None) not in (None, False)
     }
     return _derive_slice_hint(accepted, fmt == "text", used,
-                              tuple(getattr(args, "_command_path", ()) or ()))
+                              tuple(getattr(args, "_command_path", ()) or ()),
+                              getattr(args, "_analysis_bounds", ()))
 
 
 @lru_cache(maxsize=None)
@@ -1426,7 +1530,8 @@ def _slice_hint_for_command(path: tuple[str, ...], text_format: bool) -> str | N
     the_command_it_names` runs the whole registry through it.
     """
     sub = _selected_parser_for_argv(build_parser(), list(path))
-    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path)
+    bounds = next((spec["analysis_bounds"] for spec in _COMMANDS if spec["path"] == path), ())
+    return _derive_slice_hint(_known_option_strings(sub), text_format, (), path, bounds)
 
 
 def _spill_next_step_hint(
@@ -1507,7 +1612,7 @@ def blank_selector(value: Any) -> bool:
 
 def _empty_target_message(
     args: argparse.Namespace,
-    omit_hint: str = "omit --target to use the single open target",
+    omit_hint: str | None = None,
 ) -> str:
     """The refusal for an empty selector, phrased for where it CAME FROM.
 
@@ -1517,6 +1622,11 @@ def _empty_target_message(
     argument they never wrote, and the two sources are cleared in completely
     different ways (`unset BN_TARGET` vs `bn target clear`). Name the source
     and its own remedy instead (#676 item 11).
+
+    *omit_hint* is the caller's own "what omitting the flag does" (a fan-out
+    surveys every target). Without one, the typed refusal says what omitting
+    it would do HERE, which depends on how many targets are open (W10): see
+    `_empty_target_advice`.
     """
     ambient = getattr(args, "_empty_ambient_target", None)
     if ambient:
@@ -1525,13 +1635,43 @@ def _empty_target_message(
             f"{source}: {remedy}. An empty selector is a broken default, not "
             "a request for the default, so nothing was sent."
         )
-    return (
-        f"--target is empty: pass a selector from `bn target list`, or "
-        f"{omit_hint}"
-    )
+    lead = "--target is empty: pass a selector from `bn target list`"
+    if omit_hint is not None:
+        return f"{lead}, or {omit_hint}"
+    return _empty_target_advice(args, lead)
 
 
-def _implicit_target(args: argparse.Namespace) -> str:
+def _empty_target_advice(args: argparse.Namespace, lead: str) -> str:
+    """W10: "omit --target to use the single open target" was printed whatever
+    was open, so with several targets the advised rerun hit the multi-target
+    refusal. One peek decides: a sole target keeps that advice, several get
+    the shared `Open targets:` listing (`src/bn/target_hint.py`, the grammar
+    every multi-target refusal prints), none says so. Asked only of a bridge
+    already running -- a refusal must not start one, and with none running
+    there is nothing open to count -- and an unreachable one gets only the
+    lead, with no claim about what is open. The peek names no target, so the
+    empty selector is still never forwarded."""
+    if not list_instances():
+        return f"{lead}."
+    try:
+        targets = unwrap_result(
+            send_request("list_targets", params={}, target=None,
+                         instance_id=getattr(args, "instance", None)),
+            "list_targets")
+    except BridgeError:
+        return f"{lead}."
+    if not isinstance(targets, list):
+        return f"{lead}."
+    if not targets:
+        return f"{lead}; no target is open (`bn load <path>` opens one)."
+    if len(targets) == 1:
+        return f"{lead}, or omit --target to use the single open target"
+    return "\n".join([f"{lead}; {len(targets)} targets are open.", SELECT_HINT_LINE,
+                      _render_target_choices(targets)])
+
+
+def _implicit_target(args: argparse.Namespace,
+                     headline: str = MULTI_TARGET_HEADLINE) -> str:
     """Resolve the single open target to its pinned ``target_id``, else refuse.
 
     Returns the stable ``target_id`` from the peek row -- never the volatile
@@ -1559,7 +1699,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    return implicit_target_selector(response)
+    return implicit_target_selector(response, headline)
 
 
 def _resolve_target(
@@ -1772,6 +1912,9 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
             f"{', '.join(offenders)} would be silently ignored. Drop {mode} for "
             f"the paged list, or drop the flags for the {noun}."
         )
+    # The run's remedy hints read this: a mode that refuses the slice flags must
+    # not be told to rerun with them (`_slice_hint_for_args`).
+    args._aggregate_mode = mode
 
 
 def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
@@ -2261,13 +2404,16 @@ def _contextualize_diagnostic_hints(
     commands. Registry target requirements distinguish inspection/mutation hints
     from lifecycle recovery, which must retain its own instance/spawn arguments.
     """
-    if not instance and not target:
-        return value
+    # The selector a command is routed to: the call's target, or -- inside a
+    # result row that names its own target (a loaded binary) -- that row's.
+    selector = [target]
     # As in build_parser(), defer registration until cli.py is fully imported.
     from . import commands  # noqa: F401
 
     def route(match: re.Match[str]) -> str:
-        command_text = match.group(1)
+        if not match.group(2).startswith("bn "):
+            return match.group(0)
+        command_text = match.group(2)[len("bn "):]
         try:
             words = shlex.split(command_text)
         except ValueError:
@@ -2311,37 +2457,53 @@ def _contextualize_diagnostic_hints(
 
         if instance and not routed("instance"):
             flags.append(instance_option(instance))
-        if target and not routed("target"):
-            flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
-                         else shlex.quote(f"--target={target}"))
+        if selector[0] and not routed("target"):
+            flags.append(f"-t {shlex.quote(selector[0])}" if not selector[0].startswith("-")
+                         else shlex.quote(f"--target={selector[0]}"))
         if not flags:
             return match.group(0)
-        return "`bn " + " ".join(flags) + " " + command_text + "`"
+        # Through `code_span`: the selector spliced in here may itself carry a
+        # backtick, and a one-backtick fence would then end mid-command (R4-02).
+        return code_span("bn " + " ".join(flags) + " " + command_text)
 
     def route_prose(text: str) -> str:
-        return re.sub(r"`bn ([^`]+)`", route, text)
+        return CODE_SPAN_RE.sub(route, text)
 
     # `summary`/`warnings` are decompile's warning prose (#1045 review): its
     # printed `bn proto get 0x…` / `bn evidence table …` advice needs this
     # call's routing to run with several targets open.
-    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action",
-                  "recovery_advice", "summary", "warnings"}
+    # `reseed` is a taint leaf's ready-to-run `bn taint forward …` command, not
+    # prose: unrouted, it was the one hint that exited 2 ("multiple bridges")
+    # while the same command quoted in `detail` ran (BN23-ADVICE-01). route()
+    # already refuses a second selector, so the pair stays single-routed.
+    # `notes` is a load's per-target prose: a `--quick` load's `bn refresh` is
+    # routed to the target that row loaded (V7-02).
+    prose_keys = {"error", "hints", "assumptions", "note", "notes", "detail", "next_action",
+                  "recovery_advice", "summary", "warnings", "reseed"}
 
-    def visit(item: Any, *, prose: bool = False) -> None:
+    # Iterative: every result now passes through here, and a hostile reply
+    # nested past the interpreter's recursion limit must reach the result
+    # checks that refuse it, not raise out of the routing pass.
+    stack: list[tuple[Any, bool, str | None]] = [(value, False, target)]
+    while stack:
+        item, prose, routed_to = stack.pop()
+        selector[0] = routed_to
         if isinstance(item, dict):
+            own = item.get("target")
+            own = own.get("selector") if isinstance(own, dict) else None
+            if isinstance(own, str) and own:
+                selector[0] = routed_to = own
             for key, child in item.items():
                 if key in prose_keys and isinstance(child, str):
                     item[key] = route_prose(child)
                 elif isinstance(child, (dict, list)):
-                    visit(child, prose=key in prose_keys)
+                    stack.append((child, key in prose_keys, routed_to))
         elif isinstance(item, list):
             for index, child in enumerate(item):
                 if prose and isinstance(child, str):
                     item[index] = route_prose(child)
                 elif isinstance(child, (dict, list)):
-                    visit(child, prose=prose)
-
-    visit(value)
+                    stack.append((child, prose, routed_to))
     return value
 
 
@@ -2375,10 +2537,6 @@ def _call(
     # #996: copy the answering instance (stamped by `send_request`) into a dict
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
-    contextual_hints: bool = False,
-    # Bind the `bn ...` commands the TEXT renderer itself prints to this
-    # invocation's -i/-t (per row under a fan-out), so they run as printed.
-    route_rendered_commands: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2425,7 +2583,6 @@ def _call(
             text_renderer=text_renderer,
             timeout_kwargs=timeout_kwargs,
             stem=stem,
-            route_rendered_commands=route_rendered_commands,
         )
 
     target = _resolve_target(
@@ -2459,15 +2616,14 @@ def _call(
             **timeout_kwargs,
         )
     except BridgeError as exc:
-        if contextual_hints:
-            routed = _contextualize_diagnostic_hints(
-                {"error": str(exc)}, target=target,
-                instance=getattr(args, "instance", None))
-            exc.args = (routed["error"],)
+        # Every command a refusal prints runs as printed: this invocation's
+        # -i/-t (V7-02: a quick-view `strings` refusal named a bare `bn refresh`).
+        routed = _contextualize_diagnostic_hints(
+            {"error": str(exc)}, target=target, instance=getattr(args, "instance", None))
+        exc.args = (routed["error"],)
         raise
-    if contextual_hints:
-        response = _contextualize_diagnostic_hints(
-            response, target=target, instance=getattr(args, "instance", None))
+    response = _contextualize_diagnostic_hints(
+        response, target=target, instance=getattr(args, "instance", None))
     result = unwrap_result(response, op)
     if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
         answering = response.get("instance")
@@ -2549,14 +2705,16 @@ def _call(
     # accepts (dogfood pass 3: the hand-maintained lists disagreed and named
     # flags that exit 2).
     slice_hint = _slice_hint_for_args(args, fmt)
+    shown = result
     if text_renderer is not None and fmt == "text":
-        if route_rendered_commands:
-            with command_routing(target=target, instance=getattr(args, "instance", None)):
-                result = text_renderer(result)
-        else:
-            result = text_renderer(result)
+        # Every `bn ...` command the TEXT renderer itself prints -- a follow-up,
+        # the quick-view `bn refresh` -- carries this invocation's -i/-t, so it
+        # runs as printed (V7-02: only opted-in commands were routed).
+        with command_routing(target=target, instance=getattr(args, "instance", None)):
+            shown = text_renderer(result)
     spilled = _render_result(
-        result,
+        shown,
+        outcome=outcome_fields(result),
         fmt=fmt,
         out_path=None if bridge_writes_output else args.out,
         stem=stem,
@@ -2610,7 +2768,6 @@ def _fanout_call(
     text_renderer: Callable[[Any], str] | None,
     timeout_kwargs: dict[str, Any],
     stem: str,
-    route_rendered_commands: bool = False,
 ) -> int:
     """Run *op* across every running bridge instance (``--all-instances``) and/or
     every open target in each instance (``--all-targets``), and aggregate (#169 L1).
@@ -2741,6 +2898,7 @@ def _fanout_call(
         iid, tsel = item
         row: dict[str, Any] = {"instance": iid}
         start = time.monotonic()
+        target = tsel
         try:
             if tsel is None:
                 sub = argparse.Namespace(**vars(args))
@@ -2751,24 +2909,28 @@ def _fanout_call(
                     sub, require_target=require_target,
                     allow_implicit_target=allow_implicit_target,
                 )
-            else:
-                target = tsel
             response = send_request(
                 op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
             )
-            row.update({"target": target, "ok": True,
-                        _RESULT_ROW_KEY: unwrap_result(response, op)})
+            # Every command the bridge's reply prints runs as printed: this
+            # row's instance and target, as on a single call (G3-05).
+            row.update({"target": target, "ok": True, _RESULT_ROW_KEY: unwrap_result(
+                _contextualize_diagnostic_hints(response, target=target, instance=iid), op)})
             # #1037 item 4 review: the default-page note for THIS row, decided
-            # from the same reply (the helper is pure), kept beside the rows
+            # from the same reply (the helper is pure, and the note reads only
+            # its counts, which routing never rewrites), kept beside the rows
             # rather than in them so the fan-out envelope keeps its shape.
             note = _default_page_note(args, unwrap_result(response, op))
             if note:
                 page_notes[(iid, target)] = note
         except BridgeError as exc:
             # The row's error is a refusal for ONE (instance, target) call, so
-            # its listing rows are respelled as that call (#1033 item 1).
+            # the commands it prints are routed to that call and its listing
+            # rows are respelled as that call (#1033 item 1).
+            routed = _contextualize_diagnostic_hints(
+                {"error": str(exc)}, target=target, instance=iid)["error"]
             row.update({"target": tsel, "ok": False,
-                        "error": _target_hint_message(args, str(exc), fanout=True, instance=iid)})
+                        "error": _target_hint_message(args, routed, fanout=True, instance=iid)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its
         # time, not just that it felt slow (#417).
         row["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
@@ -2814,8 +2976,7 @@ def _fanout_call(
     fmt = _resolve_output_format(args)
     rendered: Any = result
     if fmt == "text":
-        rendered = _render_fanout_text(result, inner_renderer=text_renderer,
-                                       route_rows=route_rendered_commands)
+        rendered = _render_fanout_text(result, inner_renderer=text_renderer)
     _render_result(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,
@@ -3364,8 +3525,33 @@ def _single_call_argv(argv: list[str], instance: str | None) -> list[str]:
     return [*routing, *options, *argv[end:]]
 
 
+# D2-03: `bn doctor` runs the `bn` executable found on PATH with this variable
+# set to a fresh nonce; that executable answers with the code it actually runs.
+IDENTITY_PROBE_ENV = "BN_IDENTITY_PROBE"
+
+
+def _answer_identity_probe(nonce: str) -> int:
+    """Print which package this process imported and the bridge it would
+    spawn, echoing *nonce*, and do nothing else.
+
+    Answered before argument parsing and before any command runs, so the probe
+    cannot recurse: a wrapper that itself invokes `bn doctor` inherits the
+    variable and answers the probe instead of probing again. It runs through the
+    PATH executable rather than its shebang interpreter, so a broken shim fails
+    here and a wrapper that changes `sys.path` reports the package it imports."""
+    sys.stdout.write(json.dumps({
+        "identity_probe": nonce,
+        "module_dir": str(Path(__file__).resolve().parent),
+        "plugin_source_dir": str(plugin_source_dir()),
+    }) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
+    probe = os.environ.get(IDENTITY_PROBE_ENV)
+    if probe:
+        return _answer_identity_probe(probe)
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
     # Capture --format before parsing so argparse usage/type errors (which fire

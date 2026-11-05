@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from bn_agent_bridge.read_taint_models import build_catalog
@@ -152,6 +154,101 @@ def test_present_callsites_dedups_aliased_addresses():
     assert _addrs(mc[0]) == {"0x400"}
 
 
+class _Sec:
+    def __init__(self, name):
+        self.name = name
+
+
+class _BVSynthetic(_BVSpellings):
+    """BN's per-view builtin placeholders (`__builtin_memcpy`, `__builtin_strcpy`)
+    in its synthetic-builtins section, one of them referenced by a lifted inline
+    builtin, plus a real `system` import elsewhere with no callers."""
+    _SECTIONS = {0x9000: ".synthetic_builtins", 0x9008: ".synthetic_builtins",
+                 0x5000: ".extern"}
+
+    def __init__(self, refs=None):
+        self.functions = []
+        self._syms = {"__builtin_memcpy": [_Sym("__builtin_memcpy", 0x9000)],
+                      "__builtin_strcpy": [_Sym("__builtin_strcpy", 0x9008)],
+                      "system": [_Sym("system", 0x5000)]}
+        self._refs = refs or {}
+
+    def get_symbols(self):
+        return [s for lst in self._syms.values() for s in lst]
+
+    def get_sections_at(self, a):
+        return [_Sec(self._SECTIONS[a])] if a in self._SECTIONS else []
+
+
+def _present_symbols(res):
+    return {e["symbol"] for e in res["items"] if e.get("present")}
+
+
+def test_unreferenced_synthetic_builtins_are_not_present():
+    # The placeholders exist on every view, so with no code reference they prove
+    # nothing; a real import with no callers still counts.
+    res = rts._taint_models_op(_CtxWithBV(_BVSynthetic()), "active",
+                               {"present": True, "callsites": True})
+    assert _present_symbols(res) == {"system"}
+    # A placeholder BN DID reference (an inline builtin it lifted) is present.
+    res = rts._taint_models_op(_CtxWithBV(_BVSynthetic({0x9000: [_Ref(0x400)]})), "active",
+                               {"present": True})
+    assert _present_symbols(res) == {"system", "__builtin_memcpy"}
+
+
+class _BVStripped(_BVSynthetic):
+    """Every function auto-named, nothing modeled but the placeholders."""
+    def __init__(self):
+        super().__init__()
+        self.functions = [_FakeFn("sub_401000"), _FakeFn("sub_401200")]
+        del self._syms["system"]
+
+
+def test_presence_walk_counts_matched_models():
+    stripped = rts._taint_models_op(_CtxWithBV(_BVStripped()), "active", {"present": True})
+    assert stripped["presence_catalog"] is True
+    assert stripped["present_model_count"] == 0
+    assert stripped["items"] == []
+    named = rts._taint_models_op(_CtxWithBV(_FakeBV(["memcpy", "system"])), "active",
+                                 {"role": "sink"})
+    assert named["present_model_count"] == 2
+
+
+def test_no_target_catalog_claims_no_presence():
+    res = rts._taint_models_op(_CtxNoView(), None, {})
+    assert res["presence_catalog"] is False
+    assert "present_model_count" not in res
+    assert not any("present" in e for e in res["items"])
+    # A presence walk is what switches the claim (and its note) on.
+    walked = rts._taint_models_op(_CtxWithBV(_FakeBV(["memcpy"])), "active", {})
+    assert walked["presence_catalog"] is True
+    assert walked["catalog_note"] != res["catalog_note"]
+
+
+_ROLELESS_SINK = {"app_recv": {"sink": {"class": "overflow_len"}, "bogus_key": 1}}
+
+
+@pytest.mark.parametrize("via", ["$BN_TAINT_MODELS", "--models"])
+def test_bad_user_model_refusal_names_the_knob_that_supplied_it(via):
+    with pytest.raises(rts.OperationFailure) as err:
+        rts._taint_models_op(_CtxNoView(), None, {
+            "user_models": _ROLELESS_SINK, "user_models_path": "/proj/models.json",
+            "user_models_via": via})
+    assert f"({via} /proj/models.json)" in str(err.value)
+
+
+def test_overridden_env_file_is_disclosed_as_not_loaded(monkeypatch):
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    res = rts._taint_models_op(_CtxNoView(), None, {
+        "user_models": {"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}},
+        "user_models_path": "/proj/flag.json", "user_models_via": "--models",
+        "user_models_env_overridden": "/proj/env.json"})
+    kinds = {o["kind"]: o for o in res["overlays"]}
+    assert kinds["user"]["via"] == "--models"
+    assert kinds["env_not_loaded"] == {"kind": "env_not_loaded", "env": "BN_TAINT_MODELS",
+                                       "path": "/proj/env.json", "overridden_by": "--models"}
+
+
 def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # #372 guard, relocated from the retired sink-sweep SINK_RE to the single
     # source of truth: the model DB must flag the FORTIFY (*_chk) family and bare
@@ -247,24 +344,18 @@ def test_message_queue_input_reaches_path_and_spawn_sinks_957():
 
 
 def test_build_catalog_includes_underscore_prefixed_real_models_849():
-    # #849: build_catalog must NOT skip models whose names start with a single
-    # `_` but are NOT doc-key prefixed (_comment). Real model names like
-    # ``__isoc99_scanf`` / ``__isoc99_fscanf`` / ``__isoc99_vsscanf`` start
-    # with ``_`` but are genuine sources/propagators -- the engine resolves them
-    # on real binaries while the catalog used to omit them entirely. The fix
-    # matches only the doc-key prefix (``_comment``), not every leading ``_``.
+    # #849: build_catalog must NOT skip models whose names start with `_` but
+    # are NOT doc-key prefixed (_comment). ``__builtin_memset`` starts with
+    # ``_`` but is a genuine propagator and sink the engine applies on real
+    # binaries; the catalog used to omit such names entirely. The fix matches
+    # only the doc-key prefix (``_comment``), not every leading ``_``.
     from bn_agent_bridge.taint_engine import load_models
     models = load_models()
-    src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
-    for name in ("__isoc99_scanf", "__isoc99_fscanf"):
-        assert name in src_syms, (
-            f"{name} must appear in the source catalog (starts with '_' but is "
-            "a real model, not a _comment doc key)"
-        )
     prop_syms = {p["symbol"] for p in build_catalog(models, role="propagator")["propagators"]}
-    assert "__isoc99_vsscanf" in prop_syms, (
-        "__isoc99_vsscanf must appear as a propagator in the catalog"
-    )
+    assert "__builtin_memset" in prop_syms
+    sink_syms = {e["symbol"] for lst in build_catalog(models, role="sink")["sinks_by_class"].values()
+                 for e in lst}
+    assert "__builtin_memset" in sink_syms
 
 
 def test_recv_overflow_comment_names_pread_603():
@@ -283,8 +374,9 @@ def test_recv_overflow_comment_names_pread_603():
 
 def test_build_catalog_marks_non_findings_555():
     cat = build_catalog(_MODELS)
-    # Top-level: loud, machine-readable "this is a catalog, not findings".
-    assert cat["presence_catalog"] is True
+    # Top-level: loud, machine-readable "this is a catalog, not findings". A bare
+    # model list has not been checked against any binary, so it claims no presence.
+    assert cat["presence_catalog"] is False
     assert cat["is_finding"] is False
     assert "NOT taint findings" in cat["catalog_note"]
     # Every sink entry is a non-finding and carries conditional wording.
@@ -496,6 +588,89 @@ def test_constant_inline_builtin_rows_are_non_audit_958():
     mlil.params = [_const(0x10), zero, _Llil("LLIL_REG")]
     res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
     assert _sink_entry(res, "__builtin_memset")["audit_callsite_count"] == 1
+
+
+def test_a_rep_movs_lifted_behind_a_direction_flag_branch_is_an_audit_site():
+    """V8-06: BN lifts `rep movsq` to `if (flag:d)` plus one intrinsic per arm;
+    only the intrinsics carry the synthesised `__builtin_memcpy` calls. The
+    catalog judged the first LLIL instruction (the branch), called the site
+    data, and dropped it -- the variable-length copy no list showed."""
+    def synthesised():
+        call = _Llil("MLIL_CALL", _const(0x9100))
+        call.params = [_Llil("MLIL_VAR"), _Llil("MLIL_VAR"), _Llil("MLIL_LSL")]
+        intrinsic = _Llil("LLIL_INTRINSIC")
+        intrinsic.mlils = [call]
+        return intrinsic
+
+    lifted = [_Llil("LLIL_IF", mlil=_Llil("MLIL_IF")), synthesised(), synthesised()]
+    fn = _ILFn("copy_label", 0x5000, {0x5020: lifted[0]})
+    fn.get_llils_at = lambda a: lifted if a == 0x5020 else []
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            self.functions = [fn]
+            self._syms = {"__builtin_memcpy": [_Sym("__builtin_memcpy", 0x9100)]}
+            self._refs = {0x9100: [_Ref(0x5020)]}
+            self._contain = {0x5020: fn}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    entry = _sink_entry(res, "__builtin_memcpy")
+    assert [(c["address"], c["kind"]) for c in entry["callsites"]] == [("0x5020", "app_caller")]
+    assert entry["callsite_count"] == entry["audit_callsite_count"] == 1
+
+
+def test_one_catalog_request_lifts_a_function_once_and_judges_each_site_once(monkeypatch):
+    """G4c P2: the catalog fetched `fn.mlil.ssa_form` -- a fresh wrapper Binary
+    Ninja may regenerate -- for every synthesised call, and a `rep stos` lifts
+    to two, so two fixed-size sites in one function lifted it four times and
+    judged each site twice. One request now shares the engine's SSA cache and
+    judges each (function, address, argument) once."""
+    from types import SimpleNamespace
+
+    lifts = []
+    judged = []
+
+    def site(addr):
+        def lifted_call():
+            call = _Llil("MLIL_CALL", _const(0x9100))
+            call.params = [_Llil("MLIL_VAR"), _const(0), _Llil("MLIL_LSL")]
+            call.ssa_form = SimpleNamespace(address=addr, params=call.params)
+            intrinsic = _Llil("LLIL_INTRINSIC")
+            intrinsic.mlils = [call]
+            return intrinsic
+        return [_Llil("LLIL_IF", mlil=_Llil("MLIL_IF")), lifted_call(), lifted_call()]
+
+    sites = {0x5020: site(0x5020), 0x5060: site(0x5060)}
+    fn = _ILFn("reset_records", 0x5000, {a: lifted[0] for a, lifted in sites.items()})
+    fn.get_llils_at = lambda a: sites.get(a, [])
+
+    class _MLIL:
+        @property
+        def ssa_form(self):
+            lifts.append(fn.start)
+            return SimpleNamespace(source_function=fn)
+
+    fn.mlil = _MLIL()
+
+    def fixed_size(*args):
+        judged.append(args)
+        return {"intrinsic": "__memfill_u64", "length_bound": "0x138",
+                "length_kind": "alignment_split"}
+
+    monkeypatch.setattr(rts._taint, "inline_expansion_length", fixed_size)
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            self.functions = [fn]
+            self._syms = {"__builtin_memset": [_Sym("__builtin_memset", 0x9100)]}
+            self._refs = {0x9100: [_Ref(0x5020), _Ref(0x5060)]}
+            self._contain = {0x5020: fn, 0x5060: fn}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    entry = _sink_entry(res, "__builtin_memset")
+    assert entry["hidden_callsites"] == {"inline_builtin": 2}
+    assert lifts == [0x5000]
+    assert len(judged) == 2
 
 
 def test_callsite_rows_name_the_caller_demangled_unless_mangled():
@@ -776,6 +951,28 @@ def test_present_exposes_portable_identifiers_556():
     assert set(mc["accepted_aliases"]) == {"memcpy", "memcpy@plt"}
 
 
+@pytest.mark.parametrize("spellings,label", [
+    (("memcpy", "memcpy@plt"), "present"),
+    (("memcpy@plt",), "present as memcpy@plt"),
+])
+def test_a_presence_row_names_the_spelling_the_bridge_selected(spellings, label):
+    """R4-03: with both `memcpy` and `memcpy@plt` in the image the bridge
+    selects the exact `memcpy` (`resolved_symbol`), but the text row read
+    `accepted_aliases` and printed `[present as memcpy@plt]`, sending the
+    `xrefs`/`callsites` follow-up to the stub. The label follows the selection;
+    JSON keeps every spelling."""
+    from bn.formatters import _render_taint_models_text
+
+    bv = _BVSpellings()
+    bv.functions = [_FakeFn(name) for name in spellings]
+    bv._syms = {name: syms for name, syms in bv._syms.items() if name in spellings}
+    res = rts._taint_models_op(_CtxWithBV(bv), "active", {"present": True})
+    assert set(_sink_entry(res, "memcpy")["accepted_aliases"]) == set(spellings)
+    [row] = [line for line in _render_taint_models_text(res).splitlines()
+             if line.strip().startswith("memcpy (")]
+    assert re.findall(r"\[(present[^\]]*)\]", row) == [label]
+
+
 def test_catalog_only_has_model_name_but_no_raw_symbol_556():
     # Without a target there is no binary spelling to resolve; model_name is still
     # present so a consumer always has the portable alias.
@@ -936,13 +1133,23 @@ def _plain_length_program(callee, *, sized_destination=False):
             F.FBV({0x901: callee, 0x902: "malloc"}))
 
 
+def _counted(F, expr):
+    """*expr* read where `if (n <= 0) return;` dominates it: BN's value set is
+    ``1..0x40``, so the receive's return is a byte count, never its -1
+    failure (an unchecked return bounds nothing, V7-01)."""
+    expr.size = 8
+    expr.possible_values = F.FPVS("SignedRangeValue")
+    expr.possible_values.ranges = [F.types.SimpleNamespace(start=1, end=0x40, step=1)]
+    return expr
+
+
 def _bounded_receive_program(callee):
-    """``n = read(3, &src, 0x40); callee(3, &dst, n)``.
+    """``n = read(3, &src, 0x40); if (n <= 0) return; callee(3, &dst, n)``.
 
     The #159 idiom `_comment_recv_overflow` itself names as the ~100%-false-
-    positive one: the length is the return of a modeled receive provably
-    bounded by a constant count, so the honest verdict is `bounded_len` with
-    that bound, not an overflow.
+    positive one: the length is the checked return of a modeled receive
+    provably bounded by a constant count, so the honest verdict is
+    `bounded_len` with that bound, not an overflow.
     """
     F = _fakes()
     n1 = F.FSSA(F.FVar("n"), 1)
@@ -952,7 +1159,8 @@ def _bounded_receive_program(callee):
                  params=[F.FExpr("MLIL_CONST", "3", constant=3),
                          F.FExpr("MLIL_ADDRESS_OF", "&src", src=F.FVar("src", typ="char[0x40]")),
                          F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
-        _call_under_test(F, callee, 1, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]), [n1],
+        _call_under_test(F, callee, 1, _counted(F, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])),
+                         [n1],
                          F.FExpr("MLIL_ADDRESS_OF", "&dst", src=F.FVar("dst", typ="char[0x10]"))),
     ]
     return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
@@ -1086,7 +1294,8 @@ def test_fortified_entries_whose_base_has_no_sink_stay_sinkless_876(base):
 
 
 def _twin_as_bounding_source_program(callee):
-    """``n = callee(3, &buf, 0x40); memcpy(&dst, &buf, n); system(&dst)``.
+    """``n = callee(3, &buf, 0x40); if (n <= 0) return; memcpy(&dst, &buf, n);
+    system(&dst)``.
 
     Drives the read-family entry as a SOURCE rather than as a sink, which is
     the half its `sources` and `return_bound` fields describe and the A/B
@@ -1117,7 +1326,7 @@ def _twin_as_bounding_source_program(callee):
                  dest=F.FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
                  params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
                          F.FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
-                         F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+                         _counted(F, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]))]),
         F.FInstr(2, 0x30, "MLIL_CALL_SSA", "system(&dst)", writes=[],
                  dest=F.FExpr("MLIL_CONST_PTR", "0x2020", constant=0x2020),
                  params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)]),
@@ -1197,7 +1406,7 @@ def _copy_program(callee, *, tainted_length=True):
 
 
 def _bounded_copy_program(callee):
-    """``n = read(3, &src, 0x40); callee(&dst, &src, n[, guard])``.
+    """``n = read(3, &src, 0x40); if (n <= 0) return; callee(&dst, &src, n[, guard])``.
 
     The #159 idiom again, aimed at the copy family: the length is a modeled
     receive return provably bounded by a constant count, so the honest verdict
@@ -1209,7 +1418,7 @@ def _bounded_copy_program(callee):
     src = F.FVar("src", typ="char[0x40]"); dst = F.FVar("dst", typ="char[0x10]")
     params = [F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
               F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
-              F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]
+              _counted(F, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]))]
     if callee.endswith("_chk"):
         params.append(F.FExpr("MLIL_CONST", "0x10", constant=0x10))
     instrs = [
@@ -1265,10 +1474,10 @@ def test_scanf_family_models_carry_arity_capped_flag_851():
     # so the engine can emit a weak-seed note when a real call has more actual
     # params than the unrolled *arg:N run covers, rather than silently reporting
     # a clean all-clear for the unmodeled destinations.
-    from bn_agent_bridge.taint_engine import load_models
+    from bn_agent_bridge.taint_engine import load_models, lookup_model
     models = load_models()
     for name in ("scanf", "__isoc99_scanf", "fscanf", "__isoc99_fscanf"):
-        assert models[name].get("arity_capped") is True, (
+        assert lookup_model(models, name)[1].get("arity_capped") is True, (
             f"{name} must carry arity_capped=true so the engine can detect "
             "extra destinations beyond the modeled run"
         )
@@ -1279,10 +1488,70 @@ def test_scanf_family_models_carry_arity_capped_flag_851():
     # have landed). Pinning the OPPOSITE here is what let the first cut of the
     # #851 fix ship the scanf half only, with this test certifying the gap.
     for name in ("sscanf", "__isoc99_sscanf"):
-        assert models[name].get("arity_capped") is True, (
+        assert lookup_model(models, name)[1].get("arity_capped") is True, (
             f"{name} propagates into its destinations and its run is unrolled "
             "like scanf's, so it must carry arity_capped=true"
         )
+
+
+@pytest.mark.parametrize("spelling,canonical", [
+    (f"__isoc{std}_{base}", base)
+    for std in ("99", "23") for base in ("scanf", "fscanf", "sscanf", "vsscanf")
+] + [
+    # The decorations lookup_model already handled must keep working through
+    # the alias: a PLT-imported ISO spelling lands on the same model.
+    ("__isoc23_sscanf@plt", "sscanf"),
+    ("__isoc99_sscanf@plt", "sscanf"),
+    ("_isoc23_sscanf", "sscanf"),
+])
+def test_glibc_iso_scanf_spellings_alias_the_canonical_models(spelling, canonical):
+    # glibc exports __isoc99_* (C99) and __isoc23_* (C23, glibc 2.38+) for the
+    # scanf family. Each is the same call -- same arguments, same destinations
+    # -- so it must resolve to the canonical model by the alias table, not to a
+    # hand-maintained duplicate that can drift in source, propagation, sink
+    # class or arity cap.
+    from bn_agent_bridge.taint_engine import load_models, lookup_model
+    models = load_models()
+    key, model = lookup_model(models, spelling)
+    assert key == canonical
+    assert model is models[canonical], (
+        f"{spelling} must share the {canonical} model object, not a copy"
+    )
+    # The semantics the alias inherits, pinned on the model it shares.
+    if canonical in ("scanf", "fscanf", "sscanf"):
+        assert model.get("arity_capped") is True
+        assert model["sink"]["class"] == "overflow_unbounded"
+        assert model["sink"].get("format_arg") is not None
+    else:
+        assert model.get("destinations_unmodeled") is True
+
+
+def test_iso_scanf_aliases_are_not_catalog_entries_of_their_own():
+    # The catalog is a catalog of MODELS, keyed by the canonical name the
+    # engine reports (and --present annotates). An alias is a way to reach
+    # that model, so neither ISO spelling may appear as a second row that
+    # could describe different semantics.
+    from bn_agent_bridge.taint_engine import load_models
+    models = load_models()
+    cat = build_catalog(models)
+    symbols = {e["symbol"] for e in cat["sources"]}
+    symbols |= {e["symbol"] for e in cat["propagators"]}
+    symbols |= {e["symbol"] for lst in cat["sinks_by_class"].values() for e in lst}
+    assert not any(s.startswith(("__isoc23_", "__isoc99_")) for s in symbols), symbols
+    assert {"scanf", "fscanf", "sscanf"} <= symbols
+
+
+def test_c23_scanf_spellings_share_the_variadic_format_recovery():
+    # The read-side format analysis normalizes the same glibc wrappers: the
+    # C23 spelling must find the format argument exactly where the legacy
+    # spelling does, or the model knows the callee but the call evidence and
+    # listing do not know where its format is.
+    from bn_agent_bridge import il_format
+    for spelling, fmt_idx in (("__isoc23_scanf", 0), ("__isoc23_fscanf", 1),
+                              ("__isoc23_sscanf", 1)):
+        assert il_format._variadic_format_family(spelling) == (fmt_idx, True)
+    assert il_format._variadic_format_family("__isoc23_vsscanf") is None  # va_list, not variadic
+    assert il_format._normalize_libc_name("__isoc23_sscanf@plt") == "sscanf"
 
 
 def test_scanf_arity_residual_marker_in_weak_seed_set_851():
@@ -1294,3 +1563,332 @@ def test_scanf_arity_residual_marker_in_weak_seed_set_851():
         "scanf_arity_residual must be in _WEAK_SEED_ASSUMPTION_MARKERS so a "
         "residual-arity assumption withholds safe_to_report_all_clear"
     )
+
+
+# --- one argument grammar for every model role (IC04 review) ------------------
+
+from bn_agent_bridge import taint_models as tm
+
+_BAD_TOKENS = ["arg:-1", "arg:+1", "arg:01", "arg: 1", "arg:1 ", "arg:", "arg:x", "arg:1.0",
+               "arg:256", "arg:99999999999999999999", "arg:١", "ARG:1", "argv:1", ""]
+
+
+def _ptr(tok: str) -> str:
+    return "*" + tok if tok.startswith("arg") else tok
+
+
+@pytest.mark.parametrize("tok", _BAD_TOKENS)
+@pytest.mark.parametrize("field,make", [
+    ("propagates.from", lambda t: {"propagates": [{"from": t, "to": "ret"}]}),
+    ("propagates.to", lambda t: {"propagates": [{"from": "arg:0", "to": t}]}),
+    ("propagates.to", lambda t: {"propagates": [{"from": "arg:0", "to": _ptr(t)}]}),
+    ("sources.to", lambda t: {"sources": [{"to": _ptr(t)}]}),
+    ("varargs.to", lambda t: {"varargs": {"first_index": 1, "to": _ptr(t)}}),
+    ("writes", lambda t: {"writes": [_ptr(t)]}),
+    ("reads_dest", lambda t: {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                              "reads_dest": [_ptr(t)]}),
+])
+def test_every_role_refuses_a_malformed_argument_token(tok, field, make):
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_fn": make(tok)})
+    msg = str(ei.value)
+    assert "model 'app_fn'" in msg and f"`{field}" in msg, msg
+    assert "non-negative" in msg, msg
+
+
+@pytest.mark.parametrize("bad", [-1, 256, 10**20, True, "1", 1.0])
+@pytest.mark.parametrize("field,make", [
+    ("sink.tainted_args", lambda v: {"sink": {"class": "c", "tainted_args": [v]}}),
+    ("sink.len_arg", lambda v: {"sink": {"class": "c", "len_arg": v}}),
+    ("sink.buf_arg", lambda v: {"sink": {"class": "c", "tainted_args": [0], "buf_arg": v}}),
+    ("sink.pointer_args", lambda v: {"sink": {"class": "c", "tainted_args": [0], "pointer_args": [v]}}),
+    ("sink.format_arg", lambda v: {"sink": {"class": "c", "format_arg": v, "first_dest": 300}}),
+    ("varargs.first_index", lambda v: {"varargs": {"first_index": v, "to": "*arg:0"}}),
+    ("continuation.null_arg", lambda v: {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                                         "returns": "pointer", "continuation": {"null_arg": v}}),
+    ("string_args", lambda v: {"sink": {"class": "c", "tainted_args": [0]}, "string_args": [v]}),
+    ("append.dest", lambda v: {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                               "append": {"dest": v, "src": 1}}),
+    ("ret_offset.count_arg", lambda v: {"propagates": [{"from": "arg:0", "to": "ret"}],
+                                        "ret_offset": {"count_arg": v}}),
+])
+def test_every_index_field_refuses_a_non_index(bad, field, make):
+    model = make(bad)
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_fn": model})
+    msg = str(ei.value)
+    assert "model 'app_fn'" in msg and field.split(".")[0] in msg, msg
+
+
+def test_return_bound_refuses_a_negative_index():
+    with pytest.raises(tm.TaintError, match="max_from_arg"):
+        tm.load_models(extra={"read": {"return_bound": {"max_from_arg": -1}}})
+
+
+def test_the_grammar_accepts_every_documented_form():
+    ok = tm.load_models(extra={
+        "app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"},
+                                    {"from": "arg:255", "to": "arg:0"},
+                                    {"from": "arg:0", "to": "ret"},
+                                    {"from": "*arg:0", "to": "*ret"}],
+                     "reads_dest": ["*arg:0"], "string_args": [0, 1],
+                     "append": {"dest": 0, "src": 1}, "ret_offset": {"count_arg": 2}},
+        "app_recv": {"sources": [{"to": "*arg:1"}, {"to": "arg:0"}, {"to": "ret"},
+                                 {"to": "*ret"}, {"to": "*iovec:1"}]},
+        "app_fmt": {"varargs": {"first_index": 2, "to": "*arg:0"}},
+        "app_tok": {"propagates": [{"from": "*arg:0", "to": "ret"}], "returns": "pointer",
+                    "continuation": {"null_arg": 0}},
+        "app_zero": {"writes": ["*arg:0"]},
+    })
+    assert ok["app_copy"]["propagates"][1]["from"] == "arg:255"
+
+
+def test_builtin_catalog_satisfies_the_grammar():
+    # The packaged DB is validated on every load; the engine's own guard
+    # accepts the merged map too.
+    models = tm.load_models()
+    tm.validate_model_arguments(models, source="builtin")
+    tokens = [r[k] for m in models.values() if isinstance(m, dict)
+              for role in ("sources", "propagates") for r in m.get(role) or [] for k in ("from", "to")
+              if k in r]
+    assert tokens and all(t in ("ret", "*ret") or tm.parse_model_token(t) for t in tokens)
+
+
+def test_catalog_op_refuses_a_malformed_user_model():
+    # `bn taint models --models FILE` is the documented overlay check: it
+    # reports the malformed token instead of listing it.
+    with pytest.raises(tm.TaintError, match=r"`propagates.to` is '\*arg:-1'"):
+        tm.load_models(extra={"models": {"app_fn": {"propagates": [{"from": "arg:0", "to": "*arg:-1"}]}}})
+
+
+# --- required indices are never null (round-2 review) --------------------------
+
+@pytest.mark.parametrize("first_index", ["<missing>", None, True, False, "2", "+2", -1, 256, 2.0])
+def test_varargs_first_index_is_required_and_canonical(first_index):
+    va = {"to": "*arg:0"}
+    if first_index != "<missing>":
+        va["first_index"] = first_index
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_fmt": {"varargs": va}})
+    msg = str(ei.value)
+    assert "model 'app_fmt'" in msg and "`varargs.first_index` is required" in msg, msg
+
+
+@pytest.mark.parametrize("field,model", [
+    ("continuation.null_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}],
+                               "returns": "pointer", "continuation": {"null_arg": None}}),
+    ("max_from_arg", {"propagates": [{"from": "*arg:0", "to": "ret"}], "returns": "scalar",
+                      "return_bound": {"max_from_arg": None}}),
+    ("first_dest", {"sink": {"class": "c", "format_arg": 1, "first_dest": None}}),
+    ("append.dest", {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                     "append": {"dest": None, "src": 1}}),
+    ("ret_offset.count_arg", {"propagates": [{"from": "arg:0", "to": "ret"}],
+                              "ret_offset": {"count_arg": None}}),
+])
+def test_a_present_required_index_is_never_null(field, model):
+    with pytest.raises(tm.TaintError, match=field.replace(".", r"\.")):
+        tm.load_models(extra={"app_fn": model})
+
+
+def test_optional_sink_indices_may_be_null():
+    # `len_arg`, `buf_arg`, `format_arg` and `pointer_args` are optional; the
+    # engine reads a null as absent, so null stays accepted.
+    ok = tm.load_models(extra={"app_send": {"sink": {
+        "class": "net_write", "tainted_args": [1], "len_arg": None, "buf_arg": None,
+        "format_arg": None, "pointer_args": None}}})
+    assert ok["app_send"]["sink"]["len_arg"] is None
+
+
+# --- P2-09: a model file is accepted only as written ----------------------------
+
+_APP_COPY = {"propagates": [{"from": "*arg:1", "to": "*arg:0"}]}
+
+
+def test_an_empty_top_level_list_is_refused_like_a_non_empty_one():
+    # `[]` was falsy, so the loader skipped it and the disclosure omitted the
+    # file: a wrong-shape document accepted at exit 0.
+    for doc in ([], [{"app_copy": _APP_COPY}]):
+        with pytest.raises(tm.TaintError, match="must be a JSON object"):
+            tm.load_models(extra=doc, extra_via="--models", extra_path="/proj/m.json")
+
+
+def test_an_empty_object_is_a_disclosed_file_of_no_models():
+    assert tm.load_models(extra={}) == tm.load_models()
+    rows = tm.model_overlay_sources({}, user_models_path="/proj/m.json")
+    assert {"kind": "user", "via": "--models", "count": 0, "path": "/proj/m.json"} in rows
+
+
+@pytest.mark.parametrize("op", ["forward", "backward", "models"])
+@pytest.mark.parametrize("doc", [[], None])
+def test_bridge_refuses_a_non_object_model_file(op, doc):
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    params = {"user_models": doc, "user_models_path": "/proj/m.json",
+              "user_models_via": "--models"}
+    with pytest.raises(rts.OperationFailure, match=r"/proj/m\.json.*must be a JSON object"):
+        if op == "models":
+            rts._taint_models_op(_CtxNoView(), None, params)
+        else:
+            rts._taint_op(_Ctx(_BVPlain()), "active", dict(
+                params, function="handler", direction=op,
+                sources=["param:0"], sinks=["arg:memcpy:2"]))
+
+
+@pytest.mark.parametrize("model, path", [
+    ({"sink": {"class": "alloc_size", "tainted_args": [1]},
+      "OTHER_ROLES": "COPY_FROM_THE_CURRENT_MODEL"}, "OTHER_ROLES"),
+    ({"sink": {"clas": "alloc_size", "class": "alloc_size", "tainted_args": [1]}}, "sink.clas"),
+    ({"propagates": [{"from": "*arg:1", "to": "*arg:0", "form": "arg:1"}]}, "propagates[0].form"),
+    ({"sources": [{"to": "ret"}, {"to": "*arg:0", "kind": "x"}]}, "sources[1].kind"),
+    ({"varargs": {"first_index": 1, "to": "*arg:0", "first": 1}}, "varargs.first"),
+    ({**_APP_COPY, "continuation": {"null_arg": 0, "nul_arg": 0}}, "continuation.nul_arg"),
+    ({**_APP_COPY, "return_bound": {"max_from_arg": 2, "min_from_arg": 0}}, "return_bound.min_from_arg"),
+    ({**_APP_COPY, "append": {"dest": 0, "src": 1, "len": 2}}, "append.len"),
+    ({**_APP_COPY, "ret_offset": {"count_arg": 2, "cnt_arg": 2}}, "ret_offset.cnt_arg"),
+])
+def test_unknown_keys_are_refused_at_every_level_naming_the_path(model, path):
+    with pytest.raises(tm.TaintError) as err:
+        tm.load_models(extra={"ds_resize": model})
+    msg = str(err.value)
+    assert "model 'ds_resize'" in msg and f"`{path}`" in msg, msg
+
+
+def test_comment_and_prose_keys_stay_allowed_at_every_level():
+    ok = tm.load_models(extra={"app_copy": {
+        "_comment": "wrapper", "detail": "a project copy wrapper",
+        "propagates": [{"from": "*arg:1", "to": "*arg:0", "_comment_rule": "src->dst"}],
+        "sink": {"class": "overflow_len", "tainted_args": [2], "detail": "n", "_comment": "x",
+                 "dest_size_arg": 3}}})
+    assert ok["app_copy"]["sink"]["dest_size_arg"] == 3
+
+
+def test_dest_size_arg_is_an_argument_index():
+    with pytest.raises(tm.TaintError, match=r"`sink\.dest_size_arg`"):
+        tm.load_models(extra={"app_copy": {"sink": {
+            "class": "overflow_len", "tainted_args": [2], "dest_size_arg": -1}}})
+
+
+def test_a_typoed_sink_class_is_refused_listing_the_valid_set():
+    valid = tm.builtin_sink_classes()
+    assert {"overflow_len", "alloc_size", "file_write", "net_write"} <= valid
+    with pytest.raises(tm.TaintError) as err:
+        tm.load_models(extra={"app_copy": {**_APP_COPY, "sink": {
+            "class": "overflow_unbounde", "tainted_args": [1]}}})
+    msg = str(err.value)
+    assert "model 'app_copy'" in msg and "overflow_unbounde" in msg, msg
+    assert all(c in msg for c in valid), msg
+
+
+@pytest.mark.parametrize("target", [False, True])
+def test_catalog_refuses_an_unknown_class_filter(target):
+    ctx = _CtxWithBV(_FakeBV(["memcpy"])) if target else _CtxNoView()
+    with pytest.raises(rts.OperationFailure) as err:
+        rts._taint_models_op(ctx, "active" if target else None, {"class": "nonexistent_class"})
+    msg = str(err.value)
+    assert "nonexistent_class" in msg and all(c in msg for c in tm.builtin_sink_classes()), msg
+
+
+# --- address-keyed models resolve against the target ---------------------------
+
+class _FnAt:
+    def __init__(self, name, start):
+        self.name, self.start = name, start
+
+
+class _BVWithFunctions(_FakeBV):
+    """A stripped view: functions at 0x401000 (auto-named) and 0x402000."""
+    def __init__(self):
+        super().__init__(["sub_401000", "parse_frame"])
+        self._at = {0x401000: _FnAt("sub_401000", 0x401000),
+                    0x402000: _FnAt("parse_frame", 0x402000)}
+
+    def get_function_at(self, addr):
+        return self._at.get(addr)
+
+
+_ADDR_MODEL = {"0x401000": {"sources": [{"to": "*arg:1"}, {"to": "ret"}]}}
+
+
+def _taint_with(bv, user_models):
+    seen: dict = {}
+
+    class _RecordingEngine(rts._taint.TaintEngine):
+        def __init__(self, bv, models, **kw):
+            super().__init__(bv, models, **kw)
+            seen["models"] = models
+
+        def forward(self, func, locators, **kw):
+            return {"direction": "forward", "reached_sinks": [], "leaves": []}
+
+    class _Ctx(_CtxWithBV):
+        def _find_function(self, bv, name):
+            return object()
+
+    import unittest.mock as um
+    with um.patch.object(rts._taint, "TaintEngine", _RecordingEngine):
+        result = rts._taint_op(_Ctx(bv), "active", {
+            "function": "handler", "sources": ["param:0"], "user_models": user_models,
+            "user_models_path": "/proj/m.json", "user_models_via": "--models"})
+    return result, seen["models"]
+
+
+def test_address_keyed_model_applies_under_the_functions_name_and_is_disclosed():
+    result, models = _taint_with(_BVWithFunctions(), _ADDR_MODEL)
+    assert models["sub_401000"] == _ADDR_MODEL["0x401000"]
+    assert "0x401000" not in models
+    [user] = [s for s in result["model_sources"] if s["kind"] == "user"]
+    assert user["resolved"] == {"0x401000": "sub_401000"} and user["count"] == 1, user
+    # A named function resolves to its current name; the envelope form too.
+    _, models = _taint_with(_BVWithFunctions(), {"models": {"0x402000": _APP_COPY}})
+    assert models["parse_frame"] == _APP_COPY
+
+
+def test_catalog_with_a_target_resolves_address_keys():
+    res = rts._taint_models_op(_CtxWithBV(_BVWithFunctions()), "active", {
+        "user_models": _ADDR_MODEL, "user_models_path": "/proj/m.json",
+        "user_models_via": "--models", "role": "source"})
+    assert "sub_401000" in {s["symbol"] for s in res["sources"]}
+    [user] = [o for o in res["overlays"] if o["kind"] == "user"]
+    assert user["resolved"] == {"0x401000": "sub_401000"}, user
+
+
+@pytest.mark.parametrize("doc, needle", [
+    ({"0x401004": _APP_COPY}, "0x401004"),                          # not a function start
+    ({"0x401000": _APP_COPY, "sub_401000": _APP_COPY}, "sub_401000"),  # name collision
+    ({"0x401000": _APP_COPY, "0x0401000": _APP_COPY}, "0x0401000"),    # two spellings
+])
+def test_unresolvable_or_colliding_address_keys_are_refused(doc, needle):
+    with pytest.raises(rts.OperationFailure) as err:
+        _taint_with(_BVWithFunctions(), doc)
+    assert needle in str(err.value) and "/proj/m.json" in str(err.value), str(err.value)
+
+
+def test_address_keyed_model_without_a_target_is_refused():
+    with pytest.raises(rts.OperationFailure, match="0x401000.*need a target"):
+        rts._taint_models_op(_CtxNoView(), None, {
+            "user_models": _ADDR_MODEL, "user_models_path": "/proj/m.json",
+            "user_models_via": "--models"})
+    with pytest.raises(tm.TaintError, match="0x401000.*need a target"):
+        tm.load_models(extra=_ADDR_MODEL)
+
+
+_CONTENT_RULE = [{"from": "*arg:0", "to": "ret"}]
+
+
+@pytest.mark.parametrize("bad, good", [
+    # A `*arg:N -> ret` rule must say what its return is (IC06)...
+    ({"propagates": _CONTENT_RULE}, {"propagates": _CONTENT_RULE, "returns": "scalar"}),
+    ({"propagates": _CONTENT_RULE, "returns": "length"},
+     {"propagates": _CONTENT_RULE, "returns": "pointer"}),
+    # ...and only such a rule has one to say.
+    ({"propagates": [{"from": "arg:0", "to": "ret"}], "returns": "scalar"},
+     {"propagates": [{"from": "arg:0", "to": "ret"}, *_CONTENT_RULE], "returns": "scalar"}),
+])
+def test_a_content_return_must_say_whether_it_is_a_scalar_or_a_pointer(bad, good):
+    with pytest.raises(tm.TaintError) as ei:
+        tm.load_models(extra={"app_len": bad})
+    msg = str(ei.value)
+    assert "model 'app_len'" in msg and "`returns`" in msg, msg
+    assert tm.load_models(extra={"app_len": good})["app_len"]["returns"] == good["returns"]

@@ -3,12 +3,14 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shlex
 import types
 
 import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+from bn.transport import MULTI_TARGET_HEADLINE
 
 
 def test_target_flag_accepted_before_subcommand():
@@ -842,7 +844,8 @@ def test_close_bare_multiple_targets_requires_target(fake_transport, monkeypatch
         assert rc == 2, argv
         assert [c["op"] for c in calls] == ["list_targets"], argv
         err = capsys.readouterr().err
-        assert "requires --target when multiple targets are open" in err, argv
+        if argv == ["close"]:
+            assert err.splitlines()[0] == MULTI_TARGET_HEADLINE, argv
         assert "alpha.so" in err and "beta.so" in err, argv
 
 
@@ -863,7 +866,8 @@ def test_close_never_forwards_the_active_literal(fake_transport, monkeypatch, ca
     assert rc == 2
     assert [c["op"] for c in calls] == ["list_targets"]
     assert not any(c["target"] == "active" for c in calls)
-    assert "multiple targets are open" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "alpha.so" in err and "beta.so" in err
 
 
 def test_close_explicit_target_multiple_targets_skips_implicit_resolution(fake_transport, monkeypatch, capsys):
@@ -960,6 +964,21 @@ def test_target_use_does_not_overwrite_existing_pin_on_reject(tmp_session, monke
 
     assert rc == 2
     assert bn.session_state.read()["target"] == "pam_qnx.so.2"   # unchanged
+
+
+@pytest.mark.parametrize("view_id_selects, rc", [(True, 0), (None, 0), (False, 2)])
+def test_target_use_pins_a_view_id_only_where_the_bridge_accepts_one(
+        tmp_session, monkeypatch, capsys, view_id_selects, rc):
+    # D2-02: a bridge restarted without its predecessor's view-id high-water
+    # mark refuses every numeric selector, so `target use 4` must not pin one
+    # there (an older bridge that sends no flag still accepts it).
+    row = {"selector": "svc.so", "filename": "/fw/svc.so", "view_id": "4"}
+    if view_id_selects is not None:
+        row["view_id_selects"] = view_id_selects
+    monkeypatch.setattr(bn.cli, "send_request", lambda *_a, **_kw: {"result": [row]})
+
+    assert bn.cli.main(["target", "use", "4"]) == rc
+    assert bn.session_state.read().get("target") == ("4" if rc == 0 else None)
 
 
 def test_target_clear_removes_state(tmp_session, capsys):
@@ -1467,24 +1486,36 @@ def test_close_padded_active_is_forwarded_not_collapsed(fake_transport, monkeypa
     assert "Unknown target selector" in capsys.readouterr().err
 
 
-def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypatch, capsys):
-    # #690 r3: when the user DID pass `-t active` and close refuses under
-    # multiple targets, the generic "requires --target" hint alone is
-    # misleading (they passed --target). The refusal must say the volatile
-    # `active` spelling is not honored for close.
+@pytest.mark.parametrize("argv, spelling", [
+    (["close", "-t", "active"], "`-t active`"),
+    (["target", "close", "active"], "`active`"),
+])
+def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypatch, capsys,
+                                                       argv, spelling):
+    # #690 r3 / W05: the user DID pass a selector -- `active` -- so the refusal
+    # under multiple targets must lead with why that one is not honored, not
+    # with the generic "requires --target", which told them to pass what they
+    # had passed. The listing and the escape hatches still follow.
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
     calls = fake_transport({
         "list_targets": _TWO_TARGETS,
         "close_binary": {"ok": True, "result": {"closed": []}},
     })
 
-    rc = bn.cli.main(["close", "-t", "active", "--format", "text"])
+    rc = bn.cli.main([*argv, "--format", "text"])
 
     assert rc == 2
     assert [c["op"] for c in calls] == ["list_targets"]
-    err = capsys.readouterr().err
-    assert "requires --target when multiple targets are open" in err
-    assert "active" in err and "not honored" in err
+    lines = capsys.readouterr().err.splitlines()
+    # The headline names the selector exactly as given -- not the generic
+    # "requires --target" -- and the copyable `-t` rows for both targets follow.
+    assert lines[0].startswith(f"{spelling} ")
+    assert "--target" not in lines[0]
+    assert MULTI_TARGET_HEADLINE not in lines
+    rows = [shlex.split(line.split("  #")[0]) for line in lines if line.startswith("  bn ")]
+    assert [row[0] for row in rows] == ["bn", "bn"]
+    assert [row.count(sel) for row, sel in zip(rows, ("alpha.so", "beta.so"))] == [1, 1]
+    assert all("close" in row for row in rows)
 
 
 def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):
@@ -1621,3 +1652,29 @@ def test_target_close_is_advertised_by_help_and_capabilities(fake_transport, cap
     assert entry["group"] == "target"
     assert "close" in entry["help"].lower()
     assert "close" in entry["see_also"]
+
+
+@pytest.mark.parametrize("rows,advice", [
+    ([{"target_id": "1:1:1", "selector": "alpha.so", "view_id": 1},
+      {"target_id": "1:2:2", "selector": "beta.so", "view_id": 2}], "listing"),
+    ([{"target_id": "1:1:1", "selector": "alpha.so", "view_id": 1}], "omit"),
+])
+def test_a_typed_empty_target_advises_by_what_is_open(fake_transport, monkeypatch, capsys,
+                                                      rows, advice):
+    """W10: the refusal said "omit --target to use the single open target"
+    with two targets open, and that rerun hits the multi-target refusal.
+    Several open targets get the shared `Open targets:` listing; a sole one
+    keeps the omit advice. The peek names no target: the empty selector is
+    still never forwarded."""
+    monkeypatch.setattr(bn.cli, "list_instances", lambda *a, **k: [object()])
+    calls = fake_transport({"list_targets": {"ok": True, "result": rows}})
+
+    assert bn.cli.main(["function", "list", "-t", ""]) == 2
+    assert [(call["op"], call["target"]) for call in calls] == [("list_targets", None)]
+    err = capsys.readouterr().err
+    omit = "omit --target to use the single open target"
+    if advice == "listing":
+        assert omit not in err and "Open targets:" in err
+        assert "-t alpha.so " in err and "-t beta.so " in err
+    else:
+        assert omit in err and "Open targets:" not in err

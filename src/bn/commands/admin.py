@@ -13,9 +13,11 @@ import contextlib
 import fnmatch
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -43,6 +45,7 @@ from ..formatters import (
     _render_target_use_text,
 )
 from ..paths import project_root
+from ..taint_vocabulary import taint_vocabulary
 from ..target_hint import instance_option, target_option
 from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, unwrap_result
 
@@ -50,6 +53,8 @@ from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, u
 # workers. Give that work room on a loaded host before considering pinned signals.
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
+# `bn doctor` runs the PATH `bn`'s interpreter once to identify its code (P2-08).
+_PATH_CLI_PROBE_TIMEOUT = 15.0
 # #1036 item 6: a foreground `session start` of a large binary can block for
 # minutes; one stderr line this often says it is still working.
 _START_PROGRESS_INTERVAL = 30.0
@@ -82,11 +87,18 @@ def _still_loading_notice(path: str, interval: float):
 
 
 @command("capabilities",
-         help="Index of every command, what it's for, and when to pick it over a neighbor "
-              "(JSON for agents; no target needed)")
+         help="Index of every command, what it's for, and when to pick it over a neighbor, "
+              "plus the taint output vocabulary (`taint`: leaf kinds, truncation causes, "
+              "origin kinds, sink_status statuses, run_params keys) (JSON for agents; no "
+              "target needed)")
 def _capabilities(args: argparse.Namespace) -> int:
     # Derived entirely from the @command registry -- no hand-maintained second
     # list -- so the index can't drift from the actual command surface (#276).
+    # `output` is read off each command's BUILT parser (P3): what an agent asks
+    # before a large read -- which formats, whether `--out`/`--estimate-output`
+    # exist here, and which flags slice it -- answered by the parser that will
+    # accept or refuse them, not a description of it.
+    parser = cli.build_parser()
     items = [
         {
             "command": " ".join(spec["path"]),
@@ -94,14 +106,41 @@ def _capabilities(args: argparse.Namespace) -> int:
             "help": spec.get("help", ""),
             "requires_target": bool(spec.get("target", False)),
             "default_format": spec.get("fmt", "text"),
+            "output": _output_capabilities(
+                cli._selected_parser_for_argv(parser, list(spec["path"]))),
             "prefer_when": spec.get("prefer_when", ""),
             "see_also": list(spec.get("see_also", ())),
         }
         for spec in sorted(cli._COMMANDS, key=lambda spec: spec["path"])
     ]
-    result = {"kind": "capabilities", "items": items, "count": len(items)}
-    cli._emit_result(args, result, text_renderer=_render_capabilities_text, stem="capabilities")
-    return 0
+    # The taint output vocabulary (V4-05): declared sets and the engine's own
+    # literals, read by the crawler the drift tests use -- never a copy.
+    result = {"kind": "capabilities", "items": items, "count": len(items),
+              "taint": taint_vocabulary()}
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_capabilities_text, stem="capabilities")
+
+
+def _output_capabilities(sub: argparse.ArgumentParser) -> dict[str, Any]:
+    """The output surface one command's parser accepts. `slice_flags` are the
+    value-taking flags the command's own size hint draws on (`--limit`,
+    `--lines`, `--length`, ...); a switch such as `exports --count` is a mode,
+    not a bound, and `--out` has its own key. `paged` is read off the same
+    parser -- it takes both `--limit` and `--offset` -- not the registry's
+    `paged` flag, which `function cfg` and `evidence function` page without
+    (D3-03)."""
+    options = cli._known_option_strings(sub)
+    fmt = next((action for action in sub._actions if "--format" in action.option_strings), None)
+    takes_value = {option for action in sub._actions if action.nargs != 0
+                   for option in action.option_strings}
+    return {
+        "formats": list(fmt.choices) if fmt is not None and fmt.choices else [],
+        "out": "--out" in options,
+        "estimate_output": "--estimate-output" in options,
+        "paged": "--limit" in options and "--offset" in options,
+        "slice_flags": sorted({option for option, _ in sub._defaults.get("_slice_flags", ())}
+                              & takes_value - {"--out"}),
+    }
 
 
 def _render_help_index_text(value: Any) -> str:
@@ -150,13 +189,13 @@ def _help_index(args: argparse.Namespace) -> int:
         "count": len(items),
         "capabilities_command": "bn capabilities --format json",
     }
-    cli._emit_result(
+    return cli._emit_result(
         args,
         result,
+        exit_code=0,
         text_renderer=_render_help_index_text,
         stem="help",
     )
-    return 0
 
 
 def _same_dir(left: str, right: str | Path) -> bool:
@@ -174,6 +213,82 @@ def _instance_source_dir(instance: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _repository_root(directory: Path) -> str | None:
+    """The git repository or worktree *directory* lives in (nearest ancestor
+    holding a `.git` directory or worktree file), or None for an install that
+    is not a checkout (a wheel in site-packages)."""
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def _cli_identity(module_dir: Path) -> dict[str, Any]:
+    """Where a `bn` CLI's code lives: its package directory, the checkout it
+    belongs to, and a fingerprint of the whole package (P2-08)."""
+    return {
+        "module_dir": str(module_dir),
+        "repository_root": _repository_root(module_dir),
+        "build_id": cli.build_id_for_tree(module_dir),
+    }
+
+
+def _path_cli_identity(this_module_dir: Path) -> dict[str, Any]:
+    """Identity of the `bn` executable a bare `bn` command runs (P2-08).
+
+    `uv run bn` from one checkout and a `bn` installed from another look the
+    same in every report until something behaves differently; doctor names
+    the PATH one and whether it is this CLI. Probed by RUNNING that executable
+    with `IDENTITY_PROBE_ENV` set (D2-03), so what is reported is what a bare
+    `bn` does: a broken shim, an interpreter that cannot import `bn`, or a
+    wrapper that picks another package is seen as such. A nonzero exit, a
+    timeout or an answer that does not echo the nonce identifies nothing, and
+    says why in `error`."""
+    executable = shutil.which("bn")
+    if executable is None:
+        return {"executable": None, "same_as_this_cli": None,
+                "error": "no `bn` executable on PATH"}
+    identity: dict[str, Any] = {"executable": executable}
+    nonce = secrets.token_hex(8)
+
+    def unidentified(reason: str) -> dict[str, Any]:
+        identity.update({"same_as_this_cli": None, "error": reason})
+        return identity
+
+    try:
+        probe = subprocess.run(
+            [executable], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_PATH_CLI_PROBE_TIMEOUT, env={**os.environ, cli.IDENTITY_PROBE_ENV: nonce},
+        )
+    except subprocess.TimeoutExpired:
+        return unidentified(
+            f"it did not answer the identity probe within {_PATH_CLI_PROBE_TIMEOUT:g}s")
+    except OSError as exc:
+        return unidentified(f"it could not be run: {exc}")
+    if probe.returncode != 0:
+        last = (probe.stderr.strip().splitlines() or [""])[-1][:200]
+        return unidentified(
+            f"running it exited {probe.returncode}" + (
+                f": {last}" if last else
+                " without identifying its code (a `bn` older than the identity "
+                "probe prints its usage and exits 1)"))
+    try:
+        found = json.loads((probe.stdout.strip().splitlines() or [""])[-1])
+    except ValueError:
+        found = None
+    if not (isinstance(found, dict) and found.get("identity_probe") == nonce
+            and isinstance(found.get("module_dir"), str) and found["module_dir"]):
+        return unidentified(
+            "it ran but did not identify its code (a `bn` older than the identity "
+            "probe, or a wrapper that runs something else)")
+    module_dir = Path(found["module_dir"])
+    identity.update(_cli_identity(module_dir))
+    plugin_dir = found.get("plugin_source_dir")
+    identity["plugin_source_dir"] = plugin_dir if isinstance(plugin_dir, str) and plugin_dir else None
+    identity["same_as_this_cli"] = _same_dir(str(module_dir), this_module_dir)
+    return identity
+
+
 @command("doctor", help="Validate bridge discovery and installation")
 def _doctor(args: argparse.Namespace) -> int:
     install_dir = cli.plugin_install_dir()
@@ -186,6 +301,9 @@ def _doctor(args: argparse.Namespace) -> int:
     # (e.g. taint_engine.py) is flagged even though bridge.py is unchanged (#161).
     install_engine_id = cli.build_id_for_package(install_dir)
     source_engine_id = cli.build_id_for_package(source_dir)
+    cli_identity = _cli_identity(Path(cli.__file__).resolve().parent)
+    path_cli = _path_cli_identity(Path(cli.__file__).resolve().parent)
+    path_plugin_dir = path_cli.get("plugin_source_dir")
     requested = getattr(args, "instance", None)
     candidates = cli.list_instances()
     if requested:
@@ -279,6 +397,12 @@ def _doctor(args: argparse.Namespace) -> int:
                 # CLI's: restarting it from here would not change its code
                 # unless this CLI's interpreter spawns it (#992).
                 "other_checkout": other_checkout,
+                # P2-08: the bridge's code is not what the `bn` on PATH would
+                # spawn; None when either side is unknown.
+                "path_cli_other_checkout": (
+                    None if bridge_source is None or not path_plugin_dir
+                    else not _same_dir(bridge_source, path_plugin_dir)
+                ),
                 "installed_plugin_build_id": install_build_id,
                 "source_plugin_build_id": source_build_id,
                 "stale_plugin_version": (
@@ -309,6 +433,8 @@ def _doctor(args: argparse.Namespace) -> int:
 
     result = {
         "cli_version": cli.VERSION,
+        "cli": cli_identity,
+        "path_cli": path_cli,
         "plugin_source_dir": str(source_dir),
         "plugin_install_dir": str(install_dir),
         "plugin_source_build_id": source_build_id,
@@ -323,7 +449,6 @@ def _doctor(args: argparse.Namespace) -> int:
             cli.skills_source_dir() / "bn-kernel",
         ),
     }
-    cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
     # #620(c): a doctor report that never fails exit code hides unreachable
     # instances from scripted/CI callers who only check the exit status.
     # Deliberately reachable-only (not staleness): stale_plugin_version /
@@ -335,7 +460,8 @@ def _doctor(args: argparse.Namespace) -> int:
     # instances registered is not a probe failure either: any([]) is False, so
     # doctor still exits 0 when nothing is running (#620 C.3).
     unhealthy = any(not inst["reachable"] for inst in instances)
-    return 1 if unhealthy else 0
+    return cli._emit_result(args, result, exit_code=1 if unhealthy else 0,
+                            text_renderer=_render_doctor_text, stem="doctor")
 
 
 @command("plugin", "install", help="Install the GUI plugin", fmt="text",
@@ -369,10 +495,10 @@ def _plugin_install(args: argparse.Namespace) -> int:
     }
     if up_to_date:
         result["note"] = f"already installed: {state[1]}"
-    cli._emit_result(
-        args, result, text_renderer=_render_plugin_install_text, stem="plugin-install"
+    return cli._emit_result(
+        args, result, exit_code=0, text_renderer=_render_plugin_install_text,
+        stem="plugin-install"
     )
-    return 0
 
 
 # Bytecode an install never writes, but that importing the installed plugin or
@@ -936,20 +1062,15 @@ def _skill_install(args: argparse.Namespace) -> int:
     if explicit_refusal:
         result.update(ok=False, error="Skill install refused; no destinations changed.")
         if args.format != "text":
-            # Only an install refusal carries operation failure on its spill
-            # envelope. Shared output envelopes describe file-write success.
-            emission = cli.write_output_result(
+            # A spill envelope states the refusal itself (`ok: false` plus the
+            # `error`), exactly as the in-line payload does.
+            sys.stdout.write(cli.write_output_result(
                 result, fmt=args.format, out_path=None, stem="skill-install"
-            )
-            if emission.spilled and emission.artifact is not None:
-                emission.artifact.update(ok=False, error=result["error"])
-                sys.stdout.write(cli.render_envelope(emission.artifact, args.format))
-            else:
-                sys.stdout.write(emission.rendered)
+            ).rendered)
         print(_render_skill_install_text(result), file=sys.stderr, end="")
         return 2
-    cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
-    return 1 if not_updated_destinations else 0
+    return cli._emit_result(args, result, exit_code=1 if not_updated_destinations else 0,
+                            text_renderer=_render_skill_install_text, stem="skill-install")
 
 
 def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
@@ -1009,6 +1130,7 @@ def _default_skill_install_roots() -> list[Path]:
          help="Start a new headless bridge session. BN_CACHE_DIR also scopes the "
               "instance registry and sticky session: a bridge started with it set is "
               "only visible to bn commands run with the same value",
+         routes_instance=False,
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
@@ -1159,8 +1281,8 @@ def _session_start(args: argparse.Namespace) -> int:
                 "timed out waiting for teardown; no clean stop was confirmed"
             )
 
-    cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
-    return 1 if failures or association_error else 0
+    return cli._emit_result(args, result, exit_code=1 if failures or association_error else 0,
+                            text_renderer=_render_session_start_text, stem="session-start")
 
 
 def _positive_seconds(text: str) -> float:
@@ -1227,15 +1349,13 @@ def _session_status(args: argparse.Namespace) -> int:
     if wait and "waited" not in result:
         result["waited"] = {"seconds": round(time.monotonic() - started, 1),
                             "timed_out": False}
-    cli._emit_result(
+    return cli._emit_result(
         args,
         result,
+        exit_code=1 if wait and result.get("succeeded") is not True else 0,
         text_renderer=_render_session_status_text,
         stem="session-status",
     )
-    if wait:
-        return 0 if result.get("succeeded") is True else 1
-    return 0
 
 
 @command(
@@ -1341,8 +1461,15 @@ def _session_stop(args: argparse.Namespace) -> int:
                     target_id, "See `bn session list`.")) from None
             reason = signaller.send(signal.SIGTERM)
             if reason is not None:
-                print(f"error: {reason}", file=sys.stderr)
-                return 1
+                # V6-02: this is a failed stop like the teardown timeout below,
+                # so it is reported the same way -- a result through the output
+                # layer that states `ok: false`, never stderr alone, which left
+                # `--format json` and `--out` with no envelope at exit 1.
+                return cli._emit_result(
+                    args, {"ok": False, "instance_id": target_id, "stopped": False,
+                           "error": reason},
+                    exit_code=1, text_renderer=_render_session_stop_text,
+                    stem="session-stop")
             method = "sigterm"
 
         result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
@@ -1368,6 +1495,7 @@ def _session_stop(args: argparse.Namespace) -> int:
                     if reason is None:
                         converged = cli.wait_for_teardown(inst, timeout=2.0)
                 if not converged:
+                    result["ok"] = False
                     result["stopped"] = False
                     detail = f" {reason}." if reason is not None else ""
                     result["error"] = (
@@ -1375,8 +1503,9 @@ def _session_stop(args: argparse.Namespace) -> int:
                         f"(pid {inst.pid}) to fully tear down; "
                         f"registry/socket may be stale.{detail}"
                     )
-                    cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
-                    return 1
+                    return cli._emit_result(args, result, exit_code=1,
+                                            text_renderer=_render_session_stop_text,
+                                            stem="session-stop")
                 result["method"] = "sigkill"
 
         # Attached here, not with the `stopped: true` default above: the
@@ -1385,8 +1514,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         # stop did not complete (#925 review).
         if discarded:
             result["discarded_unsaved"] = discarded
-        cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
-        return 0
+        return cli._emit_result(args, result, exit_code=0,
+                                text_renderer=_render_session_stop_text, stem="session-stop")
     finally:
         if signaller is not None:
             signaller.close()
@@ -1475,6 +1604,8 @@ def _session_restart(args: argparse.Namespace) -> int:
         if isinstance(roots, list):
             inherited_roots = [root for root in roots if isinstance(root, str)]
 
+    first_view_id = _next_view_id(inst, rows)
+
     # Stop the old process: graceful shutdown, then SIGTERM/SIGKILL escalation,
     # blocking until the socket/registry are gone so the respawn can reuse the id.
     # Both signals are gated on durable process identity: a restart must never
@@ -1502,7 +1633,11 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    instance = cli.spawn_instance(resolved_id)
+    # D2-02: with no recorded high-water mark the successor cannot number its
+    # views above every id its predecessor handed out, so it accepts no bare
+    # numeric selector at all rather than infer history from the open rows.
+    instance = cli.spawn_instance(resolved_id, first_view_id=first_view_id,
+                                  numeric_view_ids=first_view_id is not None)
     # Reload targets without associating the restart command's cwd.
     #
     # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
@@ -1567,8 +1702,31 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["reload_capture_error"] = reload_capture_error
     if discarded:
         result["discarded_unsaved"] = discarded
-    cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
-    return 1 if failures or association_error or reload_capture_failed else 0
+    return cli._emit_result(
+        args, result,
+        exit_code=1 if failures or association_error or reload_capture_failed else 0,
+        text_renderer=_render_session_start_text, stem="session-restart")
+
+
+def _next_view_id(inst: Any, rows: list[dict[str, Any]]) -> int | None:
+    """The first numeric view id the restarted bridge may assign (P1-02), or
+    None when the old process's high-water mark is unknown (D2-02).
+
+    Only the registry's own `next_view_id` can say it: that number also covers
+    the views the old process closed, which nothing it lists now can. When it
+    is recorded, the listed ids still bound it from below (a view the bridge
+    numbered after its last registry write). A registry that predates the
+    field, or one written by a bridge that itself accepted no numeric ids (its
+    own numbering started over), gives None -- the restart then refuses
+    numeric selectors instead of inferring history from the open rows."""
+    meta = inst.meta if isinstance(inst.meta, dict) else {}
+    recorded = meta.get("next_view_id")
+    if (meta.get("numeric_view_ids") is False or not isinstance(recorded, int)
+            or isinstance(recorded, bool) or recorded < 1):
+        return None
+    listed = [int(row["view_id"]) + 1 for row in rows
+              if str(row.get("view_id", "")).isdigit()]
+    return max([recorded, *listed])
 
 
 def _require_headless_lifecycle(inst: Any) -> None:
@@ -1796,6 +1954,20 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             "started_at": inst.started_at,
             "rss_mb": round(rss, 1) if rss is not None else None,
         }
+        # P2-09: seconds of inactivity after which the bridge stops itself, null
+        # when it never does. Omitted for a bridge whose registry predates it.
+        if isinstance(inst.meta, dict) and "idle_timeout" in inst.meta:
+            idle = inst.meta["idle_timeout"]
+            entry["idle_timeout"] = (
+                idle if isinstance(idle, (int, float)) and not isinstance(idle, bool)
+                and idle > 0 else None
+            )
+        # D2-01: the idle window expired but unsaved targets keep the bridge
+        # alive; stated only while the bridge says it is deferring.
+        deferred = inst.meta.get("idle_deferred_unsaved_targets") if isinstance(
+            inst.meta, dict) else None
+        if isinstance(deferred, int) and not isinstance(deferred, bool) and deferred > 0:
+            entry["idle_deferred_unsaved_targets"] = deferred
         # #80: the registry now records each instance's open binaries, so list them
         # here without an N-instance `target list` round-trip. Absent (older bridge
         # or nothing open) -> omit, so the entry stays clean.
@@ -1977,8 +2149,8 @@ def _session_list(args: argparse.Namespace) -> int:
     # only, so a registry-sourced count would report "0 unsaved" for a bridge
     # holding unsaved renames -- the one wrong answer this field prevents.
     _probe_unsaved_targets(result)
-    cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="session-list")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_session_list_text, stem="session-list")
 
 
 @command("instance", "list", help="List running bridge instances (alias for `session list`)",
@@ -2001,8 +2173,8 @@ def _instance_list(args: argparse.Namespace) -> int:
                            if entry.get("sticky") or root in entry.get("project_roots", ())]
         result["project_root"] = root
         result["total_rss_mb"] = round(sum(entry["rss_mb"] or 0 for entry in result["items"]), 1)
-    cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_session_list_text, stem="instance-list")
 
 
 def _binary_query_matches(binary: str, query: str) -> bool:
@@ -2046,8 +2218,8 @@ def _instance_find(args: argparse.Namespace) -> int:
                     "binary": binary,
                 })
     result: Any = {"kind": "instance_matches", "query": query, "items": items, "count": len(items)}
-    cli._emit_result(args, result, text_renderer=_render_instance_find_text, stem="instance-find")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_instance_find_text, stem="instance-find")
 
 
 @command("instance", "use", help="Pin a bridge instance for subsequent calls", fmt="text",
@@ -2081,16 +2253,16 @@ def _instance_use(args: argparse.Namespace) -> int:
     if prev_target and prev_instance is not None and prev_instance != resolved:
         cli.session_state.update(target=None)
         result["cleared_target_pin"] = prev_target
-    cli._emit_result(args, result, text_renderer=_render_instance_use_text, stem="instance-use")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_instance_use_text, stem="instance-use")
 
 
 @command("instance", "clear", help="Clear the pinned bridge instance", fmt="text")
 def _instance_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(instance_id=None)
     result: Any = {"instance_id": None, "set": False}
-    cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="instance-clear")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_pin_clear_text, stem="instance-clear")
 
 
 @command("instance", "gc",
@@ -2100,8 +2272,8 @@ def _instance_gc(args: argparse.Namespace) -> int:
     # (the lazy liveness sweep keeps .log breadcrumbs forever) without touching
     # any live instance or the shared spawn lock (#80).
     result: Any = cli.gc_instances()
-    cli._emit_result(args, result, text_renderer=_render_instance_gc_text, stem="instance-gc")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_instance_gc_text, stem="instance-gc")
 
 
 @command("target", "list", help="List open BinaryView targets")
@@ -2118,13 +2290,31 @@ def _target_list(args: argparse.Namespace) -> int:
             if isinstance(item, dict) and _target_matches(item, sticky):
                 item["sticky"] = True
     # Wrap the bare list in the {kind, items} envelope the rest of the CLI's
-    # collection reads use, so an agent doesn't special-case target list (#358).
-    envelope: Any = {"kind": "targets", "items": result if isinstance(result, list) else []}
+    # collection reads use, so an agent doesn't special-case target list (#358)
+    # -- including the paging metadata and row schema those envelopes carry
+    # (P3). The list is never paged: it is every open target, so `has_more` is
+    # false and `total` equals `returned`.
+    rows = [row for row in result if isinstance(row, dict)] if isinstance(result, list) else []
+    envelope: Any = {"kind": "targets", "items": rows, "total": len(rows), "offset": 0,
+                     "returned": len(rows), "has_more": False,
+                     **_target_row_schema(rows)}
     # #996: name the bridge that answered -- a lone instance is used from any cwd.
     if isinstance(response, dict) and isinstance(response.get("instance"), str):
         envelope["instance"] = response["instance"]
-    cli._emit_result(args, envelope, text_renderer=_render_target_list_text, stem="targets")
-    return 0
+    return cli._emit_result(args, envelope, exit_code=0,
+                            text_renderer=_render_target_list_text, stem="targets")
+
+
+def _target_row_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """`row_fields` (keys EVERY target row carries, in the first row's order)
+    and `row_fields_optional` (the rest, with the condition that sets them), the
+    contract every bridge collection page states. Derived from the rows, so an
+    empty list claims no field."""
+    fields = [key for key in (rows[0] if rows else {}) if all(key in row for row in rows)]
+    optional = {key: ("the target pinned by `bn target use`" if key == "sticky"
+                      else "present on some rows only")
+                for row in rows for key in row if key not in fields}
+    return {"row_fields": fields, **({"row_fields_optional": optional} if optional else {})}
 
 
 def _target_matches(item: dict[str, Any], selector: str) -> bool:
@@ -2133,7 +2323,7 @@ def _target_matches(item: dict[str, Any], selector: str) -> bool:
         return True
     if selector == str(item.get("target_id", "")):
         return True
-    if selector == str(item.get("view_id", "")):
+    if item.get("view_id_selects") is not False and selector == str(item.get("view_id", "")):
         return True
     filename = item.get("filename")
     if isinstance(filename, str):
@@ -2168,13 +2358,13 @@ def _target_use(args: argparse.Namespace) -> int:
         )
     cli.session_state.update(target=args.selector)
     result: Any = {"target": args.selector, "set": True}
-    cli._emit_result(args, result, text_renderer=_render_target_use_text, stem="target-use")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_target_use_text, stem="target-use")
 
 
 @command("target", "clear", help="Clear the pinned target", fmt="text")
 def _target_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(target=None)
     result: Any = {"target": None, "set": False}
-    cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="target-clear")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_pin_clear_text, stem="target-clear")

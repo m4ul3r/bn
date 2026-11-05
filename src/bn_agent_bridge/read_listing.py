@@ -264,19 +264,29 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         for target in callee_addresses:
             code_ref_addrs |= {int(getattr(ref, "address", -1)) for ref in _get_code_refs(target)}
     rows = []
+    expansion_addrs: set[int] = set()
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
+        call_addr = int(getattr(insn, "address", 0))
         # Count tail-branch references too (a `b`/branch into the sink rendered
         # as `return <addr>(...) __tailcall`), not just bl/blx -- xrefs and
         # taint backward already treat these as calls, so callsites must agree
         # or it silently misses a reachable sink during triage (#47).
-        if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
+        if op_name in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
+            dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
+            if dest_value not in callee_addresses and call_addr not in code_ref_addrs:
+                continue
+            call_kind = "tailcall" if "TAILCALL" in op_name else "call"
+        elif (op_name == "LLIL_INTRINSIC" and call_addr in code_ref_addrs
+              and call_addr not in expansion_addrs
+              and il_format.inline_expansion_intrinsics(func, call_addr)):
+            # V8-06: an inline string expansion (`rep movs`) MLIL renders as a
+            # call to this builtin -- one row per instruction, however many
+            # intrinsics BN lifted it to.
+            expansion_addrs.add(call_addr)
+            call_kind = "inline_expansion"
+        else:
             continue
-        call_addr = int(getattr(insn, "address", 0))
-        dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
-        if dest_value not in callee_addresses and call_addr not in code_ref_addrs:
-            continue
-        call_kind = "tailcall" if "TAILCALL" in op_name else "call"
 
         instruction_length = il_format._instruction_length(bv, call_addr, arch=func_arch)
         caller_static = call_addr + instruction_length
@@ -897,6 +907,33 @@ def _scan_caller_functions(
     return scope_functions, truncated, "; ".join(notes) if notes else None
 
 
+_IMPORT_SYMBOL_TYPES = frozenset({"ImportedFunctionSymbol", "ImportedDataSymbol",
+                                  "ImportAddressSymbol", "ExternalSymbol"})
+
+
+def _symbol_call_targets(bv, identifier: str) -> list[Any]:
+    """Every symbol spelled *identifier* that a call can target without a
+    function body: an import (its stub, GOT slot or extern) or one of BN's
+    synthetic builtins (`__builtin_memcpy` in `.synthetic_builtins`, V8-06),
+    whose callers are the inline expansions MLIL renders as calls to it."""
+    if not identifier:
+        return []
+    getter = getattr(bv, "get_symbols_by_name", None)
+    symbols = list(getter(str(identifier)) or []) if callable(getter) else []
+    if not symbols:
+        raw_getter = getattr(bv, "get_symbol_by_raw_name", None)
+        raw_symbol = raw_getter(str(identifier)) if callable(raw_getter) else None
+        if raw_symbol is not None:
+            symbols = [raw_symbol]
+    targets = []
+    for symbol in symbols:
+        symbol_type = getattr(symbol, "type", None)
+        if (str(getattr(symbol_type, "name", symbol_type)) in _IMPORT_SYMBOL_TYPES
+                or il_format.in_synthetic_builtin_section(bv, int(getattr(symbol, "address", 0)))):
+            targets.append(symbol)
+    return targets
+
+
 def _callsites(
     ctx,
     selector: str | None,
@@ -915,47 +952,13 @@ def _callsites(
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Callsites")
     callee_symbol_only = False
+    symbol_targets = _symbol_call_targets(bv, callee_identifier)
     try:
         callee = ctx._find_function(bv, callee_identifier)
     except Exception:
-        getter = getattr(bv, "get_symbols_by_name", None)
-        symbols = (
-            list(getter(str(callee_identifier)) or [])
-            if callable(getter) and callee_identifier
-            else []
-        )
-        if not symbols:
-            raw_getter = getattr(bv, "get_symbol_by_raw_name", None)
-            raw_symbol = (
-                raw_getter(str(callee_identifier))
-                if callable(raw_getter) and callee_identifier
-                else None
-            )
-            if raw_symbol is not None:
-                symbols = [raw_symbol]
-        imported = []
-        allowed_types = {
-            getattr(getattr(bn, "SymbolType", None), name, None)
-            for name in (
-                "ImportedFunctionSymbol",
-                "ImportedDataSymbol",
-                "ImportAddressSymbol",
-                "ExternalSymbol",
-            )
-        }
-        for symbol in symbols:
-            symbol_type = getattr(symbol, "type", None)
-            type_name = str(getattr(symbol_type, "name", symbol_type))
-            if symbol_type in allowed_types or type_name in {
-                "ImportedFunctionSymbol",
-                "ImportedDataSymbol",
-                "ImportAddressSymbol",
-                "ExternalSymbol",
-            }:
-                imported.append(symbol)
-        if not imported:
+        if not symbol_targets:
             raise
-        symbol = min(imported, key=lambda item: int(getattr(item, "address", 0)))
+        symbol = min(symbol_targets, key=lambda item: int(getattr(item, "address", 0)))
         callee = SimpleNamespace(
             name=str(
                 getattr(symbol, "short_name", "")
@@ -966,17 +969,33 @@ def _callsites(
         callee_symbol_only = True
     # #286: an exported callee's intra-lib callers route through its same-name PLT
     # stub, so a call targeting the stub must count as a call to the callee.
+    # G4c: so does every other address the name answers to -- an image can hold
+    # both an imported `__builtin_memcpy` and the loader's synthetic placeholder
+    # of that name, whose callers are inline expansions; the rows are keyed by
+    # call address, so a site is never counted twice.
     try:
         stub_addrs = frozenset(int(s.start) for s in ctx._same_name_stub_functions(bv, callee))
     except Exception:
         stub_addrs = frozenset()
+    stub_addrs = (stub_addrs | {int(getattr(s, "address", 0)) for s in symbol_targets}) \
+        - {int(callee.start)}
+    targets = {int(callee.start), *stub_addrs}
+
+    def _callers(found: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        # An import stub that IS one of the addresses the name answers to --
+        # the PLT entry whose one instruction jumps through the GOT slot of
+        # that name -- is the call target resolving, never a caller of it
+        # (G6). A body of the name calling itself, directly or through its
+        # stub, is a real call.
+        return [(query, func) for query, func in found
+                if not (int(getattr(func, "start", -1)) in targets
+                        and is_imported_function(func))]
+
     caller_scan_truncated, caller_scan_note = False, None
     if within_identifiers:
-        scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+        scope_functions = _callers(ctx._resolve_scope_functions(bv, within_identifiers))
     else:
-        scope_functions = _all_caller_functions(
-            bv, {int(callee.start), *stub_addrs}
-        )
+        scope_functions = _callers(_all_caller_functions(bv, targets))
         if not scope_functions and callee_symbol_only:
             # #816: BN recorded no code ref to this imported callee, so the
             # code-ref enumeration above can only answer "no callers" -- which is
@@ -984,9 +1003,9 @@ def _callsites(
             # callee (it falls back to its #622 LLIL call scan). Enumerate the same
             # way here, and carry the scan's truncation up so a partial caller list
             # can never read as "not called".
-            scope_functions, caller_scan_truncated, caller_scan_note = (
-                _scan_caller_functions(ctx, bv, {int(callee.start), *stub_addrs})
-            )
+            scanned, caller_scan_truncated, caller_scan_note = (
+                _scan_caller_functions(ctx, bv, targets))
+            scope_functions = _callers(scanned)
     # Data locations holding the callee's address do not identify indirect callers.
     # Report their count and addresses, and offer class-layout navigation only
     # where bounded ELF object evidence proves a named vtable's ownership.

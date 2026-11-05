@@ -6,9 +6,12 @@ import functools
 import json
 import re
 import shlex
+import shutil
+import textwrap
 from typing import Any, Callable, Iterator, Sequence
 
 from .target_hint import instance_option, open_target_lines, target_option, target_row
+from .taint_truncation import describe_truncation_cause
 from .transport import BridgeError
 
 # FAILED_MUTATION_STATUSES is DEFINED in `mutation_statuses`, a stdlib-only leaf
@@ -18,7 +21,7 @@ from .transport import BridgeError
 # anything outside that copy would silently skip the revert-on-failure path.
 # Re-exported under this name because CLAUDE.md documents it here and tests pin
 # `bn.formatters.FAILED_MUTATION_STATUSES`.
-from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
+from .mutation_statuses import FAILED_MUTATION_STATUSES, FAILURE_PHASES  # noqa: E402,F401
 
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so
@@ -775,7 +778,7 @@ def _resolution_note(value: Any) -> str:
     """A leading note when a function-scoped read annotated how it resolved the
     requested address (#193 Part 4).
 
-    Two distinct disclosures share one `resolved_from` envelope, and text mode
+    Three distinct disclosures share one `resolved_from` envelope, and text mode
     must say exactly what the JSON says:
 
     * a non-zero offset means an INTERIOR address resolved to its containing
@@ -784,7 +787,10 @@ def _resolution_note(value: Any) -> str:
     * ``input_format: decimal`` means a digit-only token was read as an address
       rather than a symbol name. At offset ``+0x0`` that is the ONLY news: the
       read answered for exactly the function the caller named, so claiming
-      containment there contradicts the payload.
+      containment there contradicts the payload;
+    * ``normalized`` means the request's Thumb bit (bit 0) was cleared, and the
+      offset is measured from the cleared address: an odd entry pointer at
+      ``+0x0`` names the function's own start.
 
     Returns '' when not applicable.
     """
@@ -803,9 +809,16 @@ def _resolution_note(value: Any) -> str:
     name = function.get("name", "?")
     address = function.get("address", "?")
     requested = resolved_from.get("requested_address")
+    normalized = resolved_from.get("normalized")
     decimal = resolved_from.get("input_format") == "decimal"
     spelling = " (decimal input)" if decimal else ""
+    thumb = f", Thumb bit cleared to {normalized}" if normalized else ""
     if _is_exact_start(resolved_from):
+        if normalized:
+            return (
+                f"// bn: {requested}{spelling} is the Thumb-tagged entry of {name} "
+                f"@ {address} (bit 0 cleared)\n"
+            )
         if not decimal:
             return ""
         return (
@@ -814,7 +827,7 @@ def _resolution_note(value: Any) -> str:
         )
     return (
         f"// bn: {requested}{spelling} is inside {name} "
-        f"@ {address} ({resolved_from.get('offset')}); showing the containing function\n"
+        f"@ {address} ({resolved_from.get('offset')}{thumb}); showing the containing function\n"
     )
 
 
@@ -878,7 +891,8 @@ def _render_disasm_linear_text(value: Any) -> str:
 def _render_capabilities_text(value: Any) -> str:
     """Render the #276 capability index as a grouped, scannable catalog: each
     top-level group, its commands with one-line help, and the prefer-when /
-    see-also routing hints where a command overlaps a neighbor."""
+    see-also routing hints where a command overlaps a neighbor; then the taint
+    output vocabulary, one line per field."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     items = _field_list(value, "items")
@@ -904,6 +918,14 @@ def _render_capabilities_text(value: Any) -> str:
         see_also = _field_list(item, "see_also")
         if see_also:
             lines.append(f"      see also: {', '.join(str(x) for x in see_also)}")
+    taint = _field_dict(value, "taint")
+    if taint:
+        # The taint output vocabulary (V4-05), one line per field.
+        lines.extend(["", "taint output vocabulary:"])
+        for field, values in taint.items():
+            shown = (", ".join(str(v) for v in values) if isinstance(values, list)
+                     else repr(values))
+            lines.append(f"  {field}: {shown}")
     return "\n".join(lines)
 
 
@@ -921,6 +943,22 @@ def _shown_name(entry: Any, *, mangled: bool = False, name_key: str = "name",
     return entry.get(name_key)
 
 
+def _prototype_provenance_line(value: dict[str, Any]) -> str:
+    """`type: unknown (has_user_type set), confidence 96 (return type 128)` --
+    the prototype's proven origin, BN's flag when it is set, and BN's
+    confidence -- or '' when the read carried none of them."""
+    source = value.get("type_source")
+    proto = value.get("prototype_confidence")
+    ret = value.get("return_type_confidence")
+    flag = _flag_field(value, "has_user_type")
+    if source is None and proto is None and ret is None and flag is None:
+        return ""
+    flagged = " (has_user_type set)" if flag else ""
+    return (f"type: {source if source is not None else '<unknown>'}{flagged}, confidence "
+            f"{proto if proto is not None else '<unknown>'} "
+            f"(return type {ret if ret is not None else '<unknown>'})")
+
+
 @_discloses
 def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool = False) -> str:
     if not isinstance(value, dict):
@@ -928,12 +966,21 @@ def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool 
 
     function = _field_dict(value, "function")
     header_name = _shown_name(function, mangled=mangled) or "<unknown>"
+    size = f"size: {value.get('size', '<unknown>')}"
+    if value.get("span_start") is not None:
+        # `size` sums block bytes; the span bounds them, and a gap between
+        # blocks makes it the larger of the two.
+        size += f"  span {value['span_start']}..{value.get('span_end', '?')}"
+        if value.get("contiguous") is False:
+            size += " (discontiguous)"
     lines = [
         f"{_escape_control_chars(header_name)} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
+        *filter(None, [_prototype_provenance_line(value)]),
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
-        f"size: {value.get('size', '<unknown>')}",
-        f"xrefs: {value.get('xref_count', 0)}",
+        size,
+        f"xrefs: {value.get('code_ref_count', '<unknown>')} code, "
+        f"{value.get('data_ref_count', '<unknown>')} data",
     ]
 
     locals_only = _field_list(value, "locals")
@@ -1038,8 +1085,9 @@ def _render_proto_text(value: Any, *, mangled: bool = False) -> str:
         # return type (e.g. name "t" in "uint64_t") (#222 review).
         already_named = head.split()[-1:] == [name] if head else False
         if not already_named:
-            return note + f"{head} {name}({rest}" + width_note
-    return note + prototype + width_note
+            prototype = f"{head} {name}({rest}"
+    provenance = _prototype_provenance_line(value)
+    return note + prototype + (f"\n{provenance}" if provenance else "") + width_note
 
 
 @_discloses
@@ -1446,6 +1494,7 @@ def _render_save_text(value: Any) -> str:
     export = value.get("export") is True
     line = f"saved: {value.get('path', '<unknown>')}"
     if export:
+        line += "  (export)"
         # #1036 item 5: an explicit-path save is a copy. Say where the target
         # itself still saves and restarts from, so neither this agent nor a
         # second one reading `target list` mistakes the copy for its home.
@@ -1472,6 +1521,15 @@ def _render_save_text(value: Any) -> str:
             f"\nnote: an export, not this target's own database: a plain `bn save` "
             f"{plain}; `session restart` reopens {restart} ({restart_what})"
         )
+        # P2-03: what the export left as it was.
+        backing = _text_value(value, "backing_database")
+        line += f"\nbacking database: {backing or 'none (not saved to a database yet)'}"
+        unsaved = _flag_field(value, "unsaved")
+        if unsaved is not None:
+            line += (
+                "\nunsaved: yes (unchanged: the export persisted none of it; a plain "
+                "`bn save` does)" if unsaved else "\nunsaved: no"
+            )
     collision = _field_dict(value, "collides_with_open_target")
     if collision:
         # #857 r4: a save landing on a file another target already has open makes
@@ -1718,11 +1776,22 @@ def _render_session_list_text(value: Any) -> str:
         rss = item.get("rss_mb")
         if rss is not None:
             parts.append(f"rss={rss}MB")
+        if "idle_timeout" in item:
+            idle = item.get("idle_timeout")
+            parts.append(
+                f"idle={idle:g}s"
+                if isinstance(idle, (int, float)) and not isinstance(idle, bool) and idle > 0
+                else "idle=off")
         if item.get("started_at"):
             parts.append(f"started={item['started_at']}")
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        deferred = item.get("idle_deferred_unsaved_targets")
+        if isinstance(deferred, int) and not isinstance(deferred, bool) and deferred > 0:
+            lines.append(
+                f"  idle shutdown deferred: {deferred} target(s) with unsaved changes "
+                "-- save or close them; `bn session stop --discard-unsaved` discards them")
         # #992: which checkout this bridge runs.
         if item.get("source_dir"):
             lines.append(f"  source: {item['source_dir']}")
@@ -2331,6 +2400,13 @@ def _render_name_address_list_text(value: Any, *, mangled: bool = False) -> str:
         note = ("// the payload's self-defined-excluded count is not a number "
                 "that can be read (use --format json)")
         body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
+    # P2-06: duplicate symbol records collapsed into one row per (address,
+    # name, kind) identity; `total` counts rows, so the collapse is stated.
+    collapsed = _stated_count(value, "duplicates_collapsed")
+    if collapsed != "0":
+        note = (f"// {collapsed} duplicate symbol record(s) collapsed "
+                "(one row per address + name + kind)")
+        body = note if body == _EMPTY_RESULT else f"{body}\n{note}"
     # #969: `library: null` rows are imports no ELF symbol version binds to a
     # library; name the DT_NEEDED list they can come from, so the null points at
     # the answer rather than reading as "no dependency".
@@ -2745,12 +2821,6 @@ def _render_paged_list_text(
     return footer if body == _EMPTY_RESULT else f"{body}\n\n{footer}"
 
 
-_QUICK_PARTIAL_WARNING = (
-    "WARNING: target is quick-loaded; {what} is partial. "
-    "Run `bn refresh` for full analysis."
-)
-
-
 def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     """A leading warning line when a read envelope is quick-loaded/partial
     (#437), so a text reader doesn't trust a partial answer as a complete one.
@@ -2761,7 +2831,9 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     one message would otherwise tell a `decompile`/`class list`/`types`/
     `evidence function` reader that a "function list/count" was partial."""
     if isinstance(value, dict) and value.get("partial"):
-        return _QUICK_PARTIAL_WARNING.format(what=what) + "\n"
+        # The remedy runs as printed: this invocation's -i/-t (V7-02).
+        return (f"WARNING: target is quick-loaded; {what} is partial. "
+                f"Run {code_span(_bn_command('refresh'))} for full analysis.\n")
     return ""
 
 
@@ -4247,8 +4319,7 @@ def _render_message_lens_text(value: Any) -> str:
 
 
 @_discloses
-def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None,
-                        *, route_rows: bool = False) -> str:
+def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
     """Render an --all-instances fan-out (#169 L1): a header per instance, then
     that instance's result rendered by the command's own text renderer (or a
     fallback), and an ``error:`` line for instances that couldn't be reached/
@@ -4291,13 +4362,10 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
             inner = r.get("result")
             if inner_renderer is not None:
                 try:
-                    if route_rows:
-                        # Commands a row's renderer prints carry THIS row's
-                        # instance and target (#1037 review).
-                        with command_routing(target=r.get("target"),
-                                             instance=r.get("instance")):
-                            lines.append(inner_renderer(inner))
-                    else:
+                    # Commands a row's renderer prints carry THIS row's
+                    # instance and target (#1037 review).
+                    with command_routing(target=r.get("target"),
+                                         instance=r.get("instance")):
                         lines.append(inner_renderer(inner))
                 except BridgeError:
                     # A `BridgeError` is not a render failure: it is this CLI
@@ -4336,7 +4404,8 @@ def _render_orient_text(value: Any) -> str:
     state = value.get("analysis_state") or ("full" if value.get("analyzed") else "?")
     lines = [f"orientation: {name}  [analysis: {state}]"]
     if not value.get("analyzed", True):
-        lines.append("  ! loaded with --quick — run `bn refresh` before trusting strings/functions")
+        lines.append(f"  ! loaded with --quick — run {code_span(_bn_command('refresh'))} "
+                     "before trusting strings/functions")
     fc = value.get("function_count")
     if fc is not None:
         lines.append(f"  functions: {fc}")
@@ -4547,7 +4616,10 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         call_index = row.get("call_index")
         # A tailcall (tail-branch into the target) has no real return site, so flag
         # it -- its caller_static is the byte after the branch, not a return addr (#47).
-        kind_tag = "  [tailcall]" if row.get("call_kind") == "tailcall" else ""
+        # An inline expansion (`rep movs` lifted to a builtin call) is no call at all.
+        call_kind = row.get("call_kind")
+        kind_tag = (f"  [{call_kind}]" if call_kind in ("tailcall", "inline_expansion")
+                    else "")
         # #979: every label is the row's JSON key, so a filter written from the
         # text (`.containing_function`, `.hlil_statement`) finds the field.
         primary = (
@@ -4737,12 +4809,13 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
 
 
 @_discloses
-def _render_structured_il_text(value: Any) -> str:
+def _render_structured_il_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     form = "ssa" if value.get("ssa") else "non-ssa"
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}  ({value.get('view', 'mlil')} {form})"]
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}  "
+             f"({value.get('view', 'mlil')} {form})"]
     for ins in _field_list(value, "instructions"):
         # A malformed list element (non-dict) must render as fallback text, not
         # crash the whole listing with an AttributeError (#101).
@@ -4761,13 +4834,13 @@ def _render_structured_il_text(value: Any) -> str:
 
 
 @_discloses
-def _render_defuse_text(value: Any) -> str:
+def _render_defuse_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     var = _field_dict(value, "variable")
     lines = [
-        f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}",
+        f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}",
         f"variable: {var.get('ssa', var.get('name', '?'))}  ({var.get('type', '?')})",
     ]
     definition = _field_dict(value, "definition")
@@ -4847,11 +4920,14 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if c.get("kind") == "direct":
                 tgt = _field_dict(c, "target")
                 name = _shown_name(tgt, mangled=mangled) or "<unknown>"
+                # A symbol with no function body (a compiler builtin).
+                bodiless = "  (no function body)" if tgt.get("has_body") is False else ""
                 if per_site:
-                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}")
+                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}"
+                                f"{bodiless}")
                     continue
                 # Rendered spellings, so a malformed field still groups (#619).
-                key = (f"{name}", f"{tgt.get('address')}")
+                key = (f"{name}", f"{tgt.get('address')}{bodiless}")
                 if key not in groups:
                     groups[key] = []
                     rows.append(key)  # a group row, rendered once its sites are known
@@ -4889,11 +4965,14 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
                 continue
             caller = _field_dict(c, "caller")
             name = _shown_name(caller, mangled=mangled) or "<unknown>"
+            # A caller found through an indirect call's value-set, not a
+            # direct reference BN recorded.
+            how = "  (indirect call, value-set)" if c.get("kind") == "indirect" else ""
             if per_site:
                 site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
-                rows.append(f"  {site}{name} @ {caller.get('address', '?')}")
+                rows.append(f"  {site}{name} @ {caller.get('address', '?')}{how}")
                 continue
-            key = (f"{name}", f"{caller.get('address', '?')}")
+            key = (f"{name}", f"{caller.get('address', '?')}", how)
             if key not in caller_groups:
                 caller_groups[key] = []
                 rows.append(key)
@@ -4911,19 +4990,36 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if isinstance(row, tuple):
                 sites = caller_groups[row]
                 lines.append(f"  {row[0]} @ {row[1]}"
-                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else ""))
+                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else "")
+                             + row[2])
             else:
                 lines.append(row)
     return "\n".join(lines)
 
 
+def _pv_number(v: Any) -> str:
+    return f"{v:#x}" if isinstance(v, int) and not isinstance(v, bool) else str(v)
+
+
+def _pv_range(r: Any) -> str:
+    """``[0x0..0xff]`` (``step 4`` appended when not 1) for one serialized
+    value range; never the dict's Python repr."""
+    if not isinstance(r, dict):
+        return str(r)
+    step = r.get("step", 1)
+    return (f"[{_pv_number(r.get('start'))}..{_pv_number(r.get('end'))}]"
+            + (f" step {_pv_number(step)}" if step not in (1, None) else ""))
+
+
 @_discloses
-def _render_values_text(value: Any) -> str:
+def _render_values_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
-    lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}"]
+    index = value.get("il_index")
+    where = f"{value.get('at')}:{index}" if isinstance(index, int) and index >= 0 else value.get("at")
+    lines.append(f"at {where}: {value.get('expression', '<no instruction at address>')}")
     value_sets = [("possible values", value)]
     if _field_present(value, "call_destination"):
         destination = _field_dict(value, "call_destination")
@@ -4939,14 +5035,24 @@ def _render_values_text(value: Any) -> str:
             continue
         # Coerce the type before appending value details (#619).
         summary = str(pvs.get("type", "?"))
+        detailed = False
         if "value" in pvs:
-            summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
-        if pvs.get("values"):
-            summary += f"  values={pvs['values']}"
-        if pvs.get("ranges"):
-            summary += f"  ranges={pvs['ranges']}"
+            summary += f"  value={_pv_number(pvs['value'])}"
+            detailed = True
+        values = _field_list(pvs, "values")
+        if values:
+            summary += "  values={" + ", ".join(_pv_number(v) for v in values) + "}"
+            detailed = True
+        ranges = _field_list(pvs, "ranges")
+        if ranges:
+            summary += "  ranges=" + ", ".join(_pv_range(r) for r in ranges)
+            detailed = True
         lines.append(f"{label}: {summary}")
-        lines.append(f"  raw: {pvs.get('raw', '')}")
+        # BN's own rendering of the set, only for a kind this renderer has no
+        # structured fields for (a lookup table); otherwise it repeats the
+        # line above as a Python repr.
+        if not detailed and pvs.get("type") != "UndeterminedValue" and pvs.get("raw"):
+            lines.append(f"  detail: {pvs['raw']}")
         basis = value_set.get("value_basis")
         if basis == "source_expression" and value_set.get("source_expression"):
             lines.append(f"  of source expression: {value_set['source_expression']}")
@@ -4954,6 +5060,11 @@ def _render_values_text(value: Any) -> str:
             lines.append("  of instruction")
         elif basis == "destination_expression":
             lines.append(f"  of destination expression: {value_set.get('expression')}")
+    others = [o for o in _field_list(value, "other_instructions") if isinstance(o, dict)]
+    if others:
+        lines.append(f"other instructions at {value.get('at')} (select with --at "
+                     f"{value.get('at')}:<il-index>):")
+        lines.extend(f"  [{o.get('il_index')}] {o.get('text', '')}" for o in others)
     return "\n".join(lines)
 
 
@@ -4970,7 +5081,7 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"  unmodeled_callee @ {leaf.get('address')}"
             f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             f"  (tainted arg(s) {args})"
-            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     if kind == "pointer_escape":
         return (
@@ -4997,16 +5108,53 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
             f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
             f"  (recovered {leaf.get('recovered_params', '?')} param(s); "
             f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
-            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
+    if kind == "unread_callee_body":
+        cal = _field_dict(leaf, "callee")
+        args = _field_list(leaf, "tainted_args")
+        via = leaf.get("via")
+        return (
+            f"  unread_callee_body @ {leaf.get('address')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address', '?')}"
+            + (f"  (via {via})" if via else "")
+            + f"  (tainted arg(s) {args}; {leaf.get('skip_reason', '?')}"
+            # Which arguments the MLIL call did NOT carry: the reader must be
+            # able to tell an argument Binary Ninja recovered from one the
+            # calling convention's register proved.
+            + (f"; ABI-recovered arg(s) {_field_list(leaf, 'abi_recovered_args')}"
+               if leaf.get("abi_recovered_args") else "")
+            # Whether a model covered the call is the POINT of this leaf: the
+            # overlay is exactly what used to hide the unread body, so a reader
+            # must see both facts on the one row (IC05).
+            + ("; modeled" if leaf.get("modeled") else "") + ")"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
+    if kind == "global_memory_continuation":
+        return "\n".join(_render_continuation_group([leaf], mangled=mangled))
     if kind == "caller_sites_truncated":
         fn = _field_dict(leaf, "function")
         return (
             f"  caller_sites_truncated @ {leaf.get('address')}"
             f"  -> {_shown_name(fn, mangled=mangled) or '?'} @ {fn.get('address', '?')}"
-            f"  ({leaf.get('callers_followed', '?')} of {leaf.get('callers_total', '?')} "
-            f"caller(s) followed; {leaf.get('callers_dropped', '?')} dropped)"
-            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+            f"  ({leaf.get('callers_total', '?')} caller reference(s): "
+            f"{leaf.get('callers_fully_followed', '?')} fully followed, "
+            f"{leaf.get('callers_partially_followed', '?')} partially, "
+            f"{leaf.get('callers_unfollowed', '?')} not followed; "
+            f"{leaf.get('callers_dropped', '?')} dropped)"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
+    if kind == "model_destination_unrecovered":
+        cal = _field_dict(leaf, "callee")
+        srcs = ", ".join(f"{s.get('from', '?')}={s.get('tainted', '?')}"
+                         + (f" (state set at {s['continued_from']})" if s.get("continued_from") else "")
+                         for s in _field_list(leaf, "sources") if isinstance(s, dict))
+        return (
+            f"  model_destination_unrecovered @ {leaf.get('address')}"
+            f"  -> {_shown_name(cal, mangled=mangled) or '?'} @ {cal.get('address') or '?'}"
+            f"  (declared destination {leaf.get('destination', '?')} unavailable: "
+            f"recovered {leaf.get('recovered_params', '?')} arg(s); reached source(s) {srcs or '?'})"
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
         )
     return (
         f"  {kind} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
@@ -5015,8 +5163,8 @@ def _render_leaf_line(leaf: Any, *, mangled: bool = False) -> str:
 
 
 def _leaf_group_key(leaf: Any) -> tuple:
-    """Collapse near-identical frontier leaves: one group per callee for
-    unmodeled calls, per (base, offset) for field loads, per kind otherwise."""
+    """Group calls by callee, field loads by slot, caller frontiers by function
+    and measured coverage, and other near-identical frontiers by kind."""
     if not isinstance(leaf, dict):
         # Group malformed leaves by (type, repr): a type key can't collide with a
         # real `kind` string, and keying on the repr too means two DISTINCT
@@ -5031,24 +5179,55 @@ def _leaf_group_key(leaf: Any) -> tuple:
         return (kind, str(leaf.get("base")), str(leaf.get("offset")))
     if kind == "arg_under_recovered":
         return (kind, str(_field_dict(leaf, "callee").get("name", "?")))
+    if kind == "unread_callee_body":
+        # One unread body reached at one call site is ONE hole, however many
+        # tainted-argument contexts the fixpoint reached it from.
+        return (kind, str(leaf.get("address")),
+                str(_field_dict(leaf, "callee").get("address")))
+    if kind == "global_memory_continuation":
+        # The FACT is the global: one write of tainted bytes into it, then
+        # every later call the walk crossed with it live. Keying on the call
+        # too printed one row per (call site x global) -- 45 rows for three
+        # globals (P2-04) -- so one group per global lists its call sites.
+        # Two different globals stay two groups an agent must chase apart.
+        return (kind, str(_field_dict(leaf, "global").get("address")))
+    if kind == "caller_sites_truncated":
+        fn = _field_dict(leaf, "function")
+        # The reason tally's identity is its (reason, count) pairs, never the
+        # order its keys arrived in.
+        reasons = tuple(sorted((str(k), repr(v)) for k, v in _field_dict(leaf, "reasons").items()))
+        return (kind, str(fn.get("address") or leaf.get("address")), str(fn.get("name")),
+                *(str(leaf.get(k)) for k in (
+                    "callers_total", "callers_fully_followed", "callers_partially_followed",
+                    "callers_unfollowed", "callers_dropped", "demands_unfollowed")),
+                reasons)
+    if kind == "model_destination_unrecovered":
+        # One row per callee and declared destination: two missing outputs of
+        # one call are two writes to chase, never one "[2 leaves]" row.
+        return (kind, str(_field_dict(leaf, "callee").get("address")),
+                str(_field_dict(leaf, "callee").get("name")), str(leaf.get("destination")))
     return (kind,)
 
 
-def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool = False) -> list[str]:
+def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool = False,
+                           full: bool = False, width: int | None = None) -> list[str]:
     """Render unresolved leaves grouped by kind/callee with counts and a top-N
     cap (full detail stays in --format json) so real binaries don't flood the
-    text output with a wall of near-identical leaves (#160)."""
+    text output with a wall of near-identical leaves (#160). A global-memory
+    continuation group renders as a structured block; with a ``width`` (the
+    forward view passes the terminal's) every row is hard-wrapped to it, so
+    no frontier is a 2 KB line."""
     groups: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []
     for leaf in leaves:
         gk = _leaf_group_key(leaf)
         g = groups.get(gk)
         if g is None:
-            groups[gk] = {"rep": leaf, "count": 1}
+            groups[gk] = {"rep": leaf, "members": [leaf]}
             order.append(gk)
         else:
-            g["count"] += 1
-    order.sort(key=lambda gk: groups[gk]["count"], reverse=True)
+            g["members"].append(leaf)
+    order.sort(key=lambda gk: len(groups[gk]["members"]), reverse=True)
     total = len(leaves)
     ngroups = len(order)
     hdr = f"frontiers ({total}"
@@ -5056,19 +5235,176 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool 
         hdr += f" in {ngroups} group(s)"
     hdr += "):"
     out = [hdr]
-    for gk in order[:top_n]:
+    # V4-01: a global-memory continuation group (one per global) is never
+    # folded into the elision count -- on a busy run it is the actionable row
+    # -- and --verbose (``full``) renders every group of every kind.
+    shown = [gk for i, gk in enumerate(order)
+             if full or i < top_n or gk[0] == "global_memory_continuation"]
+    for gk in shown:
         g = groups[gk]
+        count = len(g["members"])
+        if gk[0] == "global_memory_continuation":
+            out.extend(_render_continuation_group(g["members"], mangled=mangled, full=full))
+            continue
         line = _render_leaf_line(g["rep"], mangled=mangled)
-        if g["count"] > 1:
+        if count > 1:
             # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
-            line += f"  [{g['count']} leaves]"
+            line += f"  [{count} leaves]"
         out.append(line)
-    if ngroups > top_n:
-        hidden = order[top_n:]
-        hidden_leaves = sum(groups[gk]["count"] for gk in hidden)
+    if len(shown) < ngroups:
+        rendered = set(shown)
+        hidden = [gk for gk in order if gk not in rendered]
+        hidden_leaves = sum(len(groups[gk]["members"]) for gk in hidden)
         out.append(
             f"  ... and {len(hidden)} more group(s) ({hidden_leaves} leaf(s)); "
-            "see --format json for the full list")
+            "see --verbose or --format json for the full list")
+    if width is None:
+        return out
+    return [wrapped for row in out for wrapped in _wrap_row(row, width)]
+
+
+# How many call sites / readers a continuation block lists before it counts
+# the rest; JSON keeps every one.
+_CONTINUATION_EXAMPLES = 4
+
+
+def _text_width() -> int:
+    """The terminal's width for wrapped rows: `$COLUMNS`, the tty, else 100."""
+    return max(40, shutil.get_terminal_size((100, 24)).columns)
+
+
+def _wrap_row(row: str, width: int) -> list[str]:
+    """*row* hard-wrapped at *width*, continuation lines indented four past the
+    row's own indent. Only the prose after a row's first `  -- ` wraps: the
+    head before it -- kind, address, callee and the parenthetical facts
+    (tainted args, skip reason, ABI-recovered args, modeled) -- stays on the
+    first line whole, so a reader or a grep that takes a frontier's first line
+    gets every fact it states (it runs past the width only when it alone is
+    wider). A backticked command is never split either: it is the one span a
+    reader pastes, so it moves to the next line whole, its text verbatim --
+    every whitespace character in it, a tab in a selector included (D5c-03)."""
+    if len(row) <= width:
+        return [row]
+    indent = row[:len(row) - len(row.lstrip(" "))]
+    glue = "\x00"
+    body = row.strip()
+    head, sep, tail = body.partition("  -- ")
+    if sep:
+        body = head.replace(" ", glue) + glue * 2 + "-- " + tail
+    # Each command -- with the space before it, so `next: <command>` stays
+    # one line -- is an opaque token while the row wraps, as wide as the
+    # command, and is restored verbatim after: textwrap expands tabs and
+    # breaks at any whitespace, so gluing only its spaces split a selector
+    # holding a tab. A command is recognised by its fence (`code_span`),
+    # never by "the next backtick": a selector may carry one (R4-02).
+    spans: list[str] = []
+
+    def opaque(m: re.Match[str]) -> str:
+        spans.append(m.group(0))
+        tag = f"\x01{len(spans) - 1}"
+        return tag + "\x02" * max(1, len(m.group(0)) - len(tag))
+
+    protected = re.sub(rf" ?{CODE_SPAN_RE.pattern}", opaque, body)
+    # A `[N leaves]` count stays one token a reader can grep for.
+    protected = re.sub(r"\[\d+ leaves\]", lambda m: m.group(0).replace(" ", glue), protected)
+    lines = textwrap.wrap(protected, width=width, initial_indent=indent,
+                          subsequent_indent=indent + "    ", break_long_words=False,
+                          break_on_hyphens=False)
+    return [re.sub(r"\x01(\d+)\x02+", lambda m: spans[int(m.group(1))], line)
+            .replace(glue, " ") for line in lines] or [row]
+
+
+def _counted(items: list[str], what: str) -> str:
+    """The first examples of *items* and how many more there are."""
+    shown = ", ".join(items[:_CONTINUATION_EXAMPLES])
+    rest = len(items) - _CONTINUATION_EXAMPLES
+    return shown + (f" (+{rest} more {what})" if rest > 0 else "")
+
+
+def _render_continuation_group(leaves: list[dict[str, Any]], *, mangled: bool = False,
+                               full: bool = False) -> list[str]:
+    """One global's continuation frontier as a block (P2-04): a header (kind,
+    first call site, global, verdict, leaf count), then the call sites it was
+    live across, its readers, the bound that cut the search, and ONE follow-up
+    command. Readers, sites and causes are the union over the group's leaves;
+    the prose ``detail`` (which repeats all of it) prints only under --verbose."""
+    rep = leaves[0]
+    glob = _field_dict(rep, "global")
+    offsets = sorted({str(o) for lf in leaves
+                      for o in _field_list(_field_dict(lf, "global"), "written_offsets")})
+    sites: list[str] = []
+    for lf in leaves:
+        # A coalesced leaf carries every call it crossed in `sites`.
+        crossed = [s for s in _field_list(lf, "sites") if isinstance(s, dict)] or [
+            {"address": lf.get("address"), "callee": lf.get("callee")}]
+        for s in crossed:
+            cal = _field_dict(s, "callee")
+            site = f"{s.get('address')} -> {_shown_name(cal, mangled=mangled) or '?'}"
+            if site not in sites:
+                sites.append(site)
+    readers: list[str] = []
+    for lf in leaves:
+        for r in _field_list(lf, "references"):
+            if not isinstance(r, dict):
+                continue
+            # The offset as the scan established it: unknown is `+?`, never
+            # rendered as the object's first byte.
+            off = r.get("offset")
+            where = ("+?" if r.get("offset_known") is False
+                     else (f"+{off:#x}" if isinstance(off, int) and off else ""))
+            reader = (f"{_shown_name(r, mangled=mangled) or '?'} @ {r.get('at', '?')}"
+                      + (f" ({where})" if where else "")
+                      + (f" ({r['access']})" if r.get("access") else ""))
+            if reader not in readers:
+                readers.append(reader)
+    reaches = [_field_dict(lf, "reachability") for lf in leaves]
+    cut = [r for r in reaches if str(r.get("status")) == "truncated"]
+    causes: list[str] = []
+    for r in cut:
+        for c in _field_list(r, "causes") or [r.get("cause")]:
+            if c is not None and str(c) not in causes:
+                causes.append(str(c))
+    # BN21-BOUND-02: a reference the scan could not account for is not a
+    # reader this walk identified; only a PROVEN read says "read by".
+    proven = any(lf.get("reads_proven") for lf in leaves)
+    verb = "read by" if proven else "may be read by"
+    verdict = (f"{verb} {len(readers)} reference(s)" if readers else "reader not named")
+    verdict += "; reachability truncated" if cut else "; reachability complete"
+    head = (f"  global_memory_continuation @ {rep.get('address')}"
+            f"  global={glob.get('address', '?')}"
+            # WHICH bytes were written: an interior copy is the same object,
+            # and naming the offset keeps a partial write from reading as
+            # coverage of the whole object (round-3 review R1).
+            + (f"(+{', +'.join(offsets)})" if offsets else "")
+            # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
+            # Ahead of the verdict, so a wrapped header keeps it on its first line.
+            + (f"  [{len(leaves)} leaves]" if len(leaves) > 1 else "")
+            + f"  -- {verdict}")
+    out = [head, f"      live across call(s): {_counted(sites, 'call site(s)')}"]
+    if readers:
+        out.append(f"      {verb}: {_counted(readers, 'reference(s)')}")
+    if cut:
+        # A named reader and an unfinished search are not alternatives: the
+        # block says both, so it never reads as "and that is all of them".
+        def _most(key: str) -> Any:
+            values = [r.get(key) for r in cut if isinstance(r.get(key), int)]
+            return max(values) if values else "?"
+        first = next((s for r in cut for s in _field_list(r, "unexamined_reference_sites")
+                      if isinstance(s, dict)), None)
+        out.append(f"      reachability truncated: {', '.join(causes) or '?'} "
+                   f"({_most('functions_examined')}/{_most('function_budget')} "
+                   f"function(s) examined, {_most('unexamined_references_total')} "
+                   "reference(s) unexamined"
+                   + (f"; first unexamined: {_shown_name(first, mangled=mangled) or '?'}"
+                      f" @ {first.get('at', first.get('address', '?'))}" if first else "")
+                   + ")")
+    reseed = next((str(lf["reseed"]) for lf in leaves if lf.get("reseed")), None)
+    if reseed:
+        out.append(f"      next: {reseed}")
+    elif glob.get("address"):
+        out.append(f"      next: {code_span(_bn_command('xrefs', str(glob['address'])))}")
+    if full and rep.get("detail"):
+        out.append(f"      detail: {rep['detail']}")
     return out
 
 
@@ -5114,43 +5450,27 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
 
 
 def _taint_truncation_note(stats: dict[str, Any]) -> str:
-    """Verdict-line truncation clause that names the CAUSE (#579/#576).
+    """Verdict-line truncation clause that names every CAUSE (#579/#576).
 
-    A fixpoint-exhaustion truncation and an interprocedural depth cutoff share
-    the run-level ``truncated`` flag but mean different things: the former's
-    ``max_depth`` stat is 0 (a same-function iteration limit), so the historical
-    ``truncated @depth 0`` misreported it as a depth-recursion cutoff. Render each
-    cause distinctly with its own remediation. When ``truncation_cause`` is absent
-    (an older bridge), preserve the historical ``@depth N`` wording verbatim."""
+    Each cause renders as itself with its own remediation, read from the one
+    vocabulary the bridge's all-clear reason also reads (``taint_truncation``):
+    the global-memory continuation's search budgets used to fall through to a
+    ``truncated @depth N`` clause and send the reader to ``--max-depth``, the
+    one knob that cannot move them. A cause the table does not know is named
+    verbatim, never as a depth cutoff. Only a bridge that predates
+    ``truncation_cause`` altogether keeps the historical ``@depth N`` wording,
+    because there no cause was stated."""
     if not stats.get("truncated"):
         return ""
-    causes = _field_list(stats, "truncation_cause")
+    causes = [str(c) for c in _field_list(stats, "truncation_cause")]
     if not causes:
         return f" · truncated @depth {stats.get('max_depth')}"
     parts: list[str] = []
-    if "max_depth" in causes:
-        parts.append(f"@depth {stats.get('max_depth')} "
-                     "(interprocedural depth bound; raise --max-depth)")
-    if "fixpoint_exhausted" in causes:
-        parts.append("fixpoint unconverged (intra-function iteration budget "
-                     "exhausted; raise --max-iters or narrow the source)")
-    if "recursion" in causes:
-        parts.append("recursion limit (possible unresolved cycle)")
-    if "caller_cap" in causes:
-        # #810: the backward caller ascent follows only the first N caller sites of
-        # a parameter-origin slice; the rest are dropped (no knob raises the cap).
-        # Name the cause and where the dropped count lives -- the frontier leaf.
-        parts.append("caller-site cap reached (not every caller was followed; "
-                     "see the caller_sites_truncated frontier)")
-    if "memory_chain" in causes:
-        # The shared graph-discovery/fixed-point allowance was exhausted;
-        # the cut can mean missing writers OR an unfinished proof.
-        parts.append("memory-chain budget exhausted while proving a local "
-                     "buffer's writers (discovery or fixed-point solve unfinished; "
-                     "seed closer to the sink -- see the "
-                     "address_of_local_unresolved frontier)")
-    if not parts:
-        return f" · truncated @depth {stats.get('max_depth')}"
+    for cause in dict.fromkeys(causes):
+        clause = describe_truncation_cause(cause)
+        # The depth a depth cut happened at is the one number its remedy needs.
+        parts.append(f"@depth {stats.get('max_depth')} ({clause})"
+                     if cause == "max_depth" else clause)
     return " · truncated " + "; ".join(parts)
 
 
@@ -5187,18 +5507,32 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
         classes = ", ".join(cls + _marks(cls)
                             for cls in sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+    # IC07: every zero-finding verdict is scoped to the sink classes the run
+    # enabled (the default catalog plus `run_params.sink_classes`) and names
+    # the opt-in calls taint reached that the run does not report -- a run
+    # with a frontier said "NO modeled sink reached" above a listed `net_write`
+    # call it had reached.
+    enabled = [str(c) for c in _field_list(_field_dict(value, "run_params"), "sink_classes")]
+    scope = "the default sink classes" + (f" + {', '.join(enabled)}" if enabled else "")
+    opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
+    skipped = (f"; {len(opt_in)} call(s) of opt-in sink class(es) "
+               f"{', '.join(sorted({str(r.get('class')) for r in opt_in}))} reached, "
+               "not reported" if opt_in else "")
     if leaves:
-        return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
-                f"(NOT an all-clear){fns_part}{trunc}")
-    # Genuinely empty: no sink AND no frontier. This is the MOST caveated case, not
-    # the least -- the engine reaching nothing does not mean the function is safe;
-    # it is exactly the shape a structurally-invisible bug (use-after-free,
-    # temporal, or an unmodeled source) produces. Carry the same "NOT an
-    # all-clear" qualifier the partial-coverage paths do (#310).
+        return (f"verdict: no sink of {scope} reached — {len(leaves)} tainted frontier(s) "
+                f"(NOT an all-clear{skipped}){fns_part}{trunc}")
+    # No sink AND no frontier. The verdict states the SAME claim the JSON gate
+    # (`diagnostics.safe_to_report_all_clear`) makes: it said "NOT an
+    # all-clear" beside a gate that said all-clear. An absent or false gate is
+    # no all-clear.
     visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
-    return (f"verdict: no taint reached any sink or frontier — NOT an all-clear "
-            f"({visited}; no modeled sink or tainted frontier found — also how a bug "
-            f"the engine can't structurally see appears){trunc}")
+    diag = _field_dict(value, "diagnostics")
+    if diag.get("safe_to_report_all_clear") is not True:
+        return (f"verdict: no sink of {scope} reached and no tainted frontier — NOT an "
+                f"all-clear ({visited}; see diagnostics{skipped}){trunc}")
+    return (f"verdict: no sink of {scope} reached and no tainted frontier — all-clear "
+            f"for those classes only, a may-analysis and not a proof ({visited}{skipped})"
+            f"{trunc}")
 
 
 def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
@@ -5249,6 +5583,10 @@ def _render_flow_line(f: dict[str, Any], *, mangled: bool = False) -> str:
         sig = _elide_template_args(str(sig))
         callee = _elide_template_args(str(callee))
     head = f"[{sink.get('class') or '?'}] {callee} @ {sink.get('address')}{arg}"
+    if _field_dict(sink, "object_taint"):
+        # V6-01: reached only through an object tainted at an unknown offset
+        # -- a may-flow to rank below a field-precise one.
+        head += " [object-wide]"
     # #1041 item 6: a flow several sources each reach on their own names them
     # as candidates; the signature keeps `multiple` (#1050 review finding 3).
     cands = [str(c) for c in _field_list(f, "source_candidates")]
@@ -5296,11 +5634,8 @@ def _elide_template_args(text: str) -> str:
 
 def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
     """A taint sink's callee as text prints it (#1001 item 4): the demangled
-    display name, or under ``--mangled`` the real raw symbol -- not the model
-    key, which drops a C++ symbol's leading underscore. Falls back to the key
-    (an older bridge, or no symbol by that name)."""
-    return _shown_name(sink, mangled=mangled,
-                       name_key="callee_symbol" if mangled and sink.get("callee_symbol") else "callee",
+    display name, or under ``--mangled`` the called symbol ``callee``."""
+    return _shown_name(sink, mangled=mangled, name_key="callee",
                        display_key="callee_display_name")
 
 
@@ -5323,9 +5658,13 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     fr = _field_dict(diag, "frontier")
     lu = _field_dict(diag, "last_use")
     out = ["diagnostics:"]
+    # A walk that did not finish measured no seed reach (`tainted_values` is
+    # null); printing the absent count as 0 claimed the seed went nowhere.
+    _tv = diag.get("tainted_values", 0)
     out.append(
         f"  seed: matched {diag.get('source_callsites', 0)} source callsite(s), "
-        f"produced {diag.get('tainted_values', 0)} tainted value(s)")
+        + (f"produced {_tv} tainted value(s)" if _tv is not None
+           else "tainted values not measured (the walk did not finish)"))
     # #805/#812: a per-callsite attributed union has no single last use, so the
     # scalar is deliberately null there and `last_use_by_source` carries the
     # real answer per callsite. Rendering only the scalar would print "seed did
@@ -5346,6 +5685,11 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
                     f"    {_addr}: {_ud.get('label', '?')} @ {_ud.get('address', '?')}{_r}")
             else:
                 out.append(f"    {_addr}: <none — this callsite did not propagate>")
+    elif diag.get("propagated"):
+        # No use was recorded, but the result's own frontier shows the seed
+        # got somewhere (P1-08): never "did not propagate" beside that proof.
+        out.append("  last propagated use: <not recorded — the frontier below shows "
+                   "the seed propagated>")
     else:
         out.append("  last propagated use: <none — seed did not propagate>")
     out.append(
@@ -5356,6 +5700,13 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     if _sm:
         _fr += f", {_sm} seed-misanchored"
     out.append(_fr)
+    # IC07: where taint left the function -- callers use it, a forward run
+    # from here does not follow it there.
+    exits = _field_dict(diag, "exits")
+    ways = (["return value"] if exits.get("return") else []) + [
+        f"out-parameter {i}" for i in _field_list(exits, "out_params")]
+    if ways:
+        out.append(f"  leaves the function through: {', '.join(ways)} (not followed)")
     # #562 honesty gate, folded into the same block: the anti-verdict, never a
     # vulnerability claim. Only present when the diagnostics carry it.
     if "safe_to_report_all_clear" in diag:
@@ -5398,7 +5749,11 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
     _fr = (f"  frontier: {_stated_count(fr, 'unresolved')} unresolved, "
            f"{_stated_count(fr, 'coarse_memory')} coarse-memory")
     _dropped = _count_field(fr, "dropped_callers")
-    if _dropped:
+    _unmeasured = _count_field(fr, "dropped_callers_unmeasured")
+    if _unmeasured:
+        _fr += (f", at least {_dropped} dropped-caller-site(s) ({_unmeasured} caller "
+                "frontier(s) carried no readable count)")
+    elif _dropped:
         _fr += f", {_dropped} dropped-caller-site(s)"
     out.append(_fr)
     if "safe_to_report_complete_slice" in diag:
@@ -5409,6 +5764,166 @@ def _render_backward_diagnostics(diag: dict[str, Any]) -> list[str]:
             out.append(f"    reason: {diag['complete_slice_reason']}")
     if diag.get("next_action"):
         out.append(f"  next: {diag['next_action']}")
+    return out
+
+
+# The per-site statuses a backward run writes, and how many site rows the text
+# view lists before it counts the rest (the caller-example bound, MAX_CALLERS).
+_SINK_SITE_STATUSES = ("seeded", "constant", "demand", "unseeded", "truncated")
+_SINK_SITE_EXAMPLES = 16
+
+
+def _sink_site_line(row: dict[str, Any]) -> str:
+    """One complete text line for a backward ``sink_status`` row."""
+    address = row.get("address")
+    if isinstance(address, int) and not isinstance(address, bool):
+        address = hex(address)
+    # Presence, not truth: a site at address 0 is still a site.
+    site = f" @ {address}" if address is not None else ""
+    status = row.get("status")
+    if status in _SINK_SITE_STATUSES:
+        tag = f"[{status}]"
+    else:
+        # An older bridge's row (`bounded`, no status) or a foreign status: say
+        # so rather than rendering it as one of the statuses this view knows.
+        _record_skew("status")
+        tag = "[? no status]" if status is None else f"[? unrecognised status {status!r}]"
+    evidence = ""
+    note = row.get("note") or ""
+    if status == "constant":
+        scalar = _field_dict(row, "scalar")
+        value = scalar.get("value")
+        if (scalar.get("kind") == "constant" and isinstance(value, int)
+                and not isinstance(value, bool)):
+            shown = f"{value:#x}"
+        else:
+            # Only an integer is a scalar count: a flag or a string is not one.
+            _record_skew("scalar")
+            shown = "? (unreadable)"
+        if row.get("destination_fit", "unproved") != "unproved":
+            _record_skew("destination_fit")
+        # A finite count never proves a destination fits, so the capacity
+        # verdict does not depend on the scalar evidence being readable.
+        evidence = f" scalar={shown}; destination capacity=unproved"
+        note = ""
+    return f"  {_describe_loc(row)}{site} {tag}{evidence} {note}".rstrip()
+
+
+# Origins one slice path text summarises on its origins line; JSON keeps all.
+_ORIGINS_SHOWN = 8
+
+
+def _backward_origin_name(names: dict[str, Any], raw: str, *, mangled: bool) -> str:
+    """*raw* (a function address or callee an origin names) as text prints
+    it: the slice's ``origin_names`` entry -- display name, or the raw symbol
+    under ``--mangled`` -- else *raw* itself."""
+    entry = _field_dict(names, raw)
+    return _text_value(entry, "name" if mangled else "display_name") or raw
+
+
+def _backward_origin_text(o: dict[str, Any], names: dict[str, Any], *, mangled: bool) -> str:
+    """One origin as ``<kind> <what>[ @ <address>] in <function>``: a constant
+    by its value, a call/source by its callee, anything else by the variable
+    or object it names."""
+    kind = _text_value(o, "kind") or "?"
+    callee = _text_value(o, "callee")
+    address = _text_value(o, "address")
+    var = _text_value(o, "var")
+    if kind == "constant" and o.get("value") is not None:
+        val = o["value"]
+        what = (f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)) + (
+            f" ({var})" if var else "")
+    elif kind == "recurrence_initializer":
+        # The literal a loop-carried value starts from, its per-trip
+        # increments (the calls an update goes through, when any), and that
+        # the trip count is not in the slice (IC08). A search that ran out
+        # proved no increment at all.
+        val = o.get("value")
+        start = f"{val:#x}" if isinstance(val, int) and not isinstance(val, bool) else str(val)
+        steps = _field_list(o, "increments")
+        ints = [s for s in steps if isinstance(s, int) and not isinstance(s, bool)]
+        calls = [str(c) for c in _field_list(o, "calls")]
+        step = ("unknown, loop search ran out" if o.get("search_exhausted")
+                else "/".join(f"{s:+d}" for s in ints) if ints and len(ints) == len(steps)
+                else "non-constant" + (f" via {', '.join(calls)}" if calls else ""))
+        what = (f"{var or '?'} = {start} looping through {_text_value(o, 'phi') or '?'} "
+                f"(per-trip {step}; trip count not in this slice)")
+    elif callee:
+        what = _backward_origin_name(names, callee, mangled=mangled) + (
+            f" @ {address}" if address else "")
+    else:
+        what = (var or _text_value(o, "buffer") or _text_value(o, "pointer")
+                or _text_value(o, "base") or address or "")
+    spill = " (via spill)" if o.get("via_spill") else ""
+    function = _text_value(o, "function")
+    where = f" in {_backward_origin_name(names, function, mangled=mangled)}" if function else ""
+    return f"{kind} {what}{spill}".rstrip() + where
+
+
+def _backward_origin_lines(sl: dict[str, Any], *, mangled: bool = False) -> list[str]:
+    """The origins line of one backward slice path (P2-05, W02-07): every
+    origin the path ends at, functions and callees by display name (raw under
+    ``--mangled``), a constant by its value. One origin prints ``origin: …``;
+    several print ``origins (N): …; …``, the first ``_ORIGINS_SHOWN`` of them."""
+    origins = [o for o in _field_list(sl, "origins") if isinstance(o, dict)]
+    if not origins:
+        origins = [o for o in [_field_dict(sl, "origin")] if o]
+    if not origins:
+        return []
+    names = dict(_field_dict(sl, "origin_names"))
+    # A bridge that names only the first origin's callee (no `origin_names`).
+    first_callee = _text_value(origins[0], "callee")
+    first_shown = _text_value(sl, "origin_callee_display_name")
+    if first_callee and first_shown and first_callee not in names:
+        names[first_callee] = {"display_name": first_shown}
+    shown = "; ".join(_backward_origin_text(o, names, mangled=mangled)
+                      for o in origins[:_ORIGINS_SHOWN])
+    more = len(origins) - _ORIGINS_SHOWN
+    if more > 0:
+        shown += f"; (+{more} more, see --format json)"
+    if len(origins) == 1:
+        return [f"  origin: {shown}"]
+    return [f"  origins ({len(origins)}): {shown}"]
+
+
+def _render_sink_sites(value: Any) -> list[str]:
+    """The backward ``sink sites`` block: bounded complete example rows plus the
+    exact count of every row it does not list. JSON keeps every site.
+
+    The examples include the first row of each status, so a status present
+    anywhere in the run is visible in text; the rest are listed in order."""
+    raw = _field_list(value, "sink_status")
+    if not raw:
+        return []
+    rows = _row_list(value, "sink_status")
+    kept: set[int] = set()
+    firsts: set[str] = set()
+    for i, row in enumerate(rows):
+        status = row.get("status")
+        key = repr(status)
+        if key not in firsts and len(kept) < _SINK_SITE_EXAMPLES:
+            firsts.add(key)
+            kept.add(i)
+    for i in range(len(rows)):
+        if len(kept) >= _SINK_SITE_EXAMPLES:
+            break
+        kept.add(i)
+    out = ["", f"sink sites ({len(raw)}):"]
+    out.extend(_sink_site_line(rows[i]) for i in sorted(kept))
+    omitted: dict[str, int] = {}
+    for i, row in enumerate(rows):
+        if i not in kept:
+            status = row.get("status")
+            label = status if status in _SINK_SITE_STATUSES else "unrecognised"
+            omitted[label] = omitted.get(label, 0) + 1
+    if omitted:
+        out.append(
+            f"  ... {sum(omitted.values())} more sink site(s) not listed: "
+            + ", ".join(f"{n} {s}" for s, n in sorted(omitted.items()))
+            + " (--format json lists every site)")
+    if len(raw) > len(rows):
+        out.append(f"  ! {len(raw) - len(rows)} sink_status row(s) unreadable, not listed "
+                   "(--format json)")
     return out
 
 
@@ -5483,6 +5998,15 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                     _why = _text_value(_sink_d, "relabel")
                     lines.append(f"      {_cat} → {_sink_d.get('class') or '?'}"
                                  + (f": {_why}" if _why else ""))
+                # W10-04: the length's last arithmetic ran in a narrower integer
+                # than the sink's parameter, so it can wrap before the widening.
+                _narrow = _field_dict(_sink_d, "width_narrowing")
+                if _narrow:
+                    lines.append(
+                        f"      width narrowing: length computed in "
+                        f"{_narrow.get('computed_width', '?')} byte(s) @ {_narrow.get('at', '?')}, "
+                        f"widened to the {_narrow.get('parameter_width', '?')}-byte parameter "
+                        "-- the arithmetic can wrap before the widening")
                 if full:
                     _detail = _field_dict(f, "sink").get('detail') or ''
                     if _detail:
@@ -5507,60 +6031,31 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
                 lines.append(f"  {sl!r}")
                 continue
             sink = _field_dict(sl, "sink")
-            origin = _field_dict(sl, "origin")
             m = _field_dict(sl, "metrics")
             sig = _signature_text(_field_dict(sl, "signature"), mangled=mangled)
-            n = sl.get("reached_via_call_sites", 1)
-            xn = (f"  (reached via {n} callsites)"
-                  if isinstance(n, int) and not isinstance(n, bool) and n > 1 else "")
             unresolved = "y" if m.get("traverses_unresolved") else "n"
             lines.append("")
-            # Compact one line per slice by default; "reached via N callsites" surfaces the engine's existing
-            # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
+            # Compact: one line per distinct slice PATH, then the origins it
+            # ends at (P2-05: one path reached from several origins is one
+            # row, not one identical row per origin). --full adds crosses/steps.
             lines.append(
                 f"  [{sink.get('class') or sink.get('kind') or '?'}] "
                 f"{_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} "
                 f"(seed {sink.get('seed', '?')})   {sig}   "
                 f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
-                f"unresolved={unresolved}}}{xn}".rstrip())
+                f"unresolved={unresolved}}}".rstrip())
+            lines.extend(_backward_origin_lines(sl, mangled=mangled))
             if full:
                 lines.append(
                     f"  slice for {_sink_callee_text(sink, mangled=mangled) or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
                 )
-                _ok = origin.get("kind")
-                if _ok == "constant" and origin.get("value") is not None:
-                    _val = origin["value"]
-                    _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
-                    _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
-                else:
-                    _extra = (((sl.get("origin_callee_display_name") if not mangled else None)
-                               or origin.get("callee"))
-                              or origin.get("var") or origin.get("address") or "")
-                _spill = " (via spill)" if origin.get("via_spill") else ""
-                lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
                 crossed = _field_list(sl, "crossed_functions")
                 if crossed:
                     lines.append(f"  crosses: {' <- '.join(str(c) for c in crossed)}")
                 for step in _field_list(sl, "slice"):
                     if isinstance(step, dict):
                         lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
-        status = _field_list(value, "sink_status")
-        # A constant-length sink is "provably bounded" -- a SUCCESS, not a failed
-        # seed -- so report it apart from genuinely-unseeded sinks (#310). A
-        # malformed (non-dict) status row is neither.
-        bounded = [s for s in status if isinstance(s, dict) and s.get("bounded")]
-        unseeded = [s for s in status
-                    if isinstance(s, dict) and not s.get("seeded", True) and not s.get("bounded")]
-        if bounded:
-            lines.append("")
-            lines.append(f"provably bounded ({len(bounded)}):")
-            for s in bounded:
-                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'constant length, nothing to slice')}")
-        if unseeded:
-            lines.append("")
-            lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")
-            for s in unseeded:
-                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
+        lines.extend(_render_sink_sites(value))
         # #812: backward's completeness gate, rendered for every backward run
         # that carries one. Leaving it JSON-only would repeat the asymmetry #810
         # fixed for the truncation verdict -- a text reader could not tell a
@@ -5611,7 +6106,23 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
     leaves = _field_list(value, "leaves")
     if leaves:
         lines.append("")
-        lines.extend(_render_grouped_leaves(leaves, mangled=mangled))
+        # P2-04: forward frontier rows reached 2 KB on one line; they wrap at
+        # the terminal's width. The backward view keeps its own row layout.
+        lines.extend(_render_grouped_leaves(
+            leaves, mangled=mangled, full=full,
+            width=_text_width() if direction == "forward" else None))
+    # IC07: calls of an opt-in sink class the run did not enable that taint
+    # armed -- outside its question, so neither a flow nor a frontier, but
+    # named so the scope of what was reported is visible.
+    opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
+    if opt_in:
+        lines.append("")
+        lines.append(f"opt-in sinks reached, not reported ({len(opt_in)}; "
+                     "add --sink-class <class> to report them):")
+        for r in opt_in:
+            args = ", ".join(str(i) for i in _field_list(r, "tainted_args"))
+            lines.append(f"  [{r.get('class')}] {r.get('callee')} @ {r.get('address')} "
+                         f"(arg {args})")
     assumptions = _field_list(value, "assumptions")
     if assumptions:
         lines.append("")
@@ -5622,6 +6133,14 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
     if msrc:
         lines.append("")
         lines.append(msrc)
+    # W07-14: a --resolve-map pin that is no call site the walk consulted pins
+    # nothing; JSON names it in run_params, and text must not stay silent.
+    rmap = _field_dict(_field_dict(value, "run_params"), "resolve_map")
+    unmatched = [str(a) for a in _field_list(rmap, "unmatched")]
+    if unmatched:
+        src = f" ({rmap['path']})" if rmap.get("path") else ""
+        lines.append(f"resolve-map{src}: {len(unmatched)} pin(s) matched no walked call "
+                     f"site: {', '.join(unmatched)}")
     if value.get("soundness"):
         lines.append("")
         lines.append(f"soundness: {value['soundness']}")
@@ -5643,6 +6162,13 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False,
     if note:
         lines.append("NOTE: " + str(note))
         lines.append("")
+    # The stripped-target case the bn-vr skill documents: a presence walk that
+    # matched no modeled name says nothing about whether the binary has sinks.
+    if value.get("present_model_count") == 0:
+        lines.append("no modeled name matched a symbol in this binary: its sinks may be "
+                     "unnamed (stripped) internal helpers, so this is not an all-clear -- "
+                     "review internal copy/format/exec helpers by hand")
+        lines.append("")
     srcs = _field_list(value, "sources")
     if srcs:
         lines.append(f"sources ({len(srcs)}):")
@@ -5650,7 +6176,7 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False,
             if not isinstance(s, dict):
                 lines.append(f"  {s!r}")
                 continue
-            p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
+            p = _presence_tag(s)
             # #958: `--callsites` expands sources too; the JSON always carried
             # them and the text dropped them, so the flag read as ignored.
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
@@ -5690,11 +6216,10 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False,
                 lines.append(f"  {p!r}")
                 continue
             lines.append(f"  {p.get('symbol', '<unknown>')}  {p.get('from_to', '')}")
-    ov = _field_list(value, "overlays")
-    if ov:
+    msrc = _render_model_sources(_field_list(value, "overlays"))
+    if msrc:
         lines.append("")
-        lines.append("overlays: " + ", ".join(
-            str(_as_dict(o).get("path", _as_dict(o).get("kind", "?"))) for o in ov))
+        lines.append(msrc)
     return "\n".join(lines) if lines else _empty_result("models matching the filter")
 
 
@@ -5729,7 +6254,7 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
 
 
 _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
-                       "inline_builtin": "constant-argument inline builtin"}
+                       "inline_builtin": "fixed-length inline builtin"}
 
 
 def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False,
@@ -5770,11 +6295,27 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = Fal
     return out
 
 
+def _presence_tag(e: dict[str, Any]) -> str:
+    """` [present]` / ` [absent]` for a catalog row checked against a target,
+    naming the spelling that matched when it is not the model's own name
+    (W07-15): `scanf [present as __isoc99_scanf]` tells the reader which
+    symbol `xrefs`/`callsites` find, while `call:scanf` still names the call.
+    That spelling is `resolved_symbol`, the one the bridge selected (R4-03):
+    `accepted_aliases` lists every spelling present, and naming another one --
+    `memcpy@plt` beside an exact `memcpy` -- sent the follow-up to the stub."""
+    if "present" not in e:
+        return ""
+    if not e.get("present"):
+        return " [absent]"
+    resolved = _text_value(e, "resolved_symbol")
+    return f" [present as {resolved}]" if resolved and resolved != e.get("symbol") else " [present]"
+
+
 def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
                              callsite_limit: int = 0) -> list[str]:
     """One present/catalog sink entry: the model line plus, under --callsites, its
     enriched callsite rows (address + containing function + non-audit kind)."""
-    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+    p = _presence_tag(e)
     desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
     head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
             f"{_callsite_count_note(e)}{desc}")
@@ -5787,10 +6328,14 @@ def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
 def _render_model_sources(sources: Any) -> str:
     """#415: one-line disclosure of the active taint-model overlays in TEXT mode
     (the default), so an agent can confirm a ``--models`` / ``BN_TAINT_MODELS``
-    overlay landed without parsing JSON or restarting the bridge."""
+    overlay landed without parsing JSON or restarting the bridge. A user overlay
+    is labelled by the knob that supplied it (``via``), and a
+    ``$BN_TAINT_MODELS`` file that ``--models`` overrode (``env_not_loaded``)
+    is named as NOT loaded rather than left out."""
     if not isinstance(sources, list):
         return ""
     parts: list[str] = []
+    skipped: list[str] = []
     for s in sources:
         if not isinstance(s, dict):
             continue
@@ -5802,13 +6347,22 @@ def _render_model_sources(sources: Any) -> str:
         elif kind == "override_default":
             parts.append(f"override ({s.get('path')})")
         elif kind == "user":
-            loc = s.get("path") or s.get("via", "--models")
+            via = s.get("via") or "--models"
+            loc = f"{via} {s['path']}" if s.get("path") else str(via)
             # #915: `count` is the role-bearing entries; a benign `{}` marker
             # armed nothing and is shown as what it is, not as a model.
             benign = s.get("benign")
             tail = f", {benign} benign" if benign else ""
-            parts.append(f"--models {loc} ({s.get('count', 0)} model(s){tail})")
-    return ("models: " + " + ".join(parts)) if parts else ""
+            parts.append(f"{loc} ({s.get('count', 0)} model(s){tail})")
+        elif kind == "env_not_loaded":
+            skipped.append(f"${s.get('env', 'BN_TAINT_MODELS')} {s.get('path')} NOT loaded "
+                           f"({s.get('overridden_by', '--models')} overrides it)")
+        elif s.get("path") or kind:
+            parts.append(str(s.get("path") or kind))
+    line = ("models: " + " + ".join(parts)) if parts else ""
+    if skipped:
+        line = "; ".join(([line] if line else []) + skipped)
+    return line
 
 
 def _describe_loc(loc: Any) -> str:
@@ -5952,6 +6506,24 @@ def _bn_command(*words: str) -> str:
     return " ".join(["bn", *flags, *(shlex.quote(w) for w in words)])
 
 
+def code_span(command: str) -> str:
+    """*command* as ONE inline code span (R4-02): the fence is one backtick
+    longer than the longest backtick run inside it, and a command that starts
+    or ends with a backtick is padded by a space (CommonMark), so a selector
+    such as ``'audit`copy.bndb'`` cannot close the span early. Every command
+    a reader is to paste is printed through here; `CODE_SPAN_RE` is the one
+    reader of the result."""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", command)), default=0) + 1)
+    pad = " " if command.startswith("`") or command.endswith("`") else ""
+    return f"{fence}{pad}{command}{pad}{fence}"
+
+
+#: One code span as `code_span` writes it: an opening backtick run and the
+#: first closing run of exactly that length. The body is group 2, padding
+#: included.
+CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+
+
 # #1037 item 1: the characters of one string value a text row shows. One
 # `strings --query` matched inside five 16 KB blobs and printed all of them in
 # one turn; the size note came after the flood. JSON keeps the value whole.
@@ -5986,7 +6558,7 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
             else:
                 command = _bn_command("read", str(address), "--encoding", "escaped")
             clipped = (f" … (+{len(text) - _STRING_VALUE_CLIP} chars; full value: "
-                       f"--format json or `{command}`)")
+                       f"--format json or {code_span(command)})")
             text = text[:_STRING_VALUE_CLIP]
         rendered = json.dumps(text, ensure_ascii=True) + clipped
         if chars is not None and isinstance(length, int) and chars != length:
@@ -6216,6 +6788,27 @@ def _render_cfg_text(value: Any) -> str:
         # known successors and undetermined ones.
         if block.get("undetermined_edges"):
             parts.append("  -> <undetermined> (analysis could not resolve the successors)")
+    if "total_blocks" in value:
+        # P2-04: a sliced graph says which slice it is, so a partial CFG never
+        # reads as the whole function. Counts are STATED (`?` when unreadable),
+        # so a skewed counter never renders as a real number or as "whole".
+        stated = {"offset": _stated_count(value, "offset"),
+                  "returned": _stated_count(value, "returned"),
+                  "matched_blocks": _stated_count(value, "matched_blocks"),
+                  "total_blocks": _stated_count(value, "total_blocks")}
+        window = _field_list(value, "address_window")
+        whole = (not window and "?" not in stated.values()
+                 and stated["offset"] == "0" and stated["returned"] == stated["total_blocks"])
+        if not whole:
+            scope = (f"{stated['matched_blocks']} in window {':'.join(map(str, window))}"
+                     if window else stated["matched_blocks"])
+            line = (f"// showing {stated['returned']} block(s) from offset {stated['offset']} "
+                    f"of {scope} (function has {stated['total_blocks']})")
+            if value.get("has_more") and "?" not in (stated["offset"], stated["returned"]):
+                following = _count_field(value, "offset") + _count_field(value, "returned")
+                line += f"; rerun with --offset {following} for the next page"
+            parts.append("")
+            parts.append(line)
     return "\n".join(parts)
 
 
@@ -6315,6 +6908,7 @@ def _render_data_symbols_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `syms`
+    page_unreadable = _field_skewed("items")
     if not syms:
         # #682 item 4: a bare "none" reads as "this view has no data symbols",
         # which is wrong -- and most misleading in the case that produces it,
@@ -6329,20 +6923,11 @@ def _render_data_symbols_text(value: Any) -> str:
     body = "\n".join(
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
         for sym in syms)
-    if value.get("has_more"):
-        # Reaches arithmetic, so it goes through the count choke point rather
-        # than a silent default: one count contract, not two (#619).
-        shown = _count_field(value, "offset") + len(syms)
-        if _field_skewed("offset"):
-            # An ACTIONABLE number: a resume offset fabricated from an
-            # unreadable page position sends a pager back over a window it
-            # already read, or loops it on page one (#722's harm class).
-            body += (f"\n// showing {len(syms)} of {value.get('total', '?')}"
-                     f"; page position unreadable -- re-read with --format json")
-        else:
-            body += (f"\n// showing {shown} of {value.get('total', '?')}"
-                     f"; resume with --offset {shown}")
-    return body
+    # P3: the shared footer every other listing prints. This one hand-rolled
+    # `// showing <offset + rows> of TOTAL`, so a second page of three read
+    # "showing 6 of 21": the NEXT offset where a reader expects the row count.
+    footer = _paging_footer(value, syms, page_unreadable)
+    return body if footer is None else f"{body}\n\n{footer}"
 
 
 @_discloses
@@ -6485,6 +7070,47 @@ def _render_read_escaped_text(value: Any) -> str:
 
 
 
+def _doctor_cli_identity_lines(value: dict[str, Any]) -> list[str]:
+    """P2-08: which code this CLI and the `bn` on PATH run, and a warning when
+    they -- or a bridge and the PATH `bn` -- come from different checkouts."""
+    lines: list[str] = []
+    this = _field_dict(value, "cli")
+    if this:
+        lines.append(f"cli module: {_text_value(this, 'module_dir') or '<unknown>'}")
+        lines.append(f"cli repository: {_text_value(this, 'repository_root') or 'none (not a checkout)'}")
+        lines.append(f"cli build: {_text_value(this, 'build_id') or '<unknown>'}")
+    path_cli = _field_dict(value, "path_cli")
+    if not path_cli:
+        return lines
+    exe = _text_value(path_cli, "executable")
+    error = _text_value(path_cli, "error")
+    if exe and not error:
+        lines.append(
+            f"PATH bn: {exe} -> {_text_value(path_cli, 'module_dir') or '<unknown>'} "
+            f"(repository {_text_value(path_cli, 'repository_root') or 'not a checkout'}, "
+            f"build {_text_value(path_cli, 'build_id') or '<unknown>'})")
+    elif exe:
+        # D2-03: running the PATH `bn` did not identify it -- a broken shim, a
+        # timeout, or an answer that is not this probe's. A bare `bn` may not
+        # even start, so this is a warning, not a footnote.
+        lines.append(f"PATH bn: {exe}")
+        lines.append(f"warning: the `bn` on PATH could not be identified: {error}")
+    else:
+        lines.append("PATH bn: not found" + (f" ({error})" if error else ""))
+    if _flag_field(path_cli, "same_as_this_cli") is False:
+        lines.append(
+            "warning: the `bn` on PATH runs a different checkout than this command; "
+            "a bare `bn` invocation does not run the code this report describes")
+    others = [str(item.get("instance_id") or item.get("pid") or "<unknown>")
+              for item in _field_list(value, "instances")
+              if isinstance(item, dict) and _flag_field(item, "path_cli_other_checkout") is True]
+    if others:
+        lines.append(
+            "warning: bridge(s) run code from a different checkout than the `bn` on "
+            "PATH: " + ", ".join(others))
+    return lines
+
+
 @_discloses
 def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -6493,6 +7119,7 @@ def _render_doctor_text(value: Any) -> str:
     kernel_dirs = _field_list(value, "bn_kernel_skill_dirs")
     lines = [
         f"cli version: {value.get('cli_version', '<unknown>')}",
+        *_doctor_cli_identity_lines(value),
         f"plugin source: {value.get('plugin_source_dir', '<unknown>')}",
         f"plugin install: {value.get('plugin_install_dir', '<unknown>')}",
         f"plugin source build: {value.get('plugin_source_build_id', '<unknown>')}",
@@ -7889,7 +8516,7 @@ def _render_mutation_summary_text(value: Any, *,
         # claims nothing about the outcome: the save's own gates (open-target
         # collision, cache fallback) decide, and its output says why and what
         # to do (predicting them failed review round 3 in both directions).
-        line += (f"\nnext: `{save_command()}` to persist it; if it is refused, "
+        line += (f"\nnext: {code_span(save_command())} to persist it; if it is refused, "
                  "its output says why and what to do")
     return line
 
@@ -7923,6 +8550,26 @@ def _overlap_listing(overlaps: Sequence[dict[str, Any]]) -> str:
     return ", ".join(_one(o) for o in overlaps)
 
 
+def _mutation_failure_banner(failed: Sequence[dict[str, Any]], *, preview: bool,
+                             rollback_failed: bool) -> str:
+    """The first line of an uncommitted failure card: what was undone and the
+    batch phase that failed -- `apply`, `verify` or `rollback`, read from the
+    failed rows' statuses (`FAILURE_PHASES`), never one fixed phrase (W07: every
+    failure, a preview's and an op refused before apply included, used to read
+    "live verification failed").
+
+    Only claim a rollback that was performed: `rolled_back: false` or a
+    `rollback_failed` row means the revert failed and the view may be modified,
+    and saying "rolled back" there would contradict the honest message (#117)."""
+    phases = {FAILURE_PHASES[_text_value(row, "status")] for row in failed}
+    cause = " and ".join(p for p in ("apply", "verify") if p in phases)
+    if rollback_failed or "rollback" in phases:
+        after = f" after {cause} failed" if cause else ""
+        return f"rollback failed{after}: the view may be left modified"
+    head = "preview rolled back" if preview else "rolled back"
+    return f"{head}: {cause} failed" if cause else head
+
+
 @_discloses
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -7938,14 +8585,8 @@ def _render_mutation_text(value: Any) -> str:
 
     if not success or failed:
         if not committed:
-            # Only claim a rollback we actually performed. When rolled_back is
-            # explicitly False the revert failed and the view may be modified --
-            # saying "rolled back" there contradicts the honest message and
-            # re-states the very symptom #117 set out to fix.
-            if value.get("rolled_back") is False:
-                lines.append("rollback failed: the view may be left modified")
-            else:
-                lines.append("rolled back: live verification failed")
+            lines.append(_mutation_failure_banner(
+                failed, preview=preview, rollback_failed=value.get("rolled_back") is False))
         # A non-string `message` (a dict/list from a malformed or future bridge
         # result) reached `"\n".join` and raised, so one wrong-typed field cost
         # every line of the failure report above it. Dump it instead (#619).
@@ -8198,6 +8839,16 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # #1001 item 2: the value is a pointer to a stack object; the stores into
     # that object are what the call consumes, and trace does not follow them.
     "address_of_local": "address of local (stores into it not followed)",
+    # The value is read from a global; the stores other code makes to it are
+    # not followed (the step names the global; the caveat cites `bn xrefs`).
+    "global_load": "global load",
+    "constant": "constant",
+    # V8-02: the literal a loop-carried value starts at; the trips that add to
+    # it are the loop's control, which trace does not follow (a caveat says so).
+    "recurrence_initializer": "loop recurrence start",
+    # A definition with nothing to walk that is not a literal: an intrinsic's
+    # result, an undefined value.
+    "no_traced_inputs": "definition with no traced inputs",
 }
 
 
@@ -8277,7 +8928,10 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     register = _text_value(arg_lbl, "register")
     if register:
         arg_desc += f" ({register})"
-    header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
+    # BN6-C010: a trace answered on a quick-loaded view says so first, as every
+    # other quick-tolerant read does.
+    header = (_quick_partial_prefix(value, "backward trace")
+              + f"backward trace of {arg_desc} in {fn_name} @ {target_addr}")
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
     if value.get("truncated"):
@@ -8299,8 +8953,14 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
         return f"{header}\n{info}\n\n{body}"
 
     lines = [header, info, ""]
+    sections = _trace_callee_sections(trace)
+    # (callee, signature of a walk already printed) -> the call site it came from
+    walked: dict[tuple[str, tuple], str] = {}
     current_fn: str | None = None
-    for step in trace:
+    resume_at = 0   # past a callee walk printed once already
+    for i, step in enumerate(trace):
+        if i < resume_at:
+            continue
         if not isinstance(step, dict):
             lines.append(f"  {step}")
             continue
@@ -8313,19 +8973,44 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
         reason = step.get("reason") or ""
         terminates = bool(step.get("terminates"))
 
+        # A step whose function differs from the last one printed: name it,
+        # including the RETURN to the traced function after a callee's walk --
+        # without that marker the caller's remaining steps read as the callee's.
+        if fn_ctx != current_fn:
+            if fn_ctx is None:
+                lines.append(f"  ── back in {fn_name} ──")
+            else:
+                shown = _shown_name(step, mangled=mangled, name_key="function_context",
+                                    display_key="function_context_display_name") or fn_ctx
+                lines.append(f"  ── in {shown} ──")
+            current_fn = fn_ctx
+
         if cross_fn:
-            callee = step.get("callee", "")
+            callee = str(step.get("callee") or "")
             shown = _shown_name(step, mangled=mangled, name_key="callee",
                                 display_key="callee_display_name") or callee
+            # The call boundary itself is a step of the CALLER: keep it, so the
+            # reader sees which call the walk crossed at.
+            lines.append(f"  {addr}  {il_text}" if addr else f"  {il_text}")
             lines.append(f"  ── enters {shown} ──")
             current_fn = callee
+            end = sections.get(i, i + 1)
+            signature = tuple(
+                (s.get("address"), s.get("il_text"), s.get("reason"), s.get("ssa_label"))
+                if isinstance(s, dict) else (str(s),)
+                for s in trace[i + 1:end])
+            first_site = walked.get((callee, signature))
+            if signature and first_site is not None:
+                # The same callee entered from another call site walks the
+                # same body: the steps are in the JSON, but printing them twice
+                # buries the caller's own steps.
+                n = len(signature)
+                lines.append(f"  (same {n} {'step' if n == 1 else 'steps'} as the walk "
+                             f"entered at {first_site})")
+                resume_at = end
+            elif signature:
+                walked[(callee, signature)] = str(addr)
             continue
-
-        if fn_ctx and fn_ctx != current_fn:
-            shown = _shown_name(step, mangled=mangled, name_key="function_context",
-                                display_key="function_context_display_name") or fn_ctx
-            lines.append(f"  ── in {shown} ──")
-            current_fn = fn_ctx
 
         if terminates:
             label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
@@ -8338,12 +9023,27 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
                     and step.get("out_param_callee")):
                 _fill = _shown_name(step, mangled=mangled, name_key="out_param_callee",
                                     display_key="out_param_callee_display_name")
-                line += f" (via {_fill})"
+                site = _text_value(step, "out_param_call_site")
+                line += f" (via {_fill}" + (f" @ {site})" if site else ")")
             if reason == "function_parameter":
-                slot = _trace_param_slot(step)
+                slot = _trace_param_slot(step, mangled=mangled)
                 if slot:
                     line += f" ({slot})"
-            if reason == "field_load":
+            if reason == "global_load":
+                gaddr = _text_value(step, "global_address")
+                gname = _text_value(step, "global_name")
+                where = f"{gname} @ {gaddr}" if gname and gaddr else (gaddr or gname)
+                line += f" ({where}; its writers not followed)" if where else ""
+            if reason == "constant":
+                const = _text_value(step, "value")
+                if const:
+                    line += f" = {const}"
+            if reason == "recurrence_initializer":
+                start = _trace_recurrence_start(step)
+                if start:
+                    line += f" = {start}"
+            if reason in ("field_load", "out_param_not_followed",
+                          "interprocedural_out_param_not_followed", "memory_load"):
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
                 if meta:
@@ -8374,16 +9074,62 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _trace_param_slot(step: Any) -> str:
+def _trace_callee_sections(trace: list[Any]) -> dict[int, int]:
+    """``{index of a cross_function step: end index of its callee walk}``.
+
+    A callee's steps follow its crossing step and carry the callee's
+    ``function_context`` (a nested callee's steps carry their own); the walk
+    ends at the first step whose context is the crossing step's own function or
+    one of ITS callers, which is how the renderer finds the span to compare
+    when one callee is entered from several call sites."""
+    stack: list[tuple[Any, int]] = [(None, -1)]   # (function context, crossing index)
+    ends: dict[int, int] = {}
+    for idx, step in enumerate(trace):
+        if not isinstance(step, dict):
+            continue
+        ctx = step.get("function_context")
+        while len(stack) > 1 and ctx != stack[-1][0] and any(ctx == c for c, _ in stack[:-1]):
+            ends[stack.pop()[1]] = idx
+        if step.get("cross_function"):
+            stack.append((step.get("callee"), idx))
+    for _, idx in stack[1:]:
+        ends[idx] = len(trace)
+    return ends
+
+
+def _trace_recurrence_start(step: Any) -> str:
+    """`0x0 (start of len#2, +0x4 per trip)` for a ``recurrence_initializer``
+    terminal (V8-02), or "" when the bridge sent no integer value. The step
+    is where a loop-carried value STARTS: the per-trip step is printed beside
+    it so the literal never reads as the value."""
+    if not isinstance(step, dict):
+        return ""
+    value = step.get("value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return ""
+    inc = _field_list(step, "increments")
+    steps = [i for i in inc if isinstance(i, int) and not isinstance(i, bool)]
+    per_trip = (", ".join(f"{i:+#x}" for i in steps) + " per trip" if steps and len(steps) == len(inc)
+                else "a non-constant step per trip")
+    phi = _text_value(step, "phi")
+    return f"{value:#x} (start of {phi}, {per_trip})" if phi else f"{value:#x} ({per_trip})"
+
+
+def _trace_param_slot(step: Any, *, mangled: bool = False) -> str:
     """`param 3, x3` for a function-parameter terminal (#959): the 0-based
     parameter position and the register it arrives in, or "" when the bridge
-    sent neither. A malformed index renders nothing rather than a wrong slot."""
+    sent neither. A malformed index renders nothing rather than a wrong slot.
+    A parameter of a CALLEE the walk crossed into names that callee
+    (`param 1 of parse_len, rsi`): the bare slot reads as the traced
+    function's own parameter."""
     if not isinstance(step, dict):
         return ""
     idx = step.get("param_index")
     parts = []
     if isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0:
-        parts.append(f"param {idx}")
+        owner = _shown_name(step, mangled=mangled, name_key="function_context",
+                            display_key="function_context_display_name")
+        parts.append(f"param {idx}" + (f" of {owner}" if owner else ""))
     reg = _text_value(step, "param_register")
     if reg:
         parts.append(reg)
@@ -8415,9 +9161,16 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
                 continue
             nm = ((ex.get("callee_display_name") if not mangled else None) or ex.get("callee")
                   or (ex.get("out_param_callee_display_name") if not mangled else None)
-                  or ex.get("out_param_callee") or ex.get("local"))
+                  or ex.get("out_param_callee") or ex.get("local")
+                  or ex.get("global_name") or ex.get("global_address"))
+            if not nm and reason == "constant":
+                nm = ex.get("value")
+            if not nm and reason == "recurrence_initializer":
+                nm = _trace_recurrence_start(ex)
+            if not nm and reason == "field_load" and ex.get("base"):
+                nm = f"{ex['base']}+{ex.get('offset') or '0x0'}"
             if not nm and reason == "function_parameter":
-                slot = _trace_param_slot(ex)
+                slot = _trace_param_slot(ex, mangled=mangled)
                 var = str(ex.get("ssa_label") or "").split("#", 1)[0]
                 nm = f"{var} ({slot})" if var and slot else (var or slot)
             if nm and nm not in named:
@@ -8743,16 +9496,6 @@ def _vtable_slot_facts(s: dict[str, Any]) -> str:
 def _render_class_show_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    if value.get("ambiguous"):
-        # Count the rows actually rendered, not the raw field: a skewed `matches`
-        # counted one match per CHARACTER of a string, which is invented data in
-        # the one line a reader uses to decide how ambiguous the query was.
-        matches = _field_list(value, "matches")
-        out = [f"ambiguous class {value.get('query', '')!r}: {len(matches)} matches"]
-        for rec in matches:
-            out.append("")
-            out.append(_render_one_class(rec))
-        return "\n".join(out)
     return _render_one_class(value)
 
 

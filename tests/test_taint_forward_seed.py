@@ -119,7 +119,7 @@ def test_unkeyed_buffer_advice_never_sends_the_agent_to_the_other_locator_1041(m
     for command in re.findall(r"`(bn [^`]+)`", advice):
         assert not any(word.startswith(("call:", "arg:")) for word in shlex.split(command)), advice
     for leaf in _misanchored(result):
-        assert "call:" not in leaf["note"] or "the same way" in leaf["note"], leaf
+        assert "call:" not in leaf["detail"] or "the same way" in leaf["detail"], leaf
 
 
 def test_call_preset_with_a_correlating_slot_keeps_its_flow_and_no_seed_leaf_1041(models):
@@ -364,11 +364,26 @@ def test_resolve_map_target_names_and_any_hex_case_resolve_1041(models, rmap):
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"]
 
 
+def test_resolve_map_records_which_pins_a_walked_call_consulted(models):
+    # W07-14: a key that is no call site in the walked region pins nothing;
+    # the map remembers the ones a walked call consulted so run_params can say
+    # which entries matched.
+    dispatch, bv = _dispatch_program()
+    engine = te.TaintEngine(bv, models, find_function=_find,
+                            resolve_map={"0x70c": ["run_sys"], "0x999": ["0x500"]})
+    engine.forward(dispatch, [te.parse_locator("param:0")])
+    assert engine.resolve_map.matched == {0x70C}
+
+
 @pytest.mark.parametrize(("rmap", "named"), [
     ({"0x70c": ["main"]}, "'main'"),             # a name nobody can resolve
     ({"0x70c": ["401176"]}, "'401176'"),         # bare digits: hex or decimal?
     ({"main": ["0x500"]}, "'main'"),             # a key must be a call address
     ({"0x70c": []}, "0x70c"),
+    # W07-14: a scalar target is not the documented list shape; it used to
+    # be coerced silently.
+    ({"0x70c": "0x500"}, "0x70c"),
+    ({"0x70c": 0x500}, "0x70c"),
     (["0x70c"], "JSON object"),
 ])
 def test_resolve_map_refusal_names_the_file_and_entry_before_the_walk_1041(models, rmap, named):

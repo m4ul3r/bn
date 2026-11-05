@@ -8,10 +8,13 @@ import cycle). This module imports ONLY stdlib + binaryninja -- never bridge.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import json
 import re
+import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,38 @@ except ModuleNotFoundError:  # no BN GUI runtime (tests, headless tooling): run 
 
     def is_main_thread() -> bool:
         return True
+
+
+# Set by BridgeHandler while a request is executing. Long operations poll it
+# to stop work after the CLI sends a cancellation request -- or goes away --
+# instead of wedging a bridge instance with abandoned work (#365). Lives here,
+# not in bridge.py, so a read-op module can poll it without importing the
+# bridge (the taint walk, P1-07).
+_request_cancel_checker = threading.local()
+
+
+@contextlib.contextmanager
+def _request_cancel_context(checker):
+    old = getattr(_request_cancel_checker, "checker", None)
+    _request_cancel_checker.checker = checker
+    try:
+        yield
+    finally:
+        if old is None:
+            with contextlib.suppress(AttributeError):
+                delattr(_request_cancel_checker, "checker")
+        else:
+            _request_cancel_checker.checker = old
+
+
+def _request_cancelled() -> bool:
+    checker = getattr(_request_cancel_checker, "checker", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
 
 
 def _json_response(
@@ -118,6 +153,16 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         "callee_variadic", "call_index", "within_query", "decompile_excerpt",
         "also_in", "arity",
     ),
+    # P3: `local list` pages; an empty page had `row_fields: []` because no
+    # declaration stood in for the rows it lacked.
+    "locals": (
+        "name", "storage", "type", "is_parameter", "index", "identifier",
+        "source_type", "local_id", "distance_to_next_slot", "span_to_next",
+    ),
+    "frame": (
+        "storage", "kind", "names", "types", "distance_to_next_slot",
+        "to_canary", "variables",
+    ),
 }
 
 # #1037 item 3: the declared keys a row carries only under a condition, with
@@ -163,6 +208,10 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
         "callee_variadic": "variadic callees",
         "decompile_excerpt": "rows whose HLIL statement is null",
     },
+    "locals": {
+        "distance_to_next_slot": "stack variables (negative storage)",
+        "span_to_next": "stack variables (negative storage)",
+    },
 }
 
 # Condition named for a key some rows of a populated page carry and others do
@@ -171,12 +220,29 @@ _OBSERVED_OPTIONAL = "present on some rows of this page only"
 
 
 def _annotate_row_fields(result: Any) -> Any:
-    """Attach `row_fields` (and `row_fields_optional`) to a collection envelope.
+    """Attach `row_fields` (and `row_fields_optional`) to a collection envelope,
+    and to each collection envelope a composite read embeds at its top level.
 
     Applied once at the dispatch boundary so every collection read -- current and
     future, CLI and native -- carries the hint without a second catalog for the
     CLI or the kernel to re-declare. Non-collection results are returned
-    untouched: a row hint on `decompile` text would be a lie.
+    untouched: a row hint on `decompile` text would be a lie. A composite read
+    (`evidence orient` embeds a `strings` sample and the `sections` page) is not
+    a collection, but the envelopes it embeds are, and they carried no schema
+    while the same pages read on their own did (P3).
+    """
+    if not isinstance(result, dict):
+        return result
+    if isinstance(result.get("items"), list):
+        return _annotate_collection(result)
+    for value in result.values():
+        if isinstance(value, dict) and isinstance(value.get("items"), list):
+            _annotate_collection(value)
+    return result
+
+
+def _annotate_collection(result: dict[str, Any]) -> dict[str, Any]:
+    """`row_fields` for one collection envelope.
 
     `row_fields` names keys EVERY row of the page carries, so `row[f]` cannot
     raise for any of them (#1037 item 3). A populated page derives that from its
@@ -188,11 +254,11 @@ def _annotate_row_fields(result: Any) -> Any:
     populated page carries on some rows and not others. It is omitted when
     there is none.
     """
-    if not isinstance(result, dict) or "row_fields" in result:
+    if "row_fields" in result:
         return result
     kind = result.get("kind")
-    items = result.get("items")
-    if not isinstance(kind, str) or not isinstance(items, list):
+    items = result["items"]
+    if not isinstance(kind, str):
         return result
     declared = list(_DECLARED_ROW_FIELDS.get(kind, ()))
     conditions = dict(_OPTIONAL_ROW_FIELDS.get(kind, {}))
@@ -379,12 +445,7 @@ def _serialize_error(exc: BaseException) -> str:
     `_raised_inside_this_project`. `OperationFailure` is exempt: the bridge
     is the only thing that constructs one, so its origin is never in doubt.
     """
-
-    # OperationFailure subclasses RuntimeError, so it is already covered by the
-    # tuple below; it is listed explicitly to document the intent.
-    if isinstance(exc, OperationFailure):
-        message = str(exc)
-    elif isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc):
+    if _is_user_facing_error(exc):
         message = str(exc)
     else:
         message = f"internal error: {type(exc).__name__}: {exc}"
@@ -395,6 +456,37 @@ def _serialize_error(exc: BaseException) -> str:
             + ", ".join(imports)
         )
     return message
+
+
+def _is_user_facing_error(exc: BaseException) -> bool:
+    """Whether *exc* carries a message the bridge composed for the user.
+
+    OperationFailure subclasses RuntimeError, so it is already covered by the
+    tuple; it is tested first to document that its origin is never in doubt.
+    """
+    if isinstance(exc, OperationFailure):
+        return True
+    return isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc)
+
+
+def _log_internal_error(op: Any, exc: BaseException) -> None:
+    """Record an op's UNEXPECTED exception with its traceback.
+
+    The client only ever sees ``internal error: <class>: <message>``; without
+    this nothing anywhere said where it was raised, so an engine crash after
+    minutes of work left an empty bridge log (P1-03). Written to BN's log (the
+    GUI's console) and to stderr, which a headless bridge's instance log
+    captures. A user-facing error is the expected outcome of a bad request
+    and is not logged."""
+    if _is_user_facing_error(exc):
+        return
+    text = (f"BN Agent Bridge op {op!r} raised an unexpected exception:\n"
+            + "".join(traceback.format_exception(exc)))
+    if bn is not None:
+        with contextlib.suppress(Exception):
+            bn.log_error(text)
+    with contextlib.suppress(Exception):
+        print(text, file=sys.stderr, flush=True)
 
 
 def _residue_error_disclosure(exc: BaseException) -> dict[str, Any] | None:
@@ -692,6 +784,31 @@ def _parse_address(value: Any) -> int:
         raise ValueError(
             f"{value!r} is not a valid address; expected a decimal or 0x-prefixed hex value"
         ) from None
+
+
+# W10: a number spelled with a minus sign, in either documented address form.
+_NEGATIVE_NUMBER_RE = re.compile(r"-\s*(0[xX][0-9a-fA-F]+|[0-9]+)")
+
+
+def _refuse_negative_address(value: Any) -> None:
+    """Refuse an address OPERAND that is a negative number (W10).
+
+    `_parse_address` is a number parser that also serves offsets (a struct
+    field offset reports its own `>= 0` refusal), so it returns `-16` as
+    parsed. The operand resolvers must not: a decimal `-16` reached
+    `BinaryView.read` and came back as BN's own `ValueError` -- an internal
+    error -- while `-0x10` fell through to a name search that answered
+    "Function not found". Called first by every resolver that turns an operand
+    into an address, so both spellings get one refusal naming the forms an
+    address takes."""
+    negative = (
+        (isinstance(value, int) and not isinstance(value, bool) and value < 0)
+        or (isinstance(value, str) and _NEGATIVE_NUMBER_RE.fullmatch(value.strip()))
+    )
+    if negative:
+        raise ValueError(
+            f"{value!r} is a negative address; pass an address as a decimal or "
+            "0x-prefixed hex value >= 0, or a symbol name")
 
 
 # The two auto-name spellings BN renders for an address with no symbol of its

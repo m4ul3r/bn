@@ -60,6 +60,7 @@ from ._shared import (  # noqa: F401
     _lookup_named_type,
     _named_type_references,
     _parse_address,
+    _validate_count,
 )
 from .bridge_state import require_analysis
 from .read_listing import _analysis_state_fields
@@ -857,10 +858,14 @@ def _runs_into_next(bv, func, block) -> int | None:
 
 def _split_pair(bv, head, tail) -> bool:
     """Whether *head* running into *tail* reads as a shared-tail split. Not
-    when either is an EH/cold fragment (`_is_eh_fragment`), and not when the
+    when either is an EH/cold fragment (`_is_eh_fragment`), not when the
     tail never returns: BN outlines a bare `call __stack_chk_fail` or abort
-    path that way, and no return path of the head is hidden behind it."""
+    path that way, and no return path of the head is hidden behind it -- and
+    not when either is a linker stub: a PLT entry ends in `ldr pc, [..]` /
+    `jmp [..]` into the GOT, and its neighbour is the next stub, never a tail
+    it shares (W06-06: the note advised `function delete` on PLT entries)."""
     return bool(getattr(tail, "can_return", True)) \
+        and not _is_linker_stub(bv, tail) and not _is_linker_stub(bv, head) \
         and not _is_eh_fragment(bv, tail) and not _is_eh_fragment(bv, head)
 
 
@@ -1401,20 +1406,24 @@ def _c_quote(value: str) -> str:
 _RESOLVED_JUMP_OPS = ("HLIL_CONST", "HLIL_CONST_PTR", "HLIL_IMPORT", "HLIL_EXTERN_PTR")
 
 
-def _is_plt_stub(bv, func) -> bool:
-    """An import stub or the PLT header (`push [..]; jmp [GOT+16]`): its jump
-    is the dynamic linker's business, not code a reader needs explained."""
+def _is_linker_stub(bv, func) -> bool:
+    """An import's stub or a PLT slot: an import symbol, or code in a `.plt`
+    section. Its jump is the dynamic linker's business."""
     try:
         start = int(func.start)
         symbol = bv.get_symbol_at(start)
         if str(getattr(getattr(symbol, "type", None), "name", "")) in _IMPORT_SYMBOL_KINDS:
             return True
-        if bool(getattr(func, "is_thunk", False)):
-            return True
         return any(".plt" in str(getattr(section, "name", ""))
                    for section in list(bv.get_sections_at(start) or []))
     except Exception:  # noqa: BLE001 - unknown: treat as ordinary code
         return False
+
+
+def _is_plt_stub(bv, func) -> bool:
+    """An import stub or the PLT header (`push [..]; jmp [GOT+16]`): its jump
+    is the dynamic linker's business, not code a reader needs explained."""
+    return bool(getattr(func, "is_thunk", False)) or _is_linker_stub(bv, func)
 
 
 def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
@@ -1968,6 +1977,77 @@ def _decompile(
     return result
 
 
+def _confidence(obj) -> int | None:
+    """BN's 0-255 confidence on a type, parameter list or calling convention,
+    or None when the object carries none."""
+    value = getattr(obj, "confidence", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _prototype_provenance(ctx, bv, func) -> dict[str, Any]:
+    """Who owns the prototype and how sure BN is of it.
+
+    ``has_user_type`` is BN's per-function flag as BN reports it. It is not
+    an origin: BN sets it for an analyst's prototype, for a DWARF/PDB import,
+    and -- after a save and reopen -- for nearly every function of the
+    database (measured: 957/959 on one corpus database, see
+    ``read_call_evidence``). So ``type_source`` claims only what can be
+    proven: ``user`` when THIS bridge set and verified the prototype in this
+    session (an in-process record, gone after a restart or reopen), ``auto``
+    when the flag is clear (analysis or a platform type library), else
+    ``unknown``; None when the flag cannot be read. One flag per function,
+    covering the return type too.
+
+    Confidences are BN's own 0-255 scale (255 is its maximum). The
+    prototype's is the LOWEST of its return type's, parameter list's, each
+    parameter type's and the calling convention's, so an inferred part is
+    never hidden behind a confident one; the return type's is reported on its
+    own because an inferred return width is the common disagreement with
+    debug info."""
+    has_user = getattr(func, "has_user_type", None)
+    return_type = getattr(func, "return_type", None)
+    if return_type is None:
+        return_type = getattr(getattr(func, "type", None), "return_value", None)
+    return_conf = _confidence(return_type)
+    parameters = getattr(getattr(func, "type", None), "parameters", None) or ()
+    parts = [return_conf, _confidence(getattr(func, "parameter_vars", None)),
+             _confidence(getattr(func, "calling_convention", None)),
+             *(_confidence(getattr(param, "type", None)) for param in parameters)]
+    known = [part for part in parts if part is not None]
+    if has_user is None:
+        source = None
+    elif not has_user:
+        source = "auto"
+    elif ctx.targets.session_prototype(bv, int(func.start)):
+        source = "user"
+    else:
+        source = "unknown"
+    return {
+        "has_user_type": None if has_user is None else bool(has_user),
+        "type_source": source,
+        "prototype_confidence": min(known) if known else None,
+        "return_type_confidence": return_conf,
+    }
+
+
+def _address_span(func) -> dict[str, Any]:
+    """The function's address extent, distinct from ``size`` (the summed bytes
+    of its basic blocks). ``span_start``..``span_end`` (exclusive) bounds every
+    block; ``contiguous`` is false when bytes the function does not own -- a
+    literal pool, padding, another function -- lie between its blocks, so
+    ``span_end - span_start`` exceeds ``size``."""
+    ranges = sorted((int(block.start), int(block.end))
+                    for block in getattr(func, "basic_blocks", None) or [])
+    if not ranges:
+        return {"span_start": None, "span_end": None, "contiguous": None}
+    end = ranges[0][1]
+    contiguous = True
+    for start, stop in ranges[1:]:
+        contiguous = contiguous and start <= end
+        end = max(end, stop)
+    return {"span_start": hex(ranges[0][0]), "span_end": hex(end), "contiguous": contiguous}
+
+
 def _basic_block_ranges(func) -> list[dict[str, Any]]:
     """Address ranges of a function's basic blocks, with incoming/outgoing edges.
 
@@ -2009,9 +2089,9 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     variables = vars_mod._list_locals(func)
     parameters = [item for item in variables if item["is_parameter"]]
     locals_only = [item for item in variables if not item["is_parameter"]]
-    # Use the genuine code-ref count so a page-aligned function isn't credited
-    # with spurious adrp page-base materializations (#284).
-    code_ref_count = read_xrefs._code_ref_count(bv, func.start)
+    # The two counts `xrefs` reports for this function, by its definitions, so
+    # the summary and the listing cannot disagree about how often it is used.
+    code_ref_count, data_ref_count = read_xrefs._ref_counts(ctx, bv, func.start)
     result = {
         "function": {
             "name": func.name,
@@ -2020,9 +2100,12 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
             "display_name": il_format._display_name(func),
         },
         **metadata,
+        **_prototype_provenance(ctx, bv, func),
+        **_address_span(func),
         "parameters": parameters,
         "locals": locals_only,
-        "xref_count": code_ref_count,
+        "code_ref_count": code_ref_count,
+        "data_ref_count": data_ref_count,
         # Count (+ addresses) of instructions BN's lifter could not model, so a
         # function with unlifted computation isn't mistaken for fully analyzed
         # (#206). count:0 means no unlifted instruction was found.
@@ -2271,6 +2354,8 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
+        **_prototype_provenance(ctx, bv, func),
+        **_address_span(func),
     }
     params = list(getattr(getattr(func, "type", None), "parameters", None) or [])
     if params:
@@ -2367,7 +2452,25 @@ def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
 _CFG_VIEWS = ("asm", "mlil", "hlil")
 
 
-def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
+def _block_in_window(bb, level: str, window: tuple[int, int]) -> bool:
+    """Whether basic block *bb* holds an instruction whose START address is in
+    the half-open *window*, at every level (D3-01). At IL levels `start` is an
+    IL index, so the instructions' own addresses decide; at asm the block's
+    rendered lines carry each instruction's start -- the block's byte range is
+    not the test, because a window strictly inside one multi-byte instruction
+    overlaps the range yet holds no instruction start. The byte range is only a
+    cheap reject before any line is rendered."""
+    lo, hi = window
+    if level == "asm":
+        if not (int(bb.start) < hi and lo < int(bb.end)):
+            return False
+        return any(lo <= int(line.address) < hi for line in bb.disassembly_text)
+    return any(lo <= int(ins.address) < hi for ins in bb)
+
+
+def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm",
+         offset: int = 0, limit: int | None = None,
+         address_window: tuple[int, int] | None = None):
     """Basic-block CFG of one function: blocks with rendered lines and outgoing
     edges, at the asm, MLIL, or HLIL level.
 
@@ -2390,6 +2493,8 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             "invalid_request",
             f"unknown cfg view {view!r}; expected one of: {', '.join(_CFG_VIEWS)}",
         )
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
     warnings: list[str] = []
@@ -2405,6 +2510,7 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
                 "not materialized); returning an empty CFG"
             )
     blocks = []
+    total_blocks = matched_blocks = 0
     if fn is not None:
         # #682 item 4: BN hands back basic blocks in its own iteration order,
         # which at the asm level is not address order (observed interleaving
@@ -2413,6 +2519,13 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
         # Sorting on `bb.start` matches the documented identity contract at
         # every level: an address at asm, an IL index at MLIL/HLIL.
         ordered = sorted(fn.basic_blocks, key=lambda bb: int(bb.start))
+        total_blocks = len(ordered)
+        # P2-04: the graph is sliced HERE, before any block is rendered, so a
+        # window or page bounds the work and the payload, not just storage.
+        if address_window is not None:
+            ordered = [bb for bb in ordered if _block_in_window(bb, level, address_window)]
+        matched_blocks = len(ordered)
+        ordered = ordered[offset:] if limit is None else ordered[offset:offset + limit]
         for bb in ordered:
             insns = [
                 {"address": hex(line.address), "text": "".join(str(t) for t in line.tokens)}
@@ -2482,7 +2595,16 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
         "view": level,
         "blocks": blocks,
         "warnings": warnings,
+        # P2-04: the paging quad over blocks, plus what the window kept.
+        "total_blocks": total_blocks,
+        "matched_blocks": matched_blocks,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(blocks),
+        "has_more": offset + len(blocks) < matched_blocks,
     }
+    if address_window is not None:
+        result["address_window"] = [hex(address_window[0]), hex(address_window[1])]
     _annotate_containment(ctx, result, identifier, func)
     return result
 
@@ -2954,7 +3076,7 @@ def _structured_il(ctx, selector, identifier, *, view: str = "mlil", ssa: bool =
             "is_call": "CALL" in opn,
         })
     result = {
-        "function": {"name": func.name, "address": hex(func.start)},
+        "function": il_format._function_identity(func),
         "view": view,
         "ssa": ssa,
         "instructions": instructions,
@@ -2995,7 +3117,7 @@ def _defuse(ctx, selector, identifier, var_selector: str):
             phi_sources.append(il_format._ssa_var_entry(s))
 
     result = {
-        "function": {"name": func.name, "address": hex(func.start)},
+        "function": il_format._function_identity(func),
         "variable": il_format._ssa_var_entry(ssa_var),
         "definition": _ref(definition),
         "uses": [_ref(u) for u in uses],
@@ -3176,6 +3298,9 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
     if direction in ("callees", "both"):
         il = il_format._il_function_for(func, "mlil", True)
         callees = []
+        # One row per (call site, target): BN can lift one instruction (a
+        # `rep stos` memset) into two MLIL calls to the same target.
+        rows_seen: set[tuple[Any, ...]] = set()
         try:
             items = list(il.instructions)
         except Exception:
@@ -3189,19 +3314,30 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
             # lookup miss (#89). Constant direct calls resolve identically.
             resolved = _taint.resolve_call_target(bv, ins, follow_thunks=False)
             target = resolved.address
+            fn = resolved.function
+            if target is None:
+                # A constant destination with no function there (a compiler
+                # builtin BN names with a bodiless symbol) is still a DIRECT
+                # call: the address is in the instruction, not computed.
+                target = _const_call_destination(ins)
             row = {
                 "call_addr": hex(int(getattr(ins, "address", func.start))),
                 "il_index": int(getattr(ins, "instr_index", -1)),
             }
             if target is not None:
-                fn = resolved.function or (bv.get_function_at(target) if hasattr(bv, "get_function_at") else None)
+                if fn is None and hasattr(bv, "get_function_at"):
+                    fn = bv.get_function_at(target)
                 sym = None
                 if fn is None and hasattr(bv, "get_symbol_at"):
                     sym = bv.get_symbol_at(target)
+                key = (row["call_addr"], "direct", target)
                 row.update({"kind": "direct",
-                            "target": {"address": hex(target), **_callgraph_names(fn, sym)}})
+                            "target": {"address": hex(target), **_callgraph_names(fn, sym),
+                                       **({} if fn is not None else {"has_body": False})}})
             else:
-                row.update({"kind": "indirect", "dest_expr": str(getattr(ins, "dest", ""))})
+                dest_expr = str(getattr(ins, "dest", ""))
+                key = (row["call_addr"], "indirect", dest_expr)
+                row.update({"kind": "indirect", "dest_expr": dest_expr})
                 if resolve_indirect:
                     pvs = getattr(getattr(ins, "dest", None), "possible_values", None)
                     resolved = _pvs_targets(ctx, bv, pvs)
@@ -3209,6 +3345,9 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
                     type_name = getattr(getattr(pvs, "type", None), "name", "") or "none"
                     row["resolution"] = "possible_values" if resolved else "unresolved"
                     row["resolution_detail"] = type_name
+            if key in rows_seen:
+                continue
+            rows_seen.add(key)
             callees.append(row)
         result["callees"] = callees
 
@@ -3222,7 +3361,7 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
                 functions = ctx._functions_containing(bv, addr)
                 fn = functions[0] if functions else None
             caller = il_format._function_identity(fn) if fn is not None else None
-            callers.append({"call_addr": hex(addr), "caller": caller})
+            callers.append({"call_addr": hex(addr), "caller": caller, "kind": "direct"})
         if not callers:
             for fn in (list(getattr(func, "callers", None) or [])):
                 marker = int(getattr(fn, "start", 0))
@@ -3230,29 +3369,107 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
                     continue
                 seen.add(marker)
                 callers.append({"caller": il_format._function_identity(fn)})
+        if resolve_indirect:
+            # BN lists an indirect call it resolved itself among caller_sites;
+            # don't report that site twice.
+            listed = {c.get("call_addr") for c in callers}
+            callers.extend(c for c in _value_set_callers(ctx, bv, func)
+                           if c["call_addr"] not in listed)
         result["callers"] = callers
 
     _annotate_containment(ctx, result, identifier, func)
     return result
 
 
+def _const_call_destination(ins) -> int | None:
+    dest = getattr(ins, "dest", None)
+    if il_format._il_op_name(dest) not in ("MLIL_CONST_PTR", "MLIL_CONST"):
+        return None
+    c = getattr(dest, "constant", None)
+    return int(c) if isinstance(c, int) and not isinstance(c, bool) else None
+
+
+def _value_set_callers(ctx, bv, func) -> list[dict[str, Any]]:
+    """Indirect calls whose destination value-set includes *func* -- the
+    callers ``caller_sites`` cannot list, because the call names a register
+    (``lea rax, [fn]; ...; call rax``). The candidates are the functions that
+    REFERENCE *func*'s address from code, so this is the reverse of the
+    callees direction's value-set resolution, not a whole-binary scan."""
+    start = int(func.start)
+    try:
+        refs = list(bv.get_code_refs(start) or [])
+    except Exception:
+        return []
+    referencing: dict[int, Any] = {}
+    for ref in refs:
+        fn = getattr(ref, "function", None)
+        if fn is not None:
+            referencing.setdefault(int(fn.start), fn)
+    rows: list[dict[str, Any]] = []
+    for fn in referencing.values():
+        try:
+            items = list(il_format._il_function_for(fn, "mlil", True).instructions)
+        except Exception:
+            continue
+        seen_sites: set[int] = set()
+        for ins in items:
+            if "CALL" not in il_format._il_op_name(ins) or _const_call_destination(ins) is not None:
+                continue
+            pvs = getattr(getattr(ins, "dest", None), "possible_values", None)
+            hits = [t for t in _pvs_targets(ctx, bv, pvs)
+                    if int(t["address"], 16) in (start, start | 1)]
+            site = int(getattr(ins, "address", 0))
+            if not hits or site in seen_sites:
+                continue
+            seen_sites.add(site)
+            rows.append({"call_addr": hex(site), "caller": il_format._function_identity(fn),
+                         "kind": "indirect", "resolution": "possible_values",
+                         "dest_expr": str(getattr(ins, "dest", ""))})
+    return rows
+
+
+# Instructions that carry no value of their own: never the answer to "what
+# value is computed at this address" when something else shares the address.
+_VALUELESS_OPS = frozenset({"MLIL_GOTO", "MLIL_NOP", "MLIL_VAR_PHI", "MLIL_MEM_PHI"})
+
+
+def _parse_at_selector(at) -> tuple[int, int | None]:
+    """``(address, il_index or None)`` from ``--at ADDR`` / ``--at ADDR:IL_INDEX``."""
+    text = str(at).strip()
+    addr_text, sep, index_text = text.partition(":")
+    address = _parse_address(addr_text)
+    if not sep:
+        return address, None
+    try:
+        index = int(index_text, 10)
+    except ValueError:
+        index = -1
+    if index < 0:
+        raise ValueError(f"{text!r}: the IL index after ':' must be a non-negative decimal "
+                         "(the [N] `bn function structured-il` prints)")
+    return address, index
+
+
+def _il_candidate(ins) -> dict[str, Any]:
+    return {
+        "il_index": int(getattr(ins, "instr_index", -1)),
+        "op": il_format._il_op_name(ins),
+        "text": str(ins),
+    }
+
+
 def _possible_values(ctx, selector, identifier, at):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
-    address = _parse_address(at)
+    address, il_index = _parse_at_selector(at)
     il = il_format._il_function_for(func, "mlil", True)
-    target_ins = None
     try:
-        for ins in list(il.instructions):
-            if int(getattr(ins, "address", -1)) == address:
-                target_ins = ins
-                # SSA inserts PHIs at the following instruction's address.
-                # Keep a PHI only if there is no actual operation at that site.
-                if il_format._il_op_name(ins) not in ("MLIL_VAR_PHI", "MLIL_MEM_PHI"):
-                    break
+        at_address = [ins for ins in list(il.instructions)
+                      if int(getattr(ins, "address", -1)) == address]
     except Exception:
-        target_ins = None
-    if target_ins is None:
+        at_address = []
+    fn_ref = hex(int(func.start))
+    if not at_address:
         # No MLIL instruction begins at --at: returning a success dict with
         # expression:None makes a bogus address look like a real instruction
         # with an unknown value-set. Refuse instead of emitting a false read (#526).
@@ -3261,12 +3478,42 @@ def _possible_values(ctx, selector, identifier, at):
         raise OperationFailure(
             "no_instruction",
             f"No MLIL instruction at {hex(address)} in {func.name}: --at must name the "
-            f"address of an instruction within the function (`bn il {hex(int(func.start))} "
+            f"address of an instruction within the function (`bn il {fn_ref} "
             f"--view mlil --ssa` lists valid instruction addresses).",
-            requested={"identifier": str(identifier), "at": hex(address)},
+            requested={"identifier": str(identifier), "at": str(at)},
         )
-    instr_pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None
-    src_expr = getattr(target_ins, "src", None) if target_ins is not None else None
+    if il_index is not None:
+        picked = [ins for ins in at_address if int(getattr(ins, "instr_index", -1)) == il_index]
+        if not picked:
+            raise OperationFailure(
+                "no_instruction",
+                f"No MLIL SSA instruction [{il_index}] at {hex(address)} in "
+                f"{il_format._display_name(func)}; "
+                "the instructions there are "
+                + ", ".join(f"[{c['il_index']}] {c['text']}" for c in map(_il_candidate, at_address)),
+                requested={"identifier": str(identifier), "at": str(at)},
+                observed={"candidates": [_il_candidate(ins) for ins in at_address]},
+            )
+        target_ins = picked[0]
+    else:
+        # SSA puts PHIs (and BN its GOTOs) at a neighbouring instruction's
+        # address; those are valueless here unless nothing else is. Two
+        # value-bearing instructions at one address (a load folded beside a
+        # branch) is a question this command cannot pick an answer to.
+        valued = [ins for ins in at_address if il_format._il_op_name(ins) not in _VALUELESS_OPS]
+        if len(valued) > 1:
+            raise OperationFailure(
+                "ambiguous_instruction",
+                f"{len(valued)} MLIL SSA instructions at {hex(address)} in "
+                f"{il_format._display_name(func)} compute "
+                "a value; pick one with --at " + hex(address) + ":<il-index>: "
+                + "; ".join(f"[{c['il_index']}] {c['text']}" for c in map(_il_candidate, valued)),
+                requested={"identifier": str(identifier), "at": str(at)},
+                observed={"candidates": [_il_candidate(ins) for ins in at_address]},
+            )
+        target_ins = (valued or at_address)[0]
+    instr_pvs = getattr(target_ins, "possible_values", None)
+    src_expr = getattr(target_ins, "src", None)
     src_pvs = getattr(src_expr, "possible_values", None) if src_expr is not None else None
     # BN leaves a SET_VAR/STORE *instruction* value-set undetermined while the
     # SOURCE expression (the value being assigned) carries the real value-set
@@ -3282,13 +3529,19 @@ def _possible_values(ctx, selector, identifier, at):
         chosen, basis = src_pvs, "source_expression"
     else:
         chosen, basis = instr_pvs, "instruction"
+    selected = int(getattr(target_ins, "instr_index", -1))
     result = {
-        "function": {"name": func.name, "address": hex(func.start)},
+        "function": il_format._function_identity(func),
         "at": hex(address),
-        "expression": str(target_ins) if target_ins is not None else None,
+        "il_index": selected,
+        "expression": str(target_ins),
         "value_basis": basis,
         "source_expression": str(src_expr) if src_expr is not None else None,
         "possible_values": il_format._serialize_pvs(chosen),
+        # The rest of the instructions at this address (PHIs, GOTOs), each
+        # selectable with `--at ADDR:IL_INDEX`.
+        "other_instructions": [_il_candidate(ins) for ins in at_address
+                               if int(getattr(ins, "instr_index", -1)) != selected],
     }
     # The destination's addresses are not possible instruction/return values.
     # Expose the operand separately, even when its analysis is undetermined,

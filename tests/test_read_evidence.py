@@ -635,6 +635,196 @@ def test_callsites_enumerates_import_callers_absent_from_the_code_ref_db(monkeyp
     assert result["caller_scan_note"] is None
 
 
+def test_callsites_of_a_synthetic_builtin_list_its_inline_expansions(monkeypatch):
+    """V8-06: `callsites __builtin_memcpy` refused -- the synthetic builtin is
+    a symbol in BN's `.synthetic_builtins` section, not a function -- so no
+    read listed the `rep movs` MLIL renders as a call to it. Its callers are
+    the expansions: one row per instruction, however many intrinsics BN
+    lifted it to."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    symbol = fake_bn.Symbol(fake_bn.SymbolType.SymbolicFunctionSymbol, 0x9100,
+                            "__builtin_memcpy")
+    caller = _FakeFunction(0x412470, "copy_label")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A3)]
+    lifted = [_FakeLLILInstruction(0x4124A0, None, operation=op)
+              for op in ("LLIL_IF", "LLIL_INTRINSIC", "LLIL_INTRINSIC")]
+    caller.low_level_il = [lifted]
+    caller.get_llils_at = lambda address: lifted if address == 0x4124A0 else []
+    bv = _FakeBV(
+        functions=[caller],
+        symbols=[symbol],
+        sections={".synthetic_builtins": _FakeSection(".synthetic_builtins", 0x9000, 0x9200)},
+        code_refs={0x9100: [_FakeCodeRef(0x4124A0, caller)]},
+        instruction_lengths={0x4124A0: 3},
+        disassembly={0x4124A0: "rep movsq qword [rdi], [rsi]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites("active", "__builtin_memcpy", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["call_kind"]) for row in result["items"]] == [
+        ("0x4124a0", "inline_expansion")]
+    assert result["total"] == 1
+    assert result["callee_symbol_only"] is True
+
+
+def test_callsites_union_an_imported_builtin_with_its_synthetic_placeholder(monkeypatch):
+    """G4c P2: an image with an imported `__builtin_memcpy` function AND the
+    loader's synthetic placeholder of that name resolved the function and
+    listed only its calls -- the inline expansion MLIL renders as a call to
+    the placeholder went missing. Every address the name answers to is a
+    target; rows stay keyed by call address."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    imported = _FakeFunction(0x9000, "__builtin_memcpy")
+    symbols = [fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x9000, "__builtin_memcpy"),
+               fake_bn.Symbol(fake_bn.SymbolType.SymbolicFunctionSymbol, 0x9100,
+                              "__builtin_memcpy")]
+    caller = _FakeFunction(0x412470, "copy_label")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124AB)]
+    expansion = [_FakeLLILInstruction(0x4124A8, None, operation=op)
+                 for op in ("LLIL_IF", "LLIL_INTRINSIC", "LLIL_INTRINSIC")]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x9000)), *expansion]]
+    caller.get_llils_at = lambda address: expansion if address == 0x4124A8 else []
+    bv = _FakeBV(
+        functions=[imported, caller],
+        symbols=symbols,
+        sections={".synthetic_builtins": _FakeSection(".synthetic_builtins", 0x9100, 0x9200)},
+        code_refs={0x9000: [_FakeCodeRef(0x4124A0, caller)],
+                   0x9100: [_FakeCodeRef(0x4124A8, caller)]},
+        instruction_lengths={0x4124A0: 5, 0x4124A5: 3, 0x4124A8: 3},
+        disassembly={0x4124A0: "call __builtin_memcpy", 0x4124A5: "nop",
+                     0x4124A8: "rep movsq qword [rdi], [rsi]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda *args, **kwargs: imported)
+    monkeypatch.setattr(instance.ctx, "_same_name_stub_functions", lambda *args: [])
+
+    result = instance._callsites("active", "__builtin_memcpy", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["call_kind"]) for row in result["items"]] == [
+        ("0x4124a0", "call"), ("0x4124a8", "inline_expansion")]
+    assert result["total"] == 2
+    assert result["callee_symbol_only"] is False
+
+
+def _stub_and_slot(fake_bn, start, slot, name):
+    """`name@plt` at *start*: an import stub whose one instruction tail-jumps
+    through the GOT slot *slot* of the same name."""
+    stub = _FakeFunction(start, name)
+    stub.symbol = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, start, name)
+    stub.basic_blocks = [_FakeBasicBlock(start + 4, start + 10)]
+    stub.low_level_il = [[_FakeLLILInstruction(start + 4, _FakeConstPtr(slot),
+                                               operation="LLIL_TAILCALL")]]
+    return stub, [stub.symbol, fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, slot, name)]
+
+
+def test_callsites_never_count_the_import_stub_jumping_to_its_own_slot(monkeypatch):
+    """G6: with every address the name answers to in the target set (G4c),
+    the import's PLT stub -- a function NAMED for the callee whose one
+    instruction tail-jumps through the GOT slot of that name -- was listed
+    as a caller of the callee. The jump is the call target resolving, not a
+    call site; the caller that calls through the stub still is one."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    stub, symbols = _stub_and_slot(sys.modules["binaryninja"], 0x9000, 0x9300, "fetch_record")
+    caller = _FakeFunction(0x412470, "load_config")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A5)]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x9000))]]
+    bv = _FakeBV(
+        functions=[stub, caller],
+        symbols=symbols,
+        code_refs={0x9000: [_FakeCodeRef(0x4124A0, caller)],
+                   0x9300: [_FakeCodeRef(0x9004, stub)]},
+        instruction_lengths={0x4124A0: 5, 0x9004: 6},
+        disassembly={0x4124A0: "call fetch_record", 0x9004: "jmp qword [rel 0x9300]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda *args, **kwargs: stub)
+    monkeypatch.setattr(instance.ctx, "_same_name_stub_functions", lambda *args: [])
+
+    result = instance._callsites("active", "fetch_record", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["containing_function"]["name"]) for row in result["items"]] == [
+        ("0x4124a0", "load_config")]
+    assert (result["total"], result["caller_total"]) == (1, 1)
+
+
+def test_callsites_of_an_exported_body_keep_its_recursion_through_its_own_stub(monkeypatch):
+    """G6, the other side: in a shared object the exported body's callers --
+    the body itself when it recurses -- reach it through its PLT stub (#286).
+    The stub's own jump through the GOT slot is resolution; the body calling
+    itself through the stub is a call site, and so is an outside caller."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    stub, symbols = _stub_and_slot(sys.modules["binaryninja"], 0x9000, 0x9300, "walk_tree")
+    body = _FakeFunction(0x412000, "walk_tree")
+    body.basic_blocks = [_FakeBasicBlock(0x412010, 0x412015)]
+    body.low_level_il = [[_FakeLLILInstruction(0x412010, _FakeConstPtr(0x9000))]]
+    caller = _FakeFunction(0x412470, "load_config")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A5)]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x9000))]]
+    bv = _FakeBV(
+        functions=[stub, body, caller],
+        symbols=symbols,
+        code_refs={0x9000: [_FakeCodeRef(0x412010, body), _FakeCodeRef(0x4124A0, caller)],
+                   0x9300: [_FakeCodeRef(0x9004, stub)]},
+        instruction_lengths={0x412010: 5, 0x4124A0: 5, 0x9004: 6},
+        disassembly={0x412010: "call walk_tree", 0x4124A0: "call walk_tree",
+                     0x9004: "jmp qword [rel 0x9300]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda *args, **kwargs: body)
+    monkeypatch.setattr(instance.ctx, "_same_name_stub_functions", lambda *args: [stub])
+
+    result = instance._callsites("active", "walk_tree", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["containing_function"]["name"]) for row in result["items"]] == [
+        ("0x412010", "walk_tree"), ("0x4124a0", "load_config")]
+    assert (result["total"], result["caller_total"]) == (2, 2)
+
+
+def test_a_stub_only_caller_list_still_falls_back_to_the_call_scan(monkeypatch):
+    """G6 + #816: a symbol-only callee whose one code-ref "caller" is its own
+    import stub has no caller yet. The LLIL call scan must still run and find
+    the caller BN recorded no code ref for, instead of the stub's removal
+    leaving an empty list that reads as "not called"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    stub, symbols = _stub_and_slot(sys.modules["binaryninja"], 0x9000, 0x9300, "fetch_record")
+    caller = _FakeFunction(0x412470, "load_config")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A5)]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x9300))]]
+    bv = _FakeBV(
+        functions=[stub, caller],
+        symbols=symbols,
+        code_refs={0x9300: [_FakeCodeRef(0x9004, stub)]},
+        instruction_lengths={0x4124A0: 5, 0x9004: 6},
+        disassembly={0x4124A0: "call qword [rel 0x9300]", 0x9004: "jmp qword [rel 0x9300]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def unresolved(*_args, **_kwargs):
+        raise bridge.OperationFailure("ambiguous_function", "fetch_record names two functions")
+
+    monkeypatch.setattr(instance.ctx, "_find_function", unresolved)
+
+    result = instance._callsites("active", "fetch_record", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["containing_function"]["name"]) for row in result["items"]] == [
+        ("0x4124a0", "load_config")]
+    assert result["callee_symbol_only"] is True
+
+
+
 def test_callsites_discloses_a_capped_caller_scan(monkeypatch):
     """#816/#622: when the caller ENUMERATION is itself partial, every count under
     it is a lower bound. Both consumers must say so -- JSON via

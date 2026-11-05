@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal as signal_module
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,10 @@ _STARTTIME_INDEX = 22 - 3
 # The kernel's per-boot random id: stable for the life of the boot, different
 # after every reboot -- exactly the scope start ticks are missing.
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+# `btime`: the boot's wall-clock start, in seconds since the epoch. Start ticks
+# plus this is when a process started, a value fixed for its whole life.
+_PROC_STAT_PATH = Path("/proc/stat")
 
 # The only primitives that make identity-check-then-signal atomic (Python 3.9+ on
 # Linux 5.3+). Availability is a property of the INTERPRETER as well as the
@@ -76,6 +81,26 @@ def process_start_ticks(pid: int) -> int | None:
     except ValueError:
         return None
     return ticks if ticks >= 0 else None
+
+
+def process_started_at(pid: int) -> str | None:
+    """When *pid* started, as an ISO-8601 UTC timestamp, or None when unknowable
+    (no ``/proc``, the process is gone, an unreadable boot time). Derived from
+    the kernel's start ticks, so it is the same for the whole life of the
+    process, however often anything that records it is rewritten (P2-07)."""
+    ticks = process_start_ticks(pid)
+    if ticks is None:
+        return None
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+        stat_text = _PROC_STAT_PATH.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    btime = next((line.split()[1] for line in stat_text.splitlines()
+                  if line.startswith("btime ") and len(line.split()) == 2), None)
+    if btime is None or not btime.isdigit() or hz <= 0:
+        return None
+    return datetime.fromtimestamp(int(btime) + ticks / hz, tz=timezone.utc).isoformat()
 
 
 def boot_id() -> str | None:

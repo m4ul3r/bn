@@ -1,0 +1,337 @@
+"""`trace`: where a backward slice stops, and how that is reported.
+
+Every terminal kind the use-def walk can stop at is a step with a reason and a
+frontier roll-up category -- a typed field load with its real member offset, a
+load from a global, a literal, an out-parameter fill with its call site -- and
+the interprocedural text keeps the call each callee walk was entered from."""
+from __future__ import annotations
+
+import types
+
+from _bridge_fakes import (
+    _FakeBV,
+    _FakeFunction,
+    _FakeMLILFunction,
+    _FakeMLILInsn,
+    _FakeSSAVariable,
+    _load_bridge,
+)
+
+from bn.formatters import _render_trace_text
+
+
+def _var(v, addr):
+    return _FakeMLILInsn(addr, operation="MLIL_VAR_SSA", vars_read=[v])
+
+
+def _const(c, addr, op="MLIL_CONST"):
+    return _FakeMLILInsn(addr, operation=op, constant=c)
+
+
+def _sink(addr, *vars_):
+    """`sink(v...)` at *addr*, every argument a plain SSA variable."""
+    return _FakeMLILInsn(addr, operation="MLIL_CALL_SSA",
+                         params=[_var(v, addr) for v in vars_], vars_read=list(vars_))
+
+
+def _slice(monkeypatch, instructions, definitions, sink_addr, *, arg=0, symbols=(), **kw):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x2000, "parse_packet")
+    fn.medium_level_il = _FakeMLILFunction(instructions, definitions=definitions)
+    bv = _FakeBV(functions=[fn], symbols=list(symbols))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return instance._backward_slice("active", "parse_packet", hex(sink_addr), arg_index=arg, **kw)
+
+
+def _struct_load(base, offset, addr, size=4):
+    load = _FakeMLILInsn(addr, operation="MLIL_LOAD_STRUCT_SSA", src=_var(base, addr),
+                         size=size, vars_read=[base])
+    load.offset = offset
+    return load
+
+
+def test_typed_field_load_reports_the_member_offset(monkeypatch):
+    # `data = hdr->data` (member at 0x38) and `len = zx.q(hdr->len)` (member at
+    # 4): the offset lives on the LOAD_STRUCT instruction, not in an address
+    # expression -- it used to be reported as 0x0, and the widened one not as
+    # a load at all.
+    hdr, data, wlen = (_FakeSSAVariable(n) for n in ("hdr#1", "data#1", "len#2"))
+    data_def = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA",
+                             src=_struct_load(hdr, 0x38, 0x2008, size=8), vars_read=[hdr])
+    zx = _FakeMLILInsn(0x200c, operation="MLIL_ZX", src=_struct_load(hdr, 4, 0x200c))
+    len_def = _FakeMLILInsn(0x200c, operation="MLIL_SET_VAR_SSA", src=zx, vars_read=[hdr])
+    result = _slice(monkeypatch, [data_def, len_def, _sink(0x2010, data, wlen)],
+                    {data: data_def, wlen: len_def}, 0x2010)
+    data_step = next(s for s in result["trace"] if s["ssa_label"] == "data#1")
+    assert (data_step["reason"], data_step["base"], data_step["offset"], data_step["width"]) == \
+        ("field_load", "hdr#1", "0x38", 8)
+    result = _slice(monkeypatch, [data_def, len_def, _sink(0x2010, data, wlen)],
+                    {data: data_def, wlen: len_def}, 0x2010, arg=1)
+    len_step = result["trace"][0]
+    assert (len_step["reason"], len_step["base"], len_step["offset"], len_step["width"]) == \
+        ("field_load", "hdr#1", "0x4", 4)
+    # The struct pointer is still walked past the load.
+    assert [s["ssa_label"] for s in result["trace"]] == ["len#2", "hdr#1"]
+
+
+def test_global_load_is_a_named_frontier_with_an_xrefs_follow_up(monkeypatch):
+    limit = _FakeSSAVariable("limit#2")
+    load = _FakeMLILInsn(0x2008, operation="MLIL_LOAD_SSA", size=4,
+                         src=_const(0x404020, 0x2008, op="MLIL_CONST_PTR"))
+    limit_def = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA", src=load)
+    sym = types.SimpleNamespace(address=0x404020, name="g_max_len", full_name="g_max_len")
+    result = _slice(monkeypatch, [limit_def, _sink(0x2010, limit)], {limit: limit_def},
+                    0x2010, symbols=[sym])
+    [step] = result["trace"]
+    assert step["terminates"] is True
+    assert (step["reason"], step["global_address"], step["global_name"], step["address"]) == \
+        ("global_load", "0x404020", "g_max_len", "0x2008")
+    assert [(g["reason"], g["count"]) for g in result["frontiers"]] == [("global_load", 1)]
+    assert result["frontiers"][0]["examples"][0]["global_address"] == "0x404020"
+    assert any("bn xrefs 0x404020" in a for a in result["assumptions"]), result["assumptions"]
+    text = _render_trace_text(result)
+    assert "g_max_len @ 0x404020" in text
+
+
+def test_every_terminal_kind_is_a_frontier_category(monkeypatch):
+    # `n = phi(0, hdr->count, arg)`: a literal, a memory load and a parameter.
+    # The roll-up used to count only the parameter: a SET_VAR load was not a
+    # terminal and a constant was an ordinary `definition`.
+    n, zero, cnt, arg = (_FakeSSAVariable(v) for v in ("n#3", "n#1", "n#2", "arg#0"))
+    hdr = _FakeSSAVariable("hdr#1")
+    phi = _FakeMLILInsn(0x2018, operation="MLIL_VAR_PHI", vars_read=[zero, cnt, arg])
+    zero_def = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA", src=_const(0, 0x2008))
+    cnt_def = _FakeMLILInsn(0x200c, operation="MLIL_SET_VAR_SSA",
+                            src=_struct_load(hdr, 0x10, 0x200c), vars_read=[hdr])
+    result = _slice(monkeypatch, [zero_def, cnt_def, phi, _sink(0x2020, n)],
+                    {n: phi, zero: zero_def, cnt: cnt_def}, 0x2020)
+    by_label = {s["ssa_label"]: s for s in result["trace"]}
+    assert (by_label["n#1"]["reason"], by_label["n#1"]["terminates"], by_label["n#1"]["value"]) == \
+        ("constant", True, "0x0")
+    assert (by_label["n#2"]["reason"], by_label["n#2"]["terminates"]) == ("field_load", True)
+    assert {g["reason"]: g["count"] for g in result["frontiers"]} == {
+        "constant": 1, "field_load": 1, "undefined_or_global": 2}
+
+
+def _ver(base, k):
+    """An SSA variable with BN's `var`/`version` shape, which the recurrence
+    test reads (the plain fake carries only a name)."""
+    v = _FakeSSAVariable(f"{base}#{k}")
+    v.var, v.version = types.SimpleNamespace(name=base), k
+    return v
+
+
+def _accumulator(update_src):
+    """`len#1 = 0; loop { len#2 = phi(len#1, len#4); ...; len#4 = phi(len#2,
+    len#3) }; sink(len#2)` with `len#3 = <update_src>` on the counted path."""
+    l1, l2, l3, l4 = (_ver("len", k) for k in (1, 2, 3, 4))
+    init = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA", src=_const(0, 0x2008))
+    head = _FakeMLILInsn(0x2010, operation="MLIL_VAR_PHI", dest=l2, vars_read=[l1, l4])
+    head.src = [l1, l4]
+    upd = _FakeMLILInsn(0x2018, operation="MLIL_SET_VAR_SSA", src=update_src(l2),
+                        vars_read=[l2])
+    join = _FakeMLILInsn(0x201c, operation="MLIL_VAR_PHI", dest=l4, vars_read=[l2, l3])
+    join.src = [l2, l3]
+    defs = {l1: init, l2: head, l3: upd, l4: join}
+    return [init, head, upd, join, _sink(0x2030, l2)], defs
+
+
+def _plus(k):
+    return lambda v: _FakeMLILInsn(0x2018, operation="MLIL_ADD", left=_var(v, 0x2018),
+                                   right=_const(k, 0x2018), vars_read=[v])
+
+
+def test_a_loop_accumulators_literal_is_a_recurrence_start_not_its_value(monkeypatch):
+    # V8-02: `len = 0; for (..) if (..) len += 4; memcpy(d, s, len)`. The
+    # roll-up said `constant [1 step]` with no caveat, so the literal read as
+    # the length; `taint backward` calls the same arm `recurrence_initializer`.
+    instrs, defs = _accumulator(_plus(4))
+    result = _slice(monkeypatch, instrs, defs, 0x2030)
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert {k: start[k] for k in ("reason", "terminates", "value", "var", "phi", "increments")} \
+        == {"reason": "recurrence_initializer", "terminates": True, "value": 0,
+            "var": "len#1", "phi": "len#2", "increments": [0, 4]}
+    assert [(g["reason"], g["count"]) for g in result["frontiers"]] == \
+        [("recurrence_initializer", 1)]
+    assert result["frontiers"][0]["examples"][0]["increments"] == [0, 4]
+    [caveat] = result["assumptions"]
+    assert caveat in _render_trace_text(result)
+
+
+def test_a_non_constant_trip_step_has_no_increments(monkeypatch):
+    # `len = len * 2`: a recurrence whose per-trip step is not one constant.
+    instrs, defs = _accumulator(lambda v: _FakeMLILInsn(
+        0x2018, operation="MLIL_MUL", left=_var(v, 0x2018), right=_const(2, 0x2018),
+        vars_read=[v]))
+    result = _slice(monkeypatch, instrs, defs, 0x2030)
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert (start["reason"], start["increments"]) == ("recurrence_initializer", None)
+    assert len(result["assumptions"]) == 1
+
+
+def test_a_recurrence_through_a_call_names_the_call(monkeypatch):
+    # `len = grow(len)` in the loop body: the trip's step is whatever `grow`
+    # returns, so no increments, and the step, its roll-up example and the
+    # caveat all name the call the recurrence passes through.
+    instrs, defs = _accumulator(lambda v: None)
+    l2, l3 = (next(v for v in defs if v.name == n) for n in ("len#2", "len#3"))
+    call = _FakeMLILInsn(0x2018, operation="MLIL_CALL_SSA",
+                         dest=_const(0x3000, 0x2018, op="MLIL_CONST_PTR"),
+                         params=[_var(l2, 0x2018)], vars_read=[l2], vars_written=[l3])
+    call.output = [l3]
+    instrs[2], defs[l3] = call, call
+    sym = types.SimpleNamespace(address=0x3000, name="grow", full_name="grow")
+    result = _slice(monkeypatch, instrs, defs, 0x2030, symbols=[sym])
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert (start["reason"], start["increments"], start["calls"]) == \
+        ("recurrence_initializer", None, ["grow"])
+    [frontier] = [g for g in result["frontiers"] if g["reason"] == "recurrence_initializer"]
+    assert (frontier["count"], frontier["examples"][0]["calls"]) == (1, ["grow"])
+    assert len([a for a in result["assumptions"] if "grow" in a]) == 1
+
+
+def test_an_exhausted_recurrence_search_is_disclosed_not_ruled_out(monkeypatch):
+    # The search stops after _RECURRENCE_NODES variables: a recurrence is not
+    # ruled out, so the literal is still only a start, with no increments and
+    # `search_exhausted` on the step and its roll-up example.
+    instrs, defs = _accumulator(_plus(4))
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge.read_taint_slice._taint.TaintEngine, "_RECURRENCE_NODES", 1)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x2000, "parse_packet")
+    fn.medium_level_il = _FakeMLILFunction(instrs, definitions=defs)
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "parse_packet", "0x2030", arg_index=0)
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert (start["reason"], start["increments"], start["search_exhausted"]) == \
+        ("recurrence_initializer", None, True)
+    [frontier] = [g for g in result["frontiers"] if g["reason"] == "recurrence_initializer"]
+    assert frontier["examples"][0]["search_exhausted"] is True
+    assert len(result["assumptions"]) == 1
+
+
+def test_a_phi_of_literals_stays_constants(monkeypatch):
+    # `len = n > 3 ? 16 : 0`: no arm cycles back -- a plain choice.
+    l1, l2, l3 = (_ver("len", k) for k in (1, 2, 3))
+    a = _FakeMLILInsn(0x2008, operation="MLIL_SET_VAR_SSA", src=_const(0, 0x2008))
+    b = _FakeMLILInsn(0x200c, operation="MLIL_SET_VAR_SSA", src=_const(16, 0x200c))
+    phi = _FakeMLILInsn(0x2010, operation="MLIL_VAR_PHI", dest=l3, vars_read=[l1, l2])
+    phi.src = [l1, l2]
+    result = _slice(monkeypatch, [a, b, phi, _sink(0x2030, l3)], {l1: a, l2: b, l3: phi}, 0x2030)
+    assert [(g["reason"], g["count"]) for g in result["frontiers"]] == [("constant", 2)]
+    assert result["assumptions"] == []
+
+
+
+def _out_param_program(fill_sites):
+    """`fill(&rec)` at each of *fill_sites*, then `len = rec.len; sink(len)`."""
+    rec = _FakeSSAVariable("rec")
+    length = _FakeSSAVariable("len#3")
+    calls = [_FakeMLILInsn(a, operation="MLIL_CALL_SSA",
+                           params=[_FakeMLILInsn(a, operation="MLIL_ADDRESS_OF", src=rec)])
+             for a in fill_sites]
+    addr_expr = _FakeMLILInsn(0x2040, operation="MLIL_ADD",
+                              left=_FakeMLILInsn(0x2040, operation="MLIL_ADDRESS_OF", src=rec),
+                              right=_const(8, 0x2040))
+    len_def = _FakeMLILInsn(0x2040, operation="MLIL_SET_VAR_SSA",
+                            src=_FakeMLILInsn(0x2040, operation="MLIL_LOAD_SSA", src=addr_expr,
+                                              size=4))
+    return calls + [len_def, _sink(0x2050, length)], {length: len_def}
+
+
+def test_out_param_step_names_the_fill_call_site(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge.read_taint_slice, "_callee_display_name",
+                        lambda ctx, bv, ins: "read_record")
+    instructions, definitions = _out_param_program([0x2010, 0x2030])
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x2000, "parse_packet")
+    fn.medium_level_il = _FakeMLILFunction(instructions, definitions=definitions)
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "parse_packet", "0x2050", arg_index=0)
+    [step] = [s for s in result["trace"] if s["reason"] == "out_param_not_followed"]
+    # The nearest fill preceding the read, not the first one in the function.
+    assert (step["out_param_callee"], step["out_param_call_site"]) == ("read_record", "0x2030")
+    [group] = [g for g in result["frontiers"] if g["reason"] == "out_param_not_followed"]
+    assert group["examples"][0]["out_param_call_site"] == "0x2030"
+
+
+def _phi_of_addresses(locals_):
+    """`p#4 = phi(p#1, p#2, ...)`, each arm `p#k = &<local>[k]`."""
+    p = _FakeSSAVariable("p#4")
+    arms, defs, instrs = [], {}, []
+    for k, local in enumerate(locals_, start=1):
+        arm = _FakeSSAVariable(f"p#{k}")
+        taken = _FakeMLILInsn(0x2000 + 4 * k, operation="MLIL_ADDRESS_OF_FIELD",
+                              src=types.SimpleNamespace(name=local))
+        defs[arm] = _FakeMLILInsn(0x2000 + 4 * k, operation="MLIL_SET_VAR_SSA", src=taken)
+        instrs.append(defs[arm])
+        arms.append(arm)
+    defs[p] = _FakeMLILInsn(0x2020, operation="MLIL_VAR_PHI", vars_read=arms)
+    return p, defs, instrs + [defs[p]]
+
+
+def _address_hints(result):
+    return [h for h in result["hints"] if "name_buf" in h or "path_buf" in h]
+
+
+def test_phi_of_one_locals_addresses_keeps_the_address_of_local_hint(monkeypatch):
+    p, defs, instrs = _phi_of_addresses(["name_buf", "name_buf", "name_buf"])
+    result = _slice(monkeypatch, instrs + [_sink(0x2030, p)], defs, 0x2030)
+    assert len(_address_hints(result)) == 1, result["hints"]
+    assert {g["reason"]: g["count"] for g in result["frontiers"]} == {"address_of_local": 3}
+    # One local, one caveat subject: the three steps are not three locals.
+    [caveat] = [a for a in result["assumptions"] if "name_buf" in a]
+    assert "more" not in caveat
+
+
+def test_phi_of_two_locals_addresses_has_no_address_of_local_hint(monkeypatch):
+    p, defs, instrs = _phi_of_addresses(["name_buf", "path_buf"])
+    result = _slice(monkeypatch, instrs + [_sink(0x2030, p)], defs, 0x2030)
+    assert _address_hints(result) == [], result["hints"]
+
+
+def _cross(addr, var, callee):
+    return {"ssa_label": var, "address": addr, "il_text": f"{var} = {callee}(x)",
+            "reason": "cross_function", "terminates": False, "cross_function": True,
+            "callee": callee}
+
+
+def _callee_body(callee, first_addr):
+    return [
+        {"ssa_label": "v#1", "address": hex(first_addr), "il_text": "v#1 = value#0 << 8",
+         "reason": "definition", "terminates": False, "function_context": callee},
+        {"ssa_label": "value#0", "reason": "function_parameter", "terminates": True,
+         "param_index": 1, "param_register": "rsi", "function_context": callee},
+    ]
+
+
+def test_interprocedural_text_keeps_call_sites_and_prints_a_repeated_walk_once():
+    trace = (
+        [{"ssa_label": "w#3", "address": "0x2010", "il_text": "w#3 = phi(w#1, w#2)",
+          "reason": "phi_source", "terminates": False}]
+        + [_cross("0x2020", "w#1", "read_u32")] + _callee_body("read_u32", 0x3000)
+        + [_cross("0x2030", "w#2", "read_u32")] + _callee_body("read_u32", 0x3000)
+        + [{"ssa_label": "base#0", "reason": "function_parameter", "terminates": True,
+            "param_index": 0, "param_register": "rdi"}]
+    )
+    text = _render_trace_text({
+        "function": "parse_packet", "function_address": "0x2000", "target_address": "0x2040",
+        "arg_index": 0, "trace": trace, "frontiers": [], "assumptions": [], "hints": []})
+    lines = text.splitlines()
+    # Both call boundaries are printed, each where the walk crossed.
+    assert any(line.strip().startswith("0x2020") for line in lines), text
+    assert any(line.strip().startswith("0x2030") for line in lines), text
+    # The callee's body is printed once; the second entry points back at it.
+    assert sum(line.strip().startswith("0x3000") for line in lines) == 1, text
+    second = next(i for i, line in enumerate(lines) if line.strip().startswith("0x2030"))
+    assert "0x2020" in lines[second + 2], text
+    # The callee's parameter is named as the callee's, and the caller's own
+    # parameter after the walk is marked as back in the caller.
+    assert any("param 1 of read_u32" in line for line in lines), text
+    back = next(i for i, line in enumerate(lines) if "base#0" in line)
+    assert "parse_packet" in lines[back - 1], text
+    assert "of read_u32" not in lines[back], text

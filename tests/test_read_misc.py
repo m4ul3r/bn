@@ -1726,6 +1726,32 @@ def test_exports_lists_global_weak_definitions_only(monkeypatch):
     assert instance._exports(None, count_only=True)["count"] == 2
 
 
+def test_exports_collapse_a_definition_listed_twice_and_count_it(monkeypatch):
+    """P2-06: BN's combined symbol list holds one record per symbol table that
+    names a definition, so a symbol in both `.symtab` and `.dynsym` listed as
+    two identical rows and inflated `total`. One row per address + name +
+    kind; the collapse is counted on the listing and on `--count`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    def handler():
+        return fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x1000, "on_packet",
+                              binding=fake_bn.SymbolBinding.GlobalBinding)
+
+    data = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x1000, "on_packet",
+                          binding=fake_bn.SymbolBinding.GlobalBinding)
+    bv = _FakeBV(symbols=[handler(), handler(), data])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._exports(None)
+    assert [(it["name"], it["kind"]) for it in result["items"]] == [
+        ("on_packet", "function"), ("on_packet", "data")]       # same address, other kind stays
+    assert (result["total"], result["duplicates_collapsed"]) == (2, 1)
+    counted = instance._exports(None, count_only=True)
+    assert (counted["count"], counted["duplicates_collapsed"]) == (2, 1)
+
+
 
 
 def test_sections_query_count_only_reflects_semantics_match(monkeypatch):
@@ -2591,3 +2617,50 @@ def test_an_import_name_reads_its_got_slot_not_the_extern_placeholder_1048(monke
     only_extern = _named_data_bv(
         fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x2080, "puts"))
     assert instance.ctx._resolve_address_operand(only_extern, "puts")[0] == 0x2080
+
+
+@pytest.mark.parametrize("op,params", [
+    ("read", {"address": "-16", "length": 4}),
+    ("read", {"address": "-0x10", "length": 4}),
+    ("read", {"address": -16, "length": 4}),
+    ("decompile", {"identifier": "-0x10"}),
+    ("decompile", {"identifier": "-16"}),
+])
+def test_a_negative_address_is_refused_naming_the_accepted_forms(monkeypatch, op, params):
+    """W10: decimal `-16` reached BN's `read` and came back as its own
+    ValueError (an `internal error`); `-0x10` fell through to a name search
+    ("Symbol/Function not found"). Every spelling is one user-facing refusal
+    naming what an address is."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x1000, "main")
+    bv = _FakeBV(functions=[fn], memory={0x1000: b"\x41\x42\x43\x44"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    response = instance.dispatch({"op": op, "params": params, "target": "active", "id": "w10"})
+
+    assert response["ok"] is False
+    operand = params.get("address", params.get("identifier"))
+    assert response["error"].startswith(f"{operand!r} is a negative address")
+    assert "internal error" not in response["error"]
+
+
+@pytest.mark.parametrize("op", ["cfg", "function_evidence"])
+@pytest.mark.parametrize("window, negative", [
+    ("-16:16", "-16"), ("-0x10:0x10", "-0x10"), ("0x10:-16", "-16"),
+])
+def test_a_negative_address_window_endpoint_is_the_same_refusal(monkeypatch, op, window,
+                                                               negative):
+    """D3-02: `--address-window=-16:16` was accepted as (-16, 16) and
+    `-0x10:0x10` failed as a generic parse error, while every other address
+    operand gets the negative-address refusal."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "main")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    response = instance.dispatch({"op": op, "target": "active", "id": "d3-02", "params": {
+        "identifier": "main", "address_window": window}})
+
+    assert response["ok"] is False
+    assert response["error"].startswith(f"{negative!r} is a negative address")

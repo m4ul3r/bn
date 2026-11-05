@@ -17,7 +17,7 @@ def test_forward_total_handoff_confidence_advice(models, variadic):
     leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
     assert leaf["callee_variadic"] is variadic
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    for text in (leaf["note"], result["diagnostics"]["next_action"]):
+    for text in (leaf["detail"], result["diagnostics"]["next_action"]):
         assert ("proto set" in text) is (variadic is False)
         if variadic is None:
             assert "inspect" in text.lower()
@@ -32,7 +32,7 @@ def test_forward_partial_handoff_confidence_advice(models, monkeypatch, variadic
     leaf = engine._arg_under_recovered_leaf(call, callee, [1, 3], 1)
     assert leaf["dropped_args"] == [1, 3]
     assert leaf["callee_variadic"] is variadic
-    assert ("proto set" in leaf["note"]) is (variadic is False)
+    assert ("proto set" in leaf["detail"]) is (variadic is False)
     diagnostics = te.forward_zero_diagnostics(
         {"leaves": [leaf], "assumptions": [], "diag": {"tainted_values": 2}},
         seed_callsites=1)
@@ -115,7 +115,7 @@ def test_unsettled_variadic_flag_keeps_unknown_forward_advice(models, value):
     leaf = next(l for l in result["leaves"] if l["kind"] == "unmodeled_callee")
     assert leaf["callee_variadic"] is None
     assert leaf["cause"] == "prototype_status_unknown"
-    assert "proto set" not in leaf["note"]
+    assert "proto set" not in leaf["detail"]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
@@ -167,7 +167,7 @@ def test_backward_known_buffer_writer_aggregate_recommends_model():
 
     diagnostics = tr.backward_diagnostics(
         [{"kind": "address_of_local_unresolved", "callee": "fill_buffer",
-          "buffer": "local_buf", "note": "model the call or seed inside it"}],
+          "buffer": "local_buf", "detail": "model the call or seed inside it"}],
         [], sinks_seeded=1, slices=1, unresolved_origins=1)
     assert diagnostics["safe_to_report_complete_slice"] is False
     assert "model" in diagnostics["next_action"]

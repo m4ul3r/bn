@@ -228,6 +228,34 @@ def test_render_taint_discloses_model_sources_in_text():
     assert "models: builtin + --models proj.json (2 model(s))" in text
 
 
+def _forward_with_sources(model_sources):
+    return {"direction": "forward", "function": {"name": "process", "address": "0x401189"},
+            "sources": [{"kind": "param", "index": 0}], "reached_sinks": [],
+            "model_sources": model_sources, "soundness": "x"}
+
+
+def test_render_model_sources_labels_an_env_supplied_overlay_by_its_knob():
+    text = _render_taint_text(_forward_with_sources([
+        {"kind": "builtin", "path": "/builtin/models.json"},
+        {"kind": "user", "via": "$BN_TAINT_MODELS", "count": 1, "path": "/proj/env.json"},
+    ]))
+    [line] = [ln for ln in text.splitlines() if ln.startswith("models:")]
+    assert "$BN_TAINT_MODELS /proj/env.json (1 model(s))" in line
+    assert "--models" not in line
+
+
+def test_render_model_sources_names_an_overridden_env_file_as_not_loaded():
+    text = _render_taint_text(_forward_with_sources([
+        {"kind": "builtin", "path": "/builtin/models.json"},
+        {"kind": "user", "via": "--models", "count": 1, "path": "/proj/flag.json"},
+        {"kind": "env_not_loaded", "env": "BN_TAINT_MODELS", "path": "/proj/env.json",
+         "overridden_by": "--models"},
+    ]))
+    [line] = [ln for ln in text.splitlines() if ln.startswith("models:")]
+    assert "--models /proj/flag.json (1 model(s))" in line
+    assert "/proj/env.json NOT loaded" in line
+
+
 def test_render_taint_forward_frontier_message():
     # reached_sinks empty BUT an unmodeled_callee frontier leaf -> the terminal
     # line must be frontier-aware, not the bare "no sinks reached" (#8).
@@ -239,13 +267,12 @@ def test_render_taint_forward_frontier_message():
         "leaves": [{"kind": "unmodeled_callee", "address": "0x1008",
                     "callee": {"name": "parse_event", "address": "0x3000"},
                     "tainted_args": [0],
-                    "note": "tainted data passed to in-binary callee with no model; investigate"}],
+                    "detail": "tainted data passed to in-binary callee with no model; investigate"}],
         "assumptions": [],
         "soundness": "may-analysis",
     }
     text = _render_taint_text(value)
     assert "no sinks reached by tainted data" not in text
-    assert "NO modeled sink reached" in text
     assert "1 tainted frontier" in text and "NOT an all-clear" in text
     # the call -> callee hand-off line for the frontier leaf
     assert "parse_event @ 0x3000" in text
@@ -306,18 +333,23 @@ _BACKWARD_CAPPED = {
                 "slice": []}],
     "leaves": [{"kind": "caller_sites_truncated", "address": "0x800",
                 "function": {"name": "use_len", "address": "0x800"},
-                "callers_total": 20, "callers_followed": 16, "callers_dropped": 4,
-                "note": ("caller-site cap: the ascent followed 16 of 20 callers "
-                         "(0 of the 16 sites the cap let through could not be "
-                         "followed, 4 left past the cap) -- an origin reachable "
-                         "only from an unfollowed caller is missing from this "
-                         "slice")}],
-    # The wording is the engine's own (`_bw_note_caller_cap`), copied rather than
-    # paraphrased: a fixture that drifts from the envelope it stands for renders
-    # prose no run can produce, and the renderer assertions stop describing the
-    # real thing (#810 review).
-    "assumptions": ["use_len has 20 callers; caller ascent followed 16, capped at 16"],
-    "stats": {"leaves": 1, "slices": 1, "truncated": True,
+                "callers_total": 20, "callers_fully_followed": 16,
+                "callers_partially_followed": 0, "callers_unfollowed": 4,
+                "callers_dropped": 4, "demands_total": 20, "demands_unfollowed": 4,
+                "reasons": {"caller_cap": 4}, "partially_followed": [],
+                "detail": ("caller-site cap: of 20 distinct caller reference(s), the "
+                           "ascent fully followed 16 (every demanded formal), partially "
+                           "followed 0 and followed none of 4; 4 of 20 (reference, "
+                           "formal) demand(s) unfollowed: 4 caller_cap -- an origin "
+                           "reachable only from an unfollowed caller is missing from "
+                           "this slice")}],
+    # The wording is the engine's own (`_bw_note_unfollowed_callers`), copied
+    # rather than paraphrased: a fixture that drifts from the envelope it
+    # stands for renders prose no run can produce, and the renderer assertions
+    # stop describing the real thing (#810 review). A cap is truncation, so it
+    # is in `stats` and the leaf, never in `assumptions` (R2).
+    "assumptions": [],
+    "stats": {"leaves": 1, "slices": 1, "max_depth": 1, "truncated": True,
               "truncation_cause": ["caller_cap"]},
     "soundness": "x",
 }
@@ -331,7 +363,7 @@ def test_render_taint_backward_truncated_is_not_a_complete_result():
     assert "verdict: INCOMPLETE" in text
     assert "caller-site cap reached" in text
     assert "caller_sites_truncated @ 0x800" in text
-    assert "16 of 20 caller(s) followed; 4 dropped" in text
+    assert "20 caller reference(s): 16 fully followed, 0 partially, 4 not followed; 4 dropped" in text
 
 
 def test_render_taint_backward_memory_chain_cut_names_its_cause_928r3():
@@ -361,24 +393,6 @@ def test_render_taint_backward_complete_run_keeps_old_text():
     text = _render_taint_text(value)
     assert "INCOMPLETE" not in text
     assert "caller_sites_truncated" not in text
-
-
-def test_render_taint_backward_bounded_sink_is_success_not_unseeded():
-    # #310: a provably-bounded (constant-length) sink renders under "provably
-    # bounded", NOT "UNSEEDED SINKS" -- it's a successful conclusion.
-    value = {
-        "direction": "backward",
-        "function": {"name": "f", "address": "0x401189"},
-        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
-        "slices": [],
-        "sink_status": [{"kind": "arg", "callee": "memcpy", "index": 2,
-                         "seeded": False, "bounded": True,
-                         "note": "arg 2 of memcpy is a compile-time constant -- provably bounded"}],
-        "leaves": [], "assumptions": [], "soundness": "x",
-    }
-    text = _render_taint_text(value)
-    assert "provably bounded (1)" in text
-    assert "UNSEEDED SINKS" not in text
 
 
 def test_render_taint_groups_repeated_leaves():
@@ -411,7 +425,8 @@ def test_render_taint_grouped_leaves_top_n_cap():
     text = _render_taint_text(value)
     assert "frontiers (20)" in text
     assert "... and 8 more group(s)" in text
-    assert "see --format json" in text
+    # the elision must point at BOTH ways of seeing the rest
+    assert "--verbose" in text and "--format json" in text
 
 
 def test_render_taint_field_load_unresolved_leaf():
@@ -628,20 +643,7 @@ def test_taint_forward_verdict_frontiers_not_all_clear():
     v = {"reached_sinks": [], "leaves": [{"kind": "coarse_memory_store"}] * 12,
          "stats": {"functions_visited": 1}}
     out = _taint_forward_verdict(v)
-    assert "NO modeled sink reached" in out and "12 tainted frontier" in out and "NOT an all-clear" in out
-
-
-def test_taint_forward_verdict_empty_is_loudly_caveated():
-    # #310: a genuinely empty forward result (no sink, no frontier) is the MOST
-    # caveated case -- it must carry the same "NOT an all-clear" qualifier as the
-    # partial-coverage paths and note the coverage, since it's also how a bug the
-    # engine can't structurally see appears.
-    v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 3}}
-    out = _taint_forward_verdict(v)
-    assert "no taint reached any sink or frontier" in out
-    assert "NOT an all-clear" in out
-    assert "visited 3 fn(s)" in out
-    assert "can't structurally see" in out
+    assert "12 tainted frontier" in out and "NOT an all-clear" in out
 
 
 def test_taint_via_trail_from_path_reasons():
@@ -767,28 +769,100 @@ def test_taint_forward_malformed_env_models_is_loud(monkeypatch, capsys, tmp_pat
     assert rc != 0   # BridgeError -> non-zero
 
 
-def test_taint_forward_missing_env_models_is_silently_ignored(monkeypatch, capsys, tmp_path):
-    # #615 review (New finding 2 / F9 correction): a MISSING $BN_TAINT_MODELS
-    # file is silently ignored per-invocation -- matching the bridge's own
-    # spawn-time handling of the identical variable (`taint_models_path()`,
-    # `if override_path.exists()`) -- not a hard exit-2 like a malformed file
-    # or a missing EXPLICIT --models typo (below). Overturns the old assertion
-    # that a nonexistent env-referenced file was loud (#615 review).
+_MODELS_COMMANDS = {
+    "forward": ["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"],
+    "backward": ["taint", "backward", "-f", "h", "--sink", "arg:memcpy:2", "--target", "active"],
+    "models": ["taint", "models"],
+}
+
+
+def _refusal(monkeypatch, capsys, argv):
+    """(exit code, parsed --format json error envelope) for a run that must be
+    refused before anything reaches a bridge."""
+    def _no_bridge(*_a, **_k):
+        raise AssertionError("a refused model file must not reach the bridge")
+    monkeypatch.setattr(bn.cli, "send_request", _no_bridge)
+    rc = bn.cli.main([*argv, "--format", "json"])
+    return rc, json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("command", sorted(_MODELS_COMMANDS))
+def test_missing_env_models_file_is_refused_like_a_missing_models_flag(
+        monkeypatch, capsys, tmp_path, command):
+    # An env-sourced typo used to degrade silently to "builtin only" at exit 0.
+    # It is now refused exactly as a missing --models file is: same exit code,
+    # same envelope keys, the knob named in the message.
+    argv = _MODELS_COMMANDS[command]
+    flag_rc, flag_env = _refusal(monkeypatch, capsys,
+                                 [*argv, "--models", str(tmp_path / "nope_flag.json")])
     monkeypatch.setenv("BN_TAINT_MODELS", str(tmp_path / "nope_env.json"))
-    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "h", "address": "0x1"},
+    env_rc, env_env = _refusal(monkeypatch, capsys, argv)
+    assert env_rc == flag_rc == 2
+    assert env_env.keys() == flag_env.keys()
+    assert "$BN_TAINT_MODELS" in env_env["error"] and "nope_env.json" in env_env["error"]
+
+
+@pytest.mark.parametrize("command", sorted(_MODELS_COMMANDS))
+@pytest.mark.parametrize("knob", ["--models", "$BN_TAINT_MODELS"])
+def test_an_empty_list_model_file_is_refused_like_a_non_empty_one(
+        monkeypatch, capsys, tmp_path, command, knob):
+    # P2-09: `[]` was falsy, so it was skipped -- exit 0 and no disclosure --
+    # while `[{...}]` was refused. Both are refused before any bridge, naming
+    # the file and the knob.
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    argv = _MODELS_COMMANDS[command]
+    for body in ("[]", '[{"app_copy": {}}]'):
+        mfile = tmp_path / "list.json"
+        mfile.write_text(body)
+        if knob == "--models":
+            rc, env = _refusal(monkeypatch, capsys, [*argv, "--models", str(mfile)])
+        else:
+            monkeypatch.setenv("BN_TAINT_MODELS", str(mfile))
+            rc, env = _refusal(monkeypatch, capsys, argv)
+        assert rc == 2, (body, env)
+        assert knob in env["error"] and str(mfile) in env["error"], env
+
+
+def test_taint_models_unknown_class_is_refused_with_the_valid_set(monkeypatch, capsys):
+    # The no-target catalog used to answer an unknown --class with an empty
+    # list at exit 0.
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    rc, env = _refusal(monkeypatch, capsys, ["taint", "models", "--class", "nonexistent_class"])
+    assert rc == 2
+    assert "nonexistent_class" in env["error"] and "overflow_len" in env["error"], env
+
+
+def test_taint_models_address_key_without_a_target_is_refused(monkeypatch, capsys, tmp_path):
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    mfile = tmp_path / "addr.json"
+    mfile.write_text(json.dumps({"0x401000": {"sources": [{"to": "ret"}]}}))
+    rc, env = _refusal(monkeypatch, capsys, ["taint", "models", "--models", str(mfile)])
+    assert rc == 2
+    assert "0x401000" in env["error"] and "need a target" in env["error"], env
+
+
+
+def test_taint_forward_both_set_forwards_the_overridden_env_path(monkeypatch, capsys, tmp_path):
+    # --models wins (documented); the env file is not read -- even a missing one
+    # is no refusal -- but its path rides along so the disclosure can name it.
+    flag_file = tmp_path / "flag_models.json"
+    flag_file.write_text(json.dumps({"flag_copy": {"sink": {"class": "overflow_len",
+                                                            "tainted_args": [1]}}}))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(tmp_path / "absent_env.json"))
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
                                    "sources": [], "reached_sinks": [], "leaves": [],
                                    "assumptions": [], "soundness": "x"}})
     monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"])
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
+                      "--models", str(flag_file), "--target", "active"])
     assert rc == 0
-    call = [c for c in calls if c["op"] == "taint"][0]
-    assert "user_models" not in call["params"]
+    params = [c for c in calls if c["op"] == "taint"][0]["params"]
+    assert params["user_models_via"] == "--models"
+    assert params["user_models_env_overridden"] == str(tmp_path / "absent_env.json")
 
 
 def test_taint_forward_missing_models_flag_stays_loud(monkeypatch, capsys, tmp_path):
-    # #615 review: an EXPLICIT --models typo is a loud error, unlike an
-    # ambient $BN_TAINT_MODELS pointing nowhere (above) -- the user directly
-    # named this file, so a silent skip would hide a real mistake.
+    # #615 review: an EXPLICIT --models typo is a loud error.
     fake, _ = _fake({"taint": {}})
     monkeypatch.setattr(bn.cli, "send_request", fake)
     rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active",
@@ -830,7 +904,44 @@ def test_render_backward_origin_via_spill():
     assert "origin: parameter var_n#5 (via spill)" in text
 
 
-def test_taint_models_command_dumps_catalog(monkeypatch, capsys):
+def _no_bridge(monkeypatch):
+    """Make every bridge call fail the way a multi-instance checkout without -i
+    does, so a passing run proves no bridge was needed."""
+    def _refuse(*_a, **_k):
+        raise bn.cli.BridgeError("Multiple Binary Ninja bridge instances are associated "
+                                 "with this project; pass -i/--instance <id>")
+    monkeypatch.setattr(bn.cli, "send_request", _refuse)
+
+
+def _bridge_catalog(params):
+    """What the bridge op answers for a target-free request, JSON-normalized."""
+    from bn_agent_bridge import read_taint_slice as rts
+    return json.loads(json.dumps(rts._taint_models_op(None, None, params)))
+
+
+@pytest.mark.parametrize("argv,params", [
+    ([], {}),
+    (["--role", "sink", "--class", "overflow_len"], {"role": "sink", "class": "overflow_len"}),
+])
+def test_taint_models_no_target_catalog_needs_no_bridge(monkeypatch, capsys, argv, params):
+    _no_bridge(monkeypatch)
+    rc = bn.cli.main(["taint", "models", *argv, "--format", "json"])
+    assert rc == 0
+    local = json.loads(capsys.readouterr().out)
+    assert local == _bridge_catalog(params)              # same shape as the bridge path
+    assert local["presence_catalog"] is False            # no binary walked, no presence claim
+    assert "present_model_count" not in local
+    assert not any("present" in e for e in local["items"])
+
+    rc = bn.cli.main(["taint", "models", *argv])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "memcpy" in out and "[present]" not in out and "[absent]" not in out
+    from bn.read_taint_models import CATALOG_NOTE
+    assert f"NOTE: {CATALOG_NOTE}" in out
+
+
+def test_taint_models_with_an_instance_still_asks_that_bridge(monkeypatch, capsys):
     fake, calls = _fake({"taint_models": {
         "sources": [{"symbol": "recv", "to": "*arg:1, ret"}],
         "sinks_by_class": {"overflow_len": [{"symbol": "memcpy", "tainted_args": [2],
@@ -838,12 +949,12 @@ def test_taint_models_command_dumps_catalog(monkeypatch, capsys):
         "propagators": [{"symbol": "strlen", "from_to": "*arg:0->ret"}],
         "overlays": [{"kind": "builtin", "path": "/x/taint_models.json"}], "items": []}})
     monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models"])
+    rc = bn.cli.main(["-i", "inst-a", "taint", "models", "--role", "sink"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "recv" in out and "memcpy" in out and "overflow_len" in out
     call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["params"] == {}                          # no filters -> empty params
+    assert call["target"] is None and call["params"] == {"role": "sink"}
 
 
 def test_taint_models_command_forwards_filters(monkeypatch, capsys):
@@ -872,50 +983,76 @@ def test_taint_models_present_auto_selects_single_target(monkeypatch, capsys):
     assert call["params"] == {"present": True}
 
 
-def test_taint_models_catalog_only_needs_no_target(monkeypatch, capsys):
-    # Regression: catalog-only mode (no --present/--callsites) must NOT require a
-    # target -- it forwards target=None so the whole model DB dumps with none open.
-    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
-                                          "overlays": [], "items": []}})
-    monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models", "--role", "sink"])
-    assert rc == 0
-    call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["target"] is None
+def _model_file(path, name):
+    path.write_text(json.dumps({name: {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
+    return path
 
 
-
-def test_taint_models_command_forwards_user_models(monkeypatch, capsys, tmp_path):
-    # #615 review F7: `bn taint models` -- the "confirm an overlay landed"
-    # check -- must accept --models like taint forward/backward, so an agent
-    # confirming a project overlay landed sees the SAME overlay taint would use.
-    mfile = tmp_path / "models.json"
-    mfile.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
-    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
-                                          "overlays": [], "items": []}})
-    monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models", "--models", str(mfile)])
-    assert rc == 0
-    call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
-    assert call["params"]["user_models_path"] == str(mfile)
-    assert call["params"]["user_models_via"] == "--models"
+def _user_overlays(overlays):
+    return [o for o in overlays if o["kind"] in ("user", "env_not_loaded")]
 
 
-def test_taint_models_command_reads_user_models_from_env(monkeypatch, capsys, tmp_path):
-    # #615 review F7: BN_TAINT_MODELS (no --models flag) must also reach
-    # `bn taint models`, matching `taint forward`/`taint backward`.
-    mfile = tmp_path / "env_models.json"
-    mfile.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
-    monkeypatch.setenv("BN_TAINT_MODELS", str(mfile))
-    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
-                                          "overlays": [], "items": []}})
-    monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "models"])
-    assert rc == 0
-    call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
-    assert call["params"]["user_models_via"] == "$BN_TAINT_MODELS"
+def test_taint_models_no_target_honors_models_flag_and_env(monkeypatch, capsys, tmp_path):
+    # #615 review F7: `bn taint models` -- the "confirm an overlay landed" check --
+    # honors --models / $BN_TAINT_MODELS like taint forward/backward, and labels
+    # each overlay by the knob that supplied it, in JSON and text.
+    _no_bridge(monkeypatch)
+    flag = _model_file(tmp_path / "flag.json", "app_flag_copy")
+    env = _model_file(tmp_path / "env.json", "app_env_copy")
+
+    def _run(*argv):
+        assert bn.cli.main(["taint", "models", "--role", "sink", *argv, "--format", "json"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert bn.cli.main(["taint", "models", "--role", "sink", *argv]) == 0
+        [line] = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("models:")]
+        return result, {e["symbol"] for e in result["items"]}, line
+
+    result, syms, line = _run("--models", str(flag))
+    assert _user_overlays(result["overlays"]) == [
+        {"kind": "user", "via": "--models", "count": 1, "path": str(flag)}]
+    assert "app_flag_copy" in syms
+    assert f"--models {flag} (1 model(s))" in line
+
+    monkeypatch.setenv("BN_TAINT_MODELS", str(env))
+    result, syms, line = _run()
+    assert _user_overlays(result["overlays"]) == [
+        {"kind": "user", "via": "$BN_TAINT_MODELS", "count": 1, "path": str(env)}]
+    assert "app_env_copy" in syms
+    assert f"$BN_TAINT_MODELS {env} (1 model(s))" in line and "--models" not in line
+
+    # Both set: the flag wins (documented) and the env file is disclosed, not dropped.
+    result, syms, line = _run("--models", str(flag))
+    assert _user_overlays(result["overlays"]) == [
+        {"kind": "user", "via": "--models", "count": 1, "path": str(flag)},
+        {"kind": "env_not_loaded", "env": "BN_TAINT_MODELS", "path": str(env),
+         "overridden_by": "--models"}]
+    assert "app_flag_copy" in syms and "app_env_copy" not in syms
+    assert str(env) in line
+
+
+def test_taint_models_text_prints_the_no_match_hint_on_an_all_unnamed_target():
+    # bn-vr documents that an empty presence catalog on a stripped target means
+    # "no modeled name matched", not "no sinks"; the text must say so.
+    from bn.formatters import _render_taint_models_text
+    from bn_agent_bridge import read_taint_slice as rts
+
+    class _Ctx:
+        def _resolve_view(self, _sel):
+            class _BV:
+                functions = [type("F", (), {"name": "sub_401000"})()]
+
+                def get_symbols(self):
+                    return []
+            return _BV()
+
+    stripped = rts._taint_models_op(_Ctx(), "active", {"role": "sink", "present": True})
+    hint = [ln for ln in _render_taint_models_text(stripped).splitlines()
+            if ln.startswith("no modeled name matched")]
+    assert len(hint) == 1
+    named = dict(stripped, present_model_count=3)
+    assert not any(ln.startswith("no modeled name matched")
+                   for ln in _render_taint_models_text(named).splitlines())
+
 
 
 def test_dataflow_defuse_renders_the_dropped_call_arg_disclosure_797(monkeypatch, capsys):
@@ -1001,3 +1138,66 @@ def test_taint_forward_forwards_a_null_resolve_map_as_present(monkeypatch, capsy
     params = [c for c in calls if c["op"] == "taint"][0]["params"]
     assert "resolve_map" in params and params["resolve_map"] is None
     assert params["resolve_map_path"] == str(rmap)
+
+
+def test_render_taint_text_shows_every_blocking_frontier_kind():
+    """BN25-META-01's formatter half: whatever the bridge returns, the text
+    surface must render the SAME leaves the JSON does -- all of them, with
+    counts that agree -- so a disagreement between the two spellings can
+    only come from the result, never from the rendering."""
+    value = {
+        "function": {"name": "wide_write_case", "address": "0x400810"},
+        "direction": "forward",
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [],
+        "leaves": [
+            {"kind": "unmodeled_callee", "address": "0x400818",
+             "callee": {"name": "__wmemcpy", "display_name": "__wmemcpy",
+                        "address": "0x40a2d0"},
+             "tainted_args": [0, 1], "cause": "return_value_unrecovered",
+             "detail": "Binary Ninja recovered no result for this call"},
+            {"kind": "global_memory_continuation", "address": "0x40081c",
+             "global": {"address": "0x491948", "label": "glob_0x491948"},
+             "references": [], "detail": "code reachable from this call reads it"},
+        ],
+        "diagnostics": {
+            "safe_to_report_all_clear": False,
+            "frontier": {"unresolved": 1, "coarse_memory": 1, "seed_misanchored": 0,
+                         "by_kind": {"unmodeled_callee": 1,
+                                     "global_memory_continuation": 1}},
+        },
+        "assumptions": [],
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value, full=True)
+    assert "frontiers (2)" in text
+    assert "2 tainted frontier(s)" in text
+    assert "unmodeled_callee @ 0x400818" in text
+    assert "global_memory_continuation @ 0x40081c" in text
+
+
+def test_render_taint_text_frontier_count_follows_the_leaves():
+    """The same result with only the continuation renders one frontier --
+    the count is the leaves', not a constant either spelling invents."""
+    value = {
+        "function": {"name": "wide_write_case", "address": "0x400810"},
+        "direction": "forward",
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [],
+        "leaves": [
+            {"kind": "global_memory_continuation", "address": "0x40081c",
+             "global": {"address": "0x491948", "label": "glob_0x491948"},
+             "references": [], "detail": "code reachable from this call reads it"},
+        ],
+        "diagnostics": {
+            "safe_to_report_all_clear": False,
+            "frontier": {"unresolved": 0, "coarse_memory": 1, "seed_misanchored": 0,
+                         "by_kind": {"global_memory_continuation": 1}},
+        },
+        "assumptions": [],
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value, full=True)
+    assert "frontiers (1)" in text
+    assert "1 tainted frontier(s)" in text
+    assert "unmodeled_callee" not in text
