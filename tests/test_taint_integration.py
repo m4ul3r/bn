@@ -7484,6 +7484,25 @@ def test_a_loop_count_length_is_a_recurrence_not_a_constant(tmp_path, shared_bn)
     assert fixed["diagnostics"]["safe_to_report_complete_slice"] is True
 
 
+def test_an_optimised_call_defined_count_keeps_its_recurrence(tmp_path, shared_bn):
+    """V7-03 on `taint_corpus/bw_loop_count.c` at -O2: `scale_rounds`'
+    `k = next_round(k)` is lifted with the copy length read straight off the
+    call's return, so the slice stops at the call -- which used to be the
+    only origin of a complete slice. The argument the call was handed is the
+    loop's phi: its literal start is a `recurrence_initializer` naming the
+    call, beside the call origin, and completeness is withheld."""
+    binary = tmp_path / "bw_loop_count_o2"
+    _compile(CORPUS / "bw_loop_count.c", binary, ["-O2"])
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "scale_rounds",
+                      "--sink", "arg:memcpy:2")
+    origins = [o for sl in result["slices"] for o in sl["origins"]]
+    assert ("call", "next_round") in {(o["kind"], o.get("callee")) for o in origins}, origins
+    [rec] = [o for o in origins if o["kind"] == "recurrence_initializer"]
+    assert (rec["value"], rec["increments"], rec.get("calls")) == (0, None, ["next_round"]), rec
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
 def _armv7_build(tmp_path, name: str) -> Path:
     cc = shutil.which("arm-linux-gnueabihf-gcc")
     if cc is None:

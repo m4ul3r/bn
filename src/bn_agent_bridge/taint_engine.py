@@ -17975,6 +17975,21 @@ class TaintEngine:
                                      **self._model_field(called_name(mkey, name)),
                                      "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
+                        # `k = f(k)` read straight off the call (-O2): the
+                        # slice stops at the call, but the argument it was
+                        # handed is a loop-carried value -- its literal start
+                        # is a recurrence beside the call (V7-03).
+                        for arg in self._call_params(defn):
+                            avar = next((x for x in map(self._as_single_ssa_var,
+                                                        reversed(self._def_chain(ssaf, arg)))
+                                         if x is not None), None)
+                            try:
+                                adef = (ssaf.get_ssa_var_definition(avar)
+                                        if avar is not None else None)
+                            except Exception:
+                                adef = None
+                            if adef is not None and op_name(adef) == "MLIL_VAR_PHI":
+                                _note_recurrence(adef)
                     elif all(s == "literal" for s in states):
                         _set_origin({"kind": "call", "callee": called_name(mkey, name),
                                      **self._model_field(called_name(mkey, name)),
