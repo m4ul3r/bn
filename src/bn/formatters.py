@@ -21,7 +21,7 @@ from .transport import BridgeError
 # anything outside that copy would silently skip the revert-on-failure path.
 # Re-exported under this name because CLAUDE.md documents it here and tests pin
 # `bn.formatters.FAILED_MUTATION_STATUSES`.
-from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
+from .mutation_statuses import FAILED_MUTATION_STATUSES, FAILURE_PHASES  # noqa: E402,F401
 
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so
@@ -8340,6 +8340,26 @@ def _overlap_listing(overlaps: Sequence[dict[str, Any]]) -> str:
     return ", ".join(_one(o) for o in overlaps)
 
 
+def _mutation_failure_banner(failed: Sequence[dict[str, Any]], *, preview: bool,
+                             rollback_failed: bool) -> str:
+    """The first line of an uncommitted failure card: what was undone and the
+    batch phase that failed -- `apply`, `verify` or `rollback`, read from the
+    failed rows' statuses (`FAILURE_PHASES`), never one fixed phrase (W07: every
+    failure, a preview's and an op refused before apply included, used to read
+    "live verification failed").
+
+    Only claim a rollback that was performed: `rolled_back: false` or a
+    `rollback_failed` row means the revert failed and the view may be modified,
+    and saying "rolled back" there would contradict the honest message (#117)."""
+    phases = {FAILURE_PHASES[_text_value(row, "status")] for row in failed}
+    cause = " and ".join(p for p in ("apply", "verify") if p in phases)
+    if rollback_failed or "rollback" in phases:
+        after = f" after {cause} failed" if cause else ""
+        return f"rollback failed{after}: the view may be left modified"
+    head = "preview rolled back" if preview else "rolled back"
+    return f"{head}: {cause} failed" if cause else head
+
+
 @_discloses
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -8355,14 +8375,8 @@ def _render_mutation_text(value: Any) -> str:
 
     if not success or failed:
         if not committed:
-            # Only claim a rollback we actually performed. When rolled_back is
-            # explicitly False the revert failed and the view may be modified --
-            # saying "rolled back" there contradicts the honest message and
-            # re-states the very symptom #117 set out to fix.
-            if value.get("rolled_back") is False:
-                lines.append("rollback failed: the view may be left modified")
-            else:
-                lines.append("rolled back: live verification failed")
+            lines.append(_mutation_failure_banner(
+                failed, preview=preview, rollback_failed=value.get("rolled_back") is False))
         # A non-string `message` (a dict/list from a malformed or future bridge
         # result) reached `"\n".join` and raised, so one wrong-typed field cost
         # every line of the failure report above it. Dump it instead (#619).

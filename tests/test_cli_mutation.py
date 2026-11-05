@@ -4716,27 +4716,59 @@ def test_render_mutation_text_does_not_claim_rollback_when_revert_failed():
         "affected_types": [],
     }
     out = formatters._render_mutation_text(value)
-    assert "rolled back: live verification failed" not in out
-    assert "rollback failed" in out
-    assert "may be left modified" in out
+    assert out.splitlines()[0] == "rollback failed: the view may be left modified"
     # the op renders under 'failed:', not as a bare '[verified]'
     assert "failed: " in out
     assert "[verified]" not in out
 
 
-def test_render_mutation_text_still_reports_clean_rollback():
-    """A failed batch that WAS cleanly reverted still says 'rolled back'."""
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize(("status", "phase"), [
+    ("invalid_request", "apply"),
+    ("unsupported", "apply"),
+    ("internal_error", "apply"),
+    ("verification_failed", "verify"),
+])
+def test_render_mutation_text_failure_banner_names_the_failed_phase(status, phase, preview):
+    """W07: the banner of a cleanly rolled-back failure names the batch phase the
+    failed row's status comes from. It used to read 'live verification failed'
+    for every failure -- an op refused before post-state verification and a
+    preview, which verifies nothing live, included."""
+    from bn import formatters
+    value = {
+        "preview": preview,
+        "success": False,
+        "committed": False,
+        "rolled_back": True,
+        "message": "bridge message",
+        "results": [{"op": "rename_symbol", "status": "reverted", "address": "0x1000"},
+                    {"op": "rename_symbol", "status": status, "address": "0x2000"}],
+    }
+    head = "preview rolled back" if preview else "rolled back"
+    assert formatters._render_mutation_text(value).splitlines()[0] == f"{head}: {phase} failed"
+
+
+def test_render_mutation_text_rollback_failure_names_the_phase_before_it():
+    """A failure whose revert also failed says so first and keeps the phase the
+    batch failed in, instead of claiming a rollback (#117)."""
     from bn import formatters
     value = {
         "preview": False,
         "success": False,
         "committed": False,
-        "rolled_back": True,
-        "message": "Rolled back because live-session verification failed.",
-        "results": [{"op": "rename_symbol", "status": "verification_failed", "address": "0x1000"}],
+        "rolled_back": False,
+        "message": "bridge message",
+        "results": [{"op": "rename_symbol", "status": "rollback_failed", "address": "0x1000"},
+                    {"op": "rename_symbol", "status": "unsupported", "address": "0x2000"}],
     }
-    out = formatters._render_mutation_text(value)
-    assert "rolled back: live verification failed" in out
+    assert (formatters._render_mutation_text(value).splitlines()[0]
+            == "rollback failed after apply failed: the view may be left modified")
+
+
+def test_every_failed_mutation_status_has_a_phase():
+    from bn.mutation_statuses import FAILED_MUTATION_STATUSES, FAILURE_PHASES
+    assert set(FAILURE_PHASES) == FAILED_MUTATION_STATUSES
+    assert set(FAILURE_PHASES.values()) == {"apply", "verify", "rollback"}
 
 
 def test_unknown_ref_label_prefers_symbol_then_section():
