@@ -87,6 +87,7 @@ _LEAF_CLASS = {
 _NON_LEAF_KINDS = {
     "call", "constant", "constant_address", "entry", "global", "got_or_extern",
     "indirect_call", "literal", "loaded_pointer", "local", "param", "parameter",
+    "recurrence_initializer",
     "returned", "source", "unknown", "unresolved",
 }
 
