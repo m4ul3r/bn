@@ -3317,7 +3317,7 @@ class TaintEngine:
                     out.append(("entry", None))
                 pending.extend(arms)
                 continue
-            if self._writes_back_what_it_reads(defn):
+            if self._writes_back_what_it_reads(ssaf, defn):
                 # A stack probe: the bytes before it are the bytes after it.
                 pending.append(self._mem_in(defn))
                 continue
@@ -3962,9 +3962,8 @@ class TaintEngine:
             return inner
         return "no"
 
-    @staticmethod
-    def _writes_back_what_it_reads(defn: Any) -> bool:
-        """A store of the bytes it loads from the very address it writes
+    def _writes_back_what_it_reads(self, ssaf: Any, defn: Any) -> bool:
+        """A store of the bytes it loads from the very slot it writes
         (``[a].q = [a].q @ mem#k``): it changes no object's contents, so it is
         never a writer -- or may-writer -- of a buffer or of a pointer's object,
         and stores no pointer anywhere. Stack-clash probes are the producer:
@@ -3972,16 +3971,37 @@ class TaintEngine:
         frame by lifts to exactly this, and its address (off the stack pointer
         through a renamed register at -O0) is otherwise one the walk cannot
         pin, so every slice through the frame gained a blocking may-alias row
-        and a spurious origin."""
+        and a spurious origin.
+
+        The slot is the whole of it -- base, field offset and width. BN's
+        ``*_STRUCT`` forms keep the field offset beside a bare base, so
+        ``m->a = m->b`` prints one address on both sides; comparing the text
+        alone read that copy as a write-back and the older store became the
+        sole origin of a "complete" slice (R2-01)."""
         if "STORE" not in op_name(defn):
             return False
         dest, src = getattr(defn, "dest", None), getattr(defn, "src", None)
         if dest is None or src is None or "LOAD" not in op_name(src):
             return False
-        # SSA text is canonical, so equal text is the same address expression
-        # over the same SSA versions.
+        if getattr(src, "size", None) != getattr(defn, "size", None):
+            return False
+        written = self._mem_access_slot(ssaf, defn, exact=True)
+        read = self._mem_access_slot(ssaf, src, exact=True)
+        if written is not None or read is not None:
+            return written == read
+        # No exact identity for the address (a probe off the stack pointer
+        # plus a run-time size): SSA text is canonical, so equal text is the
+        # same address over the same SSA versions -- and the field offsets
+        # beside it must agree too.
+        def field(access: Any) -> int | None:
+            if "_STRUCT" not in op_name(access):
+                return 0
+            try:
+                return int(getattr(access, "offset", 0) or 0)
+            except (TypeError, ValueError):
+                return None
         return (str(getattr(src, "src", None)) == str(dest)
-                and getattr(src, "size", None) == getattr(defn, "size", None))
+                and field(defn) is not None and field(defn) == field(src))
 
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
                               base_size: int | None = None,
