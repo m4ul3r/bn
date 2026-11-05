@@ -2069,6 +2069,21 @@ class TestFunctionReadProvenance:
         assert info["data_ref_count"] >= 1
         assert "xref_count" not in info
 
+    def test_ambiguous_class_show_is_the_uniform_refusal_envelope(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        declared = shared_bn.run("types", "declare", "struct `dup::Handler` { int a; };")
+        assert declared.returncode == 0, f"{declared.stdout}\n{declared.stderr}"
+        res = shared_bn.run("class", "show", "Handler", "--format", "json")
+        assert res.returncode == 2, (res.stdout, res.stderr)
+        envelope = json.loads(res.stdout)
+        assert envelope["ok"] is False
+        assert envelope["status"] == "ambiguous_class"
+        assert envelope["requested"] == {"name": "Handler"}
+        assert sorted(m["name"] for m in envelope["observed"]["matches"]) == [
+            "dup::Handler", "svc::Handler"]
+        # The full name still answers with the one card.
+        assert shared_bn.json("class", "show", "svc::Handler")["name"] == "svc::Handler"
+
 
 def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
     """Cross-build the AArch64 probe and pay for its analysis ONCE.

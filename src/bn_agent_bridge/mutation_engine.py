@@ -5985,15 +5985,16 @@ def _class_apply_types_plan(ctx, selector: str | None, name: str) -> tuple[list[
     Refuses when the class has no primary vtable or BN defined no VTable type
     for it: then there is no table type for the vptr to point at."""
     from . import read_class
-    card = read_class._class_show(ctx, selector, name)
+    cards = read_class._class_cards(ctx, selector, name)
     requested = {"op": "class_apply_types", "name": name}
-    if card.get("ambiguous"):
-        names = ", ".join(str(m.get("name")) for m in card.get("matches") or [])
+    if len(cards) > 1:
+        names = ", ".join(str(card.get("name")) for card in cards)
         raise OperationFailure(
             "invalid_request",
             f"{name!r} names more than one class ({names}); pass the full name of one.",
             requested=requested,
         )
+    card = cards[0]
     cls = str(card.get("name") or name)
     bv = ctx._resolve_view(selector)
     vtable = card.get("vtable") or {}

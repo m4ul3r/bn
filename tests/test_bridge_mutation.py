@@ -7182,7 +7182,7 @@ def test_class_apply_types_plan_builds_the_typing_batch(monkeypatch):
                 {"address": "0x4012a0", "demangled": "demo::Widget::stub", "thunk": {"is_candidate": True}},
             ]}
     slots = []
-    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_class_cards", lambda ctx, selector, name: [dict(card)])
     monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name",
                         lambda view, start: slots.append(start) or "demo::Base::demo::Widget::VTable")
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
@@ -7314,7 +7314,7 @@ def _ap_plan(monkeypatch, *, functions, slots, methods, stores, code_refs=(), ca
             "vtable": {"address": "0x404000", "slots": [
                 {"index": i, "method": {"address": hex(a), "display_name": f"sub_{a:x}"}}
                 for i, a in enumerate(slots)]}, **(card_extra or {})}
-    monkeypatch.setattr(bridge.read_class, "_class_show", lambda ctx, selector, name: dict(card))
+    monkeypatch.setattr(bridge.read_class, "_class_cards", lambda ctx, selector, name: [dict(card)])
     monkeypatch.setattr(bridge.read_class, "_bn_vtable_type_name", lambda view, start: "demo::Widget::VTable")
     monkeypatch.setattr(bridge.read_class, "_param0_address_point_stores",
                         lambda func: list(stores.get(func.start, [])))

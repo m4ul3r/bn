@@ -9289,16 +9289,6 @@ def _vtable_slot_facts(s: dict[str, Any]) -> str:
 def _render_class_show_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    if value.get("ambiguous"):
-        # Count the rows actually rendered, not the raw field: a skewed `matches`
-        # counted one match per CHARACTER of a string, which is invented data in
-        # the one line a reader uses to decide how ambiguous the query was.
-        matches = _field_list(value, "matches")
-        out = [f"ambiguous class {value.get('query', '')!r}: {len(matches)} matches"]
-        for rec in matches:
-            out.append("")
-            out.append(_render_one_class(rec))
-        return "\n".join(out)
     return _render_one_class(value)
 
 
