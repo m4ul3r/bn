@@ -187,6 +187,10 @@ def _counter_program(shape, copies=64):
     * ``nested``: `k = 0; loop { loop { k = k + 1; } }`, the inner phi
       reached twice per outer trip;
     * ``call``: `k = 0; loop { k = transform(k); }`;
+    * ``call_return``: the same loop with the length read straight off the
+      call's return (the -O2 lift: `memcpy(.., transform(k))`);
+    * ``call_of_choice``: `k = c ? 0 : 5; n = transform(k)` -- a call handed
+      a phi of literals, no loop;
     * ``mixed``: `k = 0; loop { if (..) k = k + 1; else k = reset(); }` -- a
       recurrence beside a stronger call origin on another back edge;
     * ``unrelated``: `k = 0; n = k; loop { j = k..; j++ }` with the length `n`
@@ -249,6 +253,14 @@ def _counter_program(shape, copies=64):
         body = [set_(0, k[1], const(0)), phi(1, k[2], k[1], k[3]),
                 call(2, k[3], _TRANSFORM, [k[2]])]
         length = k[2]
+    elif shape == "call_return":
+        body = [set_(0, k[1], const(0)), phi(1, k[2], k[1], k[3]),
+                call(2, k[3], _TRANSFORM, [k[2]])]
+        length = k[3]
+    elif shape == "call_of_choice":
+        body = [set_(0, k[1], const(0)), set_(1, k[2], const(5)), phi(2, k[3], k[1], k[2]),
+                call(3, k[4], _TRANSFORM, [k[3]])]
+        length = k[4]
     elif shape == "mixed":
         body = [set_(0, k[1], const(0)), phi(1, k[2], k[1], k[3], k[4]), inc(2, k[3], k[2]),
                 call(3, k[4], _RESET, [])]
@@ -325,6 +337,14 @@ def test_a_literal_that_is_the_value_stays_a_constant_origin(shape, values):
     assert result["diagnostics"]["safe_to_report_complete_slice"] is True
 
 
+def test_a_call_handed_a_choice_of_literals_is_only_the_call():
+    # Control for V7-03: the call's argument is a phi with no back edge, so
+    # its return is just the call's -- one `call` origin, a complete slice.
+    result = _counter_program("call_of_choice")
+    assert [(o["kind"], o.get("callee")) for o in _origins(result)] == [("call", "transform")]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+
+
 def _recurrence(result):
     return [o for o in _origins(result) if o["kind"] == "recurrence_initializer"]
 
@@ -341,6 +361,9 @@ def _recurrence(result):
     # A reset call on another back edge outranks the literal, yet the
     # recurrence stays an origin of its own (E2c: the call replaced it).
     pytest.param("mixed", [1], None, {"call"}, id="mixed"),
+    # The slice stops at the call whose return the sink reads, but the value
+    # it was handed is the loop's phi (V7-03: only the call, complete).
+    pytest.param("call_return", None, ["transform"], {"call"}, id="call-return"),
 ])
 def test_every_recurrence_shape_keeps_its_initializer(shape, increments, calls, others):
     result = _counter_program(shape, copies=10)

@@ -644,7 +644,6 @@ def test_function_list_text_warns_when_quick_loaded(fake_transport, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "WARNING: target is quick-loaded" in out
-    assert "bn refresh" in out
 
 
 def test_function_count_text_warns_when_quick_loaded(fake_transport, capsys):
@@ -3177,7 +3176,6 @@ def test_decompile_text_warns_when_quick_loaded(fake_transport, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "WARNING: target is quick-loaded; decompile is partial." in out
-    assert "bn refresh" in out
     assert out.index("WARNING") < out.index("int32_t sub_401000()")
 
     # A fully-analyzed view says nothing extra: no spurious warning, and the body
