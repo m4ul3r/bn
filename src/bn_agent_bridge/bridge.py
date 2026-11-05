@@ -216,13 +216,21 @@ def _check_peer_credentials(connection) -> str | None:
 GO_RENAME_CHUNK_SIZE = 256
 
 
+def _is_numeric_selector(selector: Any) -> bool:
+    """Whether *selector* names a view by its numeric view_id, normalised the
+    way matching normalises it (``str(selector).strip()``), so ``' 1 '`` is as
+    numeric here as it is to the resolver (D2-04)."""
+    candidate = str(selector).strip()
+    return candidate.isascii() and candidate.isdigit()
+
+
 def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
     lines = [f"Unknown target selector: {selector}"]
-    if not targets:
+    if targets:
+        lines.extend(open_target_lines(targets))
+    else:
         lines.append("No BinaryView targets are open.")
-        return "\n".join(lines)
-    lines.extend(open_target_lines(targets))
-    if str(selector).isdigit():
+    if _is_numeric_selector(selector):
         lines.append(PROCESS_LOCAL_VIEW_ID_NOTE)
     return "\n".join(lines)
 
@@ -1567,6 +1575,11 @@ class TargetManager:
         """
         targets = self.refresh()
         if not targets:
+            # A numeric selector is still a view_id from SOME listing -- possibly
+            # a previous process's -- so it gets the process-local note even
+            # when nothing is open now (D2-04).
+            if selector is not None and _is_numeric_selector(selector):
+                raise RuntimeError(_format_unknown_target_error(selector, targets))
             raise RuntimeError("No BinaryView targets are open")
 
         if selector in (None, "", "active"):

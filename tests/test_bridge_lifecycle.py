@@ -2461,6 +2461,47 @@ def test_an_unknown_numeric_selector_is_refused_as_process_local(monkeypatch):
     module._headless_views.clear()
 
 
+@pytest.mark.parametrize("selector", [" 1 ", "1\t", "\n2"])
+def test_a_padded_unknown_numeric_selector_is_refused_as_process_local(monkeypatch, selector):
+    # D2-04: matching strips the selector, so `-t ' 1 '` named view 1 before a
+    # restart; the refusal must classify it the same way and carry the note.
+    from _bridge_fakes import _FakeFileBV, _register_views
+    from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    _register_views(module, _FakeFileBV("/srv/alpha", session_id="1"))
+    manager = module.TargetManager(first_view_id=7)
+    manager.refresh()
+    assert manager.resolve(" 7 ") is not None          # padded and known: resolves
+    with pytest.raises(RuntimeError) as numeric:
+        manager.resolve(selector)
+    lines = str(numeric.value).splitlines()
+    assert lines[0].startswith("Unknown target selector:")
+    assert any("/srv/alpha" in line for line in lines)
+    assert lines[-1] == PROCESS_LOCAL_VIEW_ID_NOTE
+    module._headless_views.clear()
+
+
+@pytest.mark.parametrize("selector", ["2", " 2 "])
+def test_a_numeric_selector_with_nothing_open_still_gets_the_process_local_note(
+        monkeypatch, selector):
+    # D2-04: the empty-listing early return skipped the note, so a stale id
+    # after a restart that reopened nothing read as a plain "nothing open".
+    from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    manager = module.TargetManager(first_view_id=3)
+    with pytest.raises(RuntimeError) as numeric:
+        manager.resolve(selector)
+    lines = str(numeric.value).splitlines()
+    assert lines[0].startswith("Unknown target selector:")
+    assert lines[-1] == PROCESS_LOCAL_VIEW_ID_NOTE
+    with pytest.raises(RuntimeError) as named:
+        manager.resolve("gamma")
+    assert PROCESS_LOCAL_VIEW_ID_NOTE not in str(named.value)
+
+
+
 def test_registry_publishes_the_next_view_id_and_the_idle_timeout(instance, monkeypatch):
     import sys
 
