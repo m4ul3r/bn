@@ -7481,3 +7481,63 @@ def test_proto_get_flags_undefined_named_types_with_a_declare_command_1013(monke
     assert "spell a `::`-qualified name in backticks" in note
     defined = _proto_instance(monkeypatch, [param], [], defined=True)
     assert "undefined_types" not in defined._get_prototype("active", "0x401000")
+
+
+def _cfg_four_block_bv():
+    """`dispatch` with four asm blocks at 0x401000, 0x401010, 0x401020, 0x401030."""
+    fn = _FakeFunction(0x401000, "dispatch", "void dispatch(int32_t op)")
+    blocks = [
+        _FakeCFGBlock(start, lines=[_FakeCFGLine(start, "nop"), _FakeCFGLine(start + 8, "jmp")],
+                      end=start + 0x10)
+        for start in (0x401000, 0x401010, 0x401020, 0x401030)
+    ]
+    for here, nxt in zip(blocks, blocks[1:]):
+        here.outgoing_edges = [_FakeCFGEdge(nxt, "UnconditionalBranch")]
+    fn.basic_blocks = list(reversed(blocks))      # BN's own order is not address order
+    return _FakeBV(functions=[fn]), fn
+
+
+def test_cfg_pages_blocks_and_states_the_page(monkeypatch):
+    # P2-04: `function cfg` produced the whole graph; `--out` only moved it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_four_block_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm", offset=1, limit=2)
+
+    assert [b["start"] for b in result["blocks"]] == ["0x401010", "0x401020"]
+    assert (result["total_blocks"], result["matched_blocks"], result["offset"],
+            result["limit"], result["returned"], result["has_more"]) == (4, 4, 1, 2, 2, True)
+    # An edge leaving the page still names its target.
+    assert result["blocks"][1]["edges"] == [{"to": "0x401030", "branch_type": "UnconditionalBranch"}]
+
+
+def test_cfg_address_window_keeps_blocks_holding_an_address_in_it(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_four_block_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "dispatch", view="asm", address_window=(0x401018, 0x401021))
+
+    assert [b["start"] for b in result["blocks"]] == ["0x401010", "0x401020"]
+    assert (result["total_blocks"], result["matched_blocks"], result["has_more"]) == (4, 2, False)
+    assert result["address_window"] == ["0x401018", "0x401021"]
+
+
+def test_cfg_address_window_at_an_il_level_reads_instruction_addresses(monkeypatch):
+    # IL block `start` is an index, so the window is matched on the addresses
+    # of the block's instructions, never on the index.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "checked_div", "int32_t checked_div(int32_t a, int32_t b)")
+    early = _FakeCFGBlock(0, lines=[_FakeCFGLine(0x401000, "if (b == 0) trap")])
+    late = _FakeCFGBlock(2, lines=[_FakeCFGLine(0x401040, "return a / b")])
+    fn.mlil = _FakeILCFGFunction([early, late])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "checked_div", view="mlil", address_window=(0x401040, 0x401041))
+
+    assert [b["start"] for b in result["blocks"]] == ["0x2"]

@@ -7296,3 +7296,22 @@ def test_raw_byte_read_is_structured_json_and_spills_like_any_read(shared_bn, tm
     assert "spilled: true" in lines and "format: bytes" in lines
     [path] = [line.split(": ", 1)[1] for line in lines if line.startswith("path: ")]
     assert Path(path).read_bytes().hex() == hex_read["hex"]
+
+
+def test_function_cfg_slices_a_real_graph_by_block(shared_bn):
+    """P2-04: `function cfg` pages and windows the graph bridge-side."""
+    shared_bn.load(PARSER_BINARY)
+    full = shared_bn.json("function", "cfg", "parse_record")
+    starts = [block["start"] for block in full["blocks"]]
+    assert full["total_blocks"] == len(starts) >= 4 and full["has_more"] is False
+
+    page = shared_bn.json("function", "cfg", "parse_record", "--offset", "1", "--limit", "2")
+    assert [block["start"] for block in page["blocks"]] == starts[1:3]
+    assert (page["total_blocks"], page["returned"], page["has_more"]) == (len(starts), 2, True)
+
+    second = full["blocks"][1]
+    lo = int(second["insns"][0]["address"], 16)
+    window = shared_bn.json("function", "cfg", "parse_record",
+                            "--address-window", f"{lo:#x}:{lo + 1:#x}")
+    assert [block["start"] for block in window["blocks"]] == [second["start"]]
+    assert window["matched_blocks"] == 1

@@ -3779,3 +3779,32 @@ def test_function_search_count_still_accepts_an_explicit_address_sort_1048(fake_
                                                     "total": 1}},
     })
     assert bn.cli.main(["function", "search", "main", "--count", "--sort", "address"]) == 0
+
+
+def test_function_cfg_slices_by_block_and_names_the_flag(fake_transport, capsys):
+    # P2-04: the graph is sliced bridge-side, the text says which slice it is,
+    # and `--estimate-output` names the flag that bounds it -- not `--out`.
+    page = {"ok": True, "result": {
+        "kind": "cfg", "function": {"name": "dispatch", "address": "0x401000"},
+        "view": "asm", "warnings": [],
+        "blocks": [{"start": "0x401010", "insns": [{"address": "0x401010", "text": "nop"}],
+                    "edges": []}],
+        "total_blocks": 4, "matched_blocks": 4, "offset": 1, "limit": 1,
+        "returned": 1, "has_more": True}}
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "cfg": page,
+    })
+
+    assert bn.cli.main(["function", "cfg", "dispatch", "--offset", "1", "--limit", "1",
+                        "--address-window", "0x401000:0x402000"]) == 0
+    assert calls[-1]["params"] == {"identifier": "dispatch", "view": "asm", "offset": 1,
+                                   "limit": 1, "address_window": "0x401000:0x402000"}
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith("// showing 1 block(s) from offset 1 of 4 (function has 4)")
+    assert "--offset 2" in last
+
+    assert bn.cli.main(["function", "cfg", "dispatch", "--estimate-output"]) == 0
+    [rerun] = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("rerun: ")]
+    assert "--limit" in rerun and "--address-window" in rerun

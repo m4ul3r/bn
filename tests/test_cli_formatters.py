@@ -4474,9 +4474,11 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
     # instead of skipped as unstated.
     # Merged with #1037: 63 + #1040/#1049's four + #1037's four.
     # R2-16-05 adds the backward frontier's `dropped_callers_unmeasured`.
-    assert len(sites) == 72, (
+    # P2-04 adds the `function cfg` slice line's `offset`, `returned`,
+    # `matched_blocks` and `total_blocks`.
+    assert len(sites) == 76, (
         f"the module reads {len(sites)} (renderer, literal key) pairs through a "
-        "count helper, not 72. A "
+        "count helper, not 76. A "
         "read that vanishes is a read this differential stops running, so move "
         "it only with the read you deliberately added or removed.")
 

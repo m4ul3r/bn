@@ -6633,6 +6633,27 @@ def _render_cfg_text(value: Any) -> str:
         # known successors and undetermined ones.
         if block.get("undetermined_edges"):
             parts.append("  -> <undetermined> (analysis could not resolve the successors)")
+    if "total_blocks" in value:
+        # P2-04: a sliced graph says which slice it is, so a partial CFG never
+        # reads as the whole function. Counts are STATED (`?` when unreadable),
+        # so a skewed counter never renders as a real number or as "whole".
+        stated = {"offset": _stated_count(value, "offset"),
+                  "returned": _stated_count(value, "returned"),
+                  "matched_blocks": _stated_count(value, "matched_blocks"),
+                  "total_blocks": _stated_count(value, "total_blocks")}
+        window = _field_list(value, "address_window")
+        whole = (not window and "?" not in stated.values()
+                 and stated["offset"] == "0" and stated["returned"] == stated["total_blocks"])
+        if not whole:
+            scope = (f"{stated['matched_blocks']} in window {':'.join(map(str, window))}"
+                     if window else stated["matched_blocks"])
+            line = (f"// showing {stated['returned']} block(s) from offset {stated['offset']} "
+                    f"of {scope} (function has {stated['total_blocks']})")
+            if value.get("has_more") and "?" not in (stated["offset"], stated["returned"]):
+                following = _count_field(value, "offset") + _count_field(value, "returned")
+                line += f"; rerun with --offset {following} for the next page"
+            parts.append("")
+            parts.append(line)
     return "\n".join(parts)
 
 

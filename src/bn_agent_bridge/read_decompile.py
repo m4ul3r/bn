@@ -60,6 +60,7 @@ from ._shared import (  # noqa: F401
     _lookup_named_type,
     _named_type_references,
     _parse_address,
+    _validate_count,
 )
 from .bridge_state import require_analysis
 from .read_listing import _analysis_state_fields
@@ -2375,7 +2376,19 @@ def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
 _CFG_VIEWS = ("asm", "mlil", "hlil")
 
 
-def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
+def _block_in_window(bb, level: str, window: tuple[int, int]) -> bool:
+    """Whether basic block *bb* holds an instruction whose ADDRESS is in the
+    half-open *window*. At asm the block is an address range; at IL levels its
+    `start` is an IL index, so the instructions' own addresses decide."""
+    lo, hi = window
+    if level == "asm":
+        return int(bb.start) < hi and lo < int(bb.end)
+    return any(lo <= int(ins.address) < hi for ins in bb)
+
+
+def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm",
+         offset: int = 0, limit: int | None = None,
+         address_window: tuple[int, int] | None = None):
     """Basic-block CFG of one function: blocks with rendered lines and outgoing
     edges, at the asm, MLIL, or HLIL level.
 
@@ -2398,6 +2411,8 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
             "invalid_request",
             f"unknown cfg view {view!r}; expected one of: {', '.join(_CFG_VIEWS)}",
         )
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
     warnings: list[str] = []
@@ -2413,6 +2428,7 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
                 "not materialized); returning an empty CFG"
             )
     blocks = []
+    total_blocks = matched_blocks = 0
     if fn is not None:
         # #682 item 4: BN hands back basic blocks in its own iteration order,
         # which at the asm level is not address order (observed interleaving
@@ -2421,6 +2437,13 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
         # Sorting on `bb.start` matches the documented identity contract at
         # every level: an address at asm, an IL index at MLIL/HLIL.
         ordered = sorted(fn.basic_blocks, key=lambda bb: int(bb.start))
+        total_blocks = len(ordered)
+        # P2-04: the graph is sliced HERE, before any block is rendered, so a
+        # window or page bounds the work and the payload, not just storage.
+        if address_window is not None:
+            ordered = [bb for bb in ordered if _block_in_window(bb, level, address_window)]
+        matched_blocks = len(ordered)
+        ordered = ordered[offset:] if limit is None else ordered[offset:offset + limit]
         for bb in ordered:
             insns = [
                 {"address": hex(line.address), "text": "".join(str(t) for t in line.tokens)}
@@ -2490,7 +2513,16 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
         "view": level,
         "blocks": blocks,
         "warnings": warnings,
+        # P2-04: the paging quad over blocks, plus what the window kept.
+        "total_blocks": total_blocks,
+        "matched_blocks": matched_blocks,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(blocks),
+        "has_more": offset + len(blocks) < matched_blocks,
     }
+    if address_window is not None:
+        result["address_window"] = [hex(address_window[0]), hex(address_window[1])]
     _annotate_containment(ctx, result, identifier, func)
     return result
 

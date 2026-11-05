@@ -738,7 +738,7 @@ class _FakeCFGBlock:
     matching live BN, where `MediumLevelILBasicBlock.start` is an instruction
     index, not an address."""
 
-    def __init__(self, start: int, lines=None, edges=None, undetermined=False):
+    def __init__(self, start: int, lines=None, edges=None, undetermined=False, end=None):
         self.start = start
         self.disassembly_text = list(lines or [])
         self.outgoing_edges = list(edges or [])
@@ -747,6 +747,14 @@ class _FakeCFGBlock:
         # that omits it would only ever exercise the absent-probe path and
         # could never reproduce the live indirect-jump shape (#682 item 3).
         self.has_undetermined_outgoing_edges = undetermined
+        # `end`: one past the last instruction (an address at asm, an IL index
+        # at MLIL/HLIL), as BN reports it.
+        self.end = end if end is not None else start + max(1, len(self.disassembly_text))
+
+    def __iter__(self):
+        """IL blocks iterate their instructions, each with a real `address`;
+        the lines' addresses stand in for them."""
+        return iter(self.disassembly_text)
 
 
 class _FakeILCFGFunction:
