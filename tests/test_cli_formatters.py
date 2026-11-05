@@ -2357,6 +2357,10 @@ _PROBE_EXCLUSIONS = {
         "a context manager the CLI enters around a render to bind the -i/-t that "
         "commands the renderer prints must carry (#1037 review); it reads no "
         "payload and renders nothing"),
+    "CODE_SPAN_RE": (
+        "not-callable",
+        "a compiled regex, not a callable renderer: the CLI's routing reads the "
+        "command spans a renderer printed through `code_span` (R4-02) with it"),
     "_slice_text_lines": (
         "takes-more-than-a-payload",
         "its first argument is ALREADY-RENDERED TEXT plus a required line range, "

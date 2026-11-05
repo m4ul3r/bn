@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 
 from . import session_state
 from .formatters import (
+    CODE_SPAN_RE,
     FAILED_MUTATION_STATUSES,
     _add_mutation_ok,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
@@ -25,6 +26,7 @@ from .formatters import (
     _render_fanout_text,
     _render_mutation_summary_text,
     _render_mutation_text,
+    code_span,
     command_routing,
 )
 from .output import (estimate_output_result, exit_outcome, outcome_fields, render_envelope,
@@ -2313,7 +2315,9 @@ def _contextualize_diagnostic_hints(
     from . import commands  # noqa: F401
 
     def route(match: re.Match[str]) -> str:
-        command_text = match.group(1)
+        if not match.group(2).startswith("bn "):
+            return match.group(0)
+        command_text = match.group(2)[len("bn "):]
         try:
             words = shlex.split(command_text)
         except ValueError:
@@ -2362,10 +2366,12 @@ def _contextualize_diagnostic_hints(
                          else shlex.quote(f"--target={target}"))
         if not flags:
             return match.group(0)
-        return "`bn " + " ".join(flags) + " " + command_text + "`"
+        # Through `code_span`: the selector spliced in here may itself carry a
+        # backtick, and a one-backtick fence would then end mid-command (R4-02).
+        return code_span("bn " + " ".join(flags) + " " + command_text)
 
     def route_prose(text: str) -> str:
-        return re.sub(r"`bn ([^`]+)`", route, text)
+        return CODE_SPAN_RE.sub(route, text)
 
     # `summary`/`warnings` are decompile's warning prose (#1045 review): its
     # printed `bn proto get 0x…` / `bn evidence table …` advice needs this

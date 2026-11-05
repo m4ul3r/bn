@@ -10,6 +10,7 @@ readers with counts, and gives one follow-up command.
 from __future__ import annotations
 
 import re
+import shlex
 
 import bn.cli
 import pytest
@@ -167,3 +168,40 @@ def test_cli_text_frontier_command_keeps_instance_and_target(monkeypatch, capsys
     assert commands
     for command in commands:
         assert "-i audit-7" in command and "-t probe.bndb" in command, command
+
+
+@pytest.mark.parametrize("target", ["audit`copy name.bndb", "it's ``two`` ticks.bndb",
+                                    "plain name.bndb", "`edge`"])
+@pytest.mark.parametrize("width", [40, 60, 100])
+def test_a_routed_command_survives_wrapping_whatever_its_selector_holds(target, width):
+    """R4-02: the wrap protection took the first backtick after an opening one
+    as the end of a command, so a selector carrying a backtick split the
+    command across two rows. Both the CLI-routed reseed and the renderer's own
+    command are printed as one fenced span; each sits whole on one row and
+    shell-parses back to the routing it was given."""
+    instance = "audit 7"
+    leaves = [_continuation("0x401100", "flush_log", "0x60a100",
+                            reseed="`bn taint forward -f log_reader --source param:0`"),
+              _continuation("0x4011f0", "greet_peer", "0x60a400")]
+    bn.cli._contextualize_diagnostic_hints({"leaves": leaves}, target=target,
+                                           instance=instance)
+    with command_routing(target=target, instance=instance):
+        lines = _render_grouped_leaves(leaves, width=width)
+    commands = []
+    for line in lines:
+        if "next: " not in line:
+            continue
+        span = line.split("next: ", 1)[1]
+        fence = len(span) - len(span.lstrip("`"))
+        # The whole command on this row: the closing fence is the row's end.
+        assert fence and span.endswith("`" * fence), line
+        body = span[fence:-fence]
+        # A code span a reader can paste: no run inside it is as long as the
+        # fence, which would end the span there.
+        assert all(len(run) < fence for run in re.findall(r"`+", body)), line
+        commands.append(shlex.split(body))
+    assert [words[5:] for words in commands] == [
+        ["taint", "forward", "-f", "log_reader", "--source", "param:0"],
+        ["xrefs", "0x60a400"]]
+    for words in commands:
+        assert words[:5] == ["bn", "-i", instance, "-t", target]

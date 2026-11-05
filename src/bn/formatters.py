@@ -5258,8 +5258,10 @@ def _wrap_row(row: str, width: int) -> list[str]:
     if sep:
         body = head.replace(" ", glue) + glue * 2 + "-- " + tail
     # The space before a command glues too, so `next: <command>` stays one
-    # line, and a `[N leaves]` count stays one token a reader can grep for.
-    protected = re.sub(r" ?`[^`]*`|\[\d+ leaves\]",
+    # line, and a `[N leaves]` count stays one token a reader can grep for. A
+    # command is recognised by its fence (`code_span`), never by "the next
+    # backtick": a selector may carry one (R4-02).
+    protected = re.sub(rf" ?{CODE_SPAN_RE.pattern}|\[\d+ leaves\]",
                        lambda m: m.group(0).replace(" ", glue), body)
     lines = textwrap.wrap(protected, width=width, initial_indent=indent,
                           subsequent_indent=indent + "    ", break_long_words=False,
@@ -5355,7 +5357,7 @@ def _render_continuation_group(leaves: list[dict[str, Any]], *, mangled: bool = 
     if reseed:
         out.append(f"      next: {reseed}")
     elif glob.get("address"):
-        out.append(f"      next: `{_bn_command('xrefs', str(glob['address']))}`")
+        out.append(f"      next: {code_span(_bn_command('xrefs', str(glob['address'])))}")
     if full and rep.get("detail"):
         out.append(f"      detail: {rep['detail']}")
     return out
@@ -6405,6 +6407,24 @@ def _bn_command(*words: str) -> str:
     return " ".join(["bn", *flags, *(shlex.quote(w) for w in words)])
 
 
+def code_span(command: str) -> str:
+    """*command* as ONE inline code span (R4-02): the fence is one backtick
+    longer than the longest backtick run inside it, and a command that starts
+    or ends with a backtick is padded by a space (CommonMark), so a selector
+    such as ``'audit`copy.bndb'`` cannot close the span early. Every command
+    a reader is to paste is printed through here; `CODE_SPAN_RE` is the one
+    reader of the result."""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", command)), default=0) + 1)
+    pad = " " if command.startswith("`") or command.endswith("`") else ""
+    return f"{fence}{pad}{command}{pad}{fence}"
+
+
+#: One code span as `code_span` writes it: an opening backtick run and the
+#: first closing run of exactly that length. The body is group 2, padding
+#: included.
+CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+
+
 # #1037 item 1: the characters of one string value a text row shows. One
 # `strings --query` matched inside five 16 KB blobs and printed all of them in
 # one turn; the size note came after the flood. JSON keeps the value whole.
@@ -6439,7 +6459,7 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
             else:
                 command = _bn_command("read", str(address), "--encoding", "escaped")
             clipped = (f" … (+{len(text) - _STRING_VALUE_CLIP} chars; full value: "
-                       f"--format json or `{command}`)")
+                       f"--format json or {code_span(command)})")
             text = text[:_STRING_VALUE_CLIP]
         rendered = json.dumps(text, ensure_ascii=True) + clipped
         if chars is not None and isinstance(length, int) and chars != length:
@@ -8342,7 +8362,7 @@ def _render_mutation_summary_text(value: Any, *,
         # claims nothing about the outcome: the save's own gates (open-target
         # collision, cache fallback) decide, and its output says why and what
         # to do (predicting them failed review round 3 in both directions).
-        line += (f"\nnext: `{save_command()}` to persist it; if it is refused, "
+        line += (f"\nnext: {code_span(save_command())} to persist it; if it is refused, "
                  "its output says why and what to do")
     return line
 
