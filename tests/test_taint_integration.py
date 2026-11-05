@@ -7932,3 +7932,47 @@ def test_the_forward_all_clear_names_its_sink_class_scope(tmp_path, shared_bn):
     assert scaled["reached_sinks"] == [] and scaled["opt_in_sinks_reached"] == []
     assert scaled["diagnostics"]["safe_to_report_all_clear"] is True
     assert scaled["diagnostics"]["exits"]["return"] is True
+
+
+def test_trace_reports_observed_truncation_and_quick_view_state(tmp_path, shared_bn):
+    """BN6-C011: the memcpy source argument walks back four steps to the
+    function's only parameter. Budgets 4 and 5 are the same complete answer;
+    3 leaves the parameter pending. Budget 4 used to say `truncated: true`.
+    BN6-C010: the same trace on a quick-loaded copy discloses
+    `analysis_state: quick` / `partial: true`; it carried no state at all.
+    The quick copy has a saved database beside it, as a primed fixture does:
+    the quick view must still be the raw bytes, never that full analysis."""
+    built = {}
+    for name in ("trace_budget", "trace_budget_quick"):
+        built[name] = tmp_path / name
+        # -fno-builtin: GCC inlines an 8-byte memcpy even at -O0.
+        _compile(CORPUS / "trace_budget.c", built[name], ["-fno-builtin"])
+    full = shared_bn.load(built["trace_budget"], copy=False)
+    sidecar = tmp_path / "trace_budget_quick.bndb"
+    primed = shared_bn.load(built["trace_budget_quick"], copy=False)
+    saved = shared_bn.run("save", "--target", primed, "--path", str(sidecar), "--format", "json")
+    assert saved.returncode == 0 and sidecar.exists(), saved.stderr
+    closed = shared_bn.run("close", primed)
+    assert closed.returncode == 0, closed.stderr
+    quick = shared_bn.load(built["trace_budget_quick"], quick=True)
+
+    sites = _bn_json(shared_bn, "-t", full, "callsites", "memcpy",
+                     "--within", "publish_banner")["items"]
+    [call] = [site["call_addr"] for site in sites]
+
+    def trace(target, *extra):
+        return _bn_json(shared_bn, "-t", target, "trace", "publish_banner", call,
+                        "--arg", "1", *extra)
+
+    runs = {depth: trace(full, "--max-depth", str(depth)) for depth in (3, 4, 5)}
+    assert [s["reason"] for s in runs[5]["trace"]][-1] == "function_parameter"
+    assert {depth: (r["step_count"], r["truncated"], len(r["assumptions"]))
+            for depth, r in runs.items()} == {3: (3, True, 1), 4: (4, False, 0),
+                                              5: (4, False, 0)}
+    assert runs[4]["trace"] == runs[5]["trace"]
+    assert (runs[5]["analysis_state"], runs[5]["partial"]) == ("full", False)
+
+    partial = trace(quick)
+    assert (partial["analysis_state"], partial["partial"]) == ("quick", True)
+    # The raw binary was opened, not the database beside it.
+    assert Path(quick).suffix != ".bndb", quick

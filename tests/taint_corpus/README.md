@@ -19,6 +19,7 @@ brittle across compilers/optimisation.
 | `conn_recv_vtable.c`   | connection-object vtable: recv SOURCE anchored at `conn->ops->recv` (an indirect call value-set can't pin) via `--resolve-map`; tainted length reaches a memcpy sink (#282) |
 | `conn_send_vtable.c`   | backward mirror: send SINK anchored at `conn->ops->send` via `--resolve-map`; slice reaches the length parameter origin (#282) |
 | `opt_in_scope.c`       | the forward all-clear is scoped to the enabled sink classes: a seed into `send` (`net_write`, off by default) is recorded in `opt_in_sinks_reached` and reported with `--sink-class net_write`; a return-only seed is an all-clear whose diagnostics name the return exit (IC07; driven by its own test, no EXPECTED) |
+| `trace_budget.c`       | `bn trace` of a memcpy source argument that walks back exactly four steps: `truncated` only when work is left at `--max-depth`, and a quick-loaded view's trace carries `analysis_state: quick`, `partial: true` (BN6-C010/C011; driven by its own test, no EXPECTED) |
 | `interproc.c`          | tainted buffer crosses a call boundary; sink lives in the callee (interprocedural descent) |
 | `outparam.c`           | helper fills an output buffer through a pointer param; taint flows back to the caller |
 | `multihop.c`           | input -> snprintf propagator -> system (command injection); mirrors DVRF socket_cmd |

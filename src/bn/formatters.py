@@ -8906,7 +8906,10 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     register = _text_value(arg_lbl, "register")
     if register:
         arg_desc += f" ({register})"
-    header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
+    # BN6-C010: a trace answered on a quick-loaded view says so first, as every
+    # other quick-tolerant read does.
+    header = (_quick_partial_prefix(value, "backward trace")
+              + f"backward trace of {arg_desc} in {fn_name} @ {target_addr}")
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
     if value.get("truncated"):
