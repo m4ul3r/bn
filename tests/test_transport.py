@@ -1554,15 +1554,15 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel
 
 
 @pytest.mark.parametrize("polls, late_answer, outcome", [
-    (True, b'{"ok": false, "status": "cancelled", "error": "taint walk cancelled"}',
-     "honoured"),
-    (True, b'{"ok": true, "result": {}}', "finished before it took effect"),
-    (True, None, "did not stop within"),
+    (True, b'{"ok": false, "status": "cancelled", "error": "taint walk cancelled", '
+           b'"observed": {"cancelled": true, "functions_visited": 7}}', "cancelled"),
+    (True, b'{"ok": true, "result": {}}', "finished"),
+    (True, None, "no_answer"),
     # An op that never checks the flag: nothing to wait for (the wait spent a
     # `session stop` probe's own budget behind a write lock).
-    (False, b'{"ok": true, "result": {}}', "does not check for cancellation"),
+    (False, b'{"ok": true, "result": {}}', None),
     # A bridge that did not say: no wait either.
-    (None, b'{"ok": true, "result": {}}', "may keep running until it checks"),
+    (None, b'{"ok": true, "result": {}}', None),
 ])
 def test_a_timed_out_request_says_whether_its_cancel_was_honoured(
         tmp_path, monkeypatch, polls, late_answer, outcome):
@@ -1610,7 +1610,16 @@ def test_a_timed_out_request_says_whether_its_cancel_was_honoured(
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: _RequestSocket())
     with pytest.raises(transport.BridgeError, match="Timed out") as caught:
         transport._send_request_to_instance(instance, "taint", timeout=1.0)
-    assert outcome in str(caught.value)
+    err = caught.value
+    assert err.status == ("cancelled" if outcome == "cancelled" else None)
+    assert err.observed["timed_out"] is True
+    assert err.observed["request_sent"] is True
+    assert err.observed["cancel_sent"] is True
+    assert err.observed["polls_cancel"] is polls
+    assert err.observed["cancel_outcome"] == outcome
+    assert err.observed["cancelled"] is (outcome == "cancelled")
+    # The bridge's own account of the stop is kept.
+    assert err.observed.get("functions_visited") == (7 if outcome == "cancelled" else None)
     [request] = sockets
     # Listened past the timeout only for an op that can honour the cancel.
     assert (request.reads > 1) is bool(polls)
