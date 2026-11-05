@@ -995,16 +995,19 @@ def test_a_flagged_body_with_no_mlil_is_an_unread_body_not_a_caveat(models):
 _THUNK_SINK = 0x940
 
 
-def _tail_call_wrapper(body):
-    """``handle(p) { fetch_input(p); }`` where ``fetch_input`` is flagged a
-    thunk and its MLIL is *body* -- each shape ends in a tail call."""
-    p = FVar("p", ident=40)
-    p0 = FSSA(p, 0)
-    stub = FFunc("fetch_input", 0xB00, FSSAFunc(body), is_thunk=True, params=[FVar("s", ident=41)])
-    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+def _tail_call_wrapper(body, formals=1):
+    """``handle(p, q) { fetch_input(p[, q]); }`` where ``fetch_input`` is
+    flagged a thunk with *formals* parameters and its MLIL is *body* -- each
+    shape ends in a tail call."""
+    p, q = FVar("p", ident=40), FVar("q", ident=42)
+    p0, q0 = FSSA(p, 0), FSSA(q, 0)
+    stub = FFunc("fetch_input", 0xB00, FSSAFunc(body), is_thunk=True,
+                 params=[FVar("s", ident=41), FVar("n", ident=43)][:formals])
+    args = [FExpr("MLIL_VAR_SSA", "p#0", reads=[p0]), FExpr("MLIL_VAR_SSA", "q#0", reads=[q0])]
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(...)", reads=[p0, q0][:formals], writes=[],
                   dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
-                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
-    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
+                  params=args[:formals])
+    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p, q])
     sink = FFunc("memcpy", _THUNK_SINK, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
     return func, FBV({_THUNK_SINK: "memcpy"}, funcs={0xB00: stub, _THUNK_SINK: sink})
 
@@ -1054,6 +1057,25 @@ def test_a_pure_veneer_is_still_resolved_to_its_target(models):
     engine = te.TaintEngine(bv, models)
     assert engine._not_internal_reason(bv.get_function_at(0xB00)) == "thunk"
     assert engine._follow_thunk_cached(bv.get_function_at(0xB00)).start == _THUNK_SINK
+
+
+def test_a_tail_call_that_drops_a_formal_is_not_a_veneer(models):
+    # R2-05: `fetch_input(s, n) { return memcpy(s) __tailcall }` forwards its
+    # first formal only. It is no veneer: mapping the caller's arguments onto
+    # memcpy made the tainted `n` memcpy's source, and the copy into the
+    # caller's `p` a frontier. It is walked as the body it is, where `n`
+    # reaches nothing.
+    s0 = FSSA(FVar("s", ident=41), 0)
+    body = [FInstr(0, 0xB00, "MLIL_TAILCALL_SSA", "return memcpy(s#0)", reads=[s0],
+                   dest=FExpr("MLIL_CONST_PTR", "0x940", constant=_THUNK_SINK),
+                   params=[FExpr("MLIL_VAR_SSA", "s#0", reads=[s0], src=s0)])]
+    func, bv = _tail_call_wrapper(body, formals=2)
+    engine = te.TaintEngine(bv, models)
+    assert engine._not_internal_reason(bv.get_function_at(0xB00)) is None
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    assert result["reached_sinks"] == []
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] in ("arg_under_recovered", "coarse_memory_store")], result["leaves"]
 
 
 def test_a_skipped_thunk_with_stale_mlil_is_an_unread_body(models):

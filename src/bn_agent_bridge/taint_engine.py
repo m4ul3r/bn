@@ -6881,11 +6881,13 @@ class TaintEngine:
     def _is_pure_veneer(self, fn: Any) -> bool:
         """Whether *fn* is a stub the caller may resolve to its target: every
         hop of the chain ``follow_thunk`` walks is one MLIL tail call that
-        hands its own parameters on unchanged, in order. Anything else -- a
-        store, a call, an argument swap or a constant passed in a parameter's
-        place -- is a body of its own: mapping the caller's arguments straight
-        onto the target would hand them to the wrong formals, and what the
-        body does before its `jmp` would go unread."""
+        hands EVERY one of its own parameters on unchanged, in order. Anything
+        else -- a store, a call, an argument swap, a constant passed in a
+        parameter's place, or a formal it does not forward at all -- is a body
+        of its own: mapping the caller's arguments straight onto the target
+        would hand them to the wrong formals (an omitted formal's value lands
+        in a target slot it never reaches, R2-05), and what the body does
+        before its `jmp` would go unread."""
         if self._follow_thunk_cached(fn) is None:
             return False
         cur = fn
@@ -6902,7 +6904,10 @@ class TaintEngine:
                 # The end of the chain: a body follow_thunk stopped at.
                 return cur is not fn
             formals = list(getattr(cur, "parameter_vars", None) or [])
-            for i, param in enumerate(self._call_params(instructions[0])):
+            params = self._call_params(instructions[0])
+            if len(params) != len(formals):
+                return False
+            for i, param in enumerate(params):
                 src = getattr(param, "src", None)
                 if (op_name(param) != "MLIL_VAR_SSA" or i >= len(formals)
                         or getattr(src, "version", None) != 0
