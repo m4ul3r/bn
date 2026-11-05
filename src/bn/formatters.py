@@ -1742,6 +1742,11 @@ def _render_session_list_text(value: Any) -> str:
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        deferred = item.get("idle_deferred_unsaved_targets")
+        if isinstance(deferred, int) and not isinstance(deferred, bool) and deferred > 0:
+            lines.append(
+                f"  idle shutdown deferred: {deferred} target(s) with unsaved changes "
+                "-- save or close them; `bn session stop --discard-unsaved` discards them")
         # #992: which checkout this bridge runs.
         if item.get("source_dir"):
             lines.append(f"  source: {item['source_dir']}")

@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import refuse_silent_skip
+from conftest import _pid_is_gone, refuse_silent_skip
 
 from bn.paths import instances_dir
 
@@ -398,6 +398,77 @@ class TestSessionStopUnsavedGuard:
             result = json.loads(stopped.stdout)
             assert result["stopped"] is True
             assert result["discarded_unsaved"] == [{"selector": selector, "path": str(copy)}]
+        finally:
+            _session_stop(inst)
+
+
+def _session_row(instance_id: str) -> dict | None:
+    """*instance_id*'s `session list` row, or None once it is gone. `session
+    list` is an idle probe, so polling it never restarts the idle window."""
+    listing = _bn("session", "list", "--format", "json")
+    assert listing.returncode == 0, listing.stderr
+    rows = json.loads(listing.stdout).get("items") or []
+    return next((row for row in rows if row.get("instance_id") == instance_id), None)
+
+
+def _wait_for_row(instance_id: str, predicate, *, budget: float) -> dict | None:
+    deadline = time.monotonic() + budget
+    while True:
+        row = _session_row(instance_id)
+        if predicate(row) or time.monotonic() >= deadline:
+            return row
+        time.sleep(0.5)
+
+
+class TestIdleReaperUnsavedGuard:
+    """The idle reaper must not discard unsaved work (D2-01). An auto-started
+    bridge gets a finite BN_IDLE_TIMEOUT by default, so this is the path an
+    unattended agent's mutations take. A private session with a 2 s window,
+    because the bridge's own shutdown IS the subject."""
+
+    _IDLE = 2.0
+
+    def test_an_unsaved_rename_holds_an_expired_idle_window_until_saved(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BN_IDLE_TIMEOUT", str(self._IDLE))
+        copy = tmp_path / "parser"
+        shutil.copyfile(HELLO_BINARY, copy)
+        copy.chmod(0o755)
+        inst = _session_start(str(copy))["instance_id"]
+        try:
+            listing = json.loads(
+                _bn("--instance", inst, "function", "list", "--format", "json").stdout)
+            items = listing.get("items") if isinstance(listing, dict) else listing
+            renamed = _bn("--instance", inst, "rename", items[0]["name"],
+                          "IDLE_GUARD_MARKER", "--format", "json")
+            assert renamed.returncode == 0, f"{renamed.stdout}\n{renamed.stderr}"
+
+            # Several windows pass with nothing but idle probes: the bridge
+            # stays up and says why.
+            held = _wait_for_row(
+                inst, lambda row: row is None or row.get("idle_deferred_unsaved_targets"),
+                budget=10 * self._IDLE)
+            assert held is not None, "the idle reaper discarded an unsaved rename"
+            assert held["idle_deferred_unsaved_targets"] == 1
+            time.sleep(3 * self._IDLE)
+            assert _session_row(inst) is not None
+            found = _bn("--instance", inst, "function", "search", "IDLE_GUARD_MARKER",
+                        "--format", "json")
+            assert found.returncode == 0, found.stderr
+            payload = json.loads(found.stdout)
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            assert [row["name"] for row in rows] == ["IDLE_GUARD_MARKER"]
+
+            # Saved: nothing is left to lose, so the next full window reaps it.
+            saved = _bn("--instance", inst, "save", "--format", "json")
+            assert saved.returncode == 0, f"{saved.stdout}\n{saved.stderr}"
+            gone = _wait_for_row(inst, lambda row: row is None, budget=10 * self._IDLE)
+            assert gone is None, f"the saved bridge was not reaped: {gone}"
+            # The registry goes first; the process then finishes BN's teardown.
+            deadline = time.monotonic() + _SESSION_STOP_TIMEOUT
+            while not _pid_is_gone(int(held["pid"])) and time.monotonic() < deadline:
+                time.sleep(0.5)
+            assert _pid_is_gone(int(held["pid"])), "the reaped bridge never exited"
         finally:
             _session_stop(inst)
 

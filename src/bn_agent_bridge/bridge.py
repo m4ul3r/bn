@@ -867,6 +867,14 @@ class TargetManager:
         with self._lock:
             return self._numeric_view_ids
 
+    def unsaved_view_ids(self) -> list[str]:
+        """The stable view_ids holding a committed mutation not yet saved --
+        the ledger `session stop`/`restart` refuse on -- read under the
+        manager's own lock and without touching Binary Ninja, so a background
+        thread (the idle reaper) can ask it safely (D2-01)."""
+        with self._lock:
+            return sorted(self._dirty_view_ids, key=int)
+
     def mark_dirty(self, bv) -> None:
         """Record that *bv* has a committed mutation not yet written to a .bndb."""
         with self._lock:
@@ -2105,6 +2113,9 @@ class BinaryNinjaBridge:
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
+        # D2-01: the number of unsaved targets that last held an expired idle
+        # window open, or None while the reaper is not deferring a shutdown.
+        self._idle_deferred_unsaved: int | None = None
         # Retired GUI bridges this one succeeded (`succeed`), held weakly: a
         # request one of them admitted may still be running, and a cancel for it
         # now arrives HERE, on the socket path it used to own (#992). Weak, so a
@@ -2569,6 +2580,9 @@ class BinaryNinjaBridge:
         # mark refuses numeric selectors; the next restart inherits that.
         payload["numeric_view_ids"] = self.targets.numeric_view_ids()
         payload["idle_timeout"] = self._idle_timeout
+        # D2-01: how many unsaved targets are holding an expired idle window
+        # open (null while the reaper is not deferring), for `session list`.
+        payload["idle_deferred_unsaved_targets"] = self._idle_deferred_unsaved
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists. Under the
         # teardown latch (#694): a detached load worker that finishes after stop()
@@ -2742,12 +2756,26 @@ class BinaryNinjaBridge:
     def _try_idle_shutdown(self, now: float, timeout: float) -> bool:
         """Atomically decide whether to self-shutdown. Returns True (and latches
         _shutting_down so _enter_request refuses new work) only when nothing is in
-        flight, no detached load job is still queued/running, AND the bridge has
-        been idle >= timeout. A non-zero _inflight covers every operation that runs
-        inside a request's own dispatch (including update_analysis_and_wait there),
-        but a detached load job (started via load_binary_async) runs on its own
-        worker thread outside any request's dispatch, so _load_jobs must be
-        checked too or the reaper could shut down mid-load (#694)."""
+        flight, no detached load job is still queued/running, no target holds
+        unsaved work, AND the bridge has been idle >= timeout. A non-zero
+        _inflight covers every operation that runs inside a request's own
+        dispatch (including update_analysis_and_wait there), but a detached load
+        job (started via load_binary_async) runs on its own worker thread outside
+        any request's dispatch, so _load_jobs must be checked too or the reaper
+        could shut down mid-load (#694).
+
+        An expired window with unsaved targets is DEFERRED, not taken (D2-01):
+        teardown would discard them with none of the `session stop`/`restart`
+        refusal, and an auto-started bridge reaps itself by default. The count
+        is kept in ``_idle_deferred_unsaved`` for the log and the registry; the
+        window restarts when the save or close that clears them -- a request --
+        finishes and stamps ``_last_activity``."""
+        # Read the unsaved ledger BEFORE taking _request_state_lock, so this
+        # thread never holds that lock while waiting on the TargetManager's.
+        # Reading first is still sound: a request that dirties a view after
+        # this read is either still in flight below or has finished and stamped
+        # _last_activity, and either keeps the decision from latching.
+        unsaved = len(self.targets.unsaved_view_ids())
         with self._request_state_lock:
             if self._inflight > 0:
                 return False
@@ -2760,7 +2788,12 @@ class BinaryNinjaBridge:
                 self._last_activity = now
                 return False
             if (now - self._last_activity) < timeout:
+                self._idle_deferred_unsaved = None
                 return False
+            if unsaved:
+                self._idle_deferred_unsaved = unsaved
+                return False
+            self._idle_deferred_unsaved = None
             self._shutting_down = True
             return True
 
@@ -2778,6 +2811,7 @@ class BinaryNinjaBridge:
             self._last_activity = time.monotonic()
 
         def _loop() -> None:
+            published: int | None = None
             while not self._shutdown_event.is_set():
                 # wait() doubles as the sleep and as prompt wake-up on external
                 # shutdown: it returns True the moment _shutdown_event is set.
@@ -2790,6 +2824,26 @@ class BinaryNinjaBridge:
                     )
                     self._shutdown_event.set()
                     return
+                deferred = self._idle_deferred_unsaved
+                if deferred == published:
+                    continue
+                if deferred:
+                    bn.log_info(
+                        f"BN Agent Bridge idle for >= {timeout}s (BN_IDLE_TIMEOUT) "
+                        f"but {deferred} target(s) hold unsaved changes; not "
+                        "shutting down until they are saved or closed "
+                        "(`bn session stop --discard-unsaved` discards them)"
+                    )
+                # Publish each change for `session list`. A failed write loses
+                # only that disclosure -- the deferral itself is decided above --
+                # and must not end this thread, which would leave the bridge with
+                # no idle policy at all.
+                try:
+                    self._write_registry()
+                except OSError as exc:
+                    bn.log_warn(f"BN Agent Bridge could not publish its idle state: {exc}")
+                    continue
+                published = deferred
 
         thread = threading.Thread(target=_loop, name="bn-idle-reaper", daemon=True)
         thread.start()

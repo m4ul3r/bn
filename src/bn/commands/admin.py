@@ -1909,6 +1909,12 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
                 idle if isinstance(idle, (int, float)) and not isinstance(idle, bool)
                 and idle > 0 else None
             )
+        # D2-01: the idle window expired but unsaved targets keep the bridge
+        # alive; stated only while the bridge says it is deferring.
+        deferred = inst.meta.get("idle_deferred_unsaved_targets") if isinstance(
+            inst.meta, dict) else None
+        if isinstance(deferred, int) and not isinstance(deferred, bool) and deferred > 0:
+            entry["idle_deferred_unsaved_targets"] = deferred
         # #80: the registry now records each instance's open binaries, so list them
         # here without an N-instance `target list` round-trip. Absent (older bridge
         # or nothing open) -> omit, so the entry stays clean.

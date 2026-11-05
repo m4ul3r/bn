@@ -6319,6 +6319,35 @@ def test_session_list_reports_each_bridges_idle_timeout(monkeypatch, capsys):
     assert not any(part.startswith("idle=") for part in heads["older-1"])
 
 
+def test_session_list_states_an_idle_shutdown_held_by_unsaved_targets(monkeypatch, capsys):
+    # D2-01: a bridge whose idle window expired with unsaved targets is kept
+    # alive; `session list` says so, and says nothing for one that is not.
+    from dataclasses import replace
+
+    instances = [
+        replace(_fake_instance("held-1"),
+                meta={"idle_timeout": 1800.0, "idle_deferred_unsaved_targets": 2}),
+        replace(_fake_instance("idle-1"),
+                meta={"idle_timeout": 1800.0, "idle_deferred_unsaved_targets": None}),
+    ]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: instances)
+
+    assert bn.cli.main(["session", "list", "--format", "json"]) == 0
+    items = {item["instance_id"]: item for item in json.loads(capsys.readouterr().out)["items"]}
+    assert items["held-1"]["idle_deferred_unsaved_targets"] == 2
+    assert "idle_deferred_unsaved_targets" not in items["idle-1"]
+
+    assert bn.cli.main(["session", "list"]) == 0
+    blocks: dict[str, list[str]] = {}
+    for line in capsys.readouterr().out.splitlines():
+        if line and not line.startswith(" ") and "pid=" in line:
+            current = blocks.setdefault(line.split()[0], [])
+        elif line.startswith("  "):
+            current.append(line.strip())
+    assert sum(line.startswith("idle shutdown deferred: 2 ") for line in blocks["held-1"]) == 1
+    assert not any(line.startswith("idle shutdown deferred") for line in blocks["idle-1"])
+
+
 def _fake_bn_on_path(tmp_path, module_dir, plugin_dir):
     """A `bn` script whose interpreter answers the identity probe with
     *module_dir* / *plugin_dir*, like an install from another checkout."""
