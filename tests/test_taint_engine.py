@@ -4184,7 +4184,7 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert result["stats"]["leaves"] == len(result["leaves"])
     # ... and the leaf is in the shared blocking vocabulary, so the frontier can
     # never be counted as a complete answer.
-    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+    from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
     assert "caller_sites_truncated" in BLOCKING_LEAF_KINDS
     # Only the followed callers contributed slices: the dropped 4 did not.
     assert len(result["slices"]) == 16
@@ -9621,7 +9621,7 @@ def test_backward_result_carries_a_completeness_gate_812(process_func, models):
     # blocking-leaf branch -- there is no blocking leaf here for that branch to
     # mis-handle. The withholding direction is pinned by the decision-table
     # test below, which is where a curtailed slice lives.
-    from bn_agent_bridge.taint_result import BLOCKING_LEAF_KINDS
+    from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
     assert diag["safe_to_report_complete_slice"] is True, diag
     assert not [lf for lf in result["leaves"]
                 if lf.get("kind") in BLOCKING_LEAF_KINDS], result["leaves"]

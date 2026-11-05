@@ -31,9 +31,9 @@ from test_taint_backward_coverage import (
 from test_taint_caller_advice import _outer_program
 from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSAFunc, _indirect_sink_program, te
 
+from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
 from bn_agent_bridge import taint_result
 from bn_agent_bridge.taint_result import (
-    BLOCKING_LEAF_KINDS,
     backward_diagnostics,
     forward_zero_diagnostics,
 )
