@@ -1516,7 +1516,7 @@ def _verify_rename_symbol(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed_name != requested_name and before_name != requested_name:
         raise OperationFailure(
             "verification_failed",
-            f"Live rename verification failed at {item['address']}",
+            f"Post-state rename verification failed at {item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1539,7 +1539,7 @@ def _verify_set_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed != expected:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment verification failed for {item.get('function') or item['address']}",
+            f"Post-state comment verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1682,7 +1682,7 @@ def _verify_delete_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment deletion verification failed for {item.get('function') or item['address']}",
+            f"Post-state comment deletion verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1773,7 +1773,7 @@ def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             if not _prototype_matches_ignoring_param_names(bv, fn.type, source):
                 raise OperationFailure(
                     "verification_failed",
-                    f"Live prototype verification failed at {item['address']}",
+                    f"Post-state prototype verification failed at {item['address']}",
                     requested=item.get("requested"),
                     observed=item["observed"],
                 )
@@ -1787,7 +1787,7 @@ def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             and observed_can_return != expected_can_return):
         raise OperationFailure(
             "verification_failed",
-            f"Live prototype verification failed at {item['address']}: the prototype "
+            f"Post-state prototype verification failed at {item['address']}: the prototype "
             + ("requests __noreturn, but the function can still return"
                if expected_can_return is False else
                "drops __noreturn, but the function still cannot return")
@@ -1856,7 +1856,7 @@ def _verify_local_rename(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed_name != expected_name:
         raise OperationFailure(
             "verification_failed",
-            f"Live local rename verification failed at {item['address']}",
+            f"Post-state local rename verification failed at {item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1937,7 +1937,7 @@ def _verify_local_retype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if observed_type != expected_type:
         raise OperationFailure(
             "verification_failed",
-            f"Live local retype verification failed at {item['address']}",
+            f"Post-state local retype verification failed at {item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1967,7 +1967,7 @@ def _verify_struct_field_set(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     if member is None or observed["field_type"] != item["field_type"]:
         raise OperationFailure(
             "verification_failed",
-            f"Live struct field verification failed for {item['struct_name']} at {item['offset']}",
+            f"Post-state struct field verification failed for {item['struct_name']} at {item['offset']}",
             requested=item.get("requested"),
             observed=observed,
         )
@@ -2005,7 +2005,7 @@ def _verify_struct_field_rename(ctx, bv, result: dict[str, Any]) -> dict[str, An
     if member is None:
         raise OperationFailure(
             "verification_failed",
-            f"Live struct field rename verification failed for {item['struct_name']}",
+            f"Post-state struct field rename verification failed for {item['struct_name']}",
             requested=item.get("requested"),
             observed=observed,
         )
@@ -2044,7 +2044,7 @@ def _verify_struct_field_delete(ctx, bv, result: dict[str, Any]) -> dict[str, An
     if member is not None:
         raise OperationFailure(
             "verification_failed",
-            f"Live struct field delete verification failed for {item['struct_name']}",
+            f"Post-state struct field delete verification failed for {item['struct_name']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -2107,7 +2107,7 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             "parsed_variables": list(item.get("parsed_variables") or []),
         }
         item["status"] = "verification_failed"
-        item["message"] = "No declared named types were available for live verification."
+        item["message"] = "No declared named types were available for post-state verification."
         return item
     observed_types: dict[str, str | None] = {}
     observed_type_layouts: dict[str, str | None] = {}
@@ -2120,7 +2120,7 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
                 continue
             raise OperationFailure(
                 "verification_failed",
-                f"Live type verification failed for {name}",
+                f"Post-state type verification failed for {name}",
                 requested=item.get("requested"),
                 observed={
                     "defined_types": observed_types,

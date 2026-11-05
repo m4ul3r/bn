@@ -197,7 +197,7 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
         lambda ctx, bv, result: {
             **result,
             "status": "verification_failed",
-            "message": "Live rename verification failed at 0x401000",
+            "message": "Post-state rename verification failed at 0x401000",
         },
     )
 

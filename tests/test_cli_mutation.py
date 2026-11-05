@@ -444,12 +444,12 @@ def test_go_rename_summary_reads_its_own_counters():
         "kind": "go_rename", "success": False, "committed": False, "preview": False,
         "rolled_back": True,
         "results": [{"op": "rename_symbol", "status": "verification_failed",
-                     "message": "Live rename readback disagreed"}],
+                     "message": "Post-state rename readback disagreed"}],
         "go_renamed_candidates": 9, "go_verified_count": 4,
         "go_failed_count": 1, "go_committed_count": 0, "skipped_user_named": 0,
     })
     assert reverted["dirty_after"] is False
-    assert reverted["first_error"] == "Live rename readback disagreed"
+    assert reverted["first_error"] == "Post-state rename readback disagreed"
 
     # Partial failure whose rollback FAILED: renames are live in the view. This is
     # the shape that must never read clean (cf. #656 on the bridge side).
@@ -457,7 +457,7 @@ def test_go_rename_summary_reads_its_own_counters():
         "kind": "go_rename", "success": False, "committed": False, "preview": False,
         "rolled_back": False, "message": "Rollback failed; the view may be partially renamed",
         "results": [{"op": "rename_symbol", "status": "verification_failed",
-                     "message": "Live rename failed"}],
+                     "message": "Rename failed"}],
         "go_renamed_candidates": 9, "go_verified_count": 4,
         "go_failed_count": 1, "go_committed_count": 0,
     })
@@ -2225,7 +2225,7 @@ def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys)
                         "address": "0x401000",
                         "new_name": "player_update",
                         "status": "verification_failed",
-                        "message": "Live rename verification failed at 0x401000",
+                        "message": "Post-state rename verification failed at 0x401000",
                         "requested": {
                             "identifier": "sub_401000",
                             "kind": "function",
@@ -5296,3 +5296,49 @@ def test_failed_mutation_out_envelope_states_the_outcome_and_the_write_apart(
         detail = json.loads(destination.read_text())
         assert detail["ok"] is False
         assert detail["results"][0]["status"] == "verification_failed"
+
+
+@pytest.mark.parametrize("extra", [[], ["--verbose"], ["--format", "json", "--summary"],
+                                   ["--format", "json"]])
+def test_a_preview_whose_rename_does_not_land_never_claims_a_live_session(
+        monkeypatch, capsys, extra):
+    """D4-02: the banner said `preview rolled back`, but the failed row's own
+    message -- printed twice in the verbose card and copied into the compact
+    `first_error` -- still read "Live rename verification failed", for a
+    preview that never touched the live session. The verifier's message is
+    phase-neutral at its source; driven through the real bridge verifier."""
+    from _bridge_fakes import _FakeFunction, _FakeMutationBV, _load_bridge
+
+    class _StickyName(_FakeFunction):
+        """A function whose rename BN accepts and does not apply."""
+
+        @property
+        def name(self):
+            return self._name
+
+        @name.setter
+        def name(self, value):
+            if not hasattr(self, "_name"):
+                self._name = value
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _StickyName(0x401000, "parse_record")
+    bv = _FakeMutationBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, *, params=None, target=None, **kw:
+                        instance.dispatch({"op": op, "params": params, "target": target}))
+
+    rc = bn.cli.main(["rename", "--target", "fixture", hex(fn.start), "load_record",
+                      "--preview", *extra])
+
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "live" not in out.lower(), out
+    if extra == ["--format", "json", "--summary"]:
+        summary = json.loads(out)
+        assert summary["failed_count"] == 1 and summary["first_error"], summary
+    elif extra == ["--format", "json"]:
+        [row] = json.loads(out)["results"]
+        assert row["status"] == "verification_failed", row

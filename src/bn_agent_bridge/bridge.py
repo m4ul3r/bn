@@ -4798,13 +4798,13 @@ class BinaryNinjaBridge:
                     except Exception as exc:  # noqa: BLE001 - preserve all-or-nothing rename
                         failed_rows.append(self._go_rename_failure_row(
                             candidate, "verification_failed",
-                            f"Live rename failed: {_serialize_error(exc)}",
+                            f"Rename failed: {_serialize_error(exc)}",
                         ))
                         break
                     observed = str(getattr(fn, "name", "") or "")
                     if observed != candidate["new_name"]:
                         failed_rows.append(self._go_rename_failure_row(
-                            candidate, "verification_failed", "Live rename readback disagreed",
+                            candidate, "verification_failed", "Post-state rename readback disagreed",
                         ))
                         break
                     verified_count += 1
