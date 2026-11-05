@@ -98,11 +98,11 @@ For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (
 Per-op statuses:
 
 - `verified` — requested change applied and read back.
-- `noop` — the requested state already existed.
+- `noop` — the requested state already existed. It stays `noop` when a sibling fails and the batch rolls back, whether the sibling failed at apply or at verify, and counts in `noop_count`.
 - `unsupported` — this operation is unavailable for the object.
 - `verification_failed` — readback disagreed; the batch attempts rollback.
 - `invalid_request` — semantic request refusal, including an invalid field value.
-- `reverted` — an earlier successful sibling was undone after a later batch failure; not itself a failed status.
+- `reverted` — an op that changed the view was undone after a sibling's failure; not itself a failed status.
 - `not_previewed` — left out of a `--preview` because it cannot be previewed reversibly or depends on an op that cannot; not itself a failed status.
 - `not_attempted` — a later sibling was never run after a batch failure; not itself a failed status.
 - `rollback_failed` — restore failed; the view may contain some changes.

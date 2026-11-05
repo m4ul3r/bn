@@ -1106,6 +1106,30 @@ def _mark_unverified_results(
 
 
 
+def _settle_noop_verdicts(ctx, bv, results: list[dict[str, Any]], operations,
+                          type_before) -> list[dict[str, Any]]:
+    """Give the ops that applied before a sibling's apply failure their ``noop``
+    verdict, through the same verifier and type-diff annotation the post-apply
+    phase uses (P2-02).
+
+    An apply row carries no status: ``noop`` is decided only by verification, and
+    the apply-failure path rolls back without verifying, so every applied row --
+    a genuine no-op included -- reached ``_mark_unverified_results`` looking like
+    a change and was stamped ``reverted``, contradicting #630 and zeroing
+    ``noop_count``. Run while the batch is still applied (the state those
+    deciders read). Only a ``noop`` verdict is taken: anything else (a verified
+    change, or a readback that disagrees because the post-apply reanalysis never
+    ran) keeps the apply row, which the rollback stamp then rewrites."""
+    type_diffs = _diff_type_snapshots(
+        ctx, type_before, _capture_type_snapshots(ctx, bv, operations))
+    verified = [row if row.get("status") == NOT_PREVIEWED
+                else _verify_operation(ctx, bv, row) for row in results]
+    settled = _annotate_operation_results(ctx, verified, type_diffs)
+    return [verdict if verdict.get("status") == "noop" else row
+            for row, verdict in zip(results, settled)]
+
+
+
 def _has_failed_results(ctx, results: list[dict[str, Any]]) -> bool:
     """True when any per-op result carries a FAILURE status (#777).
 
@@ -3011,6 +3035,8 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
         exc = _explain_renamed_reference(operations[len(results)], results, exc)
         with exclusive_scope():
             failed_row = _operation_failure_result(ctx, operations[len(results)], exc)
+            # Before the revert: the noop deciders read the applied state.
+            settled = _settle_noop_verdicts(ctx, bv, results, operations, type_before)
             # Run BOTH revert steps unconditionally: an `and` would short-circuit
             # past the explicit restores when the undo revert fails, leaving
             # non-journaled local/prototype changes applied.
@@ -3056,7 +3082,7 @@ def _apply_batch(ctx, selector: str | None, preview: bool, operations: list[dict
                 "committed": False,
                 "rolled_back": reverted,
                 "message": message,
-                "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
+                "results": _mark_unverified_results(ctx, settled, result_note, status=result_status)
                 + [failed_row]
                 + [_not_previewed_result(ctx, op, skipped[index]) if index in skipped
                    else _unattempted_results(ctx, [op])[0]

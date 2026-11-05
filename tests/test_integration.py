@@ -618,6 +618,42 @@ class TestBatchManifestTarget:
             assert code == 0, (ops, payload)
             assert [r["status"] for r in payload["results"]] == ["verified", "verified"], payload
 
+    def test_a_noop_rename_stays_noop_when_a_later_op_fails_to_apply(self, shared_bn, tmp_path):
+        """P2-02: `[rename greet -> greet, rename main -> main_reviewed, rename
+        an absent symbol]`. The third op fails at apply and the batch rolls back;
+        the first wrote nothing, so it stays `noop` and is counted, the second is
+        `reverted`, and the run exits 3 for the failing op alone. The noop used
+        to be stamped `reverted` with `noop_count: 0`. The `--out` envelope and
+        the failure card state the same outcome."""
+        shared_bn.load(HELLO_BINARY)
+        mf = tmp_path / "noop_then_apply_failure.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": "greet", "new_name": "greet"},
+            {"op": "rename_symbol", "identifier": "main", "new_name": "main_reviewed"},
+            {"op": "rename_symbol", "identifier": "absent_symbol_zz", "new_name": "x"}]}))
+
+        summary_run = shared_bn.run("batch", "apply", str(mf), "--format", "json", "--summary")
+        assert summary_run.returncode == 3, f"{summary_run.stdout}\n{summary_run.stderr}"
+        summary = json.loads(summary_run.stdout)
+        assert (summary["noop_count"], summary["reverted_count"], summary["failed_count"],
+                summary["rolled_back"], summary["dirty_after"]) == (1, 1, 1, True, False), summary
+
+        out = tmp_path / "detail.json"
+        full = shared_bn.run("batch", "apply", str(mf), "--format", "json", "--out", str(out))
+        assert full.returncode == 3, f"{full.stdout}\n{full.stderr}"
+        envelope = json.loads(full.stdout)
+        assert (envelope["ok"], envelope["written"]) == (False, True), envelope
+        detail = json.loads(out.read_text())
+        assert [r["status"] for r in detail["results"]] == [
+            "noop", "reverted", "unsupported"], detail["results"]
+
+        card = shared_bn.run("batch", "apply", str(mf), "--verbose")
+        assert card.returncode == 3, f"{card.stdout}\n{card.stderr}"
+        assert card.stdout.splitlines()[0] == "rolled back: apply failed", card.stdout
+        names = shared_bn.run("function", "list", "--format", "json", "--limit", "200")
+        listed = {f["name"] for f in json.loads(names.stdout)["items"]}
+        assert {"greet", "main"} <= listed and "main_reviewed" not in listed, listed
+
 
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names
