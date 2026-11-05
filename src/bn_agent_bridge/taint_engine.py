@@ -9076,7 +9076,12 @@ class TaintEngine:
     def _alias_slots(self, ga: int) -> frozenset:
         """Writable pointer-sized data words whose INITIAL value points into
         the object at *ga* -- `char *g_ptr = g_alias;` -- read from BN's data
-        cross-references. Empty on a view that cannot list them."""
+        cross-references. Empty on a view that cannot list them.
+
+        Every reference BN lists is checked: the list is already in hand and
+        each costs one pointer read, while a slot left out is a reader never
+        swept -- keeping the first 64 cleared a run whose only reader loaded
+        the 65th (R1-03)."""
         ga = int(ga)
         cached = self._alias_slots_cache.get(ga)
         if cached is not None:
@@ -9094,7 +9099,7 @@ class TaintEngine:
                     refs = list(get_refs(ga) or ())
                 except Exception:
                     refs = []
-            for ref in refs[:64]:
+            for ref in refs:
                 try:
                     slot = int(ref)
                     value = int(read_ptr(slot))

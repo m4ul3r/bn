@@ -103,3 +103,29 @@ def test_coalesced_written_offsets_stay_in_numeric_order(models):
     [leaf] = _leaves(_forward(bv, func, models))
     assert [s["address"] for s in leaf["sites"]] == [hex(0x401108), hex(0x401110)], leaf
     assert leaf["global"]["written_offsets"] == ["0x8", "0x10"], leaf
+
+
+# --------------------------------------------------------------------------
+# R1-03: every pointer slot initialised to the object is an alias
+# --------------------------------------------------------------------------
+
+SLOTS = 0x404200        # `char *P[65]`-worth of separate pointer globals
+
+
+def test_the_only_reader_behind_the_sixty_fifth_pointer_slot_blocks(models):
+    # 65 writable pointer globals, each initialised to G; only the reader of
+    # the LAST one runs. Its body names that slot, never G.
+    slots = [SLOTS + 8 * k for k in range(65)]
+    reader = _slot_reader("via_last_slot", 0x401200, slots[-1], 0x401210)
+    func = _copy_then_calls(reader)
+    bv = FAliasBV({MEMCPY: "memcpy", SYSTEM: "system", reader.start: reader.name},
+                  funcs={reader.start: reader},
+                  refs={slots[-1]: [FRef(reader, 0x40120c)]},
+                  objects={G: G_SIZE, **{s: 8 for s in slots}},
+                  pointers={s: G for s in slots})
+    result = _forward(bv, func, models)
+    [leaf] = _leaves(result)
+    assert leaf["global"]["address"] == hex(G), leaf
+    assert [(r["display_name"], r["at"]) for r in leaf["references"]] == \
+        [("via_last_slot", hex(0x401210))], leaf
+    assert _all_clear(result) is False
