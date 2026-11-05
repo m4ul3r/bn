@@ -153,6 +153,16 @@ _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
         "callee_variadic", "call_index", "within_query", "decompile_excerpt",
         "also_in", "arity",
     ),
+    # P3: `local list` pages; an empty page had `row_fields: []` because no
+    # declaration stood in for the rows it lacked.
+    "locals": (
+        "name", "storage", "type", "is_parameter", "index", "identifier",
+        "source_type", "local_id", "distance_to_next_slot", "span_to_next",
+    ),
+    "frame": (
+        "storage", "kind", "names", "types", "distance_to_next_slot",
+        "to_canary", "variables",
+    ),
 }
 
 # #1037 item 3: the declared keys a row carries only under a condition, with
@@ -198,6 +208,10 @@ _OPTIONAL_ROW_FIELDS: dict[str, dict[str, str]] = {
         "callee_variadic": "variadic callees",
         "decompile_excerpt": "rows whose HLIL statement is null",
     },
+    "locals": {
+        "distance_to_next_slot": "stack variables (negative storage)",
+        "span_to_next": "stack variables (negative storage)",
+    },
 }
 
 # Condition named for a key some rows of a populated page carry and others do
@@ -206,12 +220,29 @@ _OBSERVED_OPTIONAL = "present on some rows of this page only"
 
 
 def _annotate_row_fields(result: Any) -> Any:
-    """Attach `row_fields` (and `row_fields_optional`) to a collection envelope.
+    """Attach `row_fields` (and `row_fields_optional`) to a collection envelope,
+    and to each collection envelope a composite read embeds at its top level.
 
     Applied once at the dispatch boundary so every collection read -- current and
     future, CLI and native -- carries the hint without a second catalog for the
     CLI or the kernel to re-declare. Non-collection results are returned
-    untouched: a row hint on `decompile` text would be a lie.
+    untouched: a row hint on `decompile` text would be a lie. A composite read
+    (`evidence orient` embeds a `strings` sample and the `sections` page) is not
+    a collection, but the envelopes it embeds are, and they carried no schema
+    while the same pages read on their own did (P3).
+    """
+    if not isinstance(result, dict):
+        return result
+    if isinstance(result.get("items"), list):
+        return _annotate_collection(result)
+    for value in result.values():
+        if isinstance(value, dict) and isinstance(value.get("items"), list):
+            _annotate_collection(value)
+    return result
+
+
+def _annotate_collection(result: dict[str, Any]) -> dict[str, Any]:
+    """`row_fields` for one collection envelope.
 
     `row_fields` names keys EVERY row of the page carries, so `row[f]` cannot
     raise for any of them (#1037 item 3). A populated page derives that from its
@@ -223,11 +254,11 @@ def _annotate_row_fields(result: Any) -> Any:
     populated page carries on some rows and not others. It is omitted when
     there is none.
     """
-    if not isinstance(result, dict) or "row_fields" in result:
+    if "row_fields" in result:
         return result
     kind = result.get("kind")
-    items = result.get("items")
-    if not isinstance(kind, str) or not isinstance(items, list):
+    items = result["items"]
+    if not isinstance(kind, str):
         return result
     declared = list(_DECLARED_ROW_FIELDS.get(kind, ()))
     conditions = dict(_OPTIONAL_ROW_FIELDS.get(kind, {}))

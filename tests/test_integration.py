@@ -7331,3 +7331,22 @@ def test_class_size_provenance_is_one_schema_for_rtti_and_declared_classes(share
     assert rows and all({"size", "size_source", "size_reason"} <= set(row) for row in rows)
     [row] = [r for r in rows if r["name"] == "probe_only_declared"]
     assert row["size_source"] == "declared_type"
+
+
+def test_local_pages_and_orient_collections_declare_their_rows(shared_bn):
+    """P3: the `locals` declaration the empty page falls back to covers every
+    key a real page carries, and `evidence orient`'s embedded collections
+    carry `row_fields` like the same pages read on their own."""
+    from bn_agent_bridge._shared import _DECLARED_ROW_FIELDS
+
+    shared_bn.load(HELLO_BINARY)
+    for argv, kind in ((("local", "list", "main"), "locals"),
+                       (("local", "list", "main", "--frame"), "frame")):
+        page = shared_bn.json(*argv)
+        assert page["kind"] == kind and page["items"]
+        assert {key for row in page["items"] for key in row} <= set(_DECLARED_ROW_FIELDS[kind])
+        assert page["row_fields"]
+    orient = shared_bn.json("evidence", "orient")
+    for key in ("strings_sample", "sections"):
+        rows = orient[key]["items"]
+        assert rows and all(set(orient[key]["row_fields"]) <= set(row) for row in rows)

@@ -8994,3 +8994,30 @@ def test_raw_target_row_filename_cannot_execute_shell_metadata(tmp_path, shell, 
     assert not any((tmp_path / name).exists() for name in (
         "SELECTOR_MARKER", "FILENAME_MARKER", "SUBSTITUTION_MARKER",
     ))
+
+
+def test_empty_local_pages_and_nested_collections_carry_their_row_fields():
+    """P3: an empty `local list` (or `--frame`) page had no `row_fields`,
+    because no declaration stood in for its rows, and the `strings`/`sections`
+    envelopes `evidence orient` embeds had none at all."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    empty = _annotate_row_fields({"kind": "locals", "function": {"name": "f"}, "items": []})
+    assert empty["row_fields"] == ["name", "storage", "type", "is_parameter", "index",
+                                   "identifier", "source_type", "local_id"]
+    assert set(empty["row_fields_optional"]) == {"distance_to_next_slot", "span_to_next"}
+    frame = _annotate_row_fields({"kind": "frame", "items": []})
+    assert frame["row_fields"] == ["storage", "kind", "names", "types",
+                                   "distance_to_next_slot", "to_canary", "variables"]
+
+    orient = _annotate_row_fields({
+        "kind": "orientation",
+        "strings_sample": {"kind": "strings", "items": [
+            {"address": "0x1", "value": "a", "chars": 1, "length": 1, "type": "ascii",
+             "section": ".rodata"}]},
+        "sections": {"kind": "sections", "items": []},
+        "target": {"arch": "x86_64"}})
+    assert orient["strings_sample"]["row_fields"] == [
+        "address", "value", "chars", "length", "type", "section"]
+    assert orient["sections"]["row_fields"] == ["name", "start", "end", "length", "semantics"]
+    assert "row_fields" not in orient and "row_fields" not in orient["target"]
