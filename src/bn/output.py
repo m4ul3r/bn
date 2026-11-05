@@ -113,6 +113,19 @@ def render_value(value: Any, fmt: str) -> str:
     return json.dumps(value, indent=2, sort_keys=True, default=_json_default) + "\n"
 
 
+_SUMMARY_KEYS_SHOWN = 10
+
+
+def _summary_keys(value: dict[str, Any]) -> dict[str, Any]:
+    """The first sorted keys of *value*, marked when the list is cut short."""
+    keys = sorted(value.keys())
+    out: dict[str, Any] = {"keys": keys[:_SUMMARY_KEYS_SHOWN]}
+    if len(keys) > _SUMMARY_KEYS_SHOWN:
+        out["keys_truncated"] = True
+        out["keys_total"] = len(keys)
+    return out
+
+
 def _summary(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         # A paged-list envelope ({items|functions:[...], total, ...}) must report
@@ -124,7 +137,7 @@ def _summary(value: Any) -> dict[str, Any]:
             if isinstance(page, list):
                 out: dict[str, Any] = {
                     "kind": "object",
-                    "keys": sorted(value.keys())[:10],
+                    **_summary_keys(value),
                     "page_key": page_key,
                     "count": len(page),
                 }
@@ -132,7 +145,7 @@ def _summary(value: Any) -> dict[str, Any]:
                 if isinstance(total, int):
                     out["total"] = total
                 return out
-        return {"kind": "object", "keys": sorted(value.keys())[:10], "count": len(value)}
+        return {"kind": "object", **_summary_keys(value), "count": len(value)}
     if isinstance(value, list):
         return {"kind": "array", "count": len(value)}
     if isinstance(value, str):
@@ -584,6 +597,8 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
         lines.append(f"spilled: {str(bool(payload.get('spilled'))).lower()}")
     if "artifact_path" in payload:
         lines.append(f"path: {payload['artifact_path']}")
+    if "meta_path" in payload:
+        lines.append(f"meta: {payload['meta_path']}")
     for key in ("format", "bytes", "tokens", "tokenizer", "sha256"):
         if key in payload:
             lines.append(f"{key}: {payload[key]}")
@@ -725,6 +740,7 @@ def write_output_result(
     try:
         spill_path = _spill_path(stem, suffix)
         _write_private_bytes(spill_path, encoded)
+        _write_spill_sidecar(spill_path, encoded, provenance)
     except OSError as exc:
         # The rendered output is already in memory; losing it over a failed
         # spill write (disk full, permissions) would punish the user twice.
@@ -762,11 +778,44 @@ def write_output_result(
     if rerun_hint:
         artifact["rerun"] = rerun_hint
     artifact["spill_token_limit"] = spill_token_limit
+    artifact["meta_path"] = str(spill_sidecar_path(spill_path))
     return OutputWriteResult(
         rendered=render_envelope(artifact, fmt),
         artifact=artifact,
         spilled=True,
         token_count=token_count,
+    )
+
+
+def spill_sidecar_path(artifact_path: Path) -> Path:
+    """Provenance sidecar written next to a spill artifact (``<artifact>.meta.json``)."""
+    return artifact_path.with_name(artifact_path.name + ".meta.json")
+
+
+def _write_spill_sidecar(
+    artifact_path: Path, encoded: bytes, provenance: dict[str, Any] | None
+) -> None:
+    """Record which instance/target/command produced a spill artifact.
+
+    The artifact holds only the raw result, so a file found later in the spill
+    tree could not be tied back to the binary or the read that made it. The
+    sidecar lives in the same day directory, so ``bn spill gc`` and retention
+    pruning remove it together with its artifact.
+    """
+    provenance = provenance or {}
+    meta = {
+        "kind": "spill_meta",
+        "artifact": artifact_path.name,
+        "instance": provenance.get("instance"),
+        "target": provenance.get("target"),
+        "argv": list(sys.argv),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded),
+        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _write_private_bytes(
+        spill_sidecar_path(artifact_path),
+        (json.dumps(meta, sort_keys=True, default=_json_default) + "\n").encode("utf-8"),
     )
 
 

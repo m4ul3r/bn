@@ -375,19 +375,21 @@ def _pick_resolved(key: str, raws: list[str]) -> str | None:
     return min(plain or raws, key=lambda s: (len(s), s))
 
 
-def _disasm_at(bv, addr: int) -> str:
+def _disasm_at(bv, addr: int, container=None) -> str:
     """One line of disassembly at *addr*, or ``""`` when the view cannot answer.
 
-    Guarded exactly like the sibling row emitters in ``read_xrefs`` so a BN shape
-    without ``get_disassembly`` (or a failing read at an unmapped address)
-    degrades to an empty string instead of failing the whole listing."""
-    fn = getattr(bv, "get_disassembly", None)
-    if not callable(fn):
-        return ""
+    Rendered the way ``bn disasm`` renders it, so a call's target carries the
+    view's name (``call 0x401030 <read>``) instead of a bare PLT address; the
+    containing function's architecture decodes it. Guarded like the sibling row
+    emitters in ``read_xrefs``: a BN shape that cannot decode (or a failing read
+    at an unmapped address) degrades to an empty string instead of failing the
+    whole listing."""
+    arch = getattr(container, "arch", None) or getattr(bv, "arch", None)
     try:
-        return fn(int(addr)) or ""
+        text, _length = il_format._disasm_instruction(bv, int(addr), arch=arch)
     except Exception:
         return ""
+    return text or ""
 
 
 # Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
@@ -489,7 +491,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                 rows.append({"address": hex(ai), "function": fname, "kind": kind,
                              "function_display_name": (il_format._display_name(container)
                                                        if container is not None else None),
-                             "disasm": _disasm_at(bv, ai)})
+                             "disasm": _disasm_at(bv, ai, container)})
         rows.sort(key=lambda r: int(r["address"], 16))
         slot["callsite_count"] = len(rows)
         # #560: application-caller subset -- the real VR work queue.
