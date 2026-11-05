@@ -236,7 +236,7 @@ def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tm
     value = {"kind": "instances",
              "items": [{"instance_id": f"i{n}", "pid": n} for n in range(400)]}
 
-    bn.cli._emit_result(args, value, stem="instances")
+    assert bn.cli._emit_result(args, value, exit_code=0, stem="instances") == 0
 
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["spilled"] is True
@@ -860,16 +860,32 @@ def test_class_and_go_subcommand_groups_have_help():
     assert "Go binary symbol recovery" in help_text
 
 
-def test_class_show_ambiguous_exits_nonzero_keeping_matches(fake_transport, capsys):
-    # #413: an ambiguous leaf still returns the informative matches, but with a
-    # NON-zero exit so a shell/agent can't read it as a clean single-class result.
-    fake_transport({"class_show": {"ok": True, "result": {
-        "ambiguous": True, "query": "Foo",
-        "matches": [{"name": "a::Foo"}, {"name": "b::Foo"}]}}})
+def test_class_show_ambiguous_is_the_uniform_exit_2_refusal_envelope(monkeypatch, capsys):
+    # An ambiguous leaf is refused like every other exit-2 read: under JSON the
+    # stdout object is `ok: false` with `status` and `error`, and the candidate
+    # cards ride in `observed.matches` (the transport raises what the bridge's
+    # `ambiguous_class` OperationFailure serialises to).
+    from bn.transport import BridgeError
+
+    def refuse(op, **_kwargs):
+        raise BridgeError("'Foo' names 2 classes: a::Foo, b::Foo.",
+                          status="ambiguous_class", requested={"name": "Foo"},
+                          observed={"matches": [{"name": "a::Foo"}, {"name": "b::Foo"}]})
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
     rc = bn.cli.main(["class", "show", "--target", "active", "Foo", "--format", "json"])
     assert rc == 2
-    out = capsys.readouterr().out
-    assert "a::Foo" in out and "b::Foo" in out
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["status"] == "ambiguous_class"
+    assert envelope["requested"] == {"name": "Foo"}
+    assert [m["name"] for m in envelope["observed"]["matches"]] == ["a::Foo", "b::Foo"]
+
+    rc = bn.cli.main(["class", "show", "--target", "active", "Foo"])
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "a::Foo" in err and "b::Foo" in err
 
 
 def test_missing_subcommand_prints_exact_help(capsys):
