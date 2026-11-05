@@ -98,11 +98,11 @@ For `go rename`, `--verbose` (alias `--diffs`) requests detail and `--summary` (
 Per-op statuses:
 
 - `verified` — requested change applied and read back.
-- `noop` — the requested state already existed.
+- `noop` — the requested state already existed. It stays `noop` when a sibling fails and the batch rolls back, whether the sibling failed at apply or at verify, and counts in `noop_count`.
 - `unsupported` — this operation is unavailable for the object.
 - `verification_failed` — readback disagreed; the batch attempts rollback.
 - `invalid_request` — semantic request refusal, including an invalid field value.
-- `reverted` — an earlier successful sibling was undone after a later batch failure; not itself a failed status.
+- `reverted` — an op that changed the view was undone after a sibling's failure; not itself a failed status.
 - `not_previewed` — left out of a `--preview` because it cannot be previewed reversibly or depends on an op that cannot; not itself a failed status.
 - `not_attempted` — a later sibling was never run after a batch failure; not itself a failed status.
 - `rollback_failed` — restore failed; the view may contain some changes.
@@ -110,9 +110,11 @@ Per-op statuses:
 
 A failed batch returns one row per submitted op. Failure statuses are `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, and `internal_error` (exit 3). CLI parser, file, routing, read, and transport errors normally exit 2, as can a semantic bridge refusal without one of those failure statuses. A local semantic mutation preflight exits 3 with `observed.request_sent: false`, distinguishing a refusal before send from a bridge-side exit 3 (which may carry `observed: {}`). Exit 4 means the mutation result could not be measured; inspect the view rather than interpreting unknown counts as zero. A failed rollback sets `dirty_after: true` and may leave `changed_count: null`.
 
+The `--verbose` failure card opens with the phase that failed, read from the failed rows' statuses: `invalid_request`, `unsupported` and `internal_error` stop the batch at `apply`, `verification_failed` is the post-apply `verify`, and `rollback_failed` is the `rollback` (`rolled back: apply failed`, `preview rolled back: verify failed`, `rollback failed after apply failed: the view may be left modified`).
+
 ## Output and compact status
 
-Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation never swaps its status for a spill envelope: when detail spills, stdout keeps the compact status and points to `detail_artifact_path` for `results[]`. With `--out`, stdout is an artifact envelope whose `ok` describes the file write, not the mutation; read the artifact or exit code for the verdict. A refusal can emit an error envelope without writing an artifact.
+Mutations print a compact **text status line** by default. Use `--format json --summary` for a machine-readable status, `--verbose` for full diffs, or `--out FILE` to write detail to an artifact. An explicit `--format json` requests the full JSON result unless `--summary` is also set. A mutation never swaps its status for a spill envelope: when detail spills, stdout keeps the compact status and points to `detail_artifact_path` for `results[]`. With `--out`, stdout is an artifact envelope whose `ok` is the mutation's own `ok` (false for a failed batch, including one rolled back because it failed, as in the artifact; a successful `--preview` is `rolled_back: true` and `ok: true`) and whose `written: true` says the file was delivered. A refusal can emit an error envelope without writing an artifact.
 
 ### Compact status keys
 

@@ -23,15 +23,23 @@ tests pin it there.
 """
 from __future__ import annotations
 
-# "rollback_failed" = an op succeeded but the batch revert that should have
-# undone it failed, so the view may be left modified -- a real failure. A
-# cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
-# "internal_error" = an unexpected engine bug (distinct from an unsupported
-# request); still a failure, so exit codes/rendering flag it (#122).
-FAILED_MUTATION_STATUSES = {
-    "unsupported",
-    "verification_failed",
-    "invalid_request",
-    "rollback_failed",
-    "internal_error",
+# The phase of the batch each failure status comes from, which is what a
+# failure banner names (W07: it used to say "live verification failed" for an
+# op that never got past apply, and for a preview). A semantic refusal
+# (`invalid_request`), an op Binary Ninja cannot perform (`unsupported`) and an
+# unexpected engine error (`internal_error`) stop the batch at or before
+# apply; readback disagreement (`verification_failed`) is the post-apply
+# verify; `rollback_failed` = an op succeeded but the batch revert that should
+# have undone it failed, so the view may be left modified -- a real failure. A
+# cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted
+# (#118); `internal_error` stays distinct from an unsupported request (#122).
+FAILURE_PHASES = {
+    "unsupported": "apply",
+    "invalid_request": "apply",
+    "internal_error": "apply",
+    "verification_failed": "verify",
+    "rollback_failed": "rollback",
 }
+
+# Keyed off the phases so a new failure status cannot exist without one.
+FAILED_MUTATION_STATUSES = set(FAILURE_PHASES)

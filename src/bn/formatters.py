@@ -21,7 +21,7 @@ from .transport import BridgeError
 # anything outside that copy would silently skip the revert-on-failure path.
 # Re-exported under this name because CLAUDE.md documents it here and tests pin
 # `bn.formatters.FAILED_MUTATION_STATUSES`.
-from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
+from .mutation_statuses import FAILED_MUTATION_STATUSES, FAILURE_PHASES  # noqa: E402,F401
 
 # Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
 # break a --format text row across lines or corrupt the terminal. Escape them so
@@ -778,7 +778,7 @@ def _resolution_note(value: Any) -> str:
     """A leading note when a function-scoped read annotated how it resolved the
     requested address (#193 Part 4).
 
-    Two distinct disclosures share one `resolved_from` envelope, and text mode
+    Three distinct disclosures share one `resolved_from` envelope, and text mode
     must say exactly what the JSON says:
 
     * a non-zero offset means an INTERIOR address resolved to its containing
@@ -787,7 +787,10 @@ def _resolution_note(value: Any) -> str:
     * ``input_format: decimal`` means a digit-only token was read as an address
       rather than a symbol name. At offset ``+0x0`` that is the ONLY news: the
       read answered for exactly the function the caller named, so claiming
-      containment there contradicts the payload.
+      containment there contradicts the payload;
+    * ``normalized`` means the request's Thumb bit (bit 0) was cleared, and the
+      offset is measured from the cleared address: an odd entry pointer at
+      ``+0x0`` names the function's own start.
 
     Returns '' when not applicable.
     """
@@ -806,9 +809,16 @@ def _resolution_note(value: Any) -> str:
     name = function.get("name", "?")
     address = function.get("address", "?")
     requested = resolved_from.get("requested_address")
+    normalized = resolved_from.get("normalized")
     decimal = resolved_from.get("input_format") == "decimal"
     spelling = " (decimal input)" if decimal else ""
+    thumb = f", Thumb bit cleared to {normalized}" if normalized else ""
     if _is_exact_start(resolved_from):
+        if normalized:
+            return (
+                f"// bn: {requested}{spelling} is the Thumb-tagged entry of {name} "
+                f"@ {address} (bit 0 cleared)\n"
+            )
         if not decimal:
             return ""
         return (
@@ -817,7 +827,7 @@ def _resolution_note(value: Any) -> str:
         )
     return (
         f"// bn: {requested}{spelling} is inside {name} "
-        f"@ {address} ({resolved_from.get('offset')}); showing the containing function\n"
+        f"@ {address} ({resolved_from.get('offset')}{thumb}); showing the containing function\n"
     )
 
 
@@ -881,7 +891,8 @@ def _render_disasm_linear_text(value: Any) -> str:
 def _render_capabilities_text(value: Any) -> str:
     """Render the #276 capability index as a grouped, scannable catalog: each
     top-level group, its commands with one-line help, and the prefer-when /
-    see-also routing hints where a command overlaps a neighbor."""
+    see-also routing hints where a command overlaps a neighbor; then the taint
+    output vocabulary, one line per field."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     items = _field_list(value, "items")
@@ -907,6 +918,14 @@ def _render_capabilities_text(value: Any) -> str:
         see_also = _field_list(item, "see_also")
         if see_also:
             lines.append(f"      see also: {', '.join(str(x) for x in see_also)}")
+    taint = _field_dict(value, "taint")
+    if taint:
+        # The taint output vocabulary (V4-05), one line per field.
+        lines.extend(["", "taint output vocabulary:"])
+        for field, values in taint.items():
+            shown = (", ".join(str(v) for v in values) if isinstance(values, list)
+                     else repr(values))
+            lines.append(f"  {field}: {shown}")
     return "\n".join(lines)
 
 
@@ -924,6 +943,22 @@ def _shown_name(entry: Any, *, mangled: bool = False, name_key: str = "name",
     return entry.get(name_key)
 
 
+def _prototype_provenance_line(value: dict[str, Any]) -> str:
+    """`type: unknown (has_user_type set), confidence 96 (return type 128)` --
+    the prototype's proven origin, BN's flag when it is set, and BN's
+    confidence -- or '' when the read carried none of them."""
+    source = value.get("type_source")
+    proto = value.get("prototype_confidence")
+    ret = value.get("return_type_confidence")
+    flag = _flag_field(value, "has_user_type")
+    if source is None and proto is None and ret is None and flag is None:
+        return ""
+    flagged = " (has_user_type set)" if flag else ""
+    return (f"type: {source if source is not None else '<unknown>'}{flagged}, confidence "
+            f"{proto if proto is not None else '<unknown>'} "
+            f"(return type {ret if ret is not None else '<unknown>'})")
+
+
 @_discloses
 def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool = False) -> str:
     if not isinstance(value, dict):
@@ -931,12 +966,21 @@ def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool 
 
     function = _field_dict(value, "function")
     header_name = _shown_name(function, mangled=mangled) or "<unknown>"
+    size = f"size: {value.get('size', '<unknown>')}"
+    if value.get("span_start") is not None:
+        # `size` sums block bytes; the span bounds them, and a gap between
+        # blocks makes it the larger of the two.
+        size += f"  span {value['span_start']}..{value.get('span_end', '?')}"
+        if value.get("contiguous") is False:
+            size += " (discontiguous)"
     lines = [
         f"{_escape_control_chars(header_name)} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
+        *filter(None, [_prototype_provenance_line(value)]),
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
-        f"size: {value.get('size', '<unknown>')}",
-        f"xrefs: {value.get('xref_count', 0)}",
+        size,
+        f"xrefs: {value.get('code_ref_count', '<unknown>')} code, "
+        f"{value.get('data_ref_count', '<unknown>')} data",
     ]
 
     locals_only = _field_list(value, "locals")
@@ -1041,8 +1085,9 @@ def _render_proto_text(value: Any, *, mangled: bool = False) -> str:
         # return type (e.g. name "t" in "uint64_t") (#222 review).
         already_named = head.split()[-1:] == [name] if head else False
         if not already_named:
-            return note + f"{head} {name}({rest}" + width_note
-    return note + prototype + width_note
+            prototype = f"{head} {name}({rest}"
+    provenance = _prototype_provenance_line(value)
+    return note + prototype + (f"\n{provenance}" if provenance else "") + width_note
 
 
 @_discloses
@@ -8340,6 +8385,26 @@ def _overlap_listing(overlaps: Sequence[dict[str, Any]]) -> str:
     return ", ".join(_one(o) for o in overlaps)
 
 
+def _mutation_failure_banner(failed: Sequence[dict[str, Any]], *, preview: bool,
+                             rollback_failed: bool) -> str:
+    """The first line of an uncommitted failure card: what was undone and the
+    batch phase that failed -- `apply`, `verify` or `rollback`, read from the
+    failed rows' statuses (`FAILURE_PHASES`), never one fixed phrase (W07: every
+    failure, a preview's and an op refused before apply included, used to read
+    "live verification failed").
+
+    Only claim a rollback that was performed: `rolled_back: false` or a
+    `rollback_failed` row means the revert failed and the view may be modified,
+    and saying "rolled back" there would contradict the honest message (#117)."""
+    phases = {FAILURE_PHASES[_text_value(row, "status")] for row in failed}
+    cause = " and ".join(p for p in ("apply", "verify") if p in phases)
+    if rollback_failed or "rollback" in phases:
+        after = f" after {cause} failed" if cause else ""
+        return f"rollback failed{after}: the view may be left modified"
+    head = "preview rolled back" if preview else "rolled back"
+    return f"{head}: {cause} failed" if cause else head
+
+
 @_discloses
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -8355,14 +8420,8 @@ def _render_mutation_text(value: Any) -> str:
 
     if not success or failed:
         if not committed:
-            # Only claim a rollback we actually performed. When rolled_back is
-            # explicitly False the revert failed and the view may be modified --
-            # saying "rolled back" there contradicts the honest message and
-            # re-states the very symptom #117 set out to fix.
-            if value.get("rolled_back") is False:
-                lines.append("rollback failed: the view may be left modified")
-            else:
-                lines.append("rolled back: live verification failed")
+            lines.append(_mutation_failure_banner(
+                failed, preview=preview, rollback_failed=value.get("rolled_back") is False))
         # A non-string `message` (a dict/list from a malformed or future bridge
         # result) reached `"\n".join` and raised, so one wrong-typed field cost
         # every line of the failure report above it. Dump it instead (#619).
@@ -9242,16 +9301,6 @@ def _vtable_slot_facts(s: dict[str, Any]) -> str:
 def _render_class_show_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    if value.get("ambiguous"):
-        # Count the rows actually rendered, not the raw field: a skewed `matches`
-        # counted one match per CHARACTER of a string, which is invented data in
-        # the one line a reader uses to decide how ambiguous the query was.
-        matches = _field_list(value, "matches")
-        out = [f"ambiguous class {value.get('query', '')!r}: {len(matches)} matches"]
-        for rec in matches:
-            out.append("")
-            out.append(_render_one_class(rec))
-        return "\n".join(out)
     return _render_one_class(value)
 
 
