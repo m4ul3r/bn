@@ -200,6 +200,28 @@ _RECV_FAMILY = frozenset({
     "read", "pread", "fread",
 })
 
+# How many of a function's callers seed advice names (W12-06/W10-03): the first
+# ones by callsite address, so two runs print the same list; the total is
+# always reported beside them.
+CALLER_ADVICE_LIMIT = 5
+
+
+def caller_seed_rows(callers: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    """``{function, address, reseed}`` for the first :data:`CALLER_ADVICE_LIMIT`
+    of *callers* (``{"function": <function ref>, "address": <callsite>}`` rows,
+    already in callsite-address order): ``reseed`` runs *source* forward from
+    that caller, as printed."""
+    rows = []
+    for caller in callers[:CALLER_ADVICE_LIMIT]:
+        fn_ref = str((caller.get("function") or {}).get("address"))
+        rows.append({
+            "function": caller.get("function"),
+            "address": caller.get("address"),
+            "reseed": (f"`bn taint forward -f {shlex.quote(fn_ref)} "
+                       f"--source {shlex.quote(source)}`"),
+        })
+    return rows
+
 
 def _assumption_has_weak_seed(assumptions: list[str]) -> bool:
     for a in assumptions:
@@ -362,6 +384,22 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                     f"call:recvmsg cannot resolve its buffer either; seed the filled "
                     f"buffer directly{seed}, or run taint from the caller that builds "
                     f"the iovec")
+        owned = next((lf for lf in misanchored if lf.get("caller_seeds")), None)
+        if owned is not None:
+            # W12-06: the pointer is this function's own parameter, so the
+            # buffer belongs to its callers -- where it is a local or global
+            # the walk can key. Seeding the wrapper's argument there is the fix.
+            rows, total = owned["caller_seeds"], int(owned.get("callers_total") or 0)
+            param = owned["buffer_param"]
+            more = (f"; {total - len(rows)} more caller(s) are listed by "
+                    f"`bn xrefs {shlex.quote(str(param['function']))}`"
+                    if total > len(rows) else "")
+            return (f"{head}. The buffer is parameter {param['index']} of "
+                    f"{param['function']}, filled for its callers ({total} in total); "
+                    f"seed it where a caller passes it: "
+                    + ", ".join(f"{row['reseed']} (calls it at {row['address']})"
+                                for row in rows)
+                    + more)
         if fn:
             return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                     f"fails the same way; seed a value read from the buffer instead "
@@ -1054,6 +1092,8 @@ def misanchored_recv_leaf(
     reason: str = "buffer_not_keyed",
     seed: str = "arg",
     call_resolves_iovec: bool = True,
+    buffer_param: dict[str, Any] | None = None,
+    callers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Structured leaf for a seed that tainted a buffer POINTER but did not key
     the FILLED buffer as a stable taint location (#306/#562 dogfood footgun), so
@@ -1071,7 +1111,15 @@ def misanchored_recv_leaf(
     5); otherwise that reseed seeds nothing and is not suggested. For
     ``buffer_not_keyed`` both locators resolve the buffer through the same
     pointer, so ``call:`` would fail the same way and is never suggested
-    (``suggested_source`` is None)."""
+    (``suggested_source`` is None).
+
+    ``buffer_param`` (``{"function": <name>, "index": N}``) says the pointer is
+    parameter N of the seeded function itself -- a read wrapper whose callers
+    own the buffer (W12-06). Then ``callers`` (the function's direct callers,
+    ``{"function": <function ref>, "address": <callsite>}`` in callsite-address
+    order) become ``caller_seeds``: the first :data:`CALLER_ADVICE_LIMIT`, each
+    with a ``reseed`` that seeds ``arg:<function>:N`` there, where the buffer is
+    the caller's own; ``callers_total`` counts them all."""
     base = (callee or "").split("@", 1)[0].lstrip("_")
     locator = f"call:{base}" if seed == "call" else f"arg:{base}:{arg_index}"
     suggest: str | None
@@ -1108,6 +1156,27 @@ def misanchored_recv_leaf(
             "arg: and call: seeds key it the same way; seed a value read from "
             "the buffer with var:, or the consuming parser's parameter with "
             "param:, instead")
+    caller_seeds: list[dict[str, Any]] | None = None
+    if buffer_param is not None:
+        wrapper, pidx = str(buffer_param["function"]), int(buffer_param["index"])
+        caller_seeds = caller_seed_rows(callers or [], f"arg:{wrapper}:{pidx}")
+        total = len(callers or [])
+        if caller_seeds:
+            more = (f"; {total - len(caller_seeds)} more caller(s) are not listed"
+                    if total > len(caller_seeds) else "")
+            note = (
+                f"NOT an all-clear -- the buffer is parameter {pidx} of {wrapper}, "
+                f"so it belongs to {wrapper}'s callers ({total} in total): seed it "
+                f"where they pass it -- "
+                + ", ".join(f"{row['reseed']} (calls {wrapper} at {row['address']})"
+                            for row in caller_seeds)
+                + more)
+        else:
+            note = (
+                f"NOT an all-clear -- the buffer is parameter {pidx} of {wrapper}, "
+                f"and no direct caller of {wrapper} was found (it may be reached "
+                f"only indirectly); seed the consuming parser's parameter with "
+                f"param: instead")
     # One human sentence per leaf, under `detail` like every other kind: what
     # was missed, then why it is not an all-clear and what to seed instead.
     leaf: dict[str, Any] = {
@@ -1121,6 +1190,11 @@ def misanchored_recv_leaf(
     }
     if address is not None:
         leaf["address"] = address
+    if buffer_param is not None:
+        leaf["buffer_param"] = {"function": str(buffer_param["function"]),
+                                "index": int(buffer_param["index"])}
+        leaf["caller_seeds"] = caller_seeds
+        leaf["callers_total"] = len(callers or [])
     return leaf
 
 

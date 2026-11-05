@@ -62,6 +62,7 @@ from .taint_locators import (  # noqa: F401
 )
 from .taint_result import (  # noqa: F401
     BLOCKING_LEAF_KINDS,
+    CALLER_ADVICE_LIMIT,
     backward_diagnostics,
     command_template,
     forward_zero_diagnostics,
@@ -4128,18 +4129,57 @@ class TaintEngine:
 
     def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any,
                            *, seed_kind: str = "source") -> "TaintError":
-        """A `no callsite of <callee>` TaintError that, when the function dispatches
-        through unresolved indirect calls, names them and points at --resolve-map
-        instead of a bare not-found -- so an indirectly-routed recv/read is not a
-        silent dead end (#282). Shared by the forward source seed and the backward
+        """A `no callsite of <callee>` TaintError that names where *callee* IS
+        called and, when the function dispatches through unresolved indirect
+        calls, names them and points at --resolve-map -- so neither a seed one
+        function too high (W10-03) nor an indirectly-routed recv/read (#282) is
+        a silent dead end. Shared by the forward source seed and the backward
         sink seed; *seed_kind* (``"source"``/``"sink"``) keeps the locator guidance
-        role-correct (a sink seed must not be told to use ``--source``)."""
+        role-correct (a sink seed must not be told to use ``--source``).
+
+        Direct callers lead: a function that calls *callee* is a place the same
+        seed matches, whereas an indirect call here only MAY reach it. Callers
+        this function itself calls come first (the seed was one level too high),
+        then the rest in callsite-address order."""
         flag = f"--{seed_kind}"
         indirect = [ins for ins in instrs if self._is_call(ins)
                     and const_target(getattr(ins, "dest", None)) is None]
+        addrs = ", ".join(hex(int(getattr(i, "address", 0))) for i in indirect[:4])
+        more = "" if len(indirect) <= 4 else f", +{len(indirect) - 4} more"
+        own = int(getattr(func, "start", 0))
+        callers = [c for c in self._caller_refs(
+            [s for fn in self._callee_functions(callee)
+             for s in (getattr(fn, "caller_sites", None) or [])])
+            if c["function"]["address"] != hex(own)]
+        if callers:
+            targets = (const_target(getattr(ins, "dest", None))
+                       for ins in instrs if self._is_call(ins))
+            called_here = {hex(int(getattr(fn, "start", 0))) for fn in
+                           (function_at(self.bv, t) for t in targets if t is not None)
+                           if fn is not None}
+            callers.sort(key=lambda c: c["function"]["address"] not in called_here)
+            listed = callers[:CALLER_ADVICE_LIMIT]
+            key = "name" if self.mangled else "display_name"
+            names = ", ".join(
+                f"{c['function'][key]} (-f {c['function']['address']}, calls it at "
+                f"{c['address']}"
+                + (f"; {func.name} calls it" if c["function"]["address"] in called_here
+                   else "")
+                + ")" for c in listed)
+            rest = (f", +{len(callers) - len(listed)} more" if len(callers) > len(listed)
+                    else "")
+            message = (
+                f"no callsite of {callee} in {func.name}; {callee} is called directly "
+                f"from {len(callers)} function(s): {names}{rest} -- re-run with -f "
+                f"<caller> and the same {flag} to seed it there")
+            if indirect:
+                message += (
+                    f". {func.name} also has {len(indirect)} indirect call(s) (e.g. "
+                    f"{addrs}{more}) that did not resolve to {callee}; only if one of "
+                    f"them dispatches to it, pin it with --resolve-map "
+                    f"<call_addr>=<target_addr>")
+            return TaintError(message)
         if indirect:
-            addrs = ", ".join(hex(int(getattr(i, "address", 0))) for i in indirect[:4])
-            more = "" if len(indirect) <= 4 else f", +{len(indirect) - 4} more"
             return TaintError(
                 f"no callsite of {callee} found in {func.name}; the function has "
                 f"{len(indirect)} indirect call(s) (e.g. {addrs}{more}) that neither "
@@ -4150,6 +4190,105 @@ class TaintEngine:
                 f"target: pin to {callee} itself to keep its model, or to the in-binary "
                 f"wrapper that calls {callee} and seed arg:<wrapper>:<n>")
         return TaintError(f"no callsite of {callee} found in {func.name}")
+
+    def _callee_functions(self, callee: str) -> list[Any]:
+        """The functions a callee locator names: the one at an address-form
+        locator, else every function a symbol of exactly that name starts (an
+        import's PLT stub included). ``[]`` when the view cannot say."""
+        if self.bv is None:
+            return []
+        addr = self._callee_as_addr(callee)
+        starts: list[int] = []
+        if addr is not None:
+            starts = [addr]
+        else:
+            get_symbols = getattr(self.bv, "get_symbols_by_name", None)
+            try:
+                starts = [int(getattr(s, "address", 0))
+                          for s in (get_symbols(callee) if callable(get_symbols) else [])]
+            except Exception:
+                starts = []
+        found: dict[int, Any] = {}
+        for a in starts:
+            fn = function_at(self.bv, a)
+            if fn is not None:
+                found.setdefault(int(getattr(fn, "start", a)), fn)
+        return list(found.values())
+
+    @staticmethod
+    def _caller_refs(sites: list[Any]) -> list[dict[str, Any]]:
+        """One ``{"function": <function ref>, "address": <callsite>}`` row per
+        distinct calling function, at its lowest callsite, in callsite-address
+        order -- deterministic, so seed advice names the same callers on every
+        run (W12-06/W10-03). Sites with no owning function are skipped."""
+        rows: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for site in sorted(sites, key=lambda s: int(getattr(s, "address", 0))):
+            caller = getattr(site, "function", None)
+            if caller is None:
+                continue
+            start = int(getattr(caller, "start", 0))
+            if start in seen:
+                continue
+            seen.add(start)
+            rows.append({"function": _function_ref(caller),
+                         "address": hex(int(getattr(site, "address", 0)))})
+        return rows
+
+    def _buffer_param_index(self, func: Any, ssaf: Any, expr: Any) -> int | None:
+        """The parameter of *func* a buffer-pointer argument is based on -- the
+        pointer itself or that pointer plus an offset, through SSA copies and
+        every arm of a PHI -- or None. Says the buffer was handed in by the
+        caller (a ``wrapper(fd, buf, n)`` -> ``read(fd, buf, n)``), so the
+        caller is where it can be keyed (W12-06)."""
+        visiting: set[tuple[Any, Any]] = set()
+        CYCLE = -1
+
+        def of_var(v: Any, depth: int) -> int | None:
+            node = (var_key(v), getattr(v, "version", None))
+            if node in visiting:
+                return CYCLE
+            visiting.add(node)
+            defn = self._ssa_def(ssaf, v)
+            if defn is None:
+                pidx = self._param_index_of(func, v)
+                return pidx if pidx is not None else self._param_spill_index(func, ssaf, v)
+            if op_name(defn) == "MLIL_VAR_PHI":
+                arms = {of_var(r, depth + 1) for r in expr_reads(defn)} - {CYCLE}
+                return arms.pop() if len(arms) == 1 else None
+            if op_name(defn) == "MLIL_SET_VAR_SSA":
+                return of_expr(getattr(defn, "src", None), depth + 1)
+            return None
+
+        def of_expr(e: Any, depth: int) -> int | None:
+            if e is None or depth > 8:
+                return None
+            op = op_name(e)
+            if op in ("MLIL_VAR_SSA", "MLIL_VAR_ALIASED"):
+                reads = expr_reads(e)
+                return of_var(reads[0], depth) if len(reads) == 1 else None
+            if op in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
+                return of_expr(getattr(e, "src", None), depth + 1)
+            if op == "MLIL_ADD":
+                sides = {of_expr(getattr(e, "left", None), depth + 1),
+                         of_expr(getattr(e, "right", None), depth + 1)} - {None, CYCLE}
+                return sides.pop() if len(sides) == 1 else None
+            if op == "MLIL_SUB":
+                return of_expr(getattr(e, "left", None), depth + 1)
+            return None
+
+        found = of_expr(expr, 0)
+        return None if found in (None, CYCLE) else found
+
+    def _caller_seed_fields(self, func: Any, ssaf: Any, pointer: Any) -> dict[str, Any]:
+        """The :func:`misanchored_recv_leaf` keyword arguments that name the
+        callers to seed when the unkeyed buffer pointer is a parameter of
+        *func*; ``{}`` otherwise."""
+        pidx = self._buffer_param_index(func, ssaf, pointer)
+        if pidx is None:
+            return {}
+        return {"buffer_param": {"function": str(getattr(func, "name", "")), "index": pidx},
+                "callers": self._caller_refs(list(getattr(func, "caller_sites", None) or []))}
 
     # -- forward ----------------------------------------------------------
 
@@ -13291,6 +13430,7 @@ class TaintEngine:
                                         arg_index=idx,
                                         address=hex(int(getattr(c, "address", 0))),
                                         reason="buffer_not_keyed",
+                                        **self._caller_seed_fields(func, ssaf, params[idx]),
                                     ))
                 if kind == "arg":
                     # #1041 item 1 gate (#1050 review rounds 4-5): this arg is a
@@ -13458,7 +13598,8 @@ class TaintEngine:
                                         add_leaf(misanchored_recv_leaf(
                                             callee=str(callee), arg_index=idx,
                                             address=hex(int(getattr(c, "address", 0))),
-                                            reason="buffer_not_keyed", seed="call"))
+                                            reason="buffer_not_keyed", seed="call",
+                                            **self._caller_seed_fields(func, ssaf, params[idx])))
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):
