@@ -15164,7 +15164,10 @@ class TaintEngine:
         popen(p - 8)` reads ``b`` at 0 -- never the definition's own offset."""
         seen = seen if seen is not None else set()
         if expr is None or depth > 16:
-            return [{"kind": "unknown", "object": str(expr)}]
+            # The depth cap can land on a bare SSAVariable, whose str() is
+            # BN's `<SSAVariable: x version 0>` repr, not a name.
+            return [{"kind": "unknown",
+                     "object": var_label(expr) if is_ssa_var(expr) else str(expr)}]
         op = op_name(expr)
 
         def rec(e, dd=disp):
