@@ -49,7 +49,10 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import il_format
 from . import taint_engine as _taint
 from . import vars as vars_mod
-from ._shared import OperationFailure, _parse_address, _validate_bool, is_imported_function
+from ._shared import (
+    OperationFailure, _parse_address, _request_cancelled, _validate_bool,
+    is_imported_function,
+)
 from .bridge_state import require_analysis
 from .read_taint_models import PRESENCE_CATALOG_NOTE, model_catalog
 from .read_listing import _analysis_state_fields
@@ -109,6 +112,7 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
                                 else "--resolve-map"),
             find_function=lambda name: int(ctx._find_function(bv, name).start),
             mangled=_validate_bool(params.get("mangled"), label="mangled", default=False),
+            cancel_check=_request_cancelled,
             **_engine_kwargs,
         )
         if direction == "forward":
@@ -131,6 +135,13 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         # An all-sites refusal carries every site row; its text is bounded.
         raise OperationFailure("unsupported", str(exc),
                                observed=getattr(exc, "observed", None)) from exc
+    except _taint.TaintCancelled as exc:
+        # The client cancelled (or went away): a structured outcome, so a
+        # client still listening can tell the cancel was honoured (P1-07).
+        raise OperationFailure(
+            "cancelled", str(exc),
+            observed={"cancelled": True,
+                      "functions_visited": exc.functions_visited}) from exc
     # #415: disclose which taint-model overlays were in effect for this run, so an
     # agent can confirm a project-local --models / BN_TAINT_MODELS file landed
     # (load_models reads them per request -- no bridge restart needed). Uses the

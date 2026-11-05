@@ -1553,6 +1553,56 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel
         assert "until it checks for cancellation" in message
 
 
+@pytest.mark.parametrize("late_answer, outcome", [
+    (b'{"ok": false, "status": "cancelled", "error": "taint walk cancelled"}', "honoured"),
+    (b'{"ok": true, "result": {}}', "finished before it took effect"),
+    (None, "did not stop within"),
+])
+def test_a_timed_out_request_says_whether_its_cancel_was_honoured(
+        tmp_path, monkeypatch, late_answer, outcome):
+    # P1-07: after the cancel is sent the CLI keeps listening on the request's
+    # own connection, so it can say whether the bridge actually stopped.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a, **k: None)
+    monkeypatch.setattr(transport, "_send_cancel_request", lambda inst, rid: True)
+    monkeypatch.setattr(transport, "CANCEL_OUTCOME_WAIT", 0.05)
+
+    class _RequestSocket:
+        def __init__(self):
+            self.reads = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            self.reads += 1
+            if self.reads == 1 or late_answer is None:
+                raise socket.timeout("timed out")
+            return late_answer if self.reads == 2 else b""
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: _RequestSocket())
+    with pytest.raises(transport.BridgeError, match="Timed out") as caught:
+        transport._send_request_to_instance(instance, "taint", timeout=1.0)
+    assert outcome in str(caught.value)
+
+
 @pytest.mark.parametrize("cancel_sent", [False, True])
 @pytest.mark.parametrize("transmit_json", [False, True])
 def test_sendall_timeout_preserves_delivery_uncertainty(

@@ -8,10 +8,13 @@ import cycle). This module imports ONLY stdlib + binaryninja -- never bridge.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import json
 import re
+import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,38 @@ except ModuleNotFoundError:  # no BN GUI runtime (tests, headless tooling): run 
 
     def is_main_thread() -> bool:
         return True
+
+
+# Set by BridgeHandler while a request is executing. Long operations poll it
+# to stop work after the CLI sends a cancellation request -- or goes away --
+# instead of wedging a bridge instance with abandoned work (#365). Lives here,
+# not in bridge.py, so a read-op module can poll it without importing the
+# bridge (the taint walk, P1-07).
+_request_cancel_checker = threading.local()
+
+
+@contextlib.contextmanager
+def _request_cancel_context(checker):
+    old = getattr(_request_cancel_checker, "checker", None)
+    _request_cancel_checker.checker = checker
+    try:
+        yield
+    finally:
+        if old is None:
+            with contextlib.suppress(AttributeError):
+                delattr(_request_cancel_checker, "checker")
+        else:
+            _request_cancel_checker.checker = old
+
+
+def _request_cancelled() -> bool:
+    checker = getattr(_request_cancel_checker, "checker", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
 
 
 def _json_response(
@@ -379,12 +414,7 @@ def _serialize_error(exc: BaseException) -> str:
     `_raised_inside_this_project`. `OperationFailure` is exempt: the bridge
     is the only thing that constructs one, so its origin is never in doubt.
     """
-
-    # OperationFailure subclasses RuntimeError, so it is already covered by the
-    # tuple below; it is listed explicitly to document the intent.
-    if isinstance(exc, OperationFailure):
-        message = str(exc)
-    elif isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc):
+    if _is_user_facing_error(exc):
         message = str(exc)
     else:
         message = f"internal error: {type(exc).__name__}: {exc}"
@@ -395,6 +425,37 @@ def _serialize_error(exc: BaseException) -> str:
             + ", ".join(imports)
         )
     return message
+
+
+def _is_user_facing_error(exc: BaseException) -> bool:
+    """Whether *exc* carries a message the bridge composed for the user.
+
+    OperationFailure subclasses RuntimeError, so it is already covered by the
+    tuple; it is tested first to document that its origin is never in doubt.
+    """
+    if isinstance(exc, OperationFailure):
+        return True
+    return isinstance(exc, USER_FACING_ERRORS) and _raised_inside_this_project(exc)
+
+
+def _log_internal_error(op: Any, exc: BaseException) -> None:
+    """Record an op's UNEXPECTED exception with its traceback.
+
+    The client only ever sees ``internal error: <class>: <message>``; without
+    this nothing anywhere said where it was raised, so an engine crash after
+    minutes of work left an empty bridge log (P1-03). Written to BN's log (the
+    GUI's console) and to stderr, which a headless bridge's instance log
+    captures. A user-facing error is the expected outcome of a bad request
+    and is not logged."""
+    if _is_user_facing_error(exc):
+        return
+    text = (f"BN Agent Bridge op {op!r} raised an unexpected exception:\n"
+            + "".join(traceback.format_exception(exc)))
+    if bn is not None:
+        with contextlib.suppress(Exception):
+            bn.log_error(text)
+    with contextlib.suppress(Exception):
+        print(text, file=sys.stderr, flush=True)
 
 
 def _residue_error_disclosure(exc: BaseException) -> dict[str, Any] | None:

@@ -26,6 +26,8 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 """
 from __future__ import annotations
 
+import bisect
+import contextlib
 import json
 import re
 import shlex
@@ -45,6 +47,7 @@ from .taint_models import (  # noqa: F401
 )
 from .taint_il import (  # noqa: F401
     reaching_reg_def, reaching_arg_seed_vars, argument_register_provenance,
+    llil_call_sites,
     op_name, is_ssa_var,
     _FORMAT_SPEC_RE, _count_format_args, var_key, var_label,
     ssa_reads, ssa_writes, expr_reads, function_at, const_target,
@@ -335,8 +338,36 @@ _SCAN_CAUSE_KINDS = {
     # long write-only permutation chain became a COMPLETE blocking consumer
     # (round-20 review F51).
     "parameter_scan_budget": "param_budget_exhausted",
+    # The REQUEST's allowance for global-continuation sweeps ran out: the
+    # classification stopped here, so whatever lies past it is unexamined.
+    "reference_sweep_budget": "sweep_budget_exhausted",
 }
 _SCAN_KIND_CAUSES = {v: k for k, v in _SCAN_CAUSE_KINDS.items()}
+
+
+class _SweepAllowance:
+    """The work one request's global-continuation sweeps may spend in all.
+
+    Each sweep is already bounded per question (functions, chunks, scan
+    nodes), but the questions multiply -- every (call site, tainted global)
+    asks one, and each classifies whole bodies against up to
+    `_ALIAS_HOPS` neighbouring objects -- so a binary of ordinary size ran
+    for longer than the client would wait (P1-01). Charged per pointer-scan
+    node and per instruction a classifying scan visits. Once it is gone no
+    new scan and no further function of a reachability walk is started, and
+    every answer left unfinished says so (`reference_sweep_budget`); a scan
+    already running finishes under its own bound, so that bound stays the
+    one it reports. Counted, never timed, so the same request gives the
+    same answer on any machine."""
+
+    __slots__ = ("left",)
+
+    def __init__(self, units: int) -> None:
+        self.left = int(units)
+
+    @property
+    def spent(self) -> bool:
+        return self.left <= 0
 
 
 class _ScanBudget:
@@ -345,17 +376,20 @@ class _ScanBudget:
     A bound that is reached is a fact about the answer, not a detail of the
     walk: node exhaustion and the internal return-pointer depth both used to
     read out as "nothing here" (BN21-BOUND-02/03), so the budget carries the
-    cause back and the classifier turns it into a frontier."""
+    cause back and the classifier turns it into a frontier. ``shared`` is
+    the request's sweep allowance, charged alongside while a classifying
+    scan runs inside a continuation sweep."""
 
-    __slots__ = ("nodes", "cause", "pointer_route")
+    __slots__ = ("nodes", "cause", "pointer_route", "shared")
 
     # A pointer-return chain costs `_PTR_RETURN_STEP` levels per hop, so the
     # depth limit is a WRAPPER-CHAIN limit, not a CLI `--max-depth`. Reaching
     # it is reported under its own cause; raising `--max-depth` cannot move it.
-    def __init__(self, nodes: int) -> None:
+    def __init__(self, nodes: int, shared: _SweepAllowance | None = None) -> None:
         self.nodes = int(nodes)
         self.cause: str | None = None
         self.pointer_route = False
+        self.shared = shared
 
     def spend(self) -> bool:
         """Charge one node; False once the allowance is gone."""
@@ -363,7 +397,13 @@ class _ScanBudget:
             self.cause = self.cause or "pointer_scan_budget"
             return False
         self.nodes -= 1
+        self.charge_sweep()
         return True
+
+    def charge_sweep(self) -> None:
+        """Charge one unit of the shared sweep allowance, if there is one."""
+        if self.shared is not None:
+            self.shared.left -= 1
 
     def depth_exhausted(self, *, pointer_route: bool = False) -> None:
         """Charge the internal wrapper-chain bound.
@@ -403,6 +443,99 @@ class _SalvageList(list):
         # both and the result assembly collapses them (`merge_unrecovered_leaves`).
         super().__setitem__(index, item)
         self._keep.append(item)
+
+
+class TaintCancelled(Exception):
+    """The client cancelled the request (or went away) mid-walk.
+
+    Deliberately NOT a :class:`TaintError`: that class means "this body or
+    query cannot be analysed" and is caught and degraded at several points
+    (an unread callee, an unseedable sink), which would turn a cancellation
+    into a silently partial result."""
+
+    def __init__(self, functions_visited: int) -> None:
+        super().__init__(
+            f"taint walk cancelled at the client's request after "
+            f"{functions_visited} function visit(s); no result was produced")
+        self.functions_visited = functions_visited
+
+
+class _CfgIndex:
+    """One SSA function's block layout and per-block reachability, built
+    once and asked many times (P1-01).
+
+    ``closure(b)`` is the set of block starts reachable from block *b* by AT
+    LEAST one edge, plus whether the walk met an edge or block it could not
+    read -- which, as in the per-query BFS it replaces, answers "reachable"
+    (fail open: temporal uncertainty is not proof against flow)."""
+
+    __slots__ = ("_starts", "_ends", "_succ", "_closures")
+
+    def __init__(self, starts: list[int], ends: list[int],
+                 succ: dict[int, tuple[int, ...] | None]) -> None:
+        self._starts = starts
+        self._ends = ends
+        self._succ = succ
+        self._closures: dict[int, tuple[frozenset[int], bool]] = {}
+
+    @classmethod
+    def build(cls, ssaf: Any) -> _CfgIndex | None:
+        try:
+            blocks = list(getattr(ssaf, "basic_blocks", None) or ())
+        except Exception:
+            return None
+        if not blocks:
+            return None
+        spans: list[tuple[int, int]] = []
+        succ: dict[int, tuple[int, ...] | None] = {}
+        for block in blocks:
+            try:
+                lo, hi = int(block.start), int(block.end)
+            except Exception:
+                return None        # a block whose bounds cannot be read: no CFG
+            spans.append((lo, hi))
+            try:
+                targets = []
+                for edge in list(getattr(block, "outgoing_edges", None) or ()):
+                    target = getattr(edge, "target", None)
+                    if target is None:
+                        raise ValueError("edge without a target")
+                    targets.append(int(getattr(target, "start", -1)))
+                succ[lo] = tuple(targets)
+            except Exception:
+                succ[lo] = None    # unreadable edges: anything may follow
+        spans.sort()
+        return cls([s for s, _e in spans], [e for _s, e in spans], succ)
+
+    def holding(self, idx: int) -> int | None:
+        """The start of the block holding IL index *idx*, else None."""
+        at = bisect.bisect_right(self._starts, idx) - 1
+        if at < 0 or idx >= self._ends[at]:
+            return None
+        return self._starts[at]
+
+    def closure(self, start: int) -> tuple[frozenset[int], bool]:
+        hit = self._closures.get(start)
+        if hit is not None:
+            return hit
+        seen: set[int] = set()
+        opaque = False
+        wave = [start]
+        while wave and not opaque:
+            nxt: list[int] = []
+            for block in wave:
+                targets = self._succ.get(block, ())
+                if targets is None:
+                    opaque = True
+                    break
+                for key in targets:
+                    if key not in seen:
+                        seen.add(key)
+                        nxt.append(key)
+            wave = nxt
+        out = (frozenset(seen), opaque)
+        self._closures[start] = out
+        return out
 
 
 _UNRECOVERED = "model_destination_unrecovered"
@@ -503,6 +636,7 @@ class TaintEngine:
         max_iters: int = 256,
         max_depth: int = 64,
         mangled: bool = False,
+        cancel_check: Any = None,
     ):
         self.bv = bv
         # The walk selects call arguments by the indices its models state, so
@@ -526,6 +660,35 @@ class TaintEngine:
         self.max_iters = max_iters
         self.max_depth = max_depth
         self.mangled = mangled
+        # Polled at every function visit and inside the reference sweep, so
+        # a client that cancels (or times out, or goes away) releases the
+        # bridge instead of leaving the walk running to completion (P1-07).
+        self._cancel_check = cancel_check
+        self._visits = 0
+        # The request's global-continuation sweep allowance, drawn on only
+        # while a continuation question is being answered (`_sweeping`).
+        self._sweep_allowance = _SweepAllowance(self._SWEEP_UNITS)
+        self._sweeping = False
+        # SSA function id -> (that object, its _CfgIndex), for `_il_reaches`.
+        self._cfg_cache: dict[int, tuple[Any, _CfgIndex | None]] = {}
+        # function -> its MLIL SSA form; SSA function id -> (that object, its
+        # instruction list); function start -> `_not_internal_reason`. Facts
+        # about the binary, asked over and over by the reachability sweep.
+        self._ssa_cache: dict[Any, Any] = {}
+        self._instrs_cache: dict[int, tuple[Any, list[Any]]] = {}
+        self._internal_cache: dict[int, str | None] = {}
+        # callee start -> the registers its body reads at their ENTRY version,
+        # one LLIL-SSA scan per callee (`_reg_reads_as_input`, P2-06).
+        self._entry_reads_cache: dict[int, frozenset[str] | None] = {}
+        # function start -> its LLIL-SSA call sites by address; (function
+        # start, call address, register) -> that register's provenance.
+        self._llil_calls_cache: dict[int, dict[int, Any] | None] = {}
+        self._provenance_cache: dict[tuple[int, int, str], tuple] = {}
+        # (function, global) pairs whose enclosing-object search ran out with
+        # storage unexamined; whether that matters for the function is asked
+        # once the access that found it has been cached (`_drain_region_checks`).
+        self._region_checks: list[tuple[Any, int]] = []
+        self._region_draining = False
         # follow_thunk is deterministic for a given (bv, function) and the
         # engine is created per request, so resolved thunks are cached for the
         # engine's lifetime -- avoids re-materializing a veneer's MLIL on every
@@ -617,22 +780,83 @@ class TaintEngine:
         # indirect call addresses) inside that body.
         self._indirect_sites_cache: dict[int, tuple] = {}
 
+    # -- global-continuation sweep allowance --------------------------------
+
+    # Units of `_SweepAllowance` one request may spend answering continuation
+    # questions (P1-01). Measured on the dogfood corpus: a unit costs tens of
+    # microseconds of BN API work, the probe shapes answer completely in
+    # under 2,500 units, and an ordinary `main` (a few hundred globals, each
+    # classified against up to 64 neighbours) needs millions -- minutes. This
+    # keeps the sweeps to a few seconds per request (plus the one scan in
+    # flight when it runs out, which finishes under its own node pool); past
+    # it every unfinished answer is disclosed as `reference_sweep_budget`.
+    _SWEEP_UNITS = 50_000
+
+    def _scan_budget(self, nodes: int) -> _ScanBudget:
+        """A classifying scan's budget, charged to the request's sweep
+        allowance while a continuation question is being answered."""
+        return _ScanBudget(nodes, self._sweep_allowance if self._sweeping else None)
+
+    def _sweep_exhausted(self) -> bool:
+        return self._sweeping and self._sweep_allowance.spent
+
+    # -- cancellation -----------------------------------------------------
+
+    def _check_cancelled(self) -> None:
+        """Raise :class:`TaintCancelled` when the request has been cancelled.
+
+        Cheap enough for every function visit and every function a reference
+        sweep classifies. A checker that itself fails says nothing about the
+        request, so the walk goes on."""
+        check = self._cancel_check
+        if check is None:
+            return
+        try:
+            cancelled = bool(check())
+        except Exception:
+            return
+        if cancelled:
+            raise TaintCancelled(self._visits)
+
     # -- shared resolution ------------------------------------------------
 
     def _ssa_func(self, func: Any) -> Any:
+        """*func*'s MLIL SSA form, the same object for the engine's life.
+
+        Binary Ninja hands back a fresh wrapper on every ``.mlil.ssa_form``,
+        so nothing keyed on it -- the instruction lists below, the CFG index,
+        the definition memo -- could ever be reused across the reachability
+        sweep's thousands of asks about the same bodies (P1-01). A function
+        compares and hashes by its core handle, so two wrappers of one body
+        share the entry."""
+        try:
+            hit = self._ssa_cache.get(func)
+        except TypeError:          # an unhashable stand-in: nothing to share
+            hit = None
+        if hit is not None:
+            return hit
         mlil = getattr(func, "mlil", None)
         if mlil is None:
             raise TaintError("function has no MLIL (analysis incomplete?)")
         ssaf = getattr(mlil, "ssa_form", None)
         if ssaf is None:
             raise TaintError("function has no MLIL SSA form")
+        with contextlib.suppress(TypeError):
+            self._ssa_cache[func] = ssaf
         return ssaf
 
     def _instrs(self, ssaf: Any) -> list[Any]:
+        """*ssaf*'s instructions, listed once per SSA object (see
+        :meth:`_ssa_func`). Callers only read the list."""
+        hit = self._instrs_cache.get(id(ssaf))
+        if hit is not None and hit[0] is ssaf:
+            return hit[1]
         try:
-            return list(ssaf.instructions)
+            out = list(ssaf.instructions)
         except Exception as exc:  # pragma: no cover - defensive
             raise TaintError(f"cannot enumerate SSA instructions: {exc}")
+        self._instrs_cache[id(ssaf)] = (ssaf, out)
+        return out
 
     def _callee_name(self, addr: int | None) -> str | None:
         if addr is None or self.bv is None:
@@ -946,7 +1170,7 @@ class TaintEngine:
         except Exception:
             return []
         try:
-            kind, _ = argument_register_provenance(
+            kind, _ = self._register_provenance(
                 func, int(getattr(ins, "address", -1)), reg, bn)
         except Exception:
             return []
@@ -1002,7 +1226,7 @@ class TaintEngine:
         """Recover a call argument BN dropped from the MLIL call's parameters by
         reading the calling-convention register for arg ``idx`` and bridging its
         reaching definition to the MLIL SSA var (#433), for each call site.
-        Delegates to the shared :func:`reaching_arg_seed_vars` (a dominance walk
+        Delegates to :meth:`_register_provenance` (a dominance walk
         of the LLIL-SSA reaching def). Returns ``(reg_name, [(mlil_ssa_var,
         call_site), ...])`` -- each recovered seed is paired with the CALL-site
         instruction (not the register's def site) so the slice records the sink at
@@ -1020,9 +1244,28 @@ class TaintEngine:
             by_addr.setdefault(int(getattr(c, "address", -1)), c)
         seeds: list[tuple[Any, Any]] = []
         for addr, call_site in by_addr.items():
-            for var, _defn in reaching_arg_seed_vars(func, addr, reg, bn):
+            for var, _defn in self._register_provenance(func, addr, reg, bn)[1]:
                 seeds.append((var, call_site))
         return (reg, seeds)
+
+    def _register_provenance(self, func: Any, addr: int, reg: str,
+                             bn: Any) -> tuple[str, list[tuple[Any, Any]]]:
+        """:func:`argument_register_provenance`, once per (function, call,
+        register), over a call-site index built once per function.
+
+        Both the seed bridge and the entry-value question ask it of the same
+        call, and the forward walk asks again on every fixpoint pass; each
+        ask scanned the function's whole LLIL to find the call (P2-06)."""
+        start = int(getattr(func, "start", 0))
+        key = (start, int(addr), str(reg))
+        hit = self._provenance_cache.get(key)
+        if hit is None:
+            if start not in self._llil_calls_cache:
+                self._llil_calls_cache[start] = llil_call_sites(func, bn)
+            hit = argument_register_provenance(
+                func, addr, reg, bn, calls_at=self._llil_calls_cache[start] or {})
+            self._provenance_cache[key] = hit
+        return hit
 
     def _pointee_var(self, ssaf: Any, expr: Any, depth: int = 0) -> Any:
         """Follow a pointer expression to the underlying stack Variable.
@@ -1962,7 +2205,7 @@ class TaintEngine:
                     c = getattr(val, "value", val)
                 try:
                     return (("gload", int(c)), 0)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return None
             return None
         if "CONST_PTR" in op:
@@ -1978,7 +2221,7 @@ class TaintEngine:
                 c = getattr(val, "value", val)
             try:
                 return (("gconst", int(c)), 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
         if op in ("MLIL_ADD", "MLIL_SUB"):
             left = getattr(expr, "left", None)
@@ -3980,10 +4223,11 @@ class TaintEngine:
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
-        except RecursionError:
-            # Defense in depth: should not happen now that thunk-following and the
-            # SSA/call walks are cycle-guarded, but a pathological binary must
-            # degrade to a bounded, honest result rather than crash the whole op.
+        except RecursionError as exc:
+            # Defense in depth: should not happen now that thunk-following, the
+            # SSA/call walks and the global-object scan are cycle-guarded or
+            # iterative, but a pathological binary must degrade to a bounded,
+            # honest result rather than crash the whole op.
             # What was ALREADY OBSERVED survives: discarding it reported
             # `reached_sinks: []` for a `system(s)` the walk had seen several
             # instructions before the cycle, which is strictly worse than the
@@ -3991,22 +4235,34 @@ class TaintEngine:
             # findings -- those are mirrored into `_salvage` as they are made.
             self._truncated = True
             self._truncation_causes.add("recursion")
+            cut_depth, cut_fn = self._recursion_cut(exc, func)
+            where = self._prose_function(cut_fn)
+            if cut_depth > 0:
+                # Only a bound the walk can obey is offered: below the depth
+                # of the cut the descent that hit it never happens.
+                remedy = (f"re-run with --max-depth {cut_depth - 1} to finish the "
+                          f"region above the cut (it is at depth {cut_depth}, in {where})")
+            else:
+                # A cut inside the seeded function itself is not a depth
+                # problem: --max-depth 0 hits it identically (P1-02).
+                remedy = (f"no --max-depth avoids it -- the cut is in the seeded "
+                          f"function {where} itself; seed past it from a callee "
+                          "(-f <callee> --source param:<n>)")
             sub = {"findings": list(self._salvage["findings"]),
                    "leaves": list(self._salvage["leaves"]) + [{
                        "kind": "analysis_truncated",
-                       "address": hex(int(getattr(func, "start", 0))),
+                       "address": hex(int(getattr(cut_fn, "start", 0))),
                        "cause": "recursion",
+                       "depth": cut_depth,
                        "detail": (
-                           "the walk hit Python's recursion limit (an unresolved "
-                           "cycle) and unwound: what it had already found is "
-                           "reported, what it had not reached was never walked. "
-                           "An empty or short result here is NOT an all-clear -- "
-                           "re-run with a lower --max-depth to get a bounded, "
-                           "complete answer over the region it can finish."),
+                           "the walk hit Python's recursion limit and unwound: "
+                           "what it had already found is reported, what it had "
+                           "not reached was never walked. An empty or short "
+                           f"result here is NOT an all-clear -- {remedy}."),
                    }],
                    "assumptions": [
                 f"analysis of {func.name} truncated: Python recursion limit reached "
-                "while propagating taint (possible unresolved cycle); results incomplete"]}
+                f"at depth {cut_depth} in {where}; results incomplete"]}
         # A missing output reached from several contexts (or kept twice by the
         # recursion salvage) is ONE boundary with merged sources.
         sub["leaves"] = merge_unrecovered_leaves(sub["leaves"])
@@ -4083,6 +4339,25 @@ class TaintEngine:
         if not unique_findings:
             result["diagnostics"] = self._forward_zero_diagnostics(sub, func)
         return result
+
+    @staticmethod
+    def _recursion_cut(exc: BaseException, func: Any) -> tuple[int, Any]:
+        """``(walk depth, function)`` of the deepest function visit the
+        unwinding RecursionError passed through, else ``(0, func)``.
+
+        Read from the traceback rather than tracked on every visit: it is
+        only ever wanted on this path, and the frames are the record."""
+        depth, where = 0, func
+        code = TaintEngine._run_forward.__code__
+        tb = exc.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            if frame.f_code is code:
+                local = frame.f_locals
+                if isinstance(local.get("depth"), int) and local.get("func") is not None:
+                    depth, where = local["depth"], local["func"]
+            tb = tb.tb_next
+        return depth, where
 
     def _forward_zero_diagnostics(self, sub: dict[str, Any], func: Any) -> dict[str, Any]:
         """Frontier diagnostics for a zero-sink forward run (#559).
@@ -4635,7 +4910,7 @@ class TaintEngine:
                 c = getattr(v, "value", v)
             try:
                 return int(c)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
         if is_ssa_var(expr):
             try:
@@ -5455,7 +5730,7 @@ class TaintEngine:
             c = getattr(expr, "constant", None)
             try:
                 return int(c) if c is not None else None
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
         return None
 
@@ -5522,8 +5797,7 @@ class TaintEngine:
         (not a PLT/import thunk, which we model instead)."""
         return self._not_internal_reason(fn) is None
 
-    @staticmethod
-    def _not_internal_reason(fn: Any) -> str | None:
+    def _not_internal_reason(self, fn: Any) -> str | None:
         """Why a call target is NOT descended into, or None when it is.
 
         ``no_function`` / ``import`` are the genuinely external shapes;
@@ -5532,9 +5806,24 @@ class TaintEngine:
         bodies Binary Ninja did not analyse (an oversized function past
         ``analysis.limits.maxFunctionSize``, a failed lift) -- the caveat for
         those must not call the function "external" (#1001 item 3). The import
-        check runs first: a PLT stub is a thunk AND an import symbol."""
+        check runs first: a PLT stub is a thunk AND an import symbol.
+
+        Memoised per function start: the answer lifts the body, and the
+        reachability sweep asks it of the same functions thousands of times
+        (P1-01) -- once per request also makes it one answer per request."""
         if fn is None:
             return "no_function"
+        start = getattr(fn, "start", None)
+        if start is None:
+            return self._classify_call_target(fn)
+        key = int(start)
+        if key not in self._internal_cache:
+            self._internal_cache[key] = self._classify_call_target(fn)
+        return self._internal_cache[key]
+
+    @staticmethod
+    def _classify_call_target(fn: Any) -> str | None:
+        """:meth:`_not_internal_reason`'s uncached answer for a function."""
         sym = getattr(fn, "symbol", None)
         stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
         if stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
@@ -6191,6 +6480,15 @@ class TaintEngine:
                     if is_reg and storage in missing:
                         last[storage] = (cur, var_key(w), getattr(w, "version", None))
             evidence: list[dict[str, Any]] = []
+            # The entry-value path below can only ever cite one of THIS
+            # function's parameters at its entry version (what
+            # `_abi_arg_operands` hands back for an untouched register). With
+            # none of them tainted no missing register can carry taint that
+            # way, so neither the callee scan nor the ABI provenance is paid
+            # for it (P2-06).
+            entry_tainted = any(
+                (var_key(p), 0) in tainted or (var_key(p), None) in tainted
+                for p in (getattr(func, "parameter_vars", None) or ()))
             for storage, pos in sorted(missing.items(), key=lambda kv: kv[1]):
                 # Decisive gate against false frontiers: only flag when the callee
                 # actually READS this register as an input (read-before-write in its
@@ -6199,15 +6497,20 @@ class TaintEngine:
                 # PRIOR call) is not a dropped argument -- the callee never consumes
                 # it. Requiring the callee to use the register as an incoming value
                 # is what separates a genuine under-recovered arg from a leftover.
-                if not self._reg_reads_as_input(callee, arg_regs[pos]):
-                    continue
+                # A register the call's own block wrote is judged on that write
+                # FIRST: a clean write proves nothing reached the callee there,
+                # and the callee scan is only paid for a register that carries
+                # taint (P2-06 -- asked first, it ran for every missing register).
                 written = last.get(storage)
                 if written is not None:
                     cur, key, ver = written
-                    if (key, ver) in tainted or (key, None) in tainted \
-                            or _reads_tainted(cur):
+                    if ((key, ver) in tainted or (key, None) in tainted
+                            or _reads_tainted(cur)) \
+                            and self._reg_reads_as_input(callee, arg_regs[pos]):
                         evidence.append({"index": pos, "register": str(arg_regs[pos]),
                                          "via": "block_write"})
+                    continue
+                if not entry_tainted or not self._reg_reads_as_input(callee, arg_regs[pos]):
                     continue
                 # Nothing in this block WROTE the register -- and an optimised
                 # build writes nothing when the value is already there. The
@@ -6305,31 +6608,47 @@ class TaintEngine:
         versions >= 1), so finding it anywhere in the SSA operands means the callee
         uses the register's incoming value. Scans the LLIL-SSA operands directly so
         this module keeps importing no binaryninja symbols. Degrades to False on
-        any shortfall, so it never *adds* a frontier on uncertainty."""
+        any shortfall, so it never *adds* a frontier on uncertainty.
+
+        One scan per callee collects every register it reads at its entry
+        version, memoised for the engine's life: the body does not change
+        between the fixpoint's passes or between the calls that reach it, and
+        rescanning per (call, register, pass) was most of a small walk (P2-06)."""
+        start = getattr(callee, "start", None)
+        if start is None:
+            regs = self._entry_read_registers(callee)
+        else:
+            if int(start) not in self._entry_reads_cache:
+                self._entry_reads_cache[int(start)] = self._entry_read_registers(callee)
+            regs = self._entry_reads_cache[int(start)]
+        return regs is not None and reg_name in regs
+
+    @staticmethod
+    def _entry_read_registers(callee: Any) -> frozenset[str] | None:
+        """The registers *callee*'s LLIL-SSA reads at version 0, or None when
+        it has no LLIL-SSA. A BN-API failure part-way keeps what was read
+        before it -- the answer the per-register scan gave in that case."""
+        found: set[str] = set()
         try:
             lssa = getattr(getattr(callee, "llil", None), "ssa_form", None)
             if lssa is None:
-                return False
+                return None
 
-            def _has_entry_read(node: Any, depth: int = 0) -> bool:
+            def _collect(node: Any, depth: int = 0) -> None:
                 if depth > 12:
-                    return False
+                    return
                 for op in getattr(node, "operands", []) or []:
                     if type(op).__name__ == "SSARegister":
-                        if getattr(op, "version", None) == 0 \
-                                and str(getattr(op, "reg", "")) == reg_name:
-                            return True
+                        if getattr(op, "version", None) == 0:
+                            found.add(str(getattr(op, "reg", "")))
                     elif hasattr(op, "operands"):
-                        if _has_entry_read(op, depth + 1):
-                            return True
-                return False
+                        _collect(op, depth + 1)
 
             for ins in lssa.instructions:
-                if _has_entry_read(ins):
-                    return True
-            return False
+                _collect(ins)
         except Exception:
-            return False
+            pass
+        return frozenset(found)
 
     def _call_targets_from_pvs(self, pvs: Any) -> list[int]:
         """Concrete call-target addresses from a PossibleValueSet (delegates to
@@ -6737,7 +7056,7 @@ class TaintEngine:
             if raw is not None:
                 try:
                     value = int(raw)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     value = None
                 if value is not None and ga <= value and (
                         value < ga + self._global_extent(ga)
@@ -6767,7 +7086,9 @@ class TaintEngine:
         if raw is not None:
             try:
                 value = int(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError: an MLIL FLOAT constant can be `inf`, which
+                # names no address and used to escape the whole op (P1-03).
                 value = None
             if value is not None and (
                     ga <= value < ga + self._global_extent(ga)
@@ -7705,7 +8026,7 @@ class TaintEngine:
         touched = False
         empty_only = False
         first_at = int(getattr(instrs[0], "address", 0)) if instrs else None
-        scan = _ScanBudget(self._PTR_SCAN_NODES)
+        scan = self._scan_budget(self._PTR_SCAN_NODES)
 
         def resolves(expr: Any, *, alias: bool = True) -> bool:
             nonlocal touched
@@ -7726,7 +8047,17 @@ class TaintEngine:
             collect.append(use)
             return None
 
-        for ins in instrs:
+        scan_instrs = instrs
+        if scan.shared is not None and scan.shared.spent and instrs:
+            # The request's sweep allowance is gone (P1-01): this body is not
+            # classified at all, and the answer says so -- an unfinished
+            # classification, never a body that reads nothing.
+            scan.cause = "reference_sweep_budget"
+            hit_use = emit(verdict(instrs[0], "sweep_budget_exhausted"))
+            if hit_use is not None:
+                return hit_use
+            scan_instrs = []
+        for ins in scan_instrs:
             opn = op_name(ins)
             if scan.nodes <= 0:
                 # The scan ran out before it could account for the rest of
@@ -7738,6 +8069,7 @@ class TaintEngine:
                 if hit_use is not None:
                     return hit_use
                 break
+            scan.charge_sweep()
             if self._is_call(ins):
                 params = self._call_params(ins)
                 hit = [i for i, p in enumerate(params) if resolves(p)]
@@ -8597,50 +8929,39 @@ class TaintEngine:
         return any(self._il_reaches(ssaf, int(site), at) for site in sites)
 
     def _il_reaches(self, ssaf: Any, src: int, dst: int) -> bool:
-        """Whether IL index *dst* is reachable from *src* through the CFG."""
-        blocks = list(getattr(ssaf, "basic_blocks", None) or ())
-        if not blocks:
-            return True            # no CFG to read: claim nothing
+        """Whether IL index *dst* is reachable from *src* through the CFG.
 
-        def holding(idx: int) -> Any:
-            for block in blocks:
-                try:
-                    if int(block.start) <= idx < int(block.end):
-                        return block
-                except Exception:
-                    return None
-            return None
-        start, goal = holding(src), holding(dst)
+        The block layout and each source block's reachable set are built
+        once per SSA function and reused: asked per (call site, global), an
+        uncached BFS re-listed BN's blocks and re-walked their edges through
+        the FFI on every query, and was most of a forward run's wall time on
+        a binary whose globals are written early (P1-01)."""
+        cfg = self._cfg_index(ssaf)
+        if cfg is None:
+            return True            # no CFG to read: claim nothing
+        start, goal = cfg.holding(src), cfg.holding(dst)
         if start is None or goal is None:
             return True
-        if dst > src and int(getattr(start, "start", -1)) == int(
-                getattr(goal, "start", -2)):
+        if dst > src and start == goal:
             return True            # same block, later instruction
         # Otherwise a PATH is needed -- including the one a loop's back edge
         # makes from the write round to an earlier call, which is a real way
         # for those bytes to reach it.
-        seen: set[int] = set()
-        wave = [start]
-        while wave:
-            nxt = []
-            for block in wave:
-                try:
-                    edges = list(getattr(block, "outgoing_edges", None) or ())
-                except Exception:
-                    return True
-                for edge in edges:
-                    target = getattr(edge, "target", None)
-                    if target is None:
-                        return True
-                    key = int(getattr(target, "start", -1))
-                    if key in seen:
-                        continue
-                    if key == int(getattr(goal, "start", -2)):
-                        return True
-                    seen.add(key)
-                    nxt.append(target)
-            wave = nxt
-        return False
+        reach, opaque = cfg.closure(start)
+        return opaque or goal in reach
+
+    def _cfg_index(self, ssaf: Any) -> _CfgIndex | None:
+        """The memoised :class:`_CfgIndex` of *ssaf*, or None with no CFG.
+
+        Keyed by the SSA function object itself (held, so its id cannot be
+        reused while the entry lives): the engine is per request, and one
+        walk of a function holds one SSA object."""
+        hit = self._cfg_cache.get(id(ssaf))
+        if hit is not None and hit[0] is ssaf:
+            return hit[1]
+        cfg = _CfgIndex.build(ssaf)
+        self._cfg_cache[id(ssaf)] = (ssaf, cfg)
+        return cfg
 
     # How far back an enclosing object may begin, and how many symbolled
     # predecessors the search will walk to find it. An alias/subobject names
@@ -8742,6 +9063,7 @@ class TaintEngine:
         self._neighbour_uses_cache.clear()
         self._global_direct_stores.clear()
         self._global_search_truncated.clear()
+        self._region_checks.clear()
         self._global_refs_truncated.clear()
         # ...and the answers computed FROM them.
         self._global_extent_cache.clear()
@@ -9086,12 +9408,7 @@ class TaintEngine:
         key = (int(getattr(fn, "start", 0)), int(ga))
         cached = self._reaches_object_cache.get(key)
         if cached is None:
-            self._reaches_object_cache[key] = False   # cycle guard
-            try:
-                cached = self._global_access(fn, ga).at is not None
-            except TaintError:
-                cached = False
-            self._reaches_object_cache[key] = cached
+            cached = self._settle_access(fn, ga, reach=True)
         return cached
 
     def _neighbour_uses(self, fn: Any, ssaf: Any, pb: int) -> list:
@@ -9112,6 +9429,76 @@ class TaintEngine:
             collect=uses)
         self._neighbour_uses_cache[key] = uses
         return uses
+    def _settle_access(self, fn: Any, ga: int, *, reach: bool) -> Any:
+        """Run :meth:`_global_access_steps` for *(fn, ga)* on an explicit stack.
+
+        An access asks whether *fn* reaches each object that precedes *ga*
+        (`_overlap_access` yields that question), and the answer is another
+        access one object further back -- a chain as long as the run of
+        symbols in the section. Settled by recursion it cost three frames per
+        object and hit Python's frame limit on an ordinary `main` (P1-02);
+        here each question is a stack entry, so the depth stays constant.
+
+        A ``reach`` entry is :meth:`_reaches_object`'s answer: while it is
+        in progress it reads False (the cycle guard), and a body that cannot
+        be read answers False instead of raising."""
+        def frame(f: Any, g: int, as_reach: bool) -> tuple[Any, tuple | None]:
+            rkey = (int(getattr(f, "start", 0)), int(g)) if as_reach else None
+            if rkey is not None:
+                self._reaches_object_cache[rkey] = False   # cycle guard
+            return self._global_access_steps(f, g), rkey
+
+        stack = [frame(fn, ga, reach)]
+        value: Any = None
+        while stack:
+            steps, rkey = stack[-1]
+            try:
+                ask = steps.send(value)
+            except StopIteration as done:
+                stack.pop()
+                value = done.value
+                if rkey is not None:
+                    value = self._reaches_object_cache[rkey] = value.at is not None
+                continue
+            except TaintError:
+                stack.pop()
+                if rkey is None:
+                    raise          # the root access: its caller's to handle
+                value = self._reaches_object_cache[rkey] = False
+                continue
+            qfn, qga = ask
+            known = self._reaches_object_cache.get(
+                (int(getattr(qfn, "start", 0)), int(qga)))
+            if known is not None:
+                value = known
+                continue
+            self._check_cancelled()
+            stack.append(frame(qfn, qga, True))
+            value = None
+        self._drain_region_checks()
+        return value
+
+    def _drain_region_checks(self) -> None:
+        """Settle the enclosing-object searches `_overlap_access` left open.
+
+        Whether a body names anything in an object's region is asked of every
+        global the body names, through `_global_access` -- each of which may
+        leave a search of its own open. Asked inline that was one recursion
+        level per distinct global, and the same (function, global) pair could
+        re-enter itself (P1-02). Asked here, once the access that found the
+        open search is cached, it is a worklist; the answer only decides a
+        disclosure, never the access itself, so it is the same answer."""
+        if self._region_draining:
+            return
+        self._region_draining = True
+        try:
+            while self._region_checks:
+                self._check_cancelled()
+                fn, ga = self._region_checks.pop()
+                if self._touches_object_region(fn, ga):
+                    self._global_search_truncated.add(ga)
+        finally:
+            self._region_draining = False
 
     def _overlap_access(self, fn: Any, ssaf: Any, ga: int) -> Any:
         """A use of a NEIGHBOURING object whose bytes reach into *ga*.
@@ -9139,14 +9526,15 @@ class TaintEngine:
         tainted = self._tainted_ranges(ga)
         start = int(getattr(fn, "start", 0))
         candidates, exhausted = self._preceding_objects(ga)
-        if exhausted and self._touches_object_region(fn, ga):
+        if exhausted:
             # The enumeration stopped with plausible enclosing objects
             # unexamined, so "nothing encloses it" was never established --
             # but only where it could MATTER. A fully analysed body that
             # names no global at all reads no object, enclosing or not, so
             # the unexamined storage cannot change its answer (round-14
-            # review F35).
-            self._global_search_truncated.add(ga)
+            # review F35). Whether it can is asked once this access is
+            # cached (`_drain_region_checks`, P1-02).
+            self._region_checks.append((fn, ga))
         unverified: tuple[int, Any] | None = None
         for pb in candidates:
             authoritative = self._authoritative_width(pb)
@@ -9170,13 +9558,15 @@ class TaintEngine:
             if separate:
                 # Only this body's own uses of the separate object can
                 # matter, and the scan below finds them -- through returned
-                # pointers too. Asking `_reaches_object` first would classify
-                # the neighbour in full, overlap of ITS neighbour included,
-                # and so on down the section: on a binary whose every object
-                # is declared that recursion cost more than the walk itself.
+                # pointers too. Asking whether *fn* reaches the neighbour
+                # first would classify it in full, overlap of ITS neighbour
+                # included, and so on down the section: on a binary whose
+                # every object is declared that cost more than the walk.
                 uses = self._neighbour_uses(fn, ssaf, pb)
+            # The yield asks `_settle_access` whether *fn* reaches *pb* --
+            # an answer that may need the objects before pb in turn (P1-02).
             elif start not in self._global_ref_functions(pb) \
-                    and not self._reaches_object(fn, pb):
+                    and not (yield (fn, pb)):
                 # No code reference FROM this body, and no route by which
                 # its own expressions resolve to that object either. A
                 # consumer that receives the address from a CALL names
@@ -9233,6 +9623,14 @@ class TaintEngine:
         cached = self._global_access_cache.get(key)
         if cached is not None:
             return cached
+        return self._settle_access(fn, ga, reach=False)
+
+    def _global_access_steps(self, fn: Any, ga: int) -> Any:
+        """:meth:`_global_access`'s body, run by :meth:`_settle_access`."""
+        key = (int(getattr(fn, "start", 0)), int(ga))
+        cached = self._global_access_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             ssaf = self._ssa_func(fn)
         except TaintError:
@@ -9250,7 +9648,7 @@ class TaintEngine:
         if out.at is None or out.kind == "write_only":
             # Nothing of THIS object was read here -- but an access to a
             # neighbouring symbol may still span into it (C1).
-            overlap = self._overlap_access(fn, ssaf, ga)
+            overlap = yield from self._overlap_access(fn, ssaf, ga)
             if overlap is not None:
                 out = overlap
         self._global_access_cache[key] = out
@@ -9371,6 +9769,7 @@ class TaintEngine:
         seen = {start}
         done: set[int] = set()
         budget_cut: str | None = None
+        swept_out = False
         wave, level, cut = [fn], 0, None
         while wave:
             if level > budget:
@@ -9378,6 +9777,12 @@ class TaintEngine:
                 break
             nxt = []
             for cur in wave:
+                self._check_cancelled()
+                if self._sweep_exhausted():
+                    # The request's sweep allowance is gone: what is still
+                    # queued is NOT examined, and the answer says so (P1-01).
+                    swept_out = True
+                    break
                 cs = int(getattr(cur, "start", 0))
                 done.add(cs)
                 reason = str(self._not_internal_reason(cur) or "")
@@ -9445,7 +9850,11 @@ class TaintEngine:
                     nxt.append(callee)
             # The budget stops DISCOVERY, never examination: everything
             # already queued is still looked at, so the bound only hides what
-            # it genuinely refused to enqueue.
+            # it genuinely refused to enqueue. The sweep allowance is the
+            # exception -- once it is spent, nothing more is looked at.
+            if swept_out:
+                cut = "reference_sweep_budget"
+                break
             wave, level = nxt, level + 1
         unexamined = sorted(set(known) - done)
         if not unexamined:
@@ -9481,7 +9890,9 @@ class TaintEngine:
         bounds = [c for c in (cut, *scan_cuts,
                               "unresolved_call_target" if opaque else None,
                               "unread_callee_body" if unread else None,
-                              budget_cut if unexamined else None) if c]
+                              budget_cut if unexamined else None,
+                              "reference_sweep_budget" if swept_out and unexamined
+                              else None) if c]
         status = self._reach_status(cut, len(done), unexamined, known,
                                     causes=bounds)
         status["unread_bodies"] = [
@@ -9844,9 +10255,10 @@ class TaintEngine:
                     "an indirect call whose target bn could not resolve "
                     "(pin it with --resolve-map and re-run)"),
                 "reference_sweep_budget": (
-                    "the bound on how much of one object's address range the "
-                    "reference sweep will ask for, so references past it were "
-                    "never enumerated"),
+                    "the reference sweep's bound -- on how much of one object's "
+                    "address range it will ask for, or on how much work one "
+                    "request's sweeps may spend -- so the references and "
+                    "readers past it were never examined"),
                 "unread_callee_body": (
                     "an in-binary callee body Binary Ninja did not analyse "
                     "(re-run after `bn decompile <callee> --force-analysis`)"),
@@ -9963,6 +10375,8 @@ class TaintEngine:
 
     def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
                      max_depth: int, *, top: bool) -> dict[str, Any]:
+        self._visits += 1
+        self._check_cancelled()
         ssaf = self._ssa_func(func)
         instrs = self._instrs(ssaf)
         self._funcs_visited.add(int(getattr(func, "start", 0)))
@@ -9998,12 +10412,20 @@ class TaintEngine:
         # including calls that run BEFORE the only write, which were then
         # reported as carrying tainted bytes across (round-10 review M2).
         live_global_sites: dict[int, set] = {}
-        # (call address, global address) already disclosed, so the fixpoint's
-        # repeated visits report one boundary, not one per pass.
+        # (call address, global address) already disclosed: one boundary per
+        # pair even where several IL instructions share the call's address.
         global_frontiers_seen: set[tuple[int, int]] = set()
-        # Call targets resolved for the global question, per call address, so
-        # the fixpoint's repeated visits pay BN's value-set query once.
+        # Call targets resolved for the global question, per call address.
         global_call_targets: dict[int, tuple[int, ...]] = {}
+        # IL index -> (instruction, direct target, whether an argument carried
+        # taint there) for every call or indirect jump the fixpoint crossed
+        # with a tainted global live. The continuation question is asked ONCE
+        # per (site, global) after the fixpoint converges, from the converged
+        # taint: asked at every visit, it re-ran the reachability search on
+        # every pass and was nearly all of a forward run (P1-01). Taint only
+        # grows, so the final visit's facts are the ones every earlier visit's
+        # answer would have been superseded by.
+        continuation_sites: dict[int, tuple[Any, int | None, bool]] = {}
         # Static-state tokenizers (`continuation` models, e.g. strtok): every
         # call SITE in THIS function whose `null_arg` was tainted, keyed by
         # (model key, IL index) -> (tainted node, call address, call
@@ -10197,10 +10619,8 @@ class TaintEngine:
             ``indirect_call_unresolved`` frontier owns that call."""
             addr = int(getattr(ins, "address", 0))
             # Cheapest filter first: a global already disclosed at this call,
-            # or one BN records no reference to anywhere, asks nothing of the
-            # call graph. The fixpoint revisits this instruction on every pass,
-            # so an unreachable-but-referenced global must not re-resolve the
-            # call's targets each time -- memoize them per call site.
+            # one whose tainting writes cannot reach the call, or one BN
+            # records no reference to anywhere, asks nothing of the call graph.
             pending = [ga for ga in sorted(live_globals)
                        if (addr, ga) not in global_frontiers_seen
                        and self._call_sees_global(ssaf, ins,
@@ -11410,6 +11830,7 @@ class TaintEngine:
             return changed, propagated
 
         for _ in range(self.max_iters):
+            self._check_cancelled()
             changed = False
             for ins in instrs:
                 opn = op_name(ins)
@@ -11420,7 +11841,7 @@ class TaintEngine:
                     # global crossed it silently (round-19 review F45). The
                     # same resolution applies: a `--resolve-map` pin names
                     # the real target, and nothing pinned is disclosed.
-                    note_global_continuation(ins, None, False)
+                    continuation_sites[ins_key(ins)] = (ins, None, False)
 
                 # #206 flow-sensitive honesty: a tainted value that reaches an
                 # unlifted/unimplemented instruction passes through an op BN's
@@ -11577,7 +11998,8 @@ class TaintEngine:
                     # or no code-ref DB means nothing is emitted, so this is
                     # never a blanket marker on every call after a global write.
                     if live_globals:
-                        note_global_continuation(ins, target, bool(tainted_args))
+                        continuation_sites[ins_key(ins)] = (
+                            ins, target, bool(tainted_args))
                     if not tainted_args:
                         # The MLIL call recovered no tainted arg -- but BN may have
                         # under-recovered the callee's arity (Thumb 0-arity miss /
@@ -12199,6 +12621,17 @@ class TaintEngine:
             # "no sinks reached" indistinguishable from a converged run.
             self._truncated = True
             self._truncation_causes.add("fixpoint_exhausted")
+
+        # IC03, asked once per (site, global) from the converged taint: which
+        # globals are live, where they were written and whether the call
+        # carried tainted arguments only grow across passes (P1-01).
+        sweeping, self._sweeping = self._sweeping, True
+        try:
+            for _site in sorted(continuation_sites):
+                self._check_cancelled()
+                note_global_continuation(*continuation_sites[_site])
+        finally:
+            self._sweeping = sweeping
 
         # The in-function continuations the fixpoint followed, written from the
         # converged taint, one caveat per (continuation, arming site). A clean
@@ -13354,6 +13787,8 @@ class TaintEngine:
         is the consumer's demand on what the seed points to (``walk``): set for
         an ``arg:`` sink, and for the caller ascent of a parameter the callee
         read through; None when no consumer reads through the seed."""
+        self._visits += 1
+        self._check_cancelled()
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
         visited_vars: set = set()

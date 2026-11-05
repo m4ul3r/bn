@@ -1418,6 +1418,83 @@ def test_cancel_request_marks_only_active_requests(monkeypatch):
     assert instance._is_request_cancelled("req-1") is False
 
 
+def _taint_one_call_program(monkeypatch, instance):
+    """`main(argv) { system(argv); }` behind the bridge's taint op."""
+    from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar
+
+    argv = FVar("argv")
+    argv0 = FSSA(argv, 0)
+    func = FFunc("main", 0x401100, FSSAFunc([
+        FInstr(0, 0x401104, "MLIL_CALL_SSA", "system(argv#0)", reads=[argv0],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "argv#0", reads=[argv0])])]), params=[argv])
+    bv = FBV({0x401070: "system"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda view, ident, **kw: func)
+    return {"op": "taint", "target": "t",
+            "params": {"function": "main", "direction": "forward", "sources": ["param:0"]}}
+
+
+def test_a_cancelled_taint_request_answers_with_a_cancelled_status(monkeypatch):
+    # P1-07: the walk polls the request's cancel flag (a cancel_request, or
+    # a client that hung up) and stops with a structured outcome, so a client
+    # still listening can tell the cancel was honoured.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    payload = _taint_one_call_program(monkeypatch, instance)
+
+    with bridge._request_cancel_context(lambda: True):
+        cancelled = instance.dispatch(payload)
+    assert cancelled["ok"] is False, cancelled
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["observed"] == {"cancelled": True, "functions_visited": 1}
+
+    with bridge._request_cancel_context(lambda: False):
+        completed = instance.dispatch(payload)
+    assert completed["ok"] is True, completed
+    assert [f["sink"]["callee"] for f in completed["result"]["reached_sinks"]] == ["system"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="POLLHUP on a Unix socket is Linux-specified")
+def test_only_a_client_that_hung_up_reads_as_cancelled(monkeypatch):
+    # A SIGTERM'd or timed-out client sends no cancel; its hang-up is the
+    # signal. The CLI's own half-close while it waits must not read as one.
+    bridge = _load_bridge(monkeypatch)
+    waiting, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with waiting:
+        client.sendall(b"{}\n")
+        client.shutdown(socket.SHUT_WR)
+        assert bridge._peer_hung_up(waiting) is False
+        client.close()
+        assert bridge._peer_hung_up(waiting) is True
+
+
+def test_an_unexpected_op_exception_is_logged_with_its_traceback(monkeypatch, capsys):
+    # P1-03: the client sees `internal error: <class>: <message>` only; the
+    # bridge log must say where it was raised.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    payload = _taint_one_call_program(monkeypatch, instance)
+
+    def float_to_address(*_a, **_k):
+        return int(float("inf"))
+
+    monkeypatch.setattr(instance, "_taint", float_to_address)
+    response = instance.dispatch(payload)
+    assert response["error"].startswith("internal error: OverflowError"), response
+    logged = capsys.readouterr().err
+    assert "Traceback (most recent call last)" in logged
+    assert "float_to_address" in logged and "OverflowError" in logged
+
+    # A user-facing refusal is the expected answer to a bad request: no trace.
+    def refuse(*_a, **_k):
+        raise bridge.OperationFailure("unsupported", "no such source")
+
+    monkeypatch.setattr(instance, "_taint", refuse)
+    assert instance.dispatch(payload)["error"] == "no such source"
+    assert "Traceback" not in capsys.readouterr().err
+
+
 def _cancel_through_handler(bridge, inst, request_id, identity, op="cancel_request"):
     line = json.dumps({
         "id": "cancel-1", "op": op, "params": {"request_id": request_id},
