@@ -116,6 +116,8 @@ bn spill gc --dry-run
 
 `--out` writes an artifact and prints a small envelope. JSON envelopes identify `artifact_path`, `format`, `bytes`, `sha256`, and the source `target`/`instance`; check provenance before consuming a shared file. A text `xrefs` view may cap displayed caller groups even without a spill; use `--format json`, `--limit`, or `--out` for counts. `--lines START:END` is 1-indexed, inclusive, and text-only on decompile, IL, disasm, and structured IL. An out-of-range window errors rather than returning an empty answer. `bn spill gc` reclaims cached spill days; `--out` artifacts are caller-owned.
 
+A spilled artifact gets a provenance sidecar beside it, `<artifact>.meta.json` (the envelope's `meta_path`), recording `instance`, `target`, the command `argv`, the artifact's `sha256` and `bytes`, and `created` (UTC); `bn spill gc` removes it with its artifact's day. An envelope `summary` lists at most 10 sorted `keys`; when the result has more it adds `keys_truncated: true` and `keys_total`.
+
 For paged reads, `--out` removes the default 100-row limit only when `--limit` is omitted; an explicit limit still wins, and `--offset` still applies. In particular, `bn data symbols --offset 0 --out /tmp/bn-data-symbols.json` requests the whole set in one bridge call. Each `data symbols` page otherwise rebuilds the full named-symbol population under the read lock, even though it builds rows only for that page. Prefer the one-request export when building a complete index; it avoids repeated scans, not the cost of one full scan and row build. See [Data-symbol pagination cost](reading.md#data-symbol-pagination-cost) for the large-page alternative and wire-level `limit: "all"` spelling.
 
 ## Discovery and troubleshooting

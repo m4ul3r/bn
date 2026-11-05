@@ -34,6 +34,8 @@ class _Ctx:
 def unanalysed(monkeypatch):
     class _Engine(rts._taint.TaintEngine):
         def forward(self, func, locators, **kw):
+            # The walk reaches the indirect call at 0x4011f0 and consults its pin.
+            self.resolve_map.get(0x4011F0)
             return {"direction": "forward", "reached_sinks": [], "leaves": [],
                     "run_params": {"max_depth": kw.get("max_depth")}}
 
@@ -65,7 +67,9 @@ def test_forward_run_echoes_sink_classes_resolve_map_and_models(unanalysed, tmp_
     })
     rp = result["run_params"]
     assert rp["sink_classes"] == ["file_write", "recv_overflow"]
-    assert rp["resolve_map"] == {"path": "maps/dispatch.json", "entries": 2}
+    # A pin the walk consulted is matched; one no walked call names is not.
+    assert rp["resolve_map"] == {"path": "maps/dispatch.json", "entries": 2,
+                                 "matched": ["0x4011f0"], "unmatched": ["0x401200"]}
     assert [m["path"] for m in rp["models"]] == [str(overlay)]
     # The knobs the engine echoes itself are kept, not replaced.
     assert rp["max_depth"] == 8
@@ -78,4 +82,5 @@ def test_backward_run_echoes_resolve_map_but_has_no_sink_classes(unanalysed):
     })
     rp = result["run_params"]
     assert "sink_classes" not in rp
-    assert rp["resolve_map"] == {"path": "m.json", "entries": 1}
+    assert rp["resolve_map"] == {"path": "m.json", "entries": 1,
+                                 "matched": [], "unmatched": ["0x4011f0"]}

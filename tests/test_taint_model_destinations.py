@@ -643,29 +643,35 @@ def test_the_model_run_covers_formats_of_0_to_4_conversions_exactly(models, conv
     assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
 
 
-@pytest.mark.parametrize(("conversions", "ndest", "recovered", "missing"), [
-    (5, 4, 4, 1),     # BN recovered exactly the four slots the model enumerates
-    (5, 5, 5, 1),     # BN recovered all five; the MODEL is the shortfall
-    (6, 4, 4, 2),
-    (6, 6, 6, 2),     # ...and two recovered arguments the model never names
+@pytest.mark.parametrize(("conversions", "ndest", "kind", "count"), [
+    # BN recovered exactly the four slots the model enumerates: the fifth
+    # destination is an argument BN did not recover.
+    (5, 4, "format_destination_unrecovered", 1),
+    # BN recovered all five; the MODEL's run is the shortfall.
+    (5, 5, "scanf_arity_residual", 1),
+    (6, 4, "format_destination_unrecovered", 2),
+    (6, 6, "scanf_arity_residual", 2),
 ])
 def test_a_format_proven_destination_beyond_the_model_run_is_a_boundary(
-        models, conversions, ndest, recovered, missing):
-    # IC04 follow-up (F6): the arity-capped run is unrolled to four
-    # destinations. A five-conversion format with only those four arguments
-    # recovered, or with all five recovered but only four modeled, proves one
-    # output the engine never seeds. It must be disclosed even though NO
-    # *arg:N rule exists at the missing index -- the rule loop can never see
-    # it, and the run used to return a clean all-clear.
+        models, conversions, ndest, kind, count):
+    # IC04 follow-up (F6) / P2-12: the arity-capped run is unrolled to four
+    # destinations. A five-conversion format proves one output the engine
+    # never seeds, and WHY decides the leaf: an argument BN did not recover is
+    # `format_destination_unrecovered`, a recovered argument past the model's
+    # run is `scanf_arity_residual` -- one cause per leaf, never both.
     func, bv = _sscanf_func(_num_format(conversions), ndest)
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
 
-    [leaf] = [lf for lf in result["leaves"]
-              if lf["kind"] == "format_destination_unrecovered"]
-    assert (leaf["destinations"], leaf["recovered"], leaf["modeled"], leaf["missing"]) == \
-        (conversions, recovered, 4, missing), leaf
+    format_leaves = [lf for lf in result["leaves"]
+                     if lf["kind"] in ("format_destination_unrecovered", "scanf_arity_residual")]
+    [leaf] = format_leaves
+    assert leaf["kind"] == kind and leaf["destinations"] == conversions, leaf
+    assert leaf["missing" if kind == "format_destination_unrecovered" else "residual"] == count
     assert not _missing(result)          # still not a per-slot guess
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    # The format-proven residual is not repeated as the param-count assumption.
+    assert not any("scanf_arity_residual @" in a for a in result["assumptions"]), \
+        result["assumptions"]
 
 
 def test_an_unrelated_constant_input_parse_is_not_a_blocking_frontier(models):
@@ -690,17 +696,18 @@ def test_an_unrelated_constant_input_parse_is_not_a_blocking_frontier(models):
     assert result["diagnostics"]["safe_to_report_all_clear"] is True, result["diagnostics"]
 
 
-def test_a_recovered_fifth_destination_is_still_unmodeled(models):
+def test_a_recovered_fifth_destination_is_a_model_residual_not_an_unrecovered_one(models):
     # The same fact from the other side: BN recovered the fifth destination
     # (the forwarded pointer is a real argument), so this is NOT an argument
-    # recovery shortfall. The model still ends at *arg:5, and no seeded rule
-    # reaches the fifth output. One boundary, disclosed by count.
+    # recovery shortfall. The model still ends at *arg:5: the residual leaf
+    # names argument 6, and no unrecovered-destination leaf contradicts it.
     func, bv = _sscanf_func("%d %d %d %d %d", 5)
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
-    [leaf] = [lf for lf in result["leaves"]
-              if lf["kind"] == "format_destination_unrecovered"]
-    assert leaf["recovered"] == 5 and leaf["modeled"] == 4 and leaf["missing"] == 1
-    assert "model_destination_unrecovered" not in {lf["kind"] for lf in result["leaves"]}
+    kinds = [lf["kind"] for lf in result["leaves"]]
+    assert "format_destination_unrecovered" not in kinds, result["leaves"]
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "scanf_arity_residual"]
+    assert (leaf["modeled"], leaf["residual"], leaf["residual_args"]) == (4, 1, [6]), leaf
+    assert "model_destination_unrecovered" not in kinds
 
 
 def test_a_format_proven_shortfall_in_a_descended_callee_is_disclosed(models):

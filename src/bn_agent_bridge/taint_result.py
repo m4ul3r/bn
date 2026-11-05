@@ -54,6 +54,7 @@ Reconciliation notes:
 """
 from __future__ import annotations
 
+import json
 import shlex
 from typing import Any
 
@@ -96,13 +97,14 @@ BLOCKING_LEAF_KINDS = frozenset({
     # pointer it receives is not worked out; what it does with the bytes is
     # unchecked, so an empty reached_sinks is not an all-clear.
     "indirect_call_unchecked",
-    # #1050 review round 8: a scanf-family call whose fully read constant
-    # format writes destinations that were never seeded -- either because BN
-    # recovered fewer arguments than the format requires (forwarded incoming
-    # pointers left in their argument registers) or because an arity-capped
-    # model's unrolled destination run ends before the format does. Either way
-    # an empty result is no all-clear.
+    # #1050 review round 8 / P2-12: a scanf-family call whose fully read
+    # constant format writes destinations that were never seeded, one kind per
+    # cause: BN recovered fewer arguments than the format requires (forwarded
+    # incoming pointers left in their argument registers), or an arity-capped
+    # model's unrolled destination run ends before the recovered destinations
+    # do. Either way an empty result is no all-clear.
     "format_destination_unrecovered",
+    "scanf_arity_residual",
     # BN6-C009: a reached model rule declares a write into an argument BN did
     # not recover for that call. No output pointer is guessed, so what the
     # declared destination receives is unchecked -- not an all-clear.
@@ -166,6 +168,12 @@ BLOCKING_LEAF_KINDS = frozenset({
     # an absence of evidence. Emitted whether or not a model covers the call:
     # a model is an overlay on a body, never a substitute for reading one.
     "unread_callee_body",
+    # P2-02: a backward slice ended at a register's ENTRY value that no
+    # parameter of the function's recovered prototype is bound to (BN's armv7
+    # mapping puts a `long long`/`double` in `r2:r3` on the stack, leaving
+    # `entry_r2`). The value comes from the caller through a location the
+    # prototype does not map, so the caller ascent never ran: not an origin.
+    "abi_mapping_unbound",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -206,6 +214,28 @@ _RECV_FAMILY = frozenset({
     "recv", "recvfrom", "recvmsg", "recvmmsg",
     "read", "pread", "fread",
 })
+
+# How many of a function's callers seed advice names (W12-06/W10-03): the first
+# ones by callsite address, so two runs print the same list; the total is
+# always reported beside them.
+CALLER_ADVICE_LIMIT = 5
+
+
+def caller_seed_rows(callers: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    """``{function, address, reseed}`` for the first :data:`CALLER_ADVICE_LIMIT`
+    of *callers* (``{"function": <function ref>, "address": <callsite>}`` rows,
+    already in callsite-address order): ``reseed`` runs *source* forward from
+    that caller, as printed."""
+    rows = []
+    for caller in callers[:CALLER_ADVICE_LIMIT]:
+        fn_ref = str((caller.get("function") or {}).get("address"))
+        rows.append({
+            "function": caller.get("function"),
+            "address": caller.get("address"),
+            "reseed": (f"`bn taint forward -f {shlex.quote(fn_ref)} "
+                       f"--source {shlex.quote(source)}`"),
+        })
+    return rows
 
 
 def _assumption_has_weak_seed(assumptions: list[str]) -> bool:
@@ -325,6 +355,11 @@ def command_template(command: str) -> str:
     return f"template, fill in the UPPER-CASE words: `{command}`"
 
 
+# How many unpinned indirect call sites the --resolve-map advice names and
+# writes into its template document; every leaf carries its own row.
+_RESOLVE_MAP_SITES = 8
+
+
 def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int],
                          unmodeled_reached: bool, ext_no_model: bool,
                          tainted_values: int | None, function: str | None) -> str:
@@ -384,6 +419,22 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                     f"call:recvmsg cannot resolve its buffer either; seed the filled "
                     f"buffer directly{seed}, or run taint from the caller that builds "
                     f"the iovec")
+        owned = next((lf for lf in misanchored if lf.get("caller_seeds")), None)
+        if owned is not None:
+            # W12-06: the pointer is this function's own parameter, so the
+            # buffer belongs to its callers -- where it is a local or global
+            # the walk can key. Seeding the wrapper's argument there is the fix.
+            rows, total = owned["caller_seeds"], int(owned.get("callers_total") or 0)
+            param = owned["buffer_param"]
+            more = (f"; {total - len(rows)} more caller(s) are listed by "
+                    f"`bn xrefs {shlex.quote(str(param['function']))}`"
+                    if total > len(rows) else "")
+            return (f"{head}. The buffer is parameter {param['index']} of "
+                    f"{param['function']}, filled for its callers ({total} in total); "
+                    f"seed it where a caller passes it: "
+                    + ", ".join(f"{row['reseed']} (calls it at {row['address']})"
+                                for row in rows)
+                    + more)
         if fn:
             return (f"{head}. Reseeding with arg: or call: keys the same pointer and "
                     f"fails the same way; seed a value read from the buffer instead "
@@ -424,17 +475,30 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
                 "descend into it with the arguments taint reaches, which does not show "
                 "that the target receives this buffer")
     short = [lf for lf in leaves if lf.get("kind") == "format_destination_unrecovered"]
-    if short and all(lf.get("kind") in ("format_destination_unrecovered", "format_unchecked",
-                                         "indirect_call_unchecked") for lf in leaves):
-        at = ", ".join(sorted({str(lf.get("address")) for lf in short}))
-        seed = (f" ({command_template(forward(fn, 'param:N'))} for a pointer this "
-                f"function forwards)" if fn else "")
-        disasm = f" (`bn disasm {shlex.quote(fn)}`)" if fn else ""
-        return ("no sink reached, but a scanf-family call's format writes more "
-                f"destinations than the model covers or Binary Ninja recovered as "
-                f"arguments ({at}), so they were never seeded -- read that call's "
-                f"disassembly{disasm} to find which pointers it passes, and seed each "
+    residual = [lf for lf in leaves if lf.get("kind") == "scanf_arity_residual"]
+    format_kinds = ("format_destination_unrecovered", "scanf_arity_residual",
+                    "format_unchecked", "indirect_call_unchecked")
+    if (short or residual) and all(lf.get("kind") in format_kinds for lf in leaves):
+        parts = []
+        if short:
+            at = ", ".join(sorted({str(lf.get("address")) for lf in short}))
+            reads = ", ".join(f"`bn disasm {a} --linear 8`"
+                              for a in sorted({str(lf.get("address")) for lf in short}))
+            seed = (f" ({command_template(forward(fn, 'param:N'))} for a pointer this "
+                    f"function forwards)" if fn else "")
+            parts.append(
+                "a scanf-family call's format writes more destinations than Binary Ninja "
+                f"recovered as its arguments ({at}), so they were never seeded -- read "
+                f"the call ({reads}) to find which pointers it passes, and seed each "
                 f"one{seed}")
+        if residual:
+            at = ", ".join(sorted({str(lf.get("address")) for lf in residual}))
+            parts.append(
+                "a scanf-family call's format writes recovered destinations past the "
+                f"model's destination run ({at}), so they were never seeded -- a "
+                "`--models` overlay whose rules name those `*arg:N` destinations "
+                "(the leaf's `residual_args`) seeds them")
+        return "no sink reached, but " + "; and ".join(parts)
     unchecked = [lf for lf in leaves if lf.get("kind") == "format_unchecked"]
     if unchecked and len(unchecked) == len(leaves):
         at = ", ".join(sorted({str(lf.get("address")) for lf in unchecked}))
@@ -464,6 +528,25 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return ("confirmed extra arguments disagree with a determined nonvariadic "
                 f"declaration; recover the actual callee prototype with proto set{fix} "
                 "and re-run, or seed inside the callee to inspect the incomplete flow")
+    indirect = [lf for lf in unresolved if lf.get("kind") == "indirect_call_unresolved"]
+    if indirect and len(indirect) == len(unresolved) and not ext_no_model:
+        # W01-11: every unresolved call frontier is an indirect call nothing
+        # pinned, and the remedy that changes the next run's answer is to pin
+        # it: the leaves' `resolve_map_template` rows, merged, are the
+        # --resolve-map document with only the targets left to fill in.
+        # Hex addresses order numerically by (length, spelling).
+        sites = sorted({str(lf.get("address")) for lf in indirect}, key=lambda a: (len(a), a))
+        shown = sites[:_RESOLVE_MAP_SITES]
+        more = (f", and {len(sites) - len(shown)} more each leaf's row names"
+                if len(sites) > len(shown) else "")
+        doc = json.dumps({a: ["TARGET"] for a in shown})
+        rerun = (command_template(forward(fn, "SOURCE") + " --resolve-map FILE")
+                 if fn else "--resolve-map FILE")
+        return (f"taint reached {len(sites)} indirect call(s) whose target value-set "
+                f"analysis could not pin ({', '.join(shown)}{more}); the walk does not "
+                f"follow them. Find each call's target(s), write them into FILE as "
+                f"{doc} -- a target is an address or a function name -- and re-run "
+                f"with {rerun}")
     if unmodeled_reached:
         # An in-binary callee the walk did not descend (depth bound, recursion,
         # unanalysable body) and whose tainted argument is a named parameter
@@ -881,7 +964,8 @@ def backward_diagnostics(
                   "indirect_call_unresolved", "field_load_unresolved",
                   "address_of_local_unresolved", "pointer_object_unresolved",
                   "object_extent_unknown", "region_store_proof_not_certified",
-                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded")
+                  "pointer_demand_not_certified", "sink_role_unknown", "sink_unseeded",
+                  "abi_mapping_unbound")
     COARSE = ("coarse_memory_store", "pointer_escape")
     unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED) + int(unresolved_origins)
     coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
@@ -1076,11 +1160,11 @@ def backward_diagnostics(
             next_action += (
                 ". No sink model gives the selected argument a role, so it is treated as "
                 "a pointer the sink reads through (#931). If it is a value, declare it in "
-                "a model overlay: the leaf's `declare_value_role.entry` is a TEMPLATE "
-                "(replace the UPPER-CASE placeholders). An overlay entry replaces the "
-                "callee's whole model, so start from its current model -- `bn taint models "
-                "--format json` lists the catalog. Then add `--models FILE` to the same "
-                "command you ran")
+                "a model overlay: the leaf's `declare_value_role.entry` is the callee's "
+                "current model with that value role merged in (an overlay entry replaces "
+                "the callee's whole model); replace the UPPER-CASE value of each key its "
+                "`placeholders` names -- `bn taint models --format json` lists the "
+                "catalog. Then add `--models FILE` to the same command you ran")
         if any(lf.get("kind") == "address_of_local_unresolved" and lf.get("callee")
                for lf in unresolved_leaves):
             next_action += (
@@ -1159,6 +1243,8 @@ def misanchored_recv_leaf(
     reason: str = "buffer_not_keyed",
     seed: str = "arg",
     call_resolves_iovec: bool = True,
+    buffer_param: dict[str, Any] | None = None,
+    callers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Structured leaf for a seed that tainted a buffer POINTER but did not key
     the FILLED buffer as a stable taint location (#306/#562 dogfood footgun), so
@@ -1176,7 +1262,15 @@ def misanchored_recv_leaf(
     5); otherwise that reseed seeds nothing and is not suggested. For
     ``buffer_not_keyed`` both locators resolve the buffer through the same
     pointer, so ``call:`` would fail the same way and is never suggested
-    (``suggested_source`` is None)."""
+    (``suggested_source`` is None).
+
+    ``buffer_param`` (``{"function": <name>, "index": N}``) says the pointer is
+    parameter N of the seeded function itself -- a read wrapper whose callers
+    own the buffer (W12-06). Then ``callers`` (the function's direct callers,
+    ``{"function": <function ref>, "address": <callsite>}`` in callsite-address
+    order) become ``caller_seeds``: the first :data:`CALLER_ADVICE_LIMIT`, each
+    with a ``reseed`` that seeds ``arg:<function>:N`` there, where the buffer is
+    the caller's own; ``callers_total`` counts them all."""
     base = (callee or "").split("@", 1)[0].lstrip("_")
     locator = f"call:{base}" if seed == "call" else f"arg:{base}:{arg_index}"
     suggest: str | None
@@ -1213,6 +1307,27 @@ def misanchored_recv_leaf(
             "arg: and call: seeds key it the same way; seed a value read from "
             "the buffer with var:, or the consuming parser's parameter with "
             "param:, instead")
+    caller_seeds: list[dict[str, Any]] | None = None
+    if buffer_param is not None:
+        wrapper, pidx = str(buffer_param["function"]), int(buffer_param["index"])
+        caller_seeds = caller_seed_rows(callers or [], f"arg:{wrapper}:{pidx}")
+        total = len(callers or [])
+        if caller_seeds:
+            more = (f"; {total - len(caller_seeds)} more caller(s) are not listed"
+                    if total > len(caller_seeds) else "")
+            note = (
+                f"NOT an all-clear -- the buffer is parameter {pidx} of {wrapper}, "
+                f"so it belongs to {wrapper}'s callers ({total} in total): seed it "
+                f"where they pass it -- "
+                + ", ".join(f"{row['reseed']} (calls {wrapper} at {row['address']})"
+                            for row in caller_seeds)
+                + more)
+        else:
+            note = (
+                f"NOT an all-clear -- the buffer is parameter {pidx} of {wrapper}, "
+                f"and no direct caller of {wrapper} was found (it may be reached "
+                f"only indirectly); seed the consuming parser's parameter with "
+                f"param: instead")
     # One human sentence per leaf, under `detail` like every other kind: what
     # was missed, then why it is not an all-clear and what to seed instead.
     leaf: dict[str, Any] = {
@@ -1226,6 +1341,11 @@ def misanchored_recv_leaf(
     }
     if address is not None:
         leaf["address"] = address
+    if buffer_param is not None:
+        leaf["buffer_param"] = {"function": str(buffer_param["function"]),
+                                "index": int(buffer_param["index"])}
+        leaf["caller_seeds"] = caller_seeds
+        leaf["callers_total"] = len(callers or [])
     return leaf
 
 

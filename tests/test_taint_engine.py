@@ -963,10 +963,11 @@ def test_flow_signature_display_keeps_the_raw_grouping_key_1001():
     assert plain["rendered_display"] == plain["rendered"]
 
 
-def test_unresolved_in_binary_thunk_is_not_called_external_1001(models):
-    # #1001 review nit: after `--force-analysis` BN can turn an oversized body
-    # into an in-binary thunk. It is neither an import nor an external symbol,
-    # so it is not "external". With no tail call to name, say that.
+def test_a_flagged_body_with_no_mlil_is_an_unread_body_not_a_caveat(models):
+    # P2-03: BN flags a body a thunk and lifts no MLIL for it. It is neither an
+    # import nor an external symbol, and it was never read: an
+    # `unread_callee_body` leaf with its address and reason, never a prose
+    # caveat about a thunk.
     p = FVar("p", ident=40)
     p0 = FSSA(p, 0)
     stub = FFunc("fetch_input", 0xB00, FSSAFunc([]), is_thunk=True)
@@ -976,73 +977,102 @@ def test_unresolved_in_binary_thunk_is_not_called_external_1001(models):
     func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
     result = te.TaintEngine(FBV({}, funcs={0xB00: stub}), models).forward(
         func, [te.parse_locator("param:0")])
-    assert ("in-binary fetch_input is a thunk whose tail-call target did not resolve; "
-            "it has no model; return conservatively tainted -- read it with "
-            "`bn disasm 0xb00`") in result["assumptions"]
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+    assert (leaf["address"], leaf["callee"]["address"], leaf["skip_reason"]) == (
+        "0x20", "0xb00", "no_mlil")
+    assert result["stats"]["analysis_incomplete_functions"] == ["fetch_input"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
     # An import stub is still external, even though BN also marks it a thunk.
     plt = FFunc("fetch_input", 0xB00, FSSAFunc([]), is_thunk=True,
                 symbol_type="ImportedFunctionSymbol")
     result = te.TaintEngine(FBV({}, funcs={0xB00: plt}), models).forward(
         func, [te.parse_locator("param:0")])
     assert "external fetch_input has no model; return conservatively tainted" in result["assumptions"]
+    assert not [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
 
 
-def test_multi_instruction_thunk_names_its_resolved_tail_call_target_1001(models):
-    # #1001 review round 2: `follow_thunk` takes only a one-instruction body, so
-    # the oversized function BN turns into a thunk after `--force-analysis`
-    # (nops, then a tail call into the split-off body) stops here even though
-    # its target RESOLVES. The caveat names that target instead of claiming it
-    # did not resolve, and does not call the thunk unanalysed.
+_THUNK_SINK = 0x940
+
+
+def _tail_call_wrapper(body):
+    """``handle(p) { fetch_input(p); }`` where ``fetch_input`` is flagged a
+    thunk and its MLIL is *body* -- each shape ends in a tail call."""
     p = FVar("p", ident=40)
     p0 = FSSA(p, 0)
-    body = FFunc("sub_c00", 0xC00, FSSAFunc([FInstr(0, 0xC00, "MLIL_RET", "return")]))
-    stub = FFunc("fetch_input", 0xB00, FSSAFunc([
-        FInstr(0, 0xB00, "MLIL_NOP", "nop"),
-        FInstr(1, 0xB04, "MLIL_TAILCALL_SSA", "return 0xc00() __tailcall",
-               dest=FExpr("MLIL_CONST_PTR", "0xc00", constant=0xC00)),
-    ]), is_thunk=True)
+    stub = FFunc("fetch_input", 0xB00, FSSAFunc(body), is_thunk=True, params=[FVar("s", ident=41)])
     call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
                   dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
                   params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
     func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
-    result = te.TaintEngine(FBV({}, funcs={0xB00: stub, 0xC00: body}), models).forward(
-        func, [te.parse_locator("param:0")])
-    assert ("in-binary fetch_input is a thunk Binary Ninja made of a tail call to sub_c00 "
-            "@ 0xc00, which taint does not follow through a multi-instruction thunk; it has "
-            "no model; return conservatively tainted -- read the target with "
-            "`bn decompile 0xc00`") in result["assumptions"]
-    assert result["stats"]["analysis_incomplete"] is False
+    sink = FFunc("memcpy", _THUNK_SINK, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
+    return func, FBV({_THUNK_SINK: "memcpy"}, funcs={0xB00: stub, _THUNK_SINK: sink})
 
 
-def test_thunk_with_several_tail_calls_names_each_and_stop_note_reads_once_1001(models):
-    # A thunk with two tail-call targets names both; the `--unknown-call stop`
-    # leaf note says "in-binary" once, not "in-binary thunk (in-binary ...".
-    p = FVar("p", ident=40)
-    p0 = FSSA(p, 0)
-    bodies = {a: FFunc(f"sub_{a:x}", a, FSSAFunc([FInstr(0, a, "MLIL_RET", "return")]))
-              for a in (0xC00, 0xD00)}
-    stub = FFunc("fetch_input", 0xB00, FSSAFunc([
-        FInstr(0, 0xB00, "MLIL_TAILCALL_SSA", "return 0xc00() __tailcall",
-               dest=FExpr("MLIL_CONST_PTR", "0xc00", constant=0xC00)),
-        FInstr(1, 0xB08, "MLIL_TAILCALL_SSA", "return 0xd00() __tailcall",
-               dest=FExpr("MLIL_CONST_PTR", "0xd00", constant=0xD00)),
-    ]), is_thunk=True)
-    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
-                  dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
-                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
-    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
-    bv = FBV({}, funcs={0xB00: stub, **bodies})
+@pytest.mark.parametrize("shape", ["work-then-tail-call", "argument-swap"])
+def test_a_flagged_thunk_with_a_body_is_walked_like_any_other(models, shape):
+    # P2-03: BN flags any single-block body that ENDS in a tail call a thunk --
+    # an -O2 wrapper that does work first, or one that hands its argument on in
+    # another position. The body was skipped with a prose caveat and the sink
+    # inside it went unreported; it is walked like any other body.
+    s0 = FSSA(FVar("s", ident=41), 0)
+    if shape == "work-then-tail-call":
+        body = [
+            FInstr(0, 0xB00, "MLIL_CALL_SSA", "memcpy(0x5000, 0x6000, s#0)", reads=[s0],
+                   writes=[], dest=FExpr("MLIL_CONST_PTR", "0x940", constant=_THUNK_SINK),
+                   params=[FExpr("MLIL_CONST_PTR", "0x5000", constant=0x5000),
+                           FExpr("MLIL_CONST_PTR", "0x6000", constant=0x6000),
+                           FExpr("MLIL_VAR_SSA", "s#0", reads=[s0], src=s0)]),
+            FInstr(1, 0xB08, "MLIL_TAILCALL_SSA", "return 0xc00() __tailcall",
+                   dest=FExpr("MLIL_CONST_PTR", "0xc00", constant=0xC00), params=[]),
+        ]
+    else:
+        # `return memcpy(0x5000, 0x6000, s)`: one tail call, but its first
+        # argument is not the wrapper's own first parameter.
+        body = [FInstr(0, 0xB00, "MLIL_TAILCALL_SSA", "return memcpy(0x5000, 0x6000, s#0)",
+                       reads=[s0], dest=FExpr("MLIL_CONST_PTR", "0x940", constant=_THUNK_SINK),
+                       params=[FExpr("MLIL_CONST_PTR", "0x5000", constant=0x5000),
+                               FExpr("MLIL_CONST_PTR", "0x6000", constant=0x6000),
+                               FExpr("MLIL_VAR_SSA", "s#0", reads=[s0], src=s0)])]
+    func, bv = _tail_call_wrapper(body)
+    engine = te.TaintEngine(bv, models)
+    assert engine._not_internal_reason(bv.get_function_at(0xB00)) is None
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert [(s["sink"]["callee"], s["sink"]["address"], s["sink"]["class"])
+            for s in result["reached_sinks"]] == [("memcpy", "0xb00", "overflow_len")]
+    assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_a_pure_veneer_is_still_resolved_to_its_target(models):
+    # Control: `fetch_input(s) { return memcpy(s) __tailcall }` hands its own
+    # parameter on unchanged -- a veneer, resolved to the import as before.
+    s0 = FSSA(FVar("s", ident=41), 0)
+    body = [FInstr(0, 0xB00, "MLIL_TAILCALL_SSA", "return memcpy(s#0)", reads=[s0],
+                   dest=FExpr("MLIL_CONST_PTR", "0x940", constant=_THUNK_SINK),
+                   params=[FExpr("MLIL_VAR_SSA", "s#0", reads=[s0], src=s0)])]
+    func, bv = _tail_call_wrapper(body)
+    engine = te.TaintEngine(bv, models)
+    assert engine._not_internal_reason(bv.get_function_at(0xB00)) == "thunk"
+    assert engine._follow_thunk_cached(bv.get_function_at(0xB00)).start == _THUNK_SINK
+
+
+def test_a_skipped_thunk_with_stale_mlil_is_an_unread_body(models):
+    # W05-06: BN skipped the body (too large) but left stale MLIL and the
+    # thunk flag. A skipped body is unread whatever else is true of it.
+    s0 = FSSA(FVar("s", ident=41), 0)
+    func, bv = _tail_call_wrapper([
+        FInstr(0, 0xB00, "MLIL_TAILCALL_SSA", "return memcpy(s#0)", reads=[s0],
+               dest=FExpr("MLIL_CONST_PTR", "0x940", constant=_THUNK_SINK),
+               params=[FExpr("MLIL_VAR_SSA", "s#0", reads=[s0], src=s0)])])
+    stub = bv.get_function_at(0xB00)
+    stub.analysis_skipped = True
+    stub.analysis_skip_reason = type("SkipReason", (), {"name": "ExceedFunctionSizeSkipReason"})()
     result = te.TaintEngine(bv, models).forward(func, [te.parse_locator("param:0")])
-    assert ("in-binary fetch_input is a thunk Binary Ninja made of tail calls to sub_c00 @ "
-            "0xc00, sub_d00 @ 0xd00, which taint does not follow through a multi-instruction "
-            "thunk; it has no model; return conservatively tainted -- read the targets with "
-            "`bn decompile 0xc00`, `bn decompile 0xd00`") in result["assumptions"]
-    stopped = te.TaintEngine(bv, models, unknown_call_policy="stop").forward(
-        func, [te.parse_locator("param:0")])
-    note = next(l["detail"] for l in stopped["leaves"] if l["kind"] == "unmodeled_callee")
-    assert note.startswith("--unknown-call stop: taint reached this unmodeled thunk "
-                           "(in-binary fetch_input is a thunk"), note
-    assert note.count("in-binary") == 1, note
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "unread_callee_body"]
+    assert (leaf["callee"]["address"], leaf["skip_reason"]) == (
+        "0xb00", "analysis_skipped:ExceedFunctionSizeSkipReason")
+    assert result["stats"]["analysis_incomplete_functions"] == ["fetch_input"]
+    assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
 
 
 def test_forward_modeled_sink_arg_out_of_range_silent_when_untainted(models, monkeypatch):
@@ -5089,7 +5119,7 @@ def test_load_models_rejects_non_dict_model_value(monkeypatch, tmp_path):
 def test_load_models_accepts_valid_override_with_comment(monkeypatch, tmp_path):
     ok = tmp_path / "override.json"
     ok.write_text(
-        '{"my_custom_sink": {"sink": {"class": "x", "tainted_args": [0]}}, "_comment_x": "doc text"}',
+        '{"my_custom_sink": {"sink": {"class": "overflow_len", "tainted_args": [0]}}, "_comment_x": "doc text"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: ok)
@@ -8758,7 +8788,9 @@ def test_sscanf_c99_spelling_is_not_bypassed_809(models):
         func, [te.parse_locator("param:0")])
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
     assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
-    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
+    # One model for every ISO-C spelling: the C99 symbol resolves to the
+    # canonical key, exactly as the C23 one does.
+    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "sscanf"
 
 
 @pytest.mark.parametrize(("callee", "key"), [
@@ -8818,14 +8850,16 @@ def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
 @pytest.mark.parametrize(("callee", "model_key", "stream"), [
     ("__isoc23_scanf", "scanf", False),
     ("__isoc23_fscanf", "fscanf", True),
+    ("__isoc99_scanf", "scanf", False),
+    ("__isoc99_fscanf", "fscanf", True),
 ])
-def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
-    # The `call:` preset resolves the C23 alias to the canonical model, and the
-    # application-level check names that same key. Seeding a source spelling
-    # used to produce two leaves at one address -- the raw `__isoc23_*` name
-    # from the preset and the canonical key from the model check -- because
-    # dictionary-equality dedup compares the callee string. One shortfall,
-    # one leaf, named by the model the engine actually applied.
+def test_iso_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
+    # The `call:` preset resolves the ISO alias to the canonical model, and the
+    # application-level check judges the same call. Seeding a source spelling
+    # used to produce two leaves at one address -- one named by the preset,
+    # one by the model check -- because dictionary-equality dedup compares
+    # the callee string. One shortfall, one leaf: `callee` is the symbol the
+    # binary calls, `model` the canonical model the engine applied.
     args = ([FExpr("MLIL_VAR_SSA", "f#0", reads=[FSSA(FVar("f"), 0)])] if stream else [])
     args.append(FExpr("MLIL_CONST_PTR", "fmt", constant=0x700))
     args += [FExpr("MLIL_ADDRESS_OF", f"&d{i}", src=FVar(f"d{i}")) for i in range(4)]
@@ -8839,9 +8873,9 @@ def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, s
     short = [lf for lf in result["leaves"]
              if lf["kind"] == "format_destination_unrecovered"]
     assert len(short) == 1, short
-    assert short[0]["callee"] == model_key
-    assert (short[0]["destinations"], short[0]["modeled"],
-            short[0]["recovered"], short[0]["missing"]) == (5, 4, 4, 1), short[0]
+    assert (short[0]["callee"], short[0].get("model")) == (callee, model_key)
+    assert (short[0]["destinations"], short[0]["recovered"], short[0]["missing"]) == \
+        (5, 4, 1), short[0]
 
 
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
@@ -10152,14 +10186,18 @@ def test_roleless_overlay_entry_is_rejected_before_the_walk_915(models):
     assert "no recognised model role" in msg2 and "sink/sources/propagates" in msg2, msg2
 
     # Only the fields that ARM a sink are "misplaced", and only with no `sink`
-    # beside them: a prose annotation beside a real role is left alone (the
-    # docstring's forward-compat promise), as is a root-level `len_arg` next
-    # to a nested sink that already arms the entry (PR-928 review P3).
-    with_sink = te.load_models(extra={"app_recv": {"sink": {"class": "x", "tainted_args": [0]}, "len_arg": 1}})
-    assert with_sink["app_recv"]["sink"]["class"] == "x"
+    # beside them. Beside a real role, prose `detail` is allowed; any other key
+    # outside the vocabulary -- a root-level `len_arg` next to a nested sink,
+    # the sink's own `optional`/`gate` written at the root -- is refused naming
+    # it (P2-09: the old forward-compat latitude loaded typos as no-ops).
+    with pytest.raises(te.TaintError, match="unknown key `len_arg`"):
+        te.load_models(extra={"app_recv": {"sink": {"class": "overflow_len", "tainted_args": [0]},
+                                           "len_arg": 1}})
+    with pytest.raises(te.TaintError, match="unknown key `optional`"):
+        te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                                           "optional": True, "gate": "x"}})
     annotated = te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
-                                                   "detail": "project copy wrapper",
-                                                   "optional": True, "gate": "x"}})
+                                                   "detail": "project copy wrapper"}})
     assert annotated["app_copy"]["propagates"][0]["to"] == "*arg:0"
 
     benign = te.load_models(extra={"app_recv": {}})

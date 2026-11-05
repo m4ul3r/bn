@@ -729,7 +729,8 @@ def test_a_thunk_with_no_readable_body_still_fails_closed(models):
     result = _forward(bv, func, models)
     [leaf] = _leaves(result)
     assert leaf["references"] == [], leaf
-    assert leaf["reachability"]["cause"] == "unresolved_thunk"
+    # A flagged body with no MLIL is an unread body (P2-03), not a thunk.
+    assert leaf["reachability"]["cause"] == "unread_callee_body"
     assert leaf["reachability"]["unexamined_references"] == [hex(0x401500)]
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
@@ -4651,8 +4652,8 @@ def test_an_unreadable_thunk_keeps_its_single_cause(models):
                    objects={G_DIR: 0, G_DIR + 16: 0},
                    section=(0x404000, 0x405000))
     [leaf] = _leaves(_forward(bv, func, models))
-    assert leaf["reachability"]["cause"] == "unresolved_thunk", leaf
-    assert leaf["reachability"]["causes"] == ["unresolved_thunk"], leaf
+    assert leaf["reachability"]["cause"] == "unread_callee_body", leaf
+    assert leaf["reachability"]["causes"] == ["unread_callee_body"], leaf
 
 
 def _nested_writer_program(depth=3, taken=True):

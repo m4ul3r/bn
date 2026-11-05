@@ -104,9 +104,28 @@ def _locator_index(text: str, what: str) -> int:
     return n
 
 
+class ResolveMap(dict):
+    """A validated ``--resolve-map``: ``{call_address: [target, ...]}`` that
+    remembers which entries the walk actually consulted at a call it reached.
+
+    Every pin lookup goes through ``get``. A key that is no call site in the
+    walked region (a typo, a call in another function) was accepted and
+    ignored with no trace (W07-14); ``matched`` is what ``run_params`` echoes
+    beside the entry count, so an unmatched pin is visible."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.matched: set[int] = set()
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.matched.add(key)
+        return super().get(key, default)
+
+
 def normalize_resolve_map(raw: Any, *, origin: str = "--resolve-map",
                           find_function: Callable[[str], int] | None = None,
-                          ) -> dict[int, list[int]]:
+                          ) -> ResolveMap:
     """Validate a ``--resolve-map`` once, when it is loaded (#1041 item 3).
 
     The map was parsed lazily with ``int(x, 16)`` the first time an indirect
@@ -122,7 +141,8 @@ def normalize_resolve_map(raw: Any, *, origin: str = "--resolve-map",
     A string of bare digits is refused rather than guessed: the old parser read
     it as hex, ``-f`` reads it as decimal, and either guess silently maps the
     call somewhere else. Every refusal names ``origin`` (the file) and the
-    offending entry. Returns ``{call_address: [target_address, ...]}``."""
+    offending entry. Returns ``{call_address: [target_address, ...]}`` as a
+    :class:`ResolveMap`."""
     if not isinstance(raw, dict):
         raise TaintError(
             f"{origin}: expected a JSON object mapping indirect call addresses to "
@@ -145,7 +165,7 @@ def normalize_resolve_map(raw: Any, *, origin: str = "--resolve-map",
                 return None
         raise TaintError(f"{origin}: {what} {value!r} is not an address; write {spelling}")
 
-    out: dict[int, list[int]] = {}
+    out = ResolveMap()
     for key, targets in raw.items():
         call = None
         if isinstance(key, str) and key.strip().lower().startswith("0x"):
@@ -154,12 +174,13 @@ def normalize_resolve_map(raw: Any, *, origin: str = "--resolve-map",
             raise TaintError(
                 f"{origin}: key {key!r} is not a call address; keys are the indirect "
                 f"call's address as a 0x-prefixed hex string")
-        if isinstance(targets, (str, int)) and not isinstance(targets, bool):
-            targets = [targets]
+        # A bare scalar target used to be coerced to a one-element list; the
+        # documented shape is a list, and a coercion nobody documented is how
+        # a typo (a string where a list of names was meant) pins silently.
         if not isinstance(targets, list) or not targets:
             raise TaintError(
-                f"{origin}: {key} maps to {targets!r}; expected a non-empty list of "
-                f"target addresses or function names")
+                f"{origin}: {key} maps to {targets!r}; expected a non-empty JSON list "
+                f"of target addresses or function names, like [\"0x401176\"]")
         resolved: list[int] = []
         for target in targets:
             addr = address(target, f"{key} -> target")
@@ -318,7 +339,8 @@ def derive_flow_facts(*, direction: str,
     traverses = any(o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved",
                                       "address_of_local_unresolved", "pointer_object_unresolved",
                                       "object_extent_unknown", "region_store_proof_not_certified",
-                                      "pointer_demand_not_certified", "global"}
+                                      "pointer_demand_not_certified", "global",
+                                      "abi_mapping_unbound"}
                     for o in every)
     metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
                "traverses_unresolved": bool(traverses)}

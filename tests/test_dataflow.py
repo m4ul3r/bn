@@ -814,6 +814,46 @@ def test_missing_env_models_file_is_refused_like_a_missing_models_flag(
     assert "$BN_TAINT_MODELS" in env_env["error"] and "nope_env.json" in env_env["error"]
 
 
+@pytest.mark.parametrize("command", sorted(_MODELS_COMMANDS))
+@pytest.mark.parametrize("knob", ["--models", "$BN_TAINT_MODELS"])
+def test_an_empty_list_model_file_is_refused_like_a_non_empty_one(
+        monkeypatch, capsys, tmp_path, command, knob):
+    # P2-09: `[]` was falsy, so it was skipped -- exit 0 and no disclosure --
+    # while `[{...}]` was refused. Both are refused before any bridge, naming
+    # the file and the knob.
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    argv = _MODELS_COMMANDS[command]
+    for body in ("[]", '[{"app_copy": {}}]'):
+        mfile = tmp_path / "list.json"
+        mfile.write_text(body)
+        if knob == "--models":
+            rc, env = _refusal(monkeypatch, capsys, [*argv, "--models", str(mfile)])
+        else:
+            monkeypatch.setenv("BN_TAINT_MODELS", str(mfile))
+            rc, env = _refusal(monkeypatch, capsys, argv)
+        assert rc == 2, (body, env)
+        assert knob in env["error"] and str(mfile) in env["error"], env
+
+
+def test_taint_models_unknown_class_is_refused_with_the_valid_set(monkeypatch, capsys):
+    # The no-target catalog used to answer an unknown --class with an empty
+    # list at exit 0.
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    rc, env = _refusal(monkeypatch, capsys, ["taint", "models", "--class", "nonexistent_class"])
+    assert rc == 2
+    assert "nonexistent_class" in env["error"] and "overflow_len" in env["error"], env
+
+
+def test_taint_models_address_key_without_a_target_is_refused(monkeypatch, capsys, tmp_path):
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    mfile = tmp_path / "addr.json"
+    mfile.write_text(json.dumps({"0x401000": {"sources": [{"to": "ret"}]}}))
+    rc, env = _refusal(monkeypatch, capsys, ["taint", "models", "--models", str(mfile)])
+    assert rc == 2
+    assert "0x401000" in env["error"] and "need a target" in env["error"], env
+
+
+
 def test_taint_forward_both_set_forwards_the_overridden_env_path(monkeypatch, capsys, tmp_path):
     # --models wins (documented); the env file is not read -- even a missing one
     # is no refusal -- but its path rides along so the disclosure can name it.

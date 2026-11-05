@@ -1073,3 +1073,79 @@ def test_estimate_output_result_text_envelope_is_the_artifact_shape_796():
     assert fields["format"] == "text"
     assert int(fields["tokens"]) > 0 and int(fields["bytes"]) > 0
     assert "path" not in fields and "spilled" not in fields
+
+
+# --- spill provenance sidecar + truncated summary keys -----------------------
+
+def test_spill_writes_a_provenance_sidecar(tmp_path, monkeypatch):
+    """A spill artifact holds only the raw result; the sidecar ties it back to
+    the instance, target and command that produced it."""
+    import hashlib
+    import sys
+
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.setattr(output, "_spill_pruned", True)
+    monkeypatch.setattr(sys, "argv", ["bn", "-i", "inst-1", "-t", "demo.bndb", "taint", "forward"])
+
+    res = output.write_output_result({"items": ["x" * 400]}, fmt="json", out_path=None,
+                                     stem="taint-forward",
+                                     provenance={"target": "demo.bndb", "instance": "inst-1"})
+
+    artifact = Path(res.artifact["artifact_path"])
+    sidecar = Path(res.artifact["meta_path"])
+    assert sidecar == artifact.with_name(artifact.name + ".meta.json")
+    meta = json.loads(sidecar.read_text())
+    assert meta["kind"] == "spill_meta"
+    assert meta["artifact"] == artifact.name
+    assert meta["instance"] == "inst-1" and meta["target"] == "demo.bndb"
+    assert meta["argv"] == ["bn", "-i", "inst-1", "-t", "demo.bndb", "taint", "forward"]
+    assert meta["sha256"] == hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert meta["sha256"] == res.artifact["sha256"]
+    assert meta["bytes"] == artifact.stat().st_size
+    assert "created" in meta
+    assert sidecar.stat().st_mode & 0o077 == 0
+
+
+def test_spill_gc_removes_the_sidecar_with_its_artifact(tmp_path, monkeypatch):
+    from datetime import date, datetime, timedelta, timezone
+
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.setattr(output, "_spill_pruned", True)
+    res = output.write_output_result({"items": ["x" * 400]}, fmt="json", out_path=None,
+                                     stem="functions")
+    artifact = Path(res.artifact["artifact_path"])
+    sidecar = Path(res.artifact["meta_path"])
+    assert artifact.exists() and sidecar.exists()
+
+    later = datetime.now(timezone.utc).date() + timedelta(days=60)
+    report = output.gc_spills(root=output.spill_root(), today=date(later.year, later.month, later.day))
+
+    assert report["removed_count"] == 1
+    assert report["removed"][0]["files"] == 2
+    assert not artifact.exists() and not sidecar.exists()
+
+
+def test_spill_summary_marks_truncated_key_list(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    value = {f"k{index:02d}": "x" * 40 for index in range(12)}
+    res = write_output_result(value, fmt="json", out_path=None, stem="wide")
+
+    summary = res.artifact["summary"]
+    assert len(summary["keys"]) == 10
+    assert summary["keys_truncated"] is True
+    assert summary["keys_total"] == 12
+    assert summary["count"] == 12
+
+    small = write_output_result({f"k{index}": "x" * 80 for index in range(3)}, fmt="json",
+                                out_path=None, stem="narrow")
+    assert "keys_truncated" not in small.artifact["summary"]
+    assert "keys_total" not in small.artifact["summary"]

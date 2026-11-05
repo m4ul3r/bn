@@ -597,6 +597,7 @@ def _il(args: argparse.Namespace) -> int:
                       "json/ndjson do not produce, so passing it with --format "
                       "json is REFUSED rather than ignored. For a structured "
                       "slice, take the payload's text and slice it (#675 item 3)."),
+             mangled_arg(),
          ],
          estimable=True)
 def _function_structured_il(args: argparse.Namespace) -> int:
@@ -609,7 +610,8 @@ def _function_structured_il(args: argparse.Namespace) -> int:
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
         text_renderer=lambda value: _resolution_note(value)
-        + _slice_text_lines(_render_structured_il_text(value), lines_range),
+        + _slice_text_lines(_render_structured_il_text(value, mangled=bool(args.mangled)),
+                            lines_range),
         stem="structured-il",
     )
 
