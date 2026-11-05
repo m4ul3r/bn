@@ -3410,8 +3410,33 @@ def _single_call_argv(argv: list[str], instance: str | None) -> list[str]:
     return [*routing, *options, *argv[end:]]
 
 
+# D2-03: `bn doctor` runs the `bn` executable found on PATH with this variable
+# set to a fresh nonce; that executable answers with the code it actually runs.
+IDENTITY_PROBE_ENV = "BN_IDENTITY_PROBE"
+
+
+def _answer_identity_probe(nonce: str) -> int:
+    """Print which package this process imported and the bridge it would
+    spawn, echoing *nonce*, and do nothing else.
+
+    Answered before argument parsing and before any command runs, so the probe
+    cannot recurse: a wrapper that itself invokes `bn doctor` inherits the
+    variable and answers the probe instead of probing again. It runs through the
+    PATH executable rather than its shebang interpreter, so a broken shim fails
+    here and a wrapper that changes `sys.path` reports the package it imports."""
+    sys.stdout.write(json.dumps({
+        "identity_probe": nonce,
+        "module_dir": str(Path(__file__).resolve().parent),
+        "plugin_source_dir": str(plugin_source_dir()),
+    }) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
+    probe = os.environ.get(IDENTITY_PROBE_ENV)
+    if probe:
+        return _answer_identity_probe(probe)
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
     # Capture --format before parsing so argparse usage/type errors (which fire

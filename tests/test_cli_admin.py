@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import sys
 import types
 
 import bn.cli
@@ -6349,19 +6350,102 @@ def test_session_list_states_an_idle_shutdown_held_by_unsaved_targets(monkeypatc
 
 
 def _fake_bn_on_path(tmp_path, module_dir, plugin_dir):
-    """A `bn` script whose interpreter answers the identity probe with
-    *module_dir* / *plugin_dir*, like an install from another checkout."""
-    interpreter = tmp_path / "other-python"
-    interpreter.write_text(
-        "#!/bin/sh\n"
-        f"echo '{{\"module_dir\": \"{module_dir}\", \"plugin_source_dir\": \"{plugin_dir}\"}}'\n",
-        encoding="utf-8")
-    interpreter.chmod(0o755)
+    """A `bn` executable that answers the identity probe with *module_dir* /
+    *plugin_dir*, like an install from another checkout."""
     script = tmp_path / "bin" / "bn"
     script.parent.mkdir()
-    script.write_text(f"#!{interpreter}\nimport bn\n", encoding="utf-8")
+    script.write_text(
+        "#!/bin/sh\n"
+        "printf '{\"identity_probe\": \"%s\", \"module_dir\": \"%s\", "
+        "\"plugin_source_dir\": \"%s\"}\\n' "
+        f"\"$BN_IDENTITY_PROBE\" '{module_dir}' '{plugin_dir}'\n",
+        encoding="utf-8")
     script.chmod(0o755)
     return script
+
+
+def _python_bn_on_path(tmp_path, body: str):
+    """A `bn` script run by THIS interpreter, whose body is *body* -- the shape
+    of a console-script shim or a wrapper around one."""
+    script = tmp_path / "bin" / "bn"
+    script.parent.mkdir()
+    script.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def _doctor_path_cli(monkeypatch, capsys, script) -> tuple[dict, list[str]]:
+    monkeypatch.setattr("bn.commands.admin.shutil.which",
+                        lambda name: str(script) if name == "bn" else None)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    bn.cli.main(["doctor", "--format", "json"])
+    path_cli = json.loads(capsys.readouterr().out)["path_cli"]
+    bn.cli.main(["doctor"])
+    warnings = [line for line in capsys.readouterr().out.splitlines()
+                if line.startswith("warning: the `bn` on PATH")]
+    return path_cli, warnings
+
+
+def test_doctor_runs_the_bn_on_path_so_a_broken_shim_is_not_this_cli(
+        monkeypatch, tmp_path, capsys):
+    # D2-03: the shim's interpreter imports this very package, so probing the
+    # interpreter called it "same as this CLI" -- while a bare `bn` fails.
+    script = _python_bn_on_path(tmp_path, 'raise SystemExit("broken shim")\n')
+
+    path_cli, warnings = _doctor_path_cli(monkeypatch, capsys, script)
+
+    assert path_cli["executable"] == str(script)
+    assert path_cli["same_as_this_cli"] is None
+    assert "module_dir" not in path_cli and path_cli["error"]
+    assert len(warnings) == 1 and "could not be identified" in warnings[0]
+
+
+def test_doctor_reports_the_package_a_path_wrapper_actually_imports(
+        monkeypatch, tmp_path, capsys):
+    # D2-03: a wrapper that puts another checkout first on sys.path runs THAT
+    # code; the interpreter alone would have reported this one.
+    import shutil as _shutil
+
+    here = __import__("pathlib").Path(bn.cli.__file__).resolve().parent.parent
+    other_src = tmp_path / "other" / "src"
+    for package in ("bn", "bn_agent_bridge"):
+        _shutil.copytree(here / package, other_src / package, symlinks=True,
+                         ignore=_shutil.ignore_patterns("__pycache__"))
+    script = _python_bn_on_path(
+        tmp_path, f"import sys\nsys.path.insert(0, {str(other_src)!r})\n"
+                  "import bn.cli\nsys.exit(bn.cli.main())\n")
+
+    path_cli, warnings = _doctor_path_cli(monkeypatch, capsys, script)
+
+    assert path_cli["module_dir"] == str(other_src / "bn")
+    assert path_cli["same_as_this_cli"] is False
+    assert len(warnings) == 1 and "different checkout" in warnings[0]
+
+
+def test_a_path_wrapper_that_runs_doctor_answers_the_probe_instead_of_recursing(
+        monkeypatch, tmp_path, capsys):
+    # Guard: the probe is answered before any command runs, so a wrapper that
+    # itself runs `bn doctor` cannot make doctor probe itself forever.
+    script = _python_bn_on_path(
+        tmp_path, "import sys\nimport bn.cli\nsys.exit(bn.cli.main(['doctor']))\n")
+
+    path_cli, warnings = _doctor_path_cli(monkeypatch, capsys, script)
+
+    assert path_cli["same_as_this_cli"] is True
+    assert warnings == []
+
+
+def test_a_path_bn_that_never_answers_is_a_bounded_warning(monkeypatch, tmp_path, capsys):
+    script = tmp_path / "bin" / "bn"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("bn.commands.admin._PATH_CLI_PROBE_TIMEOUT", 0.5)
+
+    path_cli, warnings = _doctor_path_cli(monkeypatch, capsys, script)
+
+    assert path_cli["same_as_this_cli"] is None
+    assert len(warnings) == 1
 
 
 def test_doctor_names_this_cli_and_the_bn_on_path(monkeypatch, tmp_path, capsys):

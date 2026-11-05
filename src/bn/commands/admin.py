@@ -13,6 +13,7 @@ import contextlib
 import fnmatch
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -197,47 +198,60 @@ def _cli_identity(module_dir: Path) -> dict[str, Any]:
     }
 
 
-# Run by the interpreter of the `bn` found on PATH: where ITS package and the
-# bridge it would spawn live.
-_PATH_CLI_PROBE = (
-    "import json, pathlib, bn, bn.paths; print(json.dumps({"
-    "'module_dir': str(pathlib.Path(bn.__file__).resolve().parent), "
-    "'plugin_source_dir': str(bn.paths.plugin_source_dir())}))"
-)
-
-
 def _path_cli_identity(this_module_dir: Path) -> dict[str, Any]:
     """Identity of the `bn` executable a bare `bn` command runs (P2-08).
 
     `uv run bn` from one checkout and a `bn` installed from another look the
     same in every report until something behaves differently; doctor names
-    the PATH one and whether it is this CLI. Probed by running the script's
-    own interpreter, the only reliable answer for an editable install."""
+    the PATH one and whether it is this CLI. Probed by RUNNING that executable
+    with `IDENTITY_PROBE_ENV` set (D2-03), so what is reported is what a bare
+    `bn` does: a broken shim, an interpreter that cannot import `bn`, or a
+    wrapper that picks another package is seen as such. A nonzero exit, a
+    timeout or an answer that does not echo the nonce identifies nothing, and
+    says why in `error`."""
     executable = shutil.which("bn")
     if executable is None:
         return {"executable": None, "same_as_this_cli": None,
                 "error": "no `bn` executable on PATH"}
     identity: dict[str, Any] = {"executable": executable}
-    try:
-        with open(executable, "rb") as fh:
-            shebang = fh.readline().decode("utf-8", "replace")
-        if not shebang.startswith("#!"):
-            raise ValueError("it is not a Python script with a shebang line")
-        probe = subprocess.run(
-            [*shlex.split(shebang[2:].strip()), "-c", _PATH_CLI_PROBE],
-            capture_output=True, text=True, timeout=_PATH_CLI_PROBE_TIMEOUT, check=True,
-        )
-        found = json.loads(probe.stdout)
-        module_dir = Path(found["module_dir"])
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-        identity.update({"same_as_this_cli": None,
-                         "error": f"could not identify its code: {exc}"})
+    nonce = secrets.token_hex(8)
+
+    def unidentified(reason: str) -> dict[str, Any]:
+        identity.update({"same_as_this_cli": None, "error": reason})
         return identity
+
+    try:
+        probe = subprocess.run(
+            [executable], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_PATH_CLI_PROBE_TIMEOUT, env={**os.environ, cli.IDENTITY_PROBE_ENV: nonce},
+        )
+    except subprocess.TimeoutExpired:
+        return unidentified(
+            f"it did not answer the identity probe within {_PATH_CLI_PROBE_TIMEOUT:g}s")
+    except OSError as exc:
+        return unidentified(f"it could not be run: {exc}")
+    if probe.returncode != 0:
+        last = (probe.stderr.strip().splitlines() or [""])[-1][:200]
+        return unidentified(
+            f"running it exited {probe.returncode}" + (
+                f": {last}" if last else
+                " without identifying its code (a `bn` older than the identity "
+                "probe prints its usage and exits 1)"))
+    try:
+        found = json.loads((probe.stdout.strip().splitlines() or [""])[-1])
+    except ValueError:
+        found = None
+    if not (isinstance(found, dict) and found.get("identity_probe") == nonce
+            and isinstance(found.get("module_dir"), str) and found["module_dir"]):
+        return unidentified(
+            "it ran but did not identify its code (a `bn` older than the identity "
+            "probe, or a wrapper that runs something else)")
+    module_dir = Path(found["module_dir"])
     identity.update(_cli_identity(module_dir))
-    identity["plugin_source_dir"] = str(found.get("plugin_source_dir") or "") or None
+    plugin_dir = found.get("plugin_source_dir")
+    identity["plugin_source_dir"] = plugin_dir if isinstance(plugin_dir, str) and plugin_dir else None
     identity["same_as_this_cli"] = _same_dir(str(module_dir), this_module_dir)
     return identity
-
 
 
 @command("doctor", help="Validate bridge discovery and installation")

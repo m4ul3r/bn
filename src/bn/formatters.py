@@ -6942,8 +6942,14 @@ def _doctor_cli_identity_lines(value: dict[str, Any]) -> list[str]:
             f"PATH bn: {exe} -> {_text_value(path_cli, 'module_dir') or '<unknown>'} "
             f"(repository {_text_value(path_cli, 'repository_root') or 'not a checkout'}, "
             f"build {_text_value(path_cli, 'build_id') or '<unknown>'})")
+    elif exe:
+        # D2-03: running the PATH `bn` did not identify it -- a broken shim, a
+        # timeout, or an answer that is not this probe's. A bare `bn` may not
+        # even start, so this is a warning, not a footnote.
+        lines.append(f"PATH bn: {exe}")
+        lines.append(f"warning: the `bn` on PATH could not be identified: {error}")
     else:
-        lines.append(f"PATH bn: {exe or 'not found'}" + (f" ({error})" if error else ""))
+        lines.append("PATH bn: not found" + (f" ({error})" if error else ""))
     if _flag_field(path_cli, "same_as_this_cli") is False:
         lines.append(
             "warning: the `bn` on PATH runs a different checkout than this command; "
