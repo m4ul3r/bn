@@ -7770,29 +7770,33 @@ def test_an_unchecked_fill_return_copied_back_out_of_its_buffer_overreads_it(
 _RECV_COPY_SOURCE = """
 extern long recv(int, void *, unsigned long, int);
 extern void *memcpy(void *, const void *, unsigned long);
-__attribute__((noinline)) void pull(int sock, char *dst) {
+__attribute__((noinline)) void pull(int sock, char *dst, unsigned long cap) {
     char scratch[64];
-    TYPE got = recv(sock, scratch, sizeof(scratch), 0);
+    TYPE got = recv(sock, scratch, COUNT, 0);
     GUARD
     memcpy(dst, scratch, got);
 }
-int main(void) { char out[128]; pull(0, out); return out[0]; }
+int main(void) { char out[128]; pull(0, out, 64); return out[0]; }
 """
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])
 @pytest.mark.parametrize("width", ["long", "int"])
 @pytest.mark.parametrize("guard, bounded", [
-    ("", False), ("if (got == -1) return;", True), ("if (got <= 0) return;", True)],
-    ids=["unchecked", "minus-one-checked", "count-checked"])
+    ("", False), ("if (got == -1) return;", True), ("if (got <= 0) return;", True),
+    ("if (got < 0) return;", True), ("if ((unsigned long)got > 64) return;", True)],
+    ids=["unchecked", "minus-one-checked", "count-checked", "negative-checked",
+         "unsigned-bound-checked"])
 def test_a_receive_return_bounds_a_copy_only_when_the_path_checks_it(
         tmp_path, shared_bn, arch, width, guard, bounded):
     """V7-01: `long got = recv(s, scratch, 64, 0); memcpy(dst, scratch, got)`
     with no check was `bounded_len` by recv's count, though BN's value set
     for the length is undetermined and its -1 failure is SIZE_MAX at the
-    copy. Bounded only behind a check; otherwise `overflow_len` with
-    `return_unchecked`."""
-    source = _RECV_COPY_SOURCE.replace("TYPE", width).replace("GUARD", guard)
+    copy. Bounded only behind a check -- a signed test, an equality, or an
+    unsigned bound (-1 is the unsigned maximum; G3-02) -- otherwise
+    `overflow_len` with `return_unchecked`."""
+    source = (_RECV_COPY_SOURCE.replace("TYPE", width).replace("GUARD", guard)
+              .replace("COUNT", "sizeof(scratch)"))
     binary = _build_arch(tmp_path, arch, f"recv_copy_{width}", source)
     target = shared_bn.load(binary, copy=False)
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "pull",
@@ -7803,6 +7807,22 @@ def test_a_receive_return_bounds_a_copy_only_when_the_path_checks_it(
         assert "return_unchecked" not in sink, sink
     else:
         assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+def test_an_unchecked_receive_return_with_a_variable_count_is_return_unchecked(
+        tmp_path, shared_bn, arch):
+    """G3-03: `recv(s, scratch, cap, 0)` copied with no check has no constant
+    bound, and the `return_unchecked` qualifier went with it."""
+    source = (_RECV_COPY_SOURCE.replace("TYPE", "long").replace("GUARD", "")
+              .replace("COUNT", "cap"))
+    binary = _build_arch(tmp_path, arch, "recv_copy_cap", source)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "pull",
+                      "--source", "call:recv")
+    [sink] = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+    assert "source_bound" not in sink, sink
 
 
 _ARGV_COPY_SOURCE = """
