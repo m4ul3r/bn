@@ -3906,6 +3906,7 @@ class BinaryNinjaBridge:
         # (#857 round-4 regression, introduced by this change).
         result = {"ok": True, "saved": True, "path": saved}
         if own_primary or in_place:
+            self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
             self.targets.note_database(bv, saved)
         else:
             # An EXPORT (#1036 items 4-5): recorded in its own ledger so a
@@ -3930,6 +3931,13 @@ class BinaryNinjaBridge:
             result["restart_path"] = self.targets.recorded_database(bv) or filename or None
             result["restart_path_is_database"] = bool(
                 self.targets.recorded_database(bv) or filename.endswith(".bndb"))
+            # P2-03: the copy persisted nothing for THIS target -- its own
+            # database (None while it has none) is unchanged, and so is its
+            # unsaved ledger: a restart still reopens that database, so the
+            # mutations stay unsaved until a plain `bn save`.
+            result["backing_database"] = self.targets.recorded_database(bv) or (
+                filename if filename.endswith(".bndb") else None)
+            result["unsaved"] = self.targets.is_dirty(bv)
         self._stamp_cache_writer(saved, result)
         _disclose_open_target_collision(self.targets, bv, saved, result)
         return result

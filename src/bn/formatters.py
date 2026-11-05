@@ -1449,6 +1449,7 @@ def _render_save_text(value: Any) -> str:
     export = value.get("export") is True
     line = f"saved: {value.get('path', '<unknown>')}"
     if export:
+        line += "  (export)"
         # #1036 item 5: an explicit-path save is a copy. Say where the target
         # itself still saves and restarts from, so neither this agent nor a
         # second one reading `target list` mistakes the copy for its home.
@@ -1475,6 +1476,15 @@ def _render_save_text(value: Any) -> str:
             f"\nnote: an export, not this target's own database: a plain `bn save` "
             f"{plain}; `session restart` reopens {restart} ({restart_what})"
         )
+        # P2-03: what the export left as it was.
+        backing = _text_value(value, "backing_database")
+        line += f"\nbacking database: {backing or 'none (not saved to a database yet)'}"
+        unsaved = _flag_field(value, "unsaved")
+        if unsaved is not None:
+            line += (
+                "\nunsaved: yes (unchanged: the export persisted none of it; a plain "
+                "`bn save` does)" if unsaved else "\nunsaved: no"
+            )
     collision = _field_dict(value, "collides_with_open_target")
     if collision:
         # #857 r4: a save landing on a file another target already has open makes
