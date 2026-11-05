@@ -5801,12 +5801,13 @@ class TaintEngine:
         """Why a call target is NOT descended into, or None when it is.
 
         ``no_function`` / ``import`` are the genuinely external shapes;
-        ``thunk`` is an in-binary stub the caller may still resolve to its
-        target. ``analysis_skipped:<BN reason>`` and ``no_mlil`` are IN-BINARY
-        bodies Binary Ninja did not analyse (an oversized function past
-        ``analysis.limits.maxFunctionSize``, a failed lift) -- the caveat for
-        those must not call the function "external" (#1001 item 3). The import
-        check runs first: a PLT stub is a thunk AND an import symbol.
+        ``thunk`` is a pure in-binary veneer the caller resolves to its target
+        (:meth:`_is_pure_veneer`). ``analysis_skipped:<BN reason>`` and
+        ``no_mlil`` are IN-BINARY bodies Binary Ninja did not analyse (an
+        oversized function past ``analysis.limits.maxFunctionSize``, a failed
+        lift) -- the caveat for those must not call the function "external"
+        (#1001 item 3). The import check runs first: a PLT stub is a thunk AND
+        an import symbol.
 
         Memoised per function start: the answer lifts the body, and the
         reachability sweep asks it of the same functions thousands of times
@@ -5822,31 +5823,30 @@ class TaintEngine:
         return self._internal_cache[key]
 
     @staticmethod
-    def _classify_call_target(fn: Any) -> str | None:
-        """:meth:`_not_internal_reason`'s uncached answer for a function."""
+    def _is_import_symbol(fn: Any) -> bool:
+        """Whether BN names *fn* an import / external symbol (a PLT stub)."""
         sym = getattr(fn, "symbol", None)
         stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
-        if stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
-                     "ImportAddressSymbol", "ExternalSymbol"}:
+        return stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
+                         "ImportAddressSymbol", "ExternalSymbol"}
+
+    def _classify_call_target(self, fn: Any) -> str | None:
+        """:meth:`_not_internal_reason`'s uncached answer for a function.
+
+        BN's ``is_thunk`` flag only says a body ENDS in a tail call: an -O2
+        wrapper that copies, allocates or calls three helpers before its
+        `jmp` carries it too, and treating every flagged body as a stub left
+        those bodies -- and the sinks in them -- unread with a prose caveat
+        (P2-03). The flag nominates; the MLIL decides: a flagged body is a
+        veneer only when it is nothing but a tail call forwarding its own
+        parameters unchanged (:meth:`_is_pure_veneer`). An unflagged body is
+        walked as it always was.
+
+        A body Binary Ninja SKIPPED is unread whatever else is true of it:
+        leftover MLIL from before the skip, or a thunk flag, is not a body
+        that was analysed (W05-06)."""
+        if self._is_import_symbol(fn):
             return "import"
-        # The BODY is materialised BEFORE the thunk flag is read. BN decides
-        # `is_thunk` while it lifts a function, so on a freshly loaded view
-        # it answers False for a stub that IS one -- and then True for every
-        # caller that asks after something lifted it. Two identical taint
-        # requests disagreed on exactly that: the first descended into the
-        # static `__wmemcpy` stub and raised a frontier for it, the second
-        # resolved the thunk and did not (BN25-META-01). Lifting first makes
-        # the verdict a property of the binary rather than of what ran
-        # before it; the flag is analysis-timing dependent everywhere, which
-        # `_same_name_stub_functions` says of its own criterion too.
-        try:
-            has_body = len(list(fn.mlil.instructions)) > 0
-        except Exception:
-            has_body = False
-        if getattr(fn, "is_thunk", False):
-            return "thunk"
-        if has_body:
-            return None
         if getattr(fn, "analysis_skipped", False):
             try:
                 raw = fn.analysis_skip_reason
@@ -5855,7 +5855,58 @@ class TaintEngine:
             except Exception:
                 why = "unknown"
             return f"analysis_skipped:{why}"
+        # The BODY is lifted before the flag is read: BN decides `is_thunk`
+        # while it lifts a function, so on a freshly loaded view the flag
+        # answers False for a stub that IS one and True for every caller
+        # that asks after something lifted it (BN25-META-01) -- lifting
+        # first makes the verdict a property of the binary rather than of
+        # what ran first.
+        try:
+            has_body = len(list(fn.mlil.instructions)) > 0
+        except Exception:
+            has_body = False
+        if has_body and getattr(fn, "is_thunk", False) and self._is_pure_veneer(fn):
+            return "thunk"
+        if has_body:
+            return None
         return "no_mlil"
+
+    def _is_pure_veneer(self, fn: Any) -> bool:
+        """Whether *fn* is a stub the caller may resolve to its target: every
+        hop of the chain ``follow_thunk`` walks is one MLIL tail call that
+        hands its own parameters on unchanged, in order. Anything else -- a
+        store, a call, an argument swap or a constant passed in a parameter's
+        place -- is a body of its own: mapping the caller's arguments straight
+        onto the target would hand them to the wrong formals, and what the
+        body does before its `jmp` would go unread."""
+        if self._follow_thunk_cached(fn) is None:
+            return False
+        cur = fn
+        seen: set[int] = set()
+        while cur is not None and int(getattr(cur, "start", -1)) not in seen:
+            seen.add(int(getattr(cur, "start", -1)))
+            if cur is not fn and self._is_import_symbol(cur):
+                # A linker stub at the end of the chain is the import's
+                # business; its own MLIL is not this binary's code.
+                return True
+            ssa = _mlil_ssa(cur)
+            instructions = _ssa_instructions(ssa) if ssa is not None else []
+            if len(instructions) != 1 or "TAILCALL" not in op_name(instructions[0]):
+                # The end of the chain: a body follow_thunk stopped at.
+                return cur is not fn
+            formals = list(getattr(cur, "parameter_vars", None) or [])
+            for i, param in enumerate(self._call_params(instructions[0])):
+                src = getattr(param, "src", None)
+                if (op_name(param) != "MLIL_VAR_SSA" or i >= len(formals)
+                        or getattr(src, "version", None) != 0
+                        or var_key(src) != var_key(formals[i])):
+                    return False
+            try:
+                addr = extract_dest_address(self.bv, instructions[0].dest)
+            except Exception:
+                return False
+            cur = function_at(self.bv, addr) if addr is not None else None
+        return True
 
     @staticmethod
     def _unanalysed_body_phrase(reason: str | None) -> str | None:
@@ -5974,28 +6025,6 @@ class TaintEngine:
                        f"{overlay} "
                        f"re-run after `bn decompile {at} --force-analysis` (may be slow)"),
         }
-
-    def _thunk_tail_targets(self, fn: Any) -> list[Any]:
-        """Every function a thunk tail-calls, found on ANY of its instructions
-        and in instruction order -- `follow_thunk` only takes a one-instruction
-        body, but BN also marks a longer body that ends in a tail jump (an
-        oversized function after `--force-analysis`) a thunk (#1001 review).
-        Empty when no tail call has a constant target that is a function."""
-        ssa = _mlil_ssa(fn)
-        if ssa is None:
-            return []
-        targets: list[Any] = []
-        for insn in _ssa_instructions(ssa):
-            if "TAILCALL" not in op_name(insn) or getattr(insn, "dest", None) is None:
-                continue
-            try:
-                addr = extract_dest_address(self.bv, insn.dest)
-            except Exception:
-                addr = None
-            target = function_at(self.bv, addr) if addr is not None else None
-            if target is not None and target is not fn and target not in targets:
-                targets.append(target)
-        return targets
 
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
@@ -12214,39 +12243,10 @@ class TaintEngine:
                             _who = nm or hex(taddr)
                             _shown = self._prose_name(nm) if nm else hex(taddr)
                             _at = hex(int(getattr(descend_fn, "start", taddr)))
-                            _thunk = None
-                            if _reason == "thunk" and self._follow_thunk_cached(descend_fn) is None:
-                                # In-binary, and not a stub onto an import either
-                                # (that one resolves). `follow_thunk` only takes a
-                                # one-instruction tail call, so a longer body BN
-                                # still calls a thunk (an oversized function after
-                                # `--force-analysis`) stops here even when its
-                                # tail-call target resolves -- name every target.
-                                _tails = self._thunk_tail_targets(descend_fn)
-                                if _tails:
-                                    _named = [(self._prose_function(t),
-                                               hex(int(getattr(t, "start", 0)))) for t in _tails]
-                                    _thunk = (f"in-binary {_shown} is a thunk Binary Ninja made of "
-                                              + ("a tail call" if len(_named) == 1 else "tail calls")
-                                              + " to " + ", ".join(f"{n} @ {a}" for n, a in _named)
-                                              + ", which taint does not follow through a multi-"
-                                              "instruction thunk",
-                                              ("read the target with " if len(_named) == 1
-                                               else "read the targets with ")
-                                              + ", ".join(f"`bn decompile {a}`" for _n, a in _named))
-                                else:
-                                    _thunk = (f"in-binary {_shown} is a thunk whose tail-call "
-                                              "target did not resolve",
-                                              f"read it with `bn disasm {_at}`")
-                            elif _unread is not None:
+                            if _unread is not None:
                                 self._analysis_incomplete.add(str(_who))
                                 _fix = (f"run `bn decompile {_at} --force-analysis` (may be slow) "
                                         "and re-run this taint query")
-                            if _thunk is not None:
-                                _caveat = (f"{_thunk[0]}; it has no model; return conservatively "
-                                           f"tainted -- {_thunk[1]}")
-                                _stop_desc = f"thunk ({_thunk[0]}; {_thunk[1]})"
-                            elif _unread is not None:
                                 _caveat = (f"in-binary {_shown} was not analysed ({_unread}) and has no "
                                            f"model; return conservatively tainted -- {_fix}")
                                 _stop_desc = f"in-binary function ({_unread}; {_fix})"

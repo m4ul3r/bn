@@ -3167,10 +3167,13 @@ def test_a_matching_model_never_certifies_an_unread_argument_callee(tmp_path, sh
     pin = tmp_path / "ic05_rmap.json"
     pin.write_text(json.dumps(
         {_indirect_call_addr(shared_bn, "call_indirect", "ic05"): [body]}))
+    # `unread_thunk` passes a constant second argument before its jump, so it
+    # is a body the walk reads (P2-03) and the unread body is reached from
+    # inside it; only a pure veneer would be named as `via`.
     routes = {
         "call_unread": None,
-        "call_thunk": "unread_thunk",
-        "call_multihop": "unread_multihop",
+        "call_thunk": None,
+        "call_multihop": None,
         "call_wrapper": None,
         "call_indirect": None,
     }
@@ -5914,10 +5917,13 @@ def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
         return res, [lf for lf in res["leaves"]
                      if lf["kind"] == "global_memory_continuation"]
 
-    # 32 wide characters cover bytes [0, 64): +88 is outside, +62 inside
-    result, leaves = gmc("pe_case")
+    # 32 wide characters cover bytes [0, 64): +88 is outside, +62 inside.
+    # mingw's in-binary `wmemcpy` scales the count before its tail call, so
+    # it is a body that is walked (P2-03), not a veneer; its own copy through
+    # a parameter pointer is a coarse store of that walk. The question here is
+    # only the global continuation's footprint.
+    _result, leaves = gmc("pe_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
     _result, leaves = gmc("pe_inside_case")
     assert any(r["display_name"] == "byte62_reader"
                for lf in leaves for r in lf["references"]), leaves
@@ -6780,3 +6786,22 @@ void _start(void) {
     text = shared_bn.run("-t", target, "taint", "models", "--present")
     assert text.returncode == 0, text.stderr
     assert "no modeled name matched" in text.stdout, text.stdout
+
+
+def test_a_tail_call_wrapper_flagged_a_thunk_is_walked(tmp_path, shared_bn):
+    """P2-03: at -O2 every wrapper below is one block ending in a tail call,
+    so Binary Ninja flags it `is_thunk` -- and taint skipped each body with a
+    prose caveat, missing the fortified copy in all three and reporting
+    nothing from `main`'s `read`."""
+    binary = tmp_path / "fwd_tail_wrappers"
+    _compile(CORPUS / "fwd_tail_wrappers.c", binary,
+             ["-O2", "-fno-inline-small-functions", "-D_FORTIFY_SOURCE=2"])
+    target = shared_bn.load(binary, copy=False)
+    for fn, sources in (("dispatch_frame", ("param:0", "param:1")), ("main", ("call:read",))):
+        args = ["-t", target, "taint", "forward", "-f", fn]
+        for source in sources:
+            args += ["--source", source]
+        result = _bn_json(shared_bn, *args)
+        reached = {s["sink"]["callee"] for s in result["reached_sinks"]}
+        assert {"memcpy_chk", "memmove_chk", "strncpy_chk"} <= reached, (fn, reached)
+        assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
