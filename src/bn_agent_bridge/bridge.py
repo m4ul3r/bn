@@ -1827,7 +1827,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                             )
                         else:
                             begin_request = getattr(
-                                bridge, "_begin_request", lambda _request_id: None
+                                bridge, "_begin_request", lambda _request_id, _op=None: None
                             )
                             end_request = getattr(
                                 bridge, "_end_request", lambda _request_id: None
@@ -1837,7 +1837,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                                 "_is_request_cancelled",
                                 lambda _request_id: False,
                             )
-                            begin_request(request_id)
+                            begin_request(request_id, op)
                             connection = self.connection
                             try:
                                 # A client killed outside its own timeout path
@@ -2036,7 +2036,9 @@ class BinaryNinjaBridge:
         self._request_state_lock = threading.Lock()
         self._requests_drained = threading.Condition(self._request_state_lock)
         self._request_threads: dict[threading.Thread, int] = {}
-        self._active_requests: set[str] = set()
+        # request id -> the op it runs, so a cancel can say whether that op
+        # will ever look at it (`OpSpec.cancellable`, P1-07).
+        self._active_requests: dict[str, str | None] = {}
         self._cancelled_requests: set[str] = set()
         self._shutdown_event = threading.Event()
         # Idle reaper (headless only, opt-in via BN_IDLE_TIMEOUT). `_inflight` is a
@@ -2617,17 +2619,17 @@ class BinaryNinjaBridge:
             with self._target_lock.write():
                 yield
 
-    def _begin_request(self, request_id: Any) -> None:
+    def _begin_request(self, request_id: Any, op: Any = None) -> None:
         if not isinstance(request_id, str) or not request_id:
             return
         with self._request_state_lock:
-            self._active_requests.add(request_id)
+            self._active_requests[request_id] = op if isinstance(op, str) else None
 
     def _end_request(self, request_id: Any) -> None:
         if not isinstance(request_id, str) or not request_id:
             return
         with self._request_state_lock:
-            self._active_requests.discard(request_id)
+            self._active_requests.pop(request_id, None)
             self._cancelled_requests.discard(request_id)
 
     def _enter_request(self, server: ThreadedUnixServer | None = None) -> bool:
@@ -2754,9 +2756,16 @@ class BinaryNinjaBridge:
         # is dispatched to that predecessor by `handle` (#992).
         with self._request_state_lock:
             active = request_id in self._active_requests
+            running = self._active_requests.get(request_id)
             if active:
                 self._cancelled_requests.add(request_id)
-        return {"kind": "cancel_request", "request_id": request_id, "cancelled": active}
+        spec = REGISTRY.spec(running) if running else None
+        # `polls_cancel`: whether the cancelled request's op checks the flag at
+        # all. A client that timed out listens for the outcome only then; an
+        # op that never looks runs to completion, and waiting on it would only
+        # spend the client's own budget (P1-07).
+        return {"kind": "cancel_request", "request_id": request_id, "cancelled": active,
+                "polls_cancel": bool(active and spec is not None and spec.cancellable)}
 
     def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
         spec = REGISTRY.spec(op)
@@ -5739,7 +5748,7 @@ def _bind_possible_values(bridge, params, target):
     return bridge._possible_values(target, params["identifier"], params["at"])
 
 
-@op("taint", lock="read")
+@op("taint", lock="read", cancellable=True)
 def _bind_taint(bridge, params, target):
     return bridge._taint(target, params)
 
@@ -6033,7 +6042,7 @@ def _bind_go_functions(bridge, params, target):
     )
 
 
-@op("go_rename", lock="none", destructive=True)
+@op("go_rename", lock="none", destructive=True, cancellable=True)
 def _bind_go_rename(bridge, params, target):
     return bridge._go_rename(
         target,

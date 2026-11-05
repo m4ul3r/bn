@@ -262,7 +262,7 @@ class _RecordingBridge:
         self.dispatch_calls.append(payload)
         return {"ok": True, "result": "pong"}
 
-    def _begin_request(self, request_id):
+    def _begin_request(self, request_id, op=None):
         pass
 
     def _end_request(self, request_id):

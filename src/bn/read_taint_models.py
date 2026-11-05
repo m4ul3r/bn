@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .taint_models import load_models, model_overlay_sources
+from .taint_models import TaintError, builtin_sink_classes, load_user_models
 
 # #555: `bn taint models [--present]` is a CATALOG of modeled sinks/sources --
 # NOT a list of taint findings. One of these notes rides at the top of every
@@ -102,12 +102,11 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
     for name, model in models.items():
         # #849: skip the DOC-key prefix only, the way the engine's own coercion
         # does (``taint_models._coerce_model_map``). Skipping every ``_``-leading
-        # key also dropped real models -- the four ``__isoc99_*`` scanf-family
-        # spellings and ``__builtin_bswap{16,32,64}``, which the engine resolves on
-        # a real binary, so the catalog (and the ``--present`` audit built on it)
-        # under-reported the models actually applied. The eighth such key,
-        # ``__builtin_memset``, is modeled like ``memset``: a propagator
-        # (``arg:1->*arg:0``) and an ``overflow_len`` sink.
+        # key also dropped real models -- ``__builtin_bswap{16,32,64}`` and
+        # ``__builtin_memset``, which the engine resolves on a real binary, so
+        # the catalog (and the ``--present`` audit built on it) under-reported
+        # the models actually applied. (The ISO ``__isoc99_*``/``__isoc23_*``
+        # scanf spellings are aliases of the plain models, not keys.)
         if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
         if model.get("sources") and want in (None, "source"):
@@ -155,24 +154,29 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
     }
 
 
-def model_catalog(params: dict[str, Any], *,
-                  honor_env: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
+def model_catalog(params: dict[str, Any], *, honor_env: bool = True,
+                  resolve_address: Any = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """The `taint_models` request's target-free answer: ``(catalog, models)``.
 
     *params* is the request's param dict (``role``/``class`` filters plus the
     ``user_models*`` keys `_add_user_models` forwards). The bridge layers presence
     on top when a target is named; the CLI returns this as-is when none is, so
     the two answers share their keys, overlay disclosure and refusals. Raises
-    ``TaintError`` for a bad model file, labelled by the knob that supplied it.
-    ``honor_env`` is :func:`load_models`'."""
-    via = params.get("user_models_via")
-    path = params.get("user_models_path")
-    models = load_models(extra=params.get("user_models"), extra_via=via, extra_path=path,
-                         honor_env=honor_env)
-    catalog = build_catalog(models, role=params.get("role"), sink_class=params.get("class"))
-    catalog["overlays"] = model_overlay_sources(
-        params.get("user_models"), user_models_path=path, user_models_via=via,
-        env_overridden_path=params.get("user_models_env_overridden"), honor_env=honor_env)
+    ``TaintError`` for a bad model file, labelled by the knob that supplied it,
+    and for a ``class`` filter that names no catalog sink class (it used to
+    answer an empty catalog). ``honor_env`` and ``resolve_address`` (the
+    target's resolver for address-keyed models; None without a target) are
+    :func:`load_user_models`'."""
+    sink_class = params.get("class")
+    if sink_class is not None:
+        valid = builtin_sink_classes()
+        if sink_class not in valid:
+            raise TaintError(f"unknown sink class {sink_class!r}; valid classes: "
+                             f"{', '.join(sorted(valid))}")
+    models, overlays = load_user_models(params, resolve_address=resolve_address,
+                                        honor_env=honor_env)
+    catalog = build_catalog(models, role=params.get("role"), sink_class=sink_class)
+    catalog["overlays"] = overlays
     catalog["items"] = ([{"role": "source", **s} for s in catalog["sources"]]
                         + [{"role": "sink", **e}
                            for lst in catalog["sinks_by_class"].values() for e in lst]

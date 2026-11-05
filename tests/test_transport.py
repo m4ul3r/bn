@@ -1553,25 +1553,35 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch, cancel
         assert "until it checks for cancellation" in message
 
 
-@pytest.mark.parametrize("late_answer, outcome", [
-    (b'{"ok": false, "status": "cancelled", "error": "taint walk cancelled"}', "honoured"),
-    (b'{"ok": true, "result": {}}', "finished before it took effect"),
-    (None, "did not stop within"),
+@pytest.mark.parametrize("polls, late_answer, outcome", [
+    (True, b'{"ok": false, "status": "cancelled", "error": "taint walk cancelled"}',
+     "honoured"),
+    (True, b'{"ok": true, "result": {}}', "finished before it took effect"),
+    (True, None, "did not stop within"),
+    # An op that never checks the flag: nothing to wait for (the wait spent a
+    # `session stop` probe's own budget behind a write lock).
+    (False, b'{"ok": true, "result": {}}', "does not check for cancellation"),
+    # A bridge that did not say: no wait either.
+    (None, b'{"ok": true, "result": {}}', "may keep running until it checks"),
 ])
 def test_a_timed_out_request_says_whether_its_cancel_was_honoured(
-        tmp_path, monkeypatch, late_answer, outcome):
+        tmp_path, monkeypatch, polls, late_answer, outcome):
     # P1-07: after the cancel is sent the CLI keeps listening on the request's
-    # own connection, so it can say whether the bridge actually stopped.
+    # own connection -- only when the bridge says the op checks for
+    # cancellation -- so it can say whether the bridge actually stopped.
     import bn.transport as transport
 
     instance = _make_instance(tmp_path)
     monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a, **k: None)
-    monkeypatch.setattr(transport, "_send_cancel_request", lambda inst, rid: True)
+    monkeypatch.setattr(transport, "_send_cancel_request",
+                        lambda inst, rid: transport._CancelAck(True, polls))
     monkeypatch.setattr(transport, "CANCEL_OUTCOME_WAIT", 0.05)
+    sockets = []
 
     class _RequestSocket:
         def __init__(self):
             self.reads = 0
+            sockets.append(self)
 
         def __enter__(self):
             return self
@@ -1601,6 +1611,51 @@ def test_a_timed_out_request_says_whether_its_cancel_was_honoured(
     with pytest.raises(transport.BridgeError, match="Timed out") as caught:
         transport._send_request_to_instance(instance, "taint", timeout=1.0)
     assert outcome in str(caught.value)
+    [request] = sockets
+    # Listened past the timeout only for an op that can honour the cancel.
+    assert (request.reads > 1) is bool(polls)
+
+
+def test_a_cancel_ack_reports_whether_the_op_polls(tmp_path, monkeypatch):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a, **k: None)
+    answers = iter([
+        b'{"ok": true, "result": {"cancelled": true, "polls_cancel": true}}',
+        b'{"ok": true, "result": {"cancelled": true, "polls_cancel": false}}',
+        b'{"ok": true, "result": {"cancelled": true}}',
+    ])
+
+    class _CancelSocket:
+        def __init__(self):
+            self.answer = next(answers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            answer, self.answer = self.answer, b""
+            return answer
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: _CancelSocket())
+    assert [transport._send_cancel_request(instance, "rid") for _ in range(3)] == [
+        (True, True), (True, False), (True, None)]
 
 
 @pytest.mark.parametrize("cancel_sent", [False, True])
@@ -1643,7 +1698,7 @@ def test_sendall_timeout_preserves_delivery_uncertainty(
     def cancel(inst, request_id):
         assert inst is instance
         cancellations.append(request_id)
-        return cancel_sent
+        return transport._CancelAck(cancel_sent)
 
     monkeypatch.setattr(transport.socket, "socket", lambda *a, **kw: SendTimeoutSocket())
     monkeypatch.setattr(transport, "_verify_socket_peer_pid", lambda *a: None)

@@ -5115,7 +5115,7 @@ def test_load_models_rejects_non_dict_model_value(monkeypatch, tmp_path):
 def test_load_models_accepts_valid_override_with_comment(monkeypatch, tmp_path):
     ok = tmp_path / "override.json"
     ok.write_text(
-        '{"my_custom_sink": {"sink": {"class": "x", "tainted_args": [0]}}, "_comment_x": "doc text"}',
+        '{"my_custom_sink": {"sink": {"class": "overflow_len", "tainted_args": [0]}}, "_comment_x": "doc text"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: ok)
@@ -8784,7 +8784,9 @@ def test_sscanf_c99_spelling_is_not_bypassed_809(models):
         func, [te.parse_locator("param:0")])
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
     assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
-    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
+    # One model for every ISO-C spelling: the C99 symbol resolves to the
+    # canonical key, exactly as the C23 one does.
+    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "sscanf"
 
 
 @pytest.mark.parametrize(("callee", "key"), [
@@ -8844,8 +8846,10 @@ def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
 @pytest.mark.parametrize(("callee", "model_key", "stream"), [
     ("__isoc23_scanf", "scanf", False),
     ("__isoc23_fscanf", "fscanf", True),
+    ("__isoc99_scanf", "scanf", False),
+    ("__isoc99_fscanf", "fscanf", True),
 ])
-def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
+def test_iso_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
     # The `call:` preset resolves the C23 alias to the canonical model, and the
     # application-level check names that same key. Seeding a source spelling
     # used to produce two leaves at one address -- the raw `__isoc23_*` name
@@ -8866,8 +8870,8 @@ def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, s
              if lf["kind"] == "format_destination_unrecovered"]
     assert len(short) == 1, short
     assert short[0]["callee"] == model_key
-    assert (short[0]["destinations"], short[0]["modeled"],
-            short[0]["recovered"], short[0]["missing"]) == (5, 4, 4, 1), short[0]
+    assert (short[0]["destinations"], short[0]["recovered"], short[0]["missing"]) == \
+        (5, 4, 1), short[0]
 
 
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):
@@ -10178,14 +10182,18 @@ def test_roleless_overlay_entry_is_rejected_before_the_walk_915(models):
     assert "no recognised model role" in msg2 and "sink/sources/propagates" in msg2, msg2
 
     # Only the fields that ARM a sink are "misplaced", and only with no `sink`
-    # beside them: a prose annotation beside a real role is left alone (the
-    # docstring's forward-compat promise), as is a root-level `len_arg` next
-    # to a nested sink that already arms the entry (PR-928 review P3).
-    with_sink = te.load_models(extra={"app_recv": {"sink": {"class": "x", "tainted_args": [0]}, "len_arg": 1}})
-    assert with_sink["app_recv"]["sink"]["class"] == "x"
+    # beside them. Beside a real role, prose `detail` is allowed; any other key
+    # outside the vocabulary -- a root-level `len_arg` next to a nested sink,
+    # the sink's own `optional`/`gate` written at the root -- is refused naming
+    # it (P2-09: the old forward-compat latitude loaded typos as no-ops).
+    with pytest.raises(te.TaintError, match="unknown key `len_arg`"):
+        te.load_models(extra={"app_recv": {"sink": {"class": "overflow_len", "tainted_args": [0]},
+                                           "len_arg": 1}})
+    with pytest.raises(te.TaintError, match="unknown key `optional`"):
+        te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                                           "optional": True, "gate": "x"}})
     annotated = te.load_models(extra={"app_copy": {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
-                                                   "detail": "project copy wrapper",
-                                                   "optional": True, "gate": "x"}})
+                                                   "detail": "project copy wrapper"}})
     assert annotated["app_copy"]["propagates"][0]["to"] == "*arg:0"
 
     benign = te.load_models(extra={"app_recv": {}})

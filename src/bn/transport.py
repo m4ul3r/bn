@@ -1574,8 +1574,20 @@ def _verify_response_identity(
             f"expected {expected!r}, received {actual!r}; "
             "refusing data from a different or stale bridge"
         )
-def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
-    """Return whether the cancellation request was sent, not whether it took effect."""
+
+
+class _CancelAck(NamedTuple):
+    """What a `cancel_request` established: whether it reached the bridge,
+    and whether the bridge said the cancelled request's op checks for
+    cancellation at all (None: it did not say -- an older bridge, or no
+    readable answer)."""
+
+    sent: bool
+    polls: bool | None = None
+
+
+def _send_cancel_request(instance: BridgeInstance, request_id: str) -> _CancelAck:
+    """Send the cancel; report whether it was sent, not whether it took effect."""
     payload = {
         "id": str(uuid.uuid4()),
         "op": "cancel_request",
@@ -1583,6 +1595,7 @@ def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
         "_bridge_identity": _instance_identity(instance),
     }
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
+    answer: list[bytes] = []
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(CANCEL_REQUEST_TIMEOUT)
@@ -1592,11 +1605,22 @@ def _send_cancel_request(instance: BridgeInstance, request_id: str) -> bool:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_WR)
             with contextlib.suppress(OSError):
-                while sock.recv(65536):
-                    pass
-        return True
+                while chunk := sock.recv(65536):
+                    answer.append(chunk)
     except (OSError, BridgeError):
-        return False
+        return _CancelAck(False)
+    return _CancelAck(True, _cancel_polled(b"".join(answer)))
+
+
+def _cancel_polled(raw: bytes) -> bool | None:
+    """The `polls_cancel` a `cancel_request` answer carries, else None."""
+    try:
+        response = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None
+    result = response.get("result") if isinstance(response, dict) else None
+    polls = result.get("polls_cancel") if isinstance(result, dict) else None
+    return polls if isinstance(polls, bool) else None
 
 
 def _await_cancel_outcome(sock: socket.socket) -> str:
@@ -1730,6 +1754,9 @@ def _send_request_to_instance(
     reached = False
     cancel_sent = False
     cancel_attempted = False
+    # Whether the bridge said the cancelled op checks for cancellation at all
+    # (None: it did not say).
+    cancel_polls: bool | None = None
     # How the request ended once a cancel sent from inside the read loop was
     # answered (`_await_cancel_outcome`); None when nothing listened for it.
     cancel_outcome: str | None = None
@@ -1784,14 +1811,17 @@ def _send_request_to_instance(
                     except TimeoutError:
                         if not chunks:
                             # Nothing of the answer arrived: ask the bridge to
-                            # stop, then listen on THIS connection for how the
-                            # request ended, so the message can say whether the
-                            # cancel was honoured (P1-07).
+                            # stop. Only an op that checks for cancellation can
+                            # end early, so only then is THIS connection kept
+                            # listening to say whether the cancel was honoured
+                            # (P1-07); for any other op the wait would extend
+                            # the caller's own budget and learn nothing.
                             if notice is not None:
                                 notice.cancel()
                             cancel_attempted = True
-                            cancel_sent = _send_cancel_request(instance, str(payload["id"]))
-                            if cancel_sent:
+                            cancel_sent, cancel_polls = _send_cancel_request(
+                                instance, str(payload["id"]))
+                            if cancel_polls:
                                 cancel_outcome = _await_cancel_outcome(sock)
                         raise
                 finally:
@@ -1802,7 +1832,7 @@ def _send_request_to_instance(
         except OSError as exc:
             last_error = exc
             if isinstance(exc, TimeoutError) and send_attempted and not cancel_attempted:
-                cancel_sent = _send_cancel_request(instance, str(payload["id"]))
+                cancel_sent, cancel_polls = _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
             delay = 0.05 * (attempt + 1)
@@ -1827,6 +1857,9 @@ def _send_request_to_instance(
         f"{CANCEL_OUTCOME_WAIT:g}s and may keep running until it checks for "
         "cancellation. "
         if cancel_outcome == "no_answer" else
+        f"A cancel request was sent, but op '{op}' does not check for cancellation, "
+        "so it runs to completion. "
+        if cancel_sent and cancel_polls is False else
         "A cancel request was sent; the operation may keep running until "
         "it checks for cancellation. "
         if cancel_sent else

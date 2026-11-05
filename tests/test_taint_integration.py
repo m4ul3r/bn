@@ -747,7 +747,6 @@ def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, a
     entry = leaf["declare_value_role"]["entry"]
     assert leaf["declare_value_role"]["template"] is True, leaf
     entry["int_sink"]["sink"]["class"] = "alloc_size"
-    del entry["int_sink"]["OTHER_ROLES"]
     models = tmp_path / "value_roles.json"
     models.write_text(json.dumps(entry))
     declared = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "int_caller",
@@ -1284,6 +1283,17 @@ int main(void) {
 """
 
 
+def _format_holes(result) -> list[dict]:
+    """The format-proven destination leaves: unrecovered arguments or a model
+    arity residual, one cause each (P2-12)."""
+    return [lf for lf in result["leaves"]
+            if lf["kind"] in ("format_destination_unrecovered", "scanf_arity_residual")]
+
+
+def _lost(leaf) -> int:
+    return leaf["missing"] if leaf["kind"] == "format_destination_unrecovered" else leaf["residual"]
+
+
 @pytest.mark.parametrize(("cflags", "symbol"), [
     (["-std=gnu17"], "__isoc99_sscanf"),
     (["-std=c2x"], "__isoc23_sscanf"),
@@ -1311,19 +1321,19 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
 
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_five",
                       "--source", "param:0")
-    [leaf] = [lf for lf in result["leaves"]
-              if lf["kind"] == "format_destination_unrecovered"]
-    assert (leaf["destinations"], leaf["modeled"], leaf["missing"]) == (5, 4, 1), leaf
+    # Which kind names the lost fifth destination depends on what BN
+    # recovered: an unrecovered argument, or a recovered one past the model's
+    # four-slot run. Exactly one leaf, one cause, counts the one destination.
+    [leaf] = _format_holes(result)
+    assert leaf["destinations"] == 5 and _lost(leaf) == 1, leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
     # The lost fifth destination is not seeded, so its command sink is not
     # reached -- the leaf is what stops the run from reading as clean.
     assert not result["reached_sinks"], result["reached_sinks"]
-    assert "model covers or Binary Ninja recovered" in result["diagnostics"]["next_action"]
 
     capped = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_cap4",
                       "--source", "param:0")
-    assert not [lf for lf in capped["leaves"]
-                if lf["kind"] == "format_destination_unrecovered"], capped["leaves"]
+    assert not _format_holes(capped), capped["leaves"]
     assert capped["diagnostics"]["safe_to_report_all_clear"] is True, capped["diagnostics"]
 
     unrelated = _bn_json(shared_bn, "-t", target, "taint", "forward",
@@ -1335,15 +1345,12 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
     # stays empty.)
     assert unrelated["leaves"] == [], unrelated["leaves"]
 
-    if symbol == "__isoc23_scanf":
-        preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
-                          "-f", "parse_scan_preset", "--source",
-                          "call:__isoc23_scanf")
-        short = [lf for lf in preset["leaves"]
-                 if lf["kind"] == "format_destination_unrecovered"]
-        assert len(short) == 1, short
-        assert short[0]["callee"] == "scanf" and short[0]["missing"] == 1, short[0]
-        assert preset["diagnostics"]["safe_to_report_all_clear"] is False
+    # Both ISO spellings now resolve a plain-name preset (W07-15).
+    preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "parse_scan_preset", "--source", "call:scanf")
+    [short] = _format_holes(preset)
+    assert short["callee"] == "scanf" and _lost(short) == 1, short
+    assert preset["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_a_synthetic_c23_alias_symbol_uses_the_same_model(tmp_path, shared_bn):
@@ -1379,11 +1386,118 @@ int main(void) { return parse_synth("1 2 3 4 x"); }
 
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_synth",
                       "--source", "param:0")
-    [leaf] = [lf for lf in result["leaves"]
-              if lf["kind"] == "format_destination_unrecovered"]
-    assert (leaf["destinations"], leaf["modeled"], leaf["missing"]) == (5, 4, 1), leaf
+    [leaf] = _format_holes(result)
+    assert leaf["destinations"] == 5 and _lost(leaf) == 1, leaf
     assert leaf["callee"] == "sscanf"       # the canonical model key, via the alias
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+_FORWARDED_SCAN_SOURCE = r"""
+#include <stdio.h>
+#define N __attribute__((noinline, noipa))
+N int scan_fwd(const char *unused, char *a, char *b, char *c) {
+    int r = scanf("%15s %15s %15s", a, b, c);
+    return r + 1;
+}
+N int scan_tail(const char *unused, char *a, char *b, char *c) {
+    return scanf("%15s %15s %15s", a, b, c);
+}
+N int parse_fwd(const char *in, int unused, char *a, char *b, char *c) {
+    int r = sscanf(in, "%s %s %s", a, b, c);
+    return r + 1;
+}
+int main(int argc, char **argv) {
+    char a[16], b[16], c[16];
+    if (argc < 2) return scan_fwd(0, a, b, c) + scan_tail(0, a, b, c);
+    return parse_fwd(argv[1], 0, a, b, c);
+}
+"""
+
+
+@pytest.mark.parametrize(("std", "spelling"), [("gnu17", "__isoc99_"), ("c2x", "__isoc23_")],
+                         ids=["c99", "c23"])
+def test_forwarded_scanf_destinations_bn_did_not_recover_are_a_frontier(tmp_path, shared_bn,
+                                                                      std, spelling):
+    """P2-12 on a real binary: at -O2 each conversion's destination is a
+    forwarded parameter, so BN recovers the scanf call with only its format.
+    A `call:`/`ret:` preset used to be refused outright ("no taint sources
+    resolved") -- or, for `ret:`, answered with an all-clear -- discarding the
+    leaf that names the three lost destinations. Either spelling of the ISO
+    alias is reached by the plain name."""
+    src = tmp_path / "scan_fwd.c"
+    src.write_text(_FORWARDED_SCAN_SOURCE)
+    binary = tmp_path / f"scan_fwd_{std}"
+    _compile(src, binary, ["-O2", "-fno-builtin", f"-std={std}"])
+    if f"{spelling}scanf" not in _dynamic_symbols(binary):
+        refuse_silent_skip(f"{spelling}scanf is not emitted by this compiler/glibc "
+                           "(the C23 spelling needs glibc 2.38+ and -std=c2x)")
+    target = shared_bn.load(binary, copy=False)
+
+    for fn, source in (("scan_fwd", "call:scanf"), ("scan_fwd", "ret:scanf"),
+                       ("scan_fwd", f"call:{spelling}scanf"), ("scan_tail", "call:scanf")):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", source)
+        holes = [lf for lf in result["leaves"] if lf["kind"] == "format_destination_unrecovered"]
+        assert [(h["callee"], h["destinations"], h["missing"]) for h in holes] == \
+            [("scanf", 3, 3)], (fn, source, result["leaves"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, source)
+
+    # The param-seeded twin: the format itself is the sink, and the lost
+    # destinations are still named.
+    parsed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_fwd",
+                      "--source", "param:0")
+    assert {(s["sink"]["callee"], s["sink"]["callee_symbol"], s["sink"]["class"])
+            for s in parsed["reached_sinks"]} == \
+        {("sscanf", f"{spelling}sscanf", "overflow_unbounded")}, parsed["reached_sinks"]
+    assert [lf["missing"] for lf in parsed["leaves"]
+            if lf["kind"] == "format_destination_unrecovered"] == [3], parsed["leaves"]
+
+
+def test_builtin_regex_and_fortify_guard_models_on_a_real_binary(tmp_path, shared_bn):
+    """W10-01: a copy sized by a regexec match offset reaches its sink with
+    the builtin catalog (no overlay). W02-06: slicing the `__strcpy_chk`
+    destination size answers with the compile-time constant, not a pointer
+    demand with a role-unknown leaf."""
+    src = tmp_path / "rx.c"
+    src.write_text(r"""
+#include <regex.h>
+#include <stdio.h>
+#include <string.h>
+#define N __attribute__((noinline, noipa))
+static regex_t re;
+N int get_field(const char *s, char *out) {
+    regmatch_t m;
+    if (regexec(&re, s, 1, &m, 0)) return -1;
+    memcpy(out, s, m.rm_eo);
+    return 0;
+}
+N void save_name(const char *s) {
+    char d[0x120];
+    strcpy(d, s);
+    puts(d);
+}
+int main(int argc, char **argv) {
+    char out[32];
+    regcomp(&re, "(a+)", REG_EXTENDED);
+    save_name(argv[0]);
+    return argc > 1 ? get_field(argv[1], out) : 0;
+}
+""")
+    binary = tmp_path / "rx"
+    _compile(src, binary, ["-O2", "-D_FORTIFY_SOURCE=2"])
+    assert "__strcpy_chk" in _dynamic_symbols(binary)
+    target = shared_bn.load(binary, copy=False)
+
+    fwd = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "get_field",
+                   "--source", "param:0")
+    assert [(s["sink"]["callee"], s["sink"]["class"], s["sink"]["tainted_arg_index"])
+            for s in fwd["reached_sinks"]] == [("memcpy", "overflow_len", 2)], fwd
+
+    bwd = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "save_name",
+                   "--sink", "arg:__strcpy_chk:2")
+    assert [(r["status"], r["scalar"]["value"]) for r in bwd["sink_status"]] == \
+        [("constant", 0x120)], bwd["sink_status"]
+    assert "sink_role_unknown" not in {lf["kind"] for lf in bwd["leaves"]}, bwd["leaves"]
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])
@@ -1761,14 +1875,28 @@ def _data_symbol_addr(binary: Path, name: str) -> str:
 
 
 def _wide_globals_binary(tmp_path, count: int = 600) -> Path:
-    """`main` copies argv into a global laid out after *count* neighbouring
-    globals, calls `reset_all()` -- which zeroes every one of them -- and
-    then hands argv to `system`."""
-    lines = ["#include <stdlib.h>", "#include <string.h>"]
-    lines += [f"long g_slot{i};" for i in range(count)]
-    lines += ["char g_name[64];", "__attribute__((noinline)) void reset_all(void) {"]
+    """`main` copies argv into `g_name`, calls `reset_all()` and then hands
+    argv to `system`. `reset_all` zeroes *count* neighbouring globals laid out
+    just before `g_name` and then calls `show_name`, the one reader of it.
+
+    The neighbours are assembler symbols with no size, so nothing DECLARES
+    where any of them ends: the search for an object enclosing `g_name` runs
+    out of hops, and whether `reset_all` touches that storage is asked of
+    every global it names. A declared (C) neighbour would end the search at
+    once and never reach that question."""
+    asm = ["  .bss", "  .balign 8"]
+    for i in range(count):
+        asm += [f"  .globl g_slot{i}", f"g_slot{i}: .zero 8"]
+    asm += ["  .text"]
+    lines = ["#include <stdio.h>", "#include <stdlib.h>", "#include <string.h>",
+             "__asm__(" + " ".join(f'"{a}\\n"' for a in asm) + ");"]
+    lines += [f"extern long g_slot{i};" for i in range(count)]
+    lines += ["char g_name[64];",
+              "__attribute__((noinline)) void show_name(void) { puts(g_name); }",
+              "__attribute__((noinline)) void reset_all(void) {"]
     lines += [f"    g_slot{i} = 0;" for i in reversed(range(count))]
-    lines += ["}", "int main(int argc, char **argv) {", "    if (argc < 2) return 1;",
+    lines += ["    show_name();", "}",
+              "int main(int argc, char **argv) {", "    if (argc < 2) return 1;",
               "    strncpy(g_name, argv[1], sizeof g_name - 1);", "    reset_all();",
               "    system(argv[1]);", "    return 0;", "}"]
     src = tmp_path / "wideglobals.c"
@@ -1781,10 +1909,13 @@ def _wide_globals_binary(tmp_path, count: int = 600) -> Path:
 @pytest.mark.parametrize("depth", ["8", "0"])
 def test_a_callee_naming_hundreds_of_globals_does_not_unwind_the_walk(tmp_path, shared_bn,
                                                                       depth):
-    """P1-02: asking whether `reset_all` touches the tainted object's region
-    re-entered the neighbouring-object scan once per global it names; the
-    walk unwound on Python's recursion limit -- at every `--max-depth`,
-    including 0 -- and the `system(argv)` after the call was never reported."""
+    """P1-02: asking whether `reset_all` touches the storage around the
+    tainted `g_name` re-entered the neighbouring-object scan once per global
+    it names; the walk unwound on Python's recursion limit and the
+    `system(argv)` after the call was never reported. Now the walk finishes:
+    the sink is kept and the call carries the continuation -- the reader
+    `show_name` one call down, or, at `--max-depth 0`, the depth bound that
+    kept the search from reaching it."""
     binary = _wide_globals_binary(tmp_path)
     target = shared_bn.load(binary, copy=False)
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
@@ -1794,6 +1925,11 @@ def test_a_callee_naming_hundreds_of_globals_does_not_unwind_the_walk(tmp_path, 
     assert not [lf for lf in result["leaves"] if lf["kind"] == "analysis_truncated"]
     [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
     assert leaf["global"]["address"] == _data_symbol_addr(binary, "g_name"), leaf
+    assert leaf["callee"]["display_name"] == "reset_all", leaf
+    if depth == "8":
+        assert [r["display_name"] for r in leaf["references"]] == ["show_name"], leaf
+    else:
+        assert "depth_budget" in leaf["reachability"]["causes"], leaf
 
 
 def test_a_float_infinity_in_a_consumer_does_not_crash_the_walk(tmp_path, shared_bn):
@@ -6843,3 +6979,106 @@ def test_armv7_argument_mapping_is_disclosed_never_complete(tmp_path, shared_bn)
                       "--source", "param:3")
     assert not [lf for lf in padded["leaves"] if lf.get("cause") == "arg_under_recovered"], \
         padded["leaves"]
+
+
+_FRONTIER_SRC = r"""
+#include <alloca.h>
+#include <stdio.h>
+#include <string.h>
+
+struct packet {
+    unsigned int kind;
+    unsigned int len;
+    char pad[48];
+    const char *data;
+};
+
+unsigned int g_cap;
+
+__attribute__((noinline)) void copy_field(char *dst, const struct packet *p) {
+    memcpy(dst, p->data, p->len);
+}
+
+__attribute__((noinline)) void copy_capped(char *dst, const char *src) {
+    memcpy(dst, src, g_cap);
+}
+
+__attribute__((noinline)) void stage(const char *where, const struct packet *p) {
+    if (strlen(where) < 4)
+        return;
+    unsigned long n = p->len;
+    char *tmp = alloca(n + 1);
+    memcpy(tmp, where, n);
+    tmp[n] = 0;
+    puts(tmp);
+}
+
+int main(int argc, char **argv) {
+    struct packet pk = {1, 8, {0}, argv[0]};
+    char buf[64];
+    g_cap = argc > 1 ? 16 : 8;
+    copy_field(buf, &pk);
+    copy_capped(buf, argv[0]);
+    stage(argv[0], &pk);
+    return 0;
+}
+"""
+
+
+@pytest.fixture
+def frontier_target(tmp_path, shared_bn):
+    src = tmp_path / "frontiers.c"
+    src.write_text(_FRONTIER_SRC)
+    binary = tmp_path / "frontiers"
+    # Stack-clash probes are what `alloca` emits under this flag (and by
+    # default on several distributions' compilers).
+    _compile(src, binary, ["-fstack-clash-protection"])
+    return shared_bn.load(binary, copy=False)
+
+
+def _memcpy_site(shared_bn, target, within):
+    [row] = _bn_json(shared_bn, "-t", target, "callsites", "memcpy", "--within", within)["items"]
+    return row["call_addr"]
+
+
+def test_trace_reports_a_typed_field_loads_member_offset(frontier_target, shared_bn):
+    """W09-01: `memcpy(dst, p->data, p->len)` -- the length is the `len` member
+    at offset 4, read by a typed field load whose offset BN keeps on the load
+    instruction; it was reported as offset 0x0."""
+    site = _memcpy_site(shared_bn, frontier_target, "copy_field")
+    result = _bn_json(shared_bn, "-t", frontier_target, "trace", "copy_field", site,
+                      "--arg", "2")
+    [load] = [s for s in result["trace"] if s.get("reason") == "field_load"]
+    assert (load["offset"], load["width"], load["terminates"]) == ("0x4", 4, True), load
+    assert "field_load" in {g["reason"] for g in result["frontiers"]}, result["frontiers"]
+
+
+def test_trace_stops_at_a_global_load_as_a_named_frontier(frontier_target, shared_bn):
+    """W09-02: a length read from a global used to end the slice with no
+    frontier at all. It is a `global_load` naming the global, rolled up, with
+    an xrefs command for its writers that runs as printed."""
+    site = _memcpy_site(shared_bn, frontier_target, "copy_capped")
+    result = _bn_json(shared_bn, "-t", frontier_target, "trace", "copy_capped", site,
+                      "--arg", "2")
+    [load] = [s for s in result["trace"] if s.get("reason") == "global_load"]
+    assert load["global_name"] == "g_cap", load
+    assert [g["reason"] for g in result["frontiers"]] == ["global_load"], result["frontiers"]
+    xrefs = _bn_json(shared_bn, "-t", frontier_target, "xrefs", load["global_address"])
+    assert any("main" in json.dumps(row) for row in xrefs["items"]), xrefs
+
+
+def test_backward_slice_ignores_alloca_stack_probes(frontier_target, shared_bn):
+    """W09-07: the stack-clash probes `alloca` emits (`or qword [rsp+..], 0`)
+    store back the bytes they load. They were reported as stores that MAY
+    write the parameter's object and the loaded bytes; they write nothing."""
+    result = _bn_json(shared_bn, "-t", frontier_target, "taint", "backward", "-f", "stage",
+                      "--sink", "arg:memcpy:1", timeout=300.0)
+    il = _bn_json(shared_bn, "-t", frontier_target, "function", "structured-il", "stage")
+    probes = {ins["address"] for ins in il["instructions"]
+              if ins["op"] == "MLIL_STORE_SSA"
+              and ins["text"].split(" = ", 1)[0].split(" @ ", 1)[0]
+              == ins["text"].split(" = ", 1)[1].split(" @ ", 1)[0]}
+    assert probes, "the build emitted no stack probe; the case is not exercised"
+    rows = [(st.get("address"), st.get("reason") or "")
+            for sl in result["slices"] for st in sl["slice"]]
+    assert not [r for r in rows if r[0] in probes], rows

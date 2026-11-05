@@ -35,6 +35,11 @@ class OpSpec:
     # manifest-only target and let a request pass the gate on its top-level
     # selector and then act on the manifest's `active` (#736 review, P1).
     selector: SelectorFrom | None = None
+    # The op polls its request's cancel flag and stops when it is set (a
+    # `cancel_request`, or a client that hung up). A client that timed out
+    # waits to hear how such a request ended; any other op runs to
+    # completion, so waiting on it would only spend the client's time (P1-07).
+    cancellable: bool = False
 
 
 class OpRegistry:
@@ -49,6 +54,7 @@ class OpRegistry:
         escalation: Escalation | None = None,
         destructive: bool = False,
         selector: SelectorFrom | None = None,
+        cancellable: bool = False,
     ) -> Callable[[Binder], Binder]:
         if lock not in _LOCK_CLASSES:
             raise ValueError(f"invalid lock class {lock!r} for op {name!r}; expected one of {_LOCK_CLASSES}")
@@ -65,6 +71,7 @@ class OpRegistry:
                 lock_escalation=escalation,
                 destructive=destructive,
                 selector=selector,
+                cancellable=cancellable,
             )
             return binder
 
