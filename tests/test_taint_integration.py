@@ -747,7 +747,6 @@ def test_sink_argument_without_a_value_role_is_incomplete(tmp_path, shared_bn, a
     entry = leaf["declare_value_role"]["entry"]
     assert leaf["declare_value_role"]["template"] is True, leaf
     entry["int_sink"]["sink"]["class"] = "alloc_size"
-    del entry["int_sink"]["OTHER_ROLES"]
     models = tmp_path / "value_roles.json"
     models.write_text(json.dumps(entry))
     declared = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "int_caller",
@@ -1284,6 +1283,17 @@ int main(void) {
 """
 
 
+def _format_holes(result) -> list[dict]:
+    """The format-proven destination leaves: unrecovered arguments or a model
+    arity residual, one cause each (P2-12)."""
+    return [lf for lf in result["leaves"]
+            if lf["kind"] in ("format_destination_unrecovered", "scanf_arity_residual")]
+
+
+def _lost(leaf) -> int:
+    return leaf["missing"] if leaf["kind"] == "format_destination_unrecovered" else leaf["residual"]
+
+
 @pytest.mark.parametrize(("cflags", "symbol"), [
     (["-std=gnu17"], "__isoc99_sscanf"),
     (["-std=c2x"], "__isoc23_sscanf"),
@@ -1311,19 +1321,19 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
 
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_five",
                       "--source", "param:0")
-    [leaf] = [lf for lf in result["leaves"]
-              if lf["kind"] == "format_destination_unrecovered"]
-    assert (leaf["destinations"], leaf["modeled"], leaf["missing"]) == (5, 4, 1), leaf
+    # Which kind names the lost fifth destination depends on what BN
+    # recovered: an unrecovered argument, or a recovered one past the model's
+    # four-slot run. Exactly one leaf, one cause, counts the one destination.
+    [leaf] = _format_holes(result)
+    assert leaf["destinations"] == 5 and _lost(leaf) == 1, leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
     # The lost fifth destination is not seeded, so its command sink is not
     # reached -- the leaf is what stops the run from reading as clean.
     assert not result["reached_sinks"], result["reached_sinks"]
-    assert "model covers or Binary Ninja recovered" in result["diagnostics"]["next_action"]
 
     capped = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_cap4",
                       "--source", "param:0")
-    assert not [lf for lf in capped["leaves"]
-                if lf["kind"] == "format_destination_unrecovered"], capped["leaves"]
+    assert not _format_holes(capped), capped["leaves"]
     assert capped["diagnostics"]["safe_to_report_all_clear"] is True, capped["diagnostics"]
 
     unrelated = _bn_json(shared_bn, "-t", target, "taint", "forward",
@@ -1335,15 +1345,12 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
     # stays empty.)
     assert unrelated["leaves"] == [], unrelated["leaves"]
 
-    if symbol == "__isoc23_scanf":
-        preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
-                          "-f", "parse_scan_preset", "--source",
-                          "call:__isoc23_scanf")
-        short = [lf for lf in preset["leaves"]
-                 if lf["kind"] == "format_destination_unrecovered"]
-        assert len(short) == 1, short
-        assert short[0]["callee"] == "scanf" and short[0]["missing"] == 1, short[0]
-        assert preset["diagnostics"]["safe_to_report_all_clear"] is False
+    # Both ISO spellings now resolve a plain-name preset (W07-15).
+    preset = _bn_json(shared_bn, "-t", target, "taint", "forward",
+                      "-f", "parse_scan_preset", "--source", "call:scanf")
+    [short] = _format_holes(preset)
+    assert short["callee"] == "scanf" and _lost(short) == 1, short
+    assert preset["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_a_synthetic_c23_alias_symbol_uses_the_same_model(tmp_path, shared_bn):
@@ -1379,11 +1386,118 @@ int main(void) { return parse_synth("1 2 3 4 x"); }
 
     result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_synth",
                       "--source", "param:0")
-    [leaf] = [lf for lf in result["leaves"]
-              if lf["kind"] == "format_destination_unrecovered"]
-    assert (leaf["destinations"], leaf["modeled"], leaf["missing"]) == (5, 4, 1), leaf
+    [leaf] = _format_holes(result)
+    assert leaf["destinations"] == 5 and _lost(leaf) == 1, leaf
     assert leaf["callee"] == "sscanf"       # the canonical model key, via the alias
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+_FORWARDED_SCAN_SOURCE = r"""
+#include <stdio.h>
+#define N __attribute__((noinline, noipa))
+N int scan_fwd(const char *unused, char *a, char *b, char *c) {
+    int r = scanf("%15s %15s %15s", a, b, c);
+    return r + 1;
+}
+N int scan_tail(const char *unused, char *a, char *b, char *c) {
+    return scanf("%15s %15s %15s", a, b, c);
+}
+N int parse_fwd(const char *in, int unused, char *a, char *b, char *c) {
+    int r = sscanf(in, "%s %s %s", a, b, c);
+    return r + 1;
+}
+int main(int argc, char **argv) {
+    char a[16], b[16], c[16];
+    if (argc < 2) return scan_fwd(0, a, b, c) + scan_tail(0, a, b, c);
+    return parse_fwd(argv[1], 0, a, b, c);
+}
+"""
+
+
+@pytest.mark.parametrize(("std", "spelling"), [("gnu17", "__isoc99_"), ("c2x", "__isoc23_")],
+                         ids=["c99", "c23"])
+def test_forwarded_scanf_destinations_bn_did_not_recover_are_a_frontier(tmp_path, shared_bn,
+                                                                      std, spelling):
+    """P2-12 on a real binary: at -O2 each conversion's destination is a
+    forwarded parameter, so BN recovers the scanf call with only its format.
+    A `call:`/`ret:` preset used to be refused outright ("no taint sources
+    resolved") -- or, for `ret:`, answered with an all-clear -- discarding the
+    leaf that names the three lost destinations. Either spelling of the ISO
+    alias is reached by the plain name."""
+    src = tmp_path / "scan_fwd.c"
+    src.write_text(_FORWARDED_SCAN_SOURCE)
+    binary = tmp_path / f"scan_fwd_{std}"
+    _compile(src, binary, ["-O2", "-fno-builtin", f"-std={std}"])
+    if f"{spelling}scanf" not in _dynamic_symbols(binary):
+        refuse_silent_skip(f"{spelling}scanf is not emitted by this compiler/glibc "
+                           "(the C23 spelling needs glibc 2.38+ and -std=c2x)")
+    target = shared_bn.load(binary, copy=False)
+
+    for fn, source in (("scan_fwd", "call:scanf"), ("scan_fwd", "ret:scanf"),
+                       ("scan_fwd", f"call:{spelling}scanf"), ("scan_tail", "call:scanf")):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", source)
+        holes = [lf for lf in result["leaves"] if lf["kind"] == "format_destination_unrecovered"]
+        assert [(h["callee"], h["destinations"], h["missing"]) for h in holes] == \
+            [("scanf", 3, 3)], (fn, source, result["leaves"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, source)
+
+    # The param-seeded twin: the format itself is the sink, and the lost
+    # destinations are still named.
+    parsed = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "parse_fwd",
+                      "--source", "param:0")
+    assert {(s["sink"]["callee"], s["sink"]["callee_symbol"], s["sink"]["class"])
+            for s in parsed["reached_sinks"]} == \
+        {("sscanf", f"{spelling}sscanf", "overflow_unbounded")}, parsed["reached_sinks"]
+    assert [lf["missing"] for lf in parsed["leaves"]
+            if lf["kind"] == "format_destination_unrecovered"] == [3], parsed["leaves"]
+
+
+def test_builtin_regex_and_fortify_guard_models_on_a_real_binary(tmp_path, shared_bn):
+    """W10-01: a copy sized by a regexec match offset reaches its sink with
+    the builtin catalog (no overlay). W02-06: slicing the `__strcpy_chk`
+    destination size answers with the compile-time constant, not a pointer
+    demand with a role-unknown leaf."""
+    src = tmp_path / "rx.c"
+    src.write_text(r"""
+#include <regex.h>
+#include <stdio.h>
+#include <string.h>
+#define N __attribute__((noinline, noipa))
+static regex_t re;
+N int get_field(const char *s, char *out) {
+    regmatch_t m;
+    if (regexec(&re, s, 1, &m, 0)) return -1;
+    memcpy(out, s, m.rm_eo);
+    return 0;
+}
+N void save_name(const char *s) {
+    char d[0x120];
+    strcpy(d, s);
+    puts(d);
+}
+int main(int argc, char **argv) {
+    char out[32];
+    regcomp(&re, "(a+)", REG_EXTENDED);
+    save_name(argv[0]);
+    return argc > 1 ? get_field(argv[1], out) : 0;
+}
+""")
+    binary = tmp_path / "rx"
+    _compile(src, binary, ["-O2", "-D_FORTIFY_SOURCE=2"])
+    assert "__strcpy_chk" in _dynamic_symbols(binary)
+    target = shared_bn.load(binary, copy=False)
+
+    fwd = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "get_field",
+                   "--source", "param:0")
+    assert [(s["sink"]["callee"], s["sink"]["class"], s["sink"]["tainted_arg_index"])
+            for s in fwd["reached_sinks"]] == [("memcpy", "overflow_len", 2)], fwd
+
+    bwd = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "save_name",
+                   "--sink", "arg:__strcpy_chk:2")
+    assert [(r["status"], r["scalar"]["value"]) for r in bwd["sink_status"]] == \
+        [("constant", 0x120)], bwd["sink_status"]
+    assert "sink_role_unknown" not in {lf["kind"] for lf in bwd["leaves"]}, bwd["leaves"]
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])

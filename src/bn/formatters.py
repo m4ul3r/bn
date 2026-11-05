@@ -5973,7 +5973,7 @@ def _render_taint_models_text(value: Any, *, mangled: bool = False,
             if not isinstance(s, dict):
                 lines.append(f"  {s!r}")
                 continue
-            p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
+            p = _presence_tag(s)
             # #958: `--callsites` expands sources too; the JSON always carried
             # them and the text dropped them, so the flag read as ignored.
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}"
@@ -6092,11 +6092,25 @@ def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = Fal
     return out
 
 
+def _presence_tag(e: dict[str, Any]) -> str:
+    """` [present]` / ` [absent]` for a catalog row checked against a target,
+    naming the spelling that matched when it is not the model's own name
+    (W07-15): `scanf [present as __isoc99_scanf]` tells the reader which
+    symbol `xrefs`/`callsites` find, while `call:scanf` still names the call."""
+    if "present" not in e:
+        return ""
+    if not e.get("present"):
+        return " [absent]"
+    symbol = e.get("symbol")
+    aliases = [str(a) for a in _field_list(e, "accepted_aliases") if a != symbol]
+    return f" [present as {', '.join(aliases)}]" if aliases else " [present]"
+
+
 def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
                              callsite_limit: int = 0) -> list[str]:
     """One present/catalog sink entry: the model line plus, under --callsites, its
     enriched callsite rows (address + containing function + non-audit kind)."""
-    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+    p = _presence_tag(e)
     desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
     head = (f"    {e.get('symbol', '<unknown>')} ({_sink_arg_spec(e)}){p}"
             f"{_callsite_count_note(e)}{desc}")

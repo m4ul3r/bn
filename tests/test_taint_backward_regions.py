@@ -833,14 +833,15 @@ def test_unmodeled_sink_argument_has_no_role_r7(carrier):
     assert leaf["kind"] == "sink_role_unknown", leaf
     assert (leaf["callee"], leaf["arg_index"]) == ("emit_line", 0), leaf
     # Round 8: guidance, not a generated command. A TEMPLATE entry as data,
-    # UPPER-CASE placeholders, no redirection, no rebuilt re-run.
+    # UPPER-CASE placeholder values, no redirection, no rebuilt re-run.
+    # emit_line has no current model, so the entry is the sink alone: no
+    # placeholder KEY a strict loader would refuse when pasted (P2-09).
     decl = leaf["declare_value_role"]
     assert decl["template"] is True, decl
     assert decl["entry"] == {"emit_line": {
-        "sink": {"class": "VALUE_CLASS", "tainted_args": [0]},
-        "OTHER_ROLES": "COPY_FROM_THE_CURRENT_MODEL"}}, decl
-    assert decl["placeholders"]["VALUE_CLASS"] == ["alloc_size", "fortified_overflow",
-                                                   "overflow_len"], decl
+        "sink": {"class": "VALUE_CLASS", "tainted_args": [0]}}}, decl
+    assert decl["placeholders"] == {"VALUE_CLASS": ["alloc_size", "fortified_overflow",
+                                                    "overflow_len"]}, decl
     advice = result["diagnostics"]["next_action"]
     assert ">" not in advice and "printf" not in advice, advice
     assert "bn taint backward" not in advice and "add `--models FILE` to the same command" in advice
@@ -857,14 +858,50 @@ def test_declared_value_role_completes_the_ad_hoc_sink_r7():
     engine = te.TaintEngine(FBV(_B_NAMES), te.load_models())
     entry = engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])["leaves"][0][
         "declare_value_role"]["entry"]
-    # Fill the template: a value class; emit_line has no current model, so
-    # there are no other roles to copy.
+    # Fill the template: a value class is the only placeholder.
     entry["emit_line"]["sink"]["class"] = "alloc_size"
-    del entry["emit_line"]["OTHER_ROLES"]
     declared = te.TaintEngine(FBV(_B_NAMES), te.load_models(entry)).backward(
         pg.func(), [te.parse_locator("arg:emit_line:0")])
     assert declared["leaves"] == [], declared["leaves"]
     assert declared["diagnostics"]["safe_to_report_complete_slice"] is True, declared
+
+
+@pytest.mark.parametrize("current, expect, placeholders", [
+    # A flow model and no sink: its roles are kept and the sink is added.
+    ({"propagates": [{"from": "*arg:1", "to": "ret"}]},
+     {"propagates": [{"from": "*arg:1", "to": "ret"}],
+      "sink": {"class": "VALUE_CLASS", "tainted_args": [0]}}, True),
+    # A value-class sink on another argument: the argument joins it -- a
+    # concrete entry, nothing to replace.
+    ({"sink": {"class": "alloc_size", "tainted_args": [1], "detail": "d"}},
+     {"sink": {"class": "alloc_size", "tainted_args": [0, 1], "detail": "d"}}, False),
+    # A pointer-class sink: its arguments stay pointers (`pointer_args`),
+    # so the new one is a value of the mixed sink.
+    ({"sink": {"class": "path_injection", "tainted_args": [1], "detail": "d"}},
+     {"sink": {"class": "path_injection", "tainted_args": [0, 1], "pointer_args": [1],
+               "detail": "d"}}, False),
+])
+def test_template_merges_the_callees_current_model(current, expect, placeholders):
+    # P2-09: the template carried `OTHER_ROLES: COPY_FROM_THE_CURRENT_MODEL`,
+    # a key the loader now refuses. With a current model the entry IS that
+    # model plus the value role, and once its placeholders (if any) are filled
+    # it loads and completes the slice.
+    from test_taint_engine import FBV, te
+    n = FVar("n", ident=86, typ="int64_t"); n0 = FSSA(n, 0)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_HELPER6, [FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])], reads=[n0])
+    engine = te.TaintEngine(FBV(_B_NAMES), te.load_models({"emit_line": current}))
+    [leaf] = [lf for lf in engine.backward(pg.func(), [te.parse_locator("arg:emit_line:0")])[
+        "leaves"] if lf["kind"] == "sink_role_unknown"]
+    decl = leaf["declare_value_role"]
+    assert decl["entry"] == {"emit_line": expect}, decl
+    assert decl["template"] is placeholders and bool(decl["placeholders"]) is placeholders, decl
+    entry = decl["entry"]
+    if placeholders:
+        entry["emit_line"]["sink"]["class"] = "alloc_size"
+    declared = te.TaintEngine(FBV(_B_NAMES), te.load_models(entry)).backward(
+        pg.func(), [te.parse_locator("arg:emit_line:0")])
+    assert not [lf for lf in declared["leaves"] if lf["kind"] == "sink_role_unknown"], declared
 
 
 def test_direct_literal_command_is_incomplete_not_refused_r7():
