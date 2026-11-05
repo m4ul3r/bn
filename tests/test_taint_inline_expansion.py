@@ -39,24 +39,32 @@ def _intrinsic(name):
                            intrinsic=SimpleNamespace(name=name), params=[], address=SITE)
 
 
-def _fill(length_of, *, intrinsic=True):
-    """``fill(p, n)``: ``len#1 = length_of(p#0, n#0); __builtin_memset(p#0, 0, len#1)``
+def _fill(length_of, *, intrinsic=True, pointer_phi=False):
+    """``fill(p, n)``: ``len#1 = length_of(p, n#0); __builtin_memset(p, 0, len#1)``
     at SITE, an inline `rep stos` expansion unless *intrinsic* is False (then
-    the instruction there is a real call)."""
+    the instruction there is a real call). *pointer_phi* makes the pointer
+    ``p#1 = ϕ(p#0, n#0)`` -- a register the expansion reads after a branch."""
     p, n = FVar("p"), FVar("n")
     p0, n0 = FSSA(p, 0), FSSA(n, 0)
     a1, len1 = FSSA(FVar("a"), 1), FSSA(FVar("len"), 1)
-    aligned = _bin("MLIL_AND", _bin("MLIL_ADD", _v(p0), _const(8), "p#0 + 8"),
-                   _const(-8), "(p#0 + 8) & -8")
-    length = length_of(p0, n0, a1)
-    instrs = [
-        FInstr(0, 0x1010, "MLIL_SET_VAR_SSA", "a#1 = (p#0 + 8) & -8", reads=[p0],
+    instrs = []
+    if pointer_phi:
+        ptr = FSSA(p, 1)
+        instrs.append(FInstr(len(instrs), 0x1008, "MLIL_VAR_PHI", "p#1 = ϕ(p#0, n#0)",
+                             reads=[p0, n0], writes=[ptr], src=[p0, n0]))
+    else:
+        ptr = p0
+    aligned = _bin("MLIL_AND", _bin("MLIL_ADD", _v(ptr), _const(8), "p + 8"),
+                   _const(-8), "(p + 8) & -8")
+    length = length_of(ptr, n0, a1)
+    instrs += [
+        FInstr(len(instrs), 0x1010, "MLIL_SET_VAR_SSA", "a#1 = (p + 8) & -8", reads=[ptr],
                writes=[a1], src=aligned),
-        FInstr(1, 0x1020, "MLIL_SET_VAR_SSA", f"len#1 = {length}",
+        FInstr(len(instrs) + 1, 0x1020, "MLIL_SET_VAR_SSA", f"len#1 = {length}",
                reads=list(length.vars_read), writes=[len1], src=length),
-        FInstr(2, SITE, "MLIL_CALL_SSA", "__builtin_memset(p#0, 0, len#1)", reads=[p0, len1],
-               dest=FExpr("MLIL_CONST_PTR", hex(MEMSET), constant=MEMSET),
-               params=[_v(p0), _const(0), _v(len1)]),
+        FInstr(len(instrs) + 2, SITE, "MLIL_CALL_SSA", "__builtin_memset(p, 0, len#1)",
+               reads=[ptr, len1], dest=FExpr("MLIL_CONST_PTR", hex(MEMSET), constant=MEMSET),
+               params=[_v(ptr), _const(0), _v(len1)]),
     ]
     ssa = FSSAFunc(instrs)
     func = FFunc("fill", 0x1000, ssa, params=[p, n])
@@ -110,6 +118,14 @@ def test_an_alignment_split_length_over_a_tainted_pointer_is_bounded(models, len
     assert sink["catalog_class"] == "overflow_len"
     assert sink["intrinsic_expansion"] == {"intrinsic": "__memfill_u64",
                                            "length_bound": hex(bound)}
+
+
+def test_an_aligned_pointer_that_is_a_phi_still_cancels(models):
+    # The pointer the expansion aligns is a phi of unrelated values: one value
+    # read twice, so it cancels like a parameter does.
+    sink = _memset_sink(models, *_fill(_aligned_total, pointer_phi=True), "param:0")
+    assert sink["class"] == "bounded_len"
+    assert sink["intrinsic_expansion"]["length_bound"] == hex(0x138)
 
 
 def test_a_tainted_total_in_the_same_expansion_still_overflows(models):

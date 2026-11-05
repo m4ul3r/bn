@@ -6898,8 +6898,10 @@ class TaintEngine:
 
     def _residue_of_var(self, ssaf: Any, var: Any, depth: int) -> tuple[Any, int, int] | None:
         """:meth:`_residue_interval` of an SSA variable: its definition when
-        that is arithmetic the interval follows, every arm of a phi, else the
-        variable itself as an opaque base (a parameter, a load, a call result)."""
+        that is arithmetic the interval follows, every arm of a phi whose arms
+        share one base, else the variable itself as an opaque base (a
+        parameter, a load, a call result, a phi of unrelated values): two reads
+        of one opaque value cancel, reads of different ones never do."""
         if not is_ssa_var(var):
             return None
         defn = self._ssa_def(ssaf, var)
@@ -6907,10 +6909,9 @@ class TaintEngine:
         if dop == "MLIL_VAR_PHI":
             arms = [self._residue_of_var(ssaf, v, depth + 1)
                     for v in (getattr(defn, "src", None) or [])]
-            if not arms or any(a is None for a in arms) or len({a[0] for a in arms}) != 1:
-                return None
-            return (arms[0][0], min(a[1] for a in arms), max(a[2] for a in arms))
-        if dop == "MLIL_SET_VAR_SSA":
+            if arms and all(a is not None for a in arms) and len({a[0] for a in arms}) == 1:
+                return (arms[0][0], min(a[1] for a in arms), max(a[2] for a in arms))
+        elif dop == "MLIL_SET_VAR_SSA":
             val = self._residue_interval(ssaf, getattr(defn, "src", None), depth + 1)
             if val is not None:
                 return val
