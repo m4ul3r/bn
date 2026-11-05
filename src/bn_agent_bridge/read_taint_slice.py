@@ -318,7 +318,8 @@ def _branch_target(dest) -> int | None:
     return None
 
 
-def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -> str | None:
+def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int],
+                    judge: _ExpansionJudge) -> str | None:
     """How the instruction at *addr* (a code reference to the modeled symbol)
     uses that symbol (#958):
 
@@ -329,7 +330,7 @@ def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -
     * ``"inline"`` -- not a call in LLIL, but BN's MLIL synthesised an inline
       builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`, a
       fixed-size `rep stos`) and every argument the model flags is settled
-      (:func:`_flagged_arg_settled`), so no taint can arm it;
+      (:meth:`_ExpansionJudge.settled`), so no taint can arm it;
     * ``"data"``   -- anything else: the `adrp` that loads the GOT page the
       import's slot sits on, the stub's own `ldr`/`add` of its slot;
     * ``None``     -- the view cannot answer (no function, no IL API), so the
@@ -370,27 +371,45 @@ def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -
     for call in synthesised:
         params = list(getattr(call, "params", []) or [])
         flagged = [i for i in flagged_args if 0 <= i < len(params)]
-        if not flagged or not all(_flagged_arg_settled(fn, addr, call, i) for i in flagged):
+        if not flagged or not all(judge.settled(fn, addr, call, i) for i in flagged):
             return "call"
     return "inline"
 
 
-def _flagged_arg_settled(fn, addr: int, call, index: int) -> bool:
-    """Whether no taint can arm argument *index* of a synthesised builtin call:
-    a constant, or the length of an inline string expansion that is a constant
-    total split by pointer alignment (the bound forward taint reports such a
-    site with, V8-03) -- gcc's `rep stos` of a fixed-size `memset`."""
-    param = list(getattr(call, "params", []) or [])[index]
-    if "CONST" in il_format._il_op_name(param):
-        return True
-    try:
-        ssa_call = call.ssa_form
-        ssaf = fn.mlil.ssa_form
-        ssa_param = list(ssa_call.params)[index]
-    except Exception:
-        return False
-    return _taint.inline_expansion_length(
-        ssaf, addr, ssa_param, lambda f, v: f.get_ssa_var_definition(v)) is not None
+class _ExpansionJudge:
+    """Whether taint can arm a flagged argument of a synthesised builtin call,
+    for ONE catalog request: a constant, or the length of an inline string
+    expansion that is a constant total split by its own pointer's alignment
+    (``alignment_split``, the length forward taint reports ``bounded_len``) --
+    gcc's `rep stos` of a fixed-size `memset`. A masked attacker value
+    (``n & 7``) is not settled. SSA forms come from one engine's per-request
+    cache, and each (function, address, argument) is judged once: a `rep stos`
+    lifts to two calls, and a catalog asks about every site of every builtin.
+    Nothing outlives the request."""
+
+    def __init__(self, bv, models) -> None:
+        self._engine = _taint.TaintEngine(bv, models)
+        self._verdicts: dict[tuple[int, int, int], bool] = {}
+
+    def settled(self, fn, addr: int, call, index: int) -> bool:
+        param = list(getattr(call, "params", []) or [])[index]
+        if "CONST" in il_format._il_op_name(param):
+            return True
+        key = (int(getattr(fn, "start", -1)), int(addr), index)
+        if key not in self._verdicts:
+            self._verdicts[key] = self._expansion_split(fn, call, index)
+        return self._verdicts[key]
+
+    def _expansion_split(self, fn, call, index: int) -> bool:
+        ssaf = self._engine._ssa_or_none(fn)
+        try:
+            ssa_call = call.ssa_form
+        except Exception:
+            return False
+        if ssaf is None or ssa_call is None:
+            return False
+        verdict = _taint.inline_expansion_length(ssaf, ssa_call, index, self._engine._ssa_def)
+        return verdict is not None and verdict["length_kind"] == "alignment_split"
 
 
 def _flagged_args(model: dict[str, Any] | None) -> list[int]:
@@ -484,6 +503,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
         if want_callsites:
             keyed.setdefault(key, []).extend(
                 getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or [])
+    judge = _ExpansionJudge(bv, models) if keyed else None
     for key, syms in keyed.items():
         slot = info[key]
         # Every address the symbol answers to (stub, GOT slot, extern) is a call
@@ -501,7 +521,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                     continue
                 seen.add(ai)
                 container = _containing_fn(bv, ai)
-                shape = _callsite_shape(container, ai, targets, flagged)
+                shape = _callsite_shape(container, ai, targets, flagged, judge)
                 if shape == "data":
                     continue
                 fname, kind = _classify_callsite(bv, ai, key, models)

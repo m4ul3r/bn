@@ -273,6 +273,25 @@ def intrinsic_operand_register(intrinsics: list[Any], index: int) -> str | None:
     return None
 
 
+def intrinsic_pointer_operands(intrinsics: list[Any], count_index: int) -> set[int]:
+    """The operands of an inline expansion that are the pointers it walks:
+    each register operand the intrinsic also writes back (``rep movs``
+    advances ``rdi`` and ``rsi``, ``rep stos`` only ``rdi``) other than the
+    count at *count_index*. ``rep stos``'s fill value (``rax``) is read, not
+    written, so it is never one."""
+    found: set[int] = set()
+    for item in intrinsics:
+        written = {str(getattr(reg, "name", None) or reg)
+                   for reg in (getattr(item, "output", None) or [])}
+        for i, operand in enumerate(getattr(item, "params", None) or []):
+            if i == count_index or _il_op_name(operand) != "LLIL_REG":
+                continue
+            reg = getattr(operand, "src", None)
+            if str(getattr(reg, "name", None) or reg) in written:
+                found.add(i)
+    return found
+
+
 def _hlil_candidates_for_llil(insn) -> list[Any]:
     candidates = []
     seen: set[tuple[str, int]] = set()

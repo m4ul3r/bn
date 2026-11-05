@@ -1,9 +1,11 @@
 """Inline string expansions (V8-03): BN lifts gcc's inline `rep stos`/`rep movs`
 to an `LLIL_INTRINSIC` that MLIL renders as a synthesised `__builtin_memset`/
-`__builtin_memcpy` call. When the count is a constant total split by pointer
-alignment, taint on the POINTER does not steer it: the sink is `bounded_len`
-with an `intrinsic_expansion` qualifier. A tainted total, or the same length
-handed to a real call, still reports `overflow_len`."""
+`__builtin_memcpy` call. When the count is a constant total split by the
+alignment of the expansion's own pointer, taint on the POINTER does not steer
+it: the sink is `bounded_len` with an `intrinsic_expansion` qualifier. A low-bit
+mask of any other value (`n & 7`) is a tainted length the mask only bounds: it
+overflows unless the destination is known to hold the bound. A tainted total, or
+the same length handed to a real call, still reports `overflow_len`."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -34,18 +36,30 @@ def _bin(op, left, right, text):
                  left=left, right=right)
 
 
+def _reg(name):
+    return SimpleNamespace(operation=SimpleNamespace(name="LLIL_REG"),
+                           src=SimpleNamespace(name=name))
+
+
 def _intrinsic(name):
+    """`rep stos`: `rdi, rcx = __memfill_u64(rdi, rax, rcx)` -- the pointer it
+    advances (an output) is operand 0; operand 1 is the fill value."""
     return SimpleNamespace(operation=SimpleNamespace(name="LLIL_INTRINSIC"),
-                           intrinsic=SimpleNamespace(name=name), params=[], address=SITE)
+                           intrinsic=SimpleNamespace(name=name),
+                           params=[_reg("rdi"), _reg("rax"), _reg("rcx")],
+                           output=[SimpleNamespace(name="rdi"), SimpleNamespace(name="rcx")],
+                           address=SITE)
 
 
-def _fill(length_of, *, intrinsic=True, pointer_phi=None):
+def _fill(length_of, *, intrinsic=True, pointer_phi=None, dest=None):
     """``fill(p, n)``: ``len#1 = length_of(p, n#0); __builtin_memset(p, 0, len#1)``
     at SITE, an inline `rep stos` expansion unless *intrinsic* is False (then
     the instruction there is a real call). *pointer_phi* makes the pointer a
     phi: ``"branch"`` is ``p#1 = ϕ(p#0, n#0)``, a register read after a
     branch; ``"loop"`` is ``p#1 = ϕ(p#0, p#2)`` with ``p#2 = ϕ(p#1, n#0)``, the
-    pointer of an inner and outer loop whose phis feed each other."""
+    pointer of an inner and outer loop whose phis feed each other. *dest*
+    (a C array type such as ``char[4]``) fills a local of that type instead of
+    ``p``."""
     p, n = FVar("p"), FVar("n")
     p0, n0 = FSSA(p, 0), FSSA(n, 0)
     a1, len1 = FSSA(FVar("a"), 1), FSSA(FVar("len"), 1)
@@ -72,7 +86,8 @@ def _fill(length_of, *, intrinsic=True, pointer_phi=None):
                reads=list(length.vars_read), writes=[len1], src=length),
         FInstr(len(instrs) + 2, SITE, "MLIL_CALL_SSA", "__builtin_memset(p, 0, len#1)",
                reads=[ptr, len1], dest=FExpr("MLIL_CONST_PTR", hex(MEMSET), constant=MEMSET),
-               params=[_v(ptr), _const(0), _v(len1)]),
+               params=[(FExpr("MLIL_ADDRESS_OF", "&buf", src=FVar("buf", typ=dest))
+                        if dest else _v(ptr)), _const(0), _v(len1)]),
     ]
     ssa = FSSAFunc(instrs)
     func = FFunc("fill", 0x1000, ssa, params=[p, n])
@@ -91,10 +106,15 @@ def _aligned_total(p0, _n0, a1):
                 "(...) << 3")
 
 
-def _masked_distance(p0, n0, _a1):
-    # (p - n) & 7: the misalignment between two pointers
-    return _bin("MLIL_AND", _bin("MLIL_SUB", _v(p0), _v(n0), "p#0 - n#0"), _const(7),
-                "(p#0 - n#0) & 7")
+def _tainted_low_bits(_p0, n0, _a1):
+    # n & 7: the low bits of a value that is not the expansion's pointer
+    return _bin("MLIL_AND", _v(n0), _const(7), "n#0 & 7")
+
+
+def _tainted_residue(_p0, n0, _a1):
+    # n - (n & ~7): the same residue spelled as a subtraction of its alignment
+    return _bin("MLIL_SUB", _v(n0), _bin("MLIL_AND", _v(n0), _const(-8), "n#0 & -8"),
+                "n#0 - (n#0 & -8)")
 
 
 def _negated_residue(p0, _n0, _a1):
@@ -118,14 +138,35 @@ def _memset_sink(models, func, bv, source):
     return sinks[0]
 
 
-@pytest.mark.parametrize("length_of, bound", [
-    (_aligned_total, 0x138), (_masked_distance, 7), (_negated_residue, 7)])
+@pytest.mark.parametrize("length_of, bound", [(_aligned_total, 0x138), (_negated_residue, 7)])
 def test_an_alignment_split_length_over_a_tainted_pointer_is_bounded(models, length_of, bound):
     sink = _memset_sink(models, *_fill(length_of), "param:0")
     assert sink["class"] == "bounded_len"
     assert sink["catalog_class"] == "overflow_len"
     assert sink["intrinsic_expansion"] == {"intrinsic": "__memfill_u64",
-                                           "length_bound": hex(bound)}
+                                           "length_bound": hex(bound),
+                                           "length_kind": "alignment_split"}
+
+
+@pytest.mark.parametrize("length_of", [_tainted_low_bits, _tainted_residue])
+def test_a_masked_tainted_value_is_an_overflow_with_its_bound_as_a_fact(models, length_of):
+    """G4c P1: the mask bounds the attacker's value, it does not remove it."""
+    sink = _memset_sink(models, *_fill(length_of), "param:1")
+    assert sink["class"] == "overflow_len"
+    assert sink["intrinsic_expansion"] == {"intrinsic": "__memfill_u64", "length_bound": "0x7",
+                                           "length_kind": "masked_value",
+                                           "destination_fit": "unproved"}
+
+
+@pytest.mark.parametrize("dest, cls, fit", [("char[4]", "overflow_len", "exceeds"),
+                                            ("char[0x10]", "bounded_len", "fits")])
+def test_a_masked_tainted_length_is_checked_against_the_destination(models, dest, cls, fit):
+    # A 7-byte fill overflows a 4-byte local and fits a 16-byte one.
+    sink = _memset_sink(models, *_fill(_tainted_low_bits, dest=dest), "param:1")
+    assert sink["class"] == cls
+    assert sink["intrinsic_expansion"]["length_kind"] == "masked_value"
+    assert sink["intrinsic_expansion"]["destination_fit"] == fit
+    assert sink["intrinsic_expansion"]["destination_capacity"] == int(dest[5:-1], 0)
 
 
 @pytest.mark.parametrize("phi", ["branch", "loop"])

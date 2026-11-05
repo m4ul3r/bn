@@ -619,6 +619,59 @@ def test_a_rep_movs_lifted_behind_a_direction_flag_branch_is_an_audit_site():
     assert entry["callsite_count"] == entry["audit_callsite_count"] == 1
 
 
+def test_one_catalog_request_lifts_a_function_once_and_judges_each_site_once(monkeypatch):
+    """G4c P2: the catalog fetched `fn.mlil.ssa_form` -- a fresh wrapper Binary
+    Ninja may regenerate -- for every synthesised call, and a `rep stos` lifts
+    to two, so two fixed-size sites in one function lifted it four times and
+    judged each site twice. One request now shares the engine's SSA cache and
+    judges each (function, address, argument) once."""
+    from types import SimpleNamespace
+
+    lifts = []
+    judged = []
+
+    def site(addr):
+        def lifted_call():
+            call = _Llil("MLIL_CALL", _const(0x9100))
+            call.params = [_Llil("MLIL_VAR"), _const(0), _Llil("MLIL_LSL")]
+            call.ssa_form = SimpleNamespace(address=addr, params=call.params)
+            intrinsic = _Llil("LLIL_INTRINSIC")
+            intrinsic.mlils = [call]
+            return intrinsic
+        return [_Llil("LLIL_IF", mlil=_Llil("MLIL_IF")), lifted_call(), lifted_call()]
+
+    sites = {0x5020: site(0x5020), 0x5060: site(0x5060)}
+    fn = _ILFn("reset_records", 0x5000, {a: lifted[0] for a, lifted in sites.items()})
+    fn.get_llils_at = lambda a: sites.get(a, [])
+
+    class _MLIL:
+        @property
+        def ssa_form(self):
+            lifts.append(fn.start)
+            return SimpleNamespace(source_function=fn)
+
+    fn.mlil = _MLIL()
+
+    def fixed_size(*args):
+        judged.append(args)
+        return {"intrinsic": "__memfill_u64", "length_bound": "0x138",
+                "length_kind": "alignment_split"}
+
+    monkeypatch.setattr(rts._taint, "inline_expansion_length", fixed_size)
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            self.functions = [fn]
+            self._syms = {"__builtin_memset": [_Sym("__builtin_memset", 0x9100)]}
+            self._refs = {0x9100: [_Ref(0x5020), _Ref(0x5060)]}
+            self._contain = {0x5020: fn, 0x5060: fn}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    entry = _sink_entry(res, "__builtin_memset")
+    assert entry["hidden_callsites"] == {"inline_builtin": 2}
+    assert lifts == [0x5000]
+    assert len(judged) == 2
+
 
 def test_callsite_rows_name_the_caller_demangled_unless_mangled():
     # #978's rule for text: the containing function by its demangled display

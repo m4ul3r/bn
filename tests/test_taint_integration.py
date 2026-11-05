@@ -8082,11 +8082,43 @@ def test_an_alignment_split_inline_expansion_is_bounded_not_overflow(tmp_path, s
         assert (sink["callee"], sink["class"], sink["catalog_class"]) == (
             callee, "bounded_len", "overflow_len"), (fn, sink)
         assert sink["intrinsic_expansion"]["intrinsic"] == intrinsic
+        assert sink["intrinsic_expansion"]["length_kind"] == "alignment_split"
         assert int(sink["intrinsic_expansion"]["length_bound"], 16) <= 0x140, sink
 
     [label] = sinks("copy_label")
     assert (label["callee"], label["class"]) == ("__builtin_memcpy", "overflow_len"), label
     assert "intrinsic_expansion" not in label
+
+
+def test_a_tainted_size_inline_memset_overflows_even_when_masked(tmp_path, shared_bn):
+    """G4c P1: `memset(out, 0, (pkt[0] & 0x3ff) + 16)` at -O2 is a `rep stos`
+    whose count adds the packet's masked size to the alignment correction. The
+    mask erased the size's dependency, so the sink read `bounded_len` with
+    `length_bound: 0x408` -- an overflow of any destination shorter than that.
+    It is `overflow_len` with the bound as a fact, and a catalog audit row; the
+    unmasked `memset(out, 0, pkt[0])` (`rep stos` too) stays `overflow_len`."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+
+    def sink_of(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:1")
+        [sink] = [s["sink"] for s in result["reached_sinks"]]
+        return sink
+
+    masked = sink_of("clear_masked")
+    assert (masked["callee"], masked["class"]) == ("__builtin_memset", "overflow_len"), masked
+    assert masked["intrinsic_expansion"] == {
+        "intrinsic": "__memfill_u64", "length_bound": "0x408",
+        "length_kind": "masked_value", "destination_fit": "unproved"}, masked
+    tail = sink_of("clear_tail")
+    assert (tail["callee"], tail["class"]) == ("__builtin_memset", "overflow_len"), tail
+
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
+                       "--present", "--callsites", "--all-sites")
+    [entry] = [e for e in catalog["items"] if e["symbol"] == "__builtin_memset"]
+    kinds = {row["function"]: row["kind"] for row in entry["callsites"]}
+    assert (kinds["clear_masked"], kinds["clear_tail"], kinds["record_reset"]) == (
+        "app_caller", "app_caller", "inline_builtin"), kinds
 
 
 def test_an_inline_copy_is_one_backward_sink_site(tmp_path, shared_bn):

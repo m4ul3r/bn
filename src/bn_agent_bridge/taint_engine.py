@@ -6767,6 +6767,27 @@ class TaintEngine:
             cur, at = getattr(d, "src", None), getattr(d, "address", None)
         return None
 
+    def _expansion_verdict(self, ssaf: Any, call: Any, params: list[Any], length_idx: int,
+                           model: dict[str, Any]) -> dict[str, Any] | None:
+        """:func:`taint_il.inline_expansion_length` of the call's length, with a
+        ``masked_value`` length checked against the destination it writes:
+        ``destination_fit`` is ``fits``/``exceeds`` when the destination is a
+        fixed-size object (``destination_capacity`` its bytes), else
+        ``unproved``. An ``alignment_split`` length needs no capacity."""
+        verdict = inline_expansion_length(ssaf, call, length_idx, self._ssa_def)
+        if verdict is None or verdict["length_kind"] == "alignment_split":
+            return verdict
+        roles = _model_copy_roles(model)
+        dest_idx = roles[1] if roles else 0
+        cap = (self._buffer_capacity(ssaf, params[dest_idx]) if dest_idx < len(params)
+               else None)
+        size = cap[0] if cap else None
+        if size is None:
+            return {**verdict, "destination_fit": "unproved"}
+        return {**verdict, "destination_capacity": size,
+                "destination_fit": "fits" if int(verdict["length_bound"], 16) <= size
+                else "exceeds"}
+
     def _buffer_capacity(self, ssaf: Any, expr: Any,
                          depth: int = 0) -> tuple[int | None, str, Any] | None:
         """``(bytes available from expr, description, alloc_size_expr)`` for a
@@ -14128,28 +14149,37 @@ class TaintEngine:
                             # #443: for a recv-style bounded-write sink the
                             # destination is `buf_arg` (not memcpy's arg0), so the
                             # provably-bounded downgrade checks the right buffer.
-                            # V8-03: an inline string expansion (`rep stos`/
-                            # `rep movs` BN synthesises a `__builtin_*` call
-                            # from) whose count is a constant total split by
-                            # pointer alignment cannot be steered by taint on
-                            # the pointer: bounded, and nothing below may
-                            # re-headline it.
-                            _expansion = (inline_expansion_length(ssaf, addr, params[argidx],
-                                                                  self._ssa_def)
+                            # V8-03 / G4c: an inline string expansion (`rep
+                            # stos`/`rep movs` BN synthesises a `__builtin_*`
+                            # call from) whose count is a constant total split
+                            # by its own pointer's alignment cannot be steered
+                            # by taint: bounded, and nothing below may
+                            # re-headline it. A masked attacker value (`n & 7`)
+                            # is bounded only when the destination holds the
+                            # bound; otherwise it stays an overflow and carries
+                            # the bound as a fact (added after the relabels).
+                            _expansion = (self._expansion_verdict(ssaf, ins, params, argidx, model)
                                           if classify and sink.get("class") == "overflow_len"
                                           else None)
-                            if _expansion is not None:
+                            if _expansion is not None and (
+                                    _expansion["length_kind"] == "alignment_split"
+                                    or _expansion.get("destination_fit") == "fits"):
                                 _bnd_reason = None
+                                _why = ("a constant total split by pointer alignment -- taint "
+                                        "on the pointer does not reach it"
+                                        if _expansion["length_kind"] == "alignment_split"
+                                        else "an attacker-controlled value's low bits, which the "
+                                        f"{_expansion['destination_capacity']}-byte destination holds")
                                 eff_sink = {
                                     **sink,
                                     "class": "bounded_len",
                                     "intrinsic_expansion": _expansion,
                                     "detail": (sink.get("detail") or "")
                                     + f" (inline {_expansion['intrinsic']} expansion: the length "
-                                    f"is at most {_expansion['length_bound']}, a constant total "
-                                    "split by pointer alignment -- taint on the pointer does "
-                                    "not reach it)",
-                                    "relabel": "inline expansion of a constant-size copy/fill",
+                                    f"is at most {_expansion['length_bound']}, {_why})",
+                                    "relabel": ("inline expansion of a constant-size copy/fill"
+                                                if _expansion["length_kind"] == "alignment_split"
+                                                else "masked length within the destination"),
                                 }
                             elif argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
                                 # Armed by len_arg but NO buf_arg declared: do NOT
@@ -14330,6 +14360,11 @@ class TaintEngine:
                                         "build reuses registers, so read them against "
                                         "the IL rather than expecting `cap`/`progress`)",
                                     }
+                            # G4c: a masked attacker length the destination is
+                            # not known to hold keeps its class and carries the
+                            # bound (and the capacity, when known) as a fact.
+                            if _expansion is not None and "intrinsic_expansion" not in eff_sink:
+                                eff_sink = {**eff_sink, "intrinsic_expansion": _expansion}
                             # #980: a finding re-headlined away from its catalog
                             # class names that class, so `taint models` and the
                             # finding are visibly the same sink.
