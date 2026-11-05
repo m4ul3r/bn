@@ -517,3 +517,22 @@ def test_backward_next_action_prints_only_a_complete_forward_command(leaf, comma
         assert "`bn " not in text, text
     else:
         assert command in text, text
+
+
+def test_a_global_load_behind_a_may_alias_store_is_the_origin():
+    # W02-10: the length is a byte loaded from a writable global; a later
+    # store through a pointer the walk cannot prove disjoint MAY have written
+    # it. That store's value comes from another unresolved load, whose
+    # frontier used to represent the slice -- naming an anonymous pointer
+    # load instead of the global the sink actually read.
+    g = 0x402010
+    p = _FieldProgram()
+    p.store(p.addr(p.n0, 0), 1, p.load(p.addr(p.m0, 0x28), 8))
+    p.sink(p.load(FExpr("MLIL_CONST_PTR", hex(g), constant=g), 1))
+    result, origins, reasons, fields = p.run(writable=True)
+    assert any("may write the loaded bytes" in r for r in reasons), reasons
+    assert origins[0]["kind"] == "field_load_unresolved", origins
+    assert origins[0]["base"] == hex(g), origins
+    # The may-alias store's own provenance stays disclosed as a frontier.
+    assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
