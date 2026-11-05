@@ -829,6 +829,14 @@ class TaintEngine:
         # what tells an interior ALIAS from the next object along; built
         # once from the raw image, never from this run's evidence.
         self._declared_objects: list[tuple[int, int]] | None = None
+        # `(link address, view address, size)` of each declared object of a
+        # rebased fixed-address image whose link-time address the view does
+        # not map: its absolute references still name the link address, and
+        # both spellings are ONE object, keyed at the view address (D5a-01).
+        self._link_spellings: list[tuple[int, int, int]] = []
+        # Their link-time spans merged, `(start, end, view - link)`, sorted.
+        self._link_spans: list[tuple[int, int, int]] = []
+        self._link_span_starts: list[int] = []
         self._declared_object_cache: dict[int, tuple[int, int] | None] = {}
         # Object widths a declaration states (image symbol table or debug
         # info), per address: facts about the binary, never this run's.
@@ -2312,7 +2320,7 @@ class TaintEngine:
                 v = getattr(expr, "value", None)
                 c = getattr(v, "value", v)
             try:
-                addr = int(c)
+                addr = self._view_spelling(int(c))
             except Exception:
                 return None
             if not canon:
@@ -2383,6 +2391,7 @@ class TaintEngine:
         offsets into one buffer share a taint location) and require it be writable,
         so rodata strings / code pointers are not treated as buffers. Permissive
         when the BinaryView lacks these APIs (the unit-test fakes)."""
+        addr = self._view_spelling(addr)
         cached = self._canon_global_cache.get(addr, _MISSING)
         if cached is not _MISSING:
             return cached
@@ -2537,13 +2546,16 @@ class TaintEngine:
         return all(hi is not None and (off + width <= lo or off >= hi) for lo, hi in ranges)
 
     def _int_const(self, expr: Any) -> int | None:
+        """*expr*'s integer constant, an address in the view's spelling
+        (:meth:`_view_spelling`: a rebased image's link-time address of a
+        declared object is that object), else None."""
         if expr is None or "CONST" not in op_name(expr):
             return None
         c = getattr(expr, "constant", None)
         if c is None:
             return None
         try:
-            return int(c)
+            return self._view_spelling(int(c))
         except Exception:
             return None
 
@@ -8554,7 +8566,7 @@ class TaintEngine:
                 elif sub is not None:
                     stack.append((sub, depth + 1))
             stack.extend((s, depth + 1) for s in (getattr(node, "operands", None) or ()))
-        out = tuple(sorted(set(found)))
+        out = tuple(sorted({self._view_spelling(value) for value in found}))
         if key is not None:
             self._expr_constants_cache[key] = (owner, out)
         return out
@@ -8629,6 +8641,12 @@ class TaintEngine:
                     at = start
                 if start not in out or at < out[start]:
                     out[start] = at
+            # D5a-01: a rebased fixed-address image's absolute references
+            # still name the object at its link-time spelling, where BN
+            # records no reference: the view does not map that address.
+            for start, at in self._link_spelling_refs(ga, extent):
+                if start not in out or at < out[start]:
+                    out[start] = at
         self._global_refs[ga] = out
         return out
 
@@ -8669,26 +8687,17 @@ class TaintEngine:
             except Exception:
                 data = b""
             needles = set()
-            if 0 <= ga < 1 << 32:
-                needles.add(ga.to_bytes(4, "little", signed=False))
-            if 0 <= ga < 1 << 64:
-                needles.add(ga.to_bytes(8, "little", signed=False))
-            length_at = getattr(self.bv, "get_instruction_length", None)
+            link = self._link_spelling(ga)
+            for spelling in (int(ga), *(() if link is None else (link[0],))):
+                if 0 <= spelling < 1 << 32:
+                    needles.add(spelling.to_bytes(4, "little", signed=False))
+                if 0 <= spelling < 1 << 64:
+                    needles.add(spelling.to_bytes(8, "little", signed=False))
             seen: set[int] = set()
             for needle in sorted(needles, key=len, reverse=True):
                 pos = data.find(needle)
                 while pos >= 0 and len(out) < 8:
-                    hit = start + pos
-                    site = hit
-                    if callable(length_at):
-                        for back in range(1, 16):
-                            try:
-                                size = int(length_at(hit - back) or 0)
-                            except Exception:
-                                break
-                            if size > back:
-                                site = hit - back
-                                break
+                    site = self._instruction_containing(start + pos)
                     if site not in seen:
                         seen.add(site)
                         out.append(site)
@@ -8696,6 +8705,74 @@ class TaintEngine:
         result = tuple(sorted(out))
         self._native_refs_cache[key] = result
         return result
+
+    def _instruction_containing(self, hit: int) -> int:
+        """The start of the instruction whose bytes include *hit*: the
+        nearest decode before it that runs past it, else *hit* itself."""
+        length_at = getattr(self.bv, "get_instruction_length", None)
+        if callable(length_at):
+            for back in range(1, 16):
+                try:
+                    size = int(length_at(hit - back) or 0)
+                except Exception:
+                    break
+                if size > back:
+                    return hit - back
+        return hit
+
+    # Code bytes one object's link-spelling search reads before it stops and
+    # records the sweep as truncated.
+    _LINK_SCAN_BYTES = 64 << 20
+
+    def _link_spelling_refs(self, ga: int, extent: int) -> list[tuple[int, int]]:
+        """``(function start, instruction)`` for each place an executable
+        segment's bytes carry an address inside the link-time spelling of
+        the object at *ga* (:meth:`_link_spelling`).
+
+        BN records references only to addresses the view maps, so an
+        unrelocated immediate naming the link address (`mov edi, 0x404020`
+        once the image is rebased to 0x500000) is in no code-reference DB
+        (measured). The bytes still carry it, little-endian, as for
+        :meth:`_native_global_refs`. The search keys on the encoding's
+        high bytes, which every address of a small object shares, and
+        checks each candidate's whole value, so one pass over the code
+        covers every interior offset."""
+        link = self._link_spelling(ga)
+        read = getattr(self.bv, "read", None)
+        containing = getattr(self.bv, "get_functions_containing", None)
+        if link is None or not callable(read) or not callable(containing):
+            return []
+        lo, end = link
+        hi = min(end, lo + max(1, int(extent)))
+        width = 4 if hi <= 1 << 32 else 8
+        out: list[tuple[int, int]] = []
+        budget = self._LINK_SCAN_BYTES
+        for seg in list(getattr(self.bv, "segments", None) or []):
+            if not getattr(seg, "executable", False):
+                continue
+            start = int(seg.start)
+            size = int(seg.end) - start
+            if size > budget:
+                self._global_refs_truncated.add(ga)
+                size = budget
+            budget -= size
+            try:
+                data = bytes(read(start, size) or b"")
+            except Exception:
+                continue
+            for prefix in range(lo >> 16, ((hi - 1) >> 16) + 1):
+                needle = prefix.to_bytes(width - 2, "little")
+                pos = data.find(needle, 2)
+                while 0 <= pos <= len(data) - width + 2:
+                    value = int.from_bytes(data[pos - 2:pos - 2 + width], "little")
+                    if lo <= value < hi:
+                        site = self._instruction_containing(start + pos - 2)
+                        for fn in containing(site) or []:
+                            out.append((int(fn.start), site))
+                    pos = data.find(needle, pos + 1)
+            if budget <= 0:
+                break
+        return out
 
     # Expression shapes a POINTER can be carried through without ceasing to
     # point at the same object: SSA copies, PHI merges, widening/narrowing
@@ -10115,13 +10192,49 @@ class TaintEngine:
         if self._declared_objects is not None:
             return self._declared_objects
         table: list[tuple[int, int]] = []
+        spellings: list[tuple[int, int, int]] = []
         try:
-            table = self._read_elf_object_sizes()
+            table, spellings = self._read_elf_object_sizes()
         except Exception:
-            table = []
+            table, spellings = [], []
         table.sort()
+        self._link_spellings = sorted(spellings)
+        # The link-time spans merged, for a bisect per constant: every
+        # spelling moved by the one load bias, so a span's delta is its own.
+        spans: list[list[int]] = []
+        for link, view, size in self._link_spellings:
+            if spans and link <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], link + size)
+            else:
+                spans.append([link, link + size, view - link])
+        self._link_spans = [(lo, hi, delta) for lo, hi, delta in spans]
+        self._link_span_starts = [lo for lo, _hi, _delta in spans]
         self._declared_objects = table
         return table
+
+    def _view_spelling(self, addr: int) -> int:
+        """*addr* in the view's address space: an address inside a declared
+        object's link-time spelling (:attr:`_link_spellings`) is the same
+        byte of the object where the view has it; any other address is
+        itself. Every question about WHICH storage an address names is asked
+        of this spelling, so the two spellings are one object (D5a-01)."""
+        addr = int(addr)
+        if self._declared_objects is None:
+            self._declared_object_table()
+        i = bisect.bisect_right(self._link_span_starts, addr) - 1
+        if i >= 0 and addr < self._link_spans[i][1]:
+            return addr + self._link_spans[i][2]
+        return addr
+
+    def _link_spelling(self, ga: int) -> tuple[int, int] | None:
+        """``(spelling, end)``: the link-time spelling of view address *ga*
+        and the end of its object's link-time span, when a rebased
+        fixed-address image's references may still name it there."""
+        self._declared_object_table()
+        for link, view, size in self._link_spellings:
+            if view <= int(ga) < view + size:
+                return int(ga) - view + link, link + size
+        return None
 
     # ELF data symbols only (`STT_OBJECT`), and only where the image states
     # a size: a zero `st_size` says nothing, which is not the same as 0.
@@ -10129,10 +10242,12 @@ class TaintEngine:
     # `e_type` of a fixed-address executable (a PIE or shared object is ET_DYN).
     _ELF_ET_EXEC = 2
 
-    def _read_elf_object_sizes(self) -> list[tuple[int, int]]:
-        """The `(address, size)` pairs an ELF image's symbol tables state,
-        in the VIEW's address space -- and, for a rebased fixed-address
-        image, at its link-time address too.
+    def _read_elf_object_sizes(self) -> tuple[list[tuple[int, int]],
+                                              list[tuple[int, int, int]]]:
+        """The `(address, size)` pairs an ELF image's symbol tables state, in
+        the VIEW's address space, and the `(link, view, size)` spelling of
+        each one a rebased fixed-address image still names at its link-time
+        address.
 
         `st_value` is a link-time address. BN maps the whole image by the
         load bias -- the view's start against the lowest `PT_LOAD` address:
@@ -10145,17 +10260,18 @@ class TaintEngine:
         rebased, its immediates and initialised pointers still hold
         `st_value` (measured on BN: `mov esi, imm32` and a `.data` pointer
         both keep the link address while the symbol moves). So such an
-        object is also keyed at `st_value` -- unless that address is mapped
-        in the view, where it is some other storage's address."""
+        object's link address is a second SPELLING of it -- unless that
+        address is mapped in the view, where it is some other storage's
+        address."""
         import struct
 
         raw_view = getattr(self.bv, "parent_view", None)
         read = getattr(raw_view, "read", None)
         if not callable(read):
-            return []
+            return [], []
         head = read(0, 64) or b""
         if len(head) < 64 or head[:4] != b"\x7fELF":
-            return []
+            return [], []
         wide = head[4] == 2
         little = head[5] == 1
         end = "<" if little else ">"
@@ -10167,10 +10283,10 @@ class TaintEngine:
             shoff, = struct.unpack_from(end + "I", head, 0x20)
             shentsize, shnum = struct.unpack_from(end + "HH", head, 0x2E)
         if not shoff or not shnum or shentsize < (64 if wide else 40):
-            return []
+            return [], []
         table = read(shoff, shentsize * shnum) or b""
         if len(table) < shentsize * shnum:
-            return []
+            return [], []
         sections: list[tuple[int, int, int, int, int]] = []
         for i in range(shnum):
             at = i * shentsize
@@ -10189,6 +10305,7 @@ class TaintEngine:
         bias = self._elf_load_bias(head, read, wide, end)
         view = self._view_span() if bias and e_type == self._ELF_ET_EXEC else None
         out: list[tuple[int, int]] = []
+        spellings: list[tuple[int, int, int]] = []
         for s_type, offset, size, link, entsize in sections:
             # SHT_SYMTAB (2) and SHT_DYNSYM (11).
             if s_type not in (2, 11) or not entsize or link >= len(sections):
@@ -10207,9 +10324,9 @@ class TaintEngine:
                 if value:
                     out.append((int(value) + bias, int(st_size)))
                     if view is not None and not view[0] <= int(value) < view[1]:
-                        out.append((int(value), int(st_size)))
+                        spellings.append((int(value), int(value) + bias, int(st_size)))
             del step
-        return out
+        return out, spellings
 
     def _view_span(self) -> tuple[int, int] | None:
         """``(start, end)`` the view maps, None when either is unknown."""
@@ -10253,7 +10370,7 @@ class TaintEngine:
         The widest, because an alias declares its own byte and the object
         it names the inside of declares the whole buffer; the question
         here is which STORAGE the address belongs to."""
-        addr = int(addr)
+        addr = self._view_spelling(addr)
         if addr in self._declared_object_cache:
             return self._declared_object_cache[addr]
         best: tuple[int, int] | None = None
@@ -10283,7 +10400,7 @@ class TaintEngine:
         declares no sizes the LAYOUT answers as before: below, a distinct
         named object strictly between the two separates them; above, an arm
         that is itself a named object's base IS that object."""
-        addr, ga = int(addr), int(ga)
+        addr, ga = self._view_spelling(addr), self._view_spelling(ga)
         if addr == ga:
             return True
         key = (addr, ga)
@@ -11083,7 +11200,9 @@ class TaintEngine:
         declared width, while the image and the debug info can. Treating
         every declared scalar as "no recovered type" made a typed 8-byte
         global written by an 8-byte store an object of unknown extent whose
-        neighbours' loads were cited as reads of it (P1-05)."""
+        neighbours' loads were cited as reads of it (P1-05). A link-time
+        spelling of a rebased object is asked at its view address."""
+        ga = self._view_spelling(ga)
         getdv = getattr(self.bv, "get_data_var_at", None)
         if callable(getdv):
             try:
@@ -11100,7 +11219,7 @@ class TaintEngine:
         """The storage the BINARY declares from *ga* onward: the rest of the
         widest symbol-table object containing it, else the width its debug
         info gives the variable at *ga*, else 0."""
-        ga = int(ga)
+        ga = self._view_spelling(ga)
         cached = self._declared_width_cache.get(ga)
         if cached is not None:
             return cached

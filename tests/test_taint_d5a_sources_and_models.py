@@ -10,7 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from test_taint_engine import FBV, FExpr, FFunc, FInstr, FPVS, FSSA, FSSAFunc, FVar, te
-from test_taint_forward_global_frontier import FGlobalBV, FRawView, _elf_with_object_sizes
+from test_taint_forward_global_frontier import (
+    FExtentBV, FGlobalBV, FRawView, FRef, GFunc, _elf_with_object_sizes, _gptr,
+)
 from test_taint_width_and_relabel import _memcpy_sink, _recv_then_dup
 
 
@@ -41,17 +43,96 @@ def _image_engine(models, *, e_type, link_base, view_start, view_end, objects):
     return te.TaintEngine(bv, models)
 
 
-def test_a_rebased_fixed_address_image_declares_its_object_at_both_addresses(models):
+def test_a_rebased_fixed_address_image_keys_one_object_at_both_spellings(models):
     # Linked at 0x400000, the view rebased to 0x500000: BN moves the symbol to
     # 0x504060, while the image's absolute references (no relocations) still
-    # name 0x404060. Both key the one 8-byte object; neither sizes past it.
+    # name 0x404060. Both spellings are the one 8-byte object at its view
+    # address; neither sizes past it.
     eng = _image_engine(models, e_type=ET_EXEC, link_base=0x400000, view_start=0x500000,
                         view_end=0x506000, objects={"g": (0x404060, 8)})
-    assert eng._authoritative_width(0x504060) == 8
-    assert eng._authoritative_width(0x404060) == 8
-    assert eng._declared_object(0x404067) == (0x404060, 8)
+    assert eng._declared_object_table() == [(0x504060, 8)]
+    assert eng._authoritative_width(0x504060) == eng._authoritative_width(0x404060) == 8
+    assert eng._declared_object(0x404067) == eng._declared_object(0x504067) == (0x504060, 8)
     assert eng._declared_object(0x404068) is None
     assert eng._declared_object(0x504068) is None
+    assert eng._same_storage(0x404060, 0x504060)
+    assert eng._canon_global(0x404060) == 0x504060
+
+
+MEMCPY_AT, SYSTEM_AT, MAIN_AT, READER_AT = 0x501060, 0x501070, 0x501100, 0x501200
+READ_INS = READER_AT + 0x10      # `mov edi, imm32` before the `system` call
+
+
+class FRebasedBV(FExtentBV):
+    """A fixed-address image linked at 0x400000 that BN rebased to 0x500000;
+    its 8-byte object `g` is at 0x504060 in the view. BN records code
+    references only at mapped addresses, so a reader whose immediate still
+    holds the link address 0x404060 appears in no reference list -- only in
+    the bytes of its instruction (measured on BN)."""
+
+    def __init__(self, funcs, refs, read_at):
+        super().__init__({MEMCPY_AT: "memcpy", SYSTEM_AT: "system",
+                          **{start: fn.name for start, fn in funcs.items()}},
+                         funcs=funcs, refs=refs, objects={0x504060: 8},
+                         section=(0x504000, 0x505000))
+        image = bytearray(_elf_with_object_sizes({"g": (0x404060, 8)}))
+        struct.pack_into("<H", image, 0x10, ET_EXEC)
+        struct.pack_into("<Q", image, 0x20, 0x40)
+        struct.pack_into("<HH", image, 0x36, 56, 1)
+        image[0x40:0x40 + 56] = struct.pack("<IIQQQQQQ", 1, 6, 0, 0x400000, 0x400000,
+                                            0x6000, 0x6000, 0x1000)
+        self.parent_view = FRawView(bytes(image))
+        self.start, self.end = 0x500000, 0x506000
+        self.segments = [SimpleNamespace(start=0x501000, end=0x502000, executable=True),
+                         SimpleNamespace(start=0x504000, end=0x505000, executable=False)]
+        code = bytearray(0x1000)
+        code[READ_INS - 0x501000:READ_INS - 0x501000 + 5] = b"\xbf" + struct.pack("<I", read_at)
+        self._code = bytes(code)
+
+    def read(self, addr, length):
+        lo = int(addr) - 0x501000
+        return self._code[lo:lo + int(length)] if 0 <= lo < len(self._code) else b""
+
+    def get_instruction_length(self, addr):
+        return 5 if int(addr) == READ_INS else 0
+
+    def get_functions_containing(self, addr):
+        return [fn for fn in self._funcs.values() if fn.start <= int(addr) < fn.start + 0x40]
+
+
+def _copy_then_reader(write_at, read_at):
+    """`main(argv)`: `memcpy(<write_at>, argv, 8)` then `reader()`, which runs
+    `system(<read_at>)` -- one spelling of `g` each."""
+    reader = GFunc("reader", READER_AT, FSSAFunc([
+        FInstr(0, READ_INS + 5, "MLIL_CALL_SSA", f"system({hex(read_at)})",
+               dest=_gptr(SYSTEM_AT), params=[_gptr(read_at)]),
+    ]), params=[])
+    argv0 = FSSA(FVar("argv"), 0)
+    main = GFunc("main", MAIN_AT, FSSAFunc([
+        FInstr(0, MAIN_AT + 4, "MLIL_CALL_SSA", f"memcpy({hex(write_at)}, argv#0, 8)",
+               reads=[argv0], dest=_gptr(MEMCPY_AT),
+               params=[_gptr(write_at), FExpr("MLIL_VAR_SSA", "argv#0", reads=[argv0]),
+                       FExpr("MLIL_CONST", "8", constant=8)]),
+        FInstr(1, MAIN_AT + 8, "MLIL_CALL_SSA", "reader()", dest=_gptr(READER_AT), params=[]),
+    ]), params=[argv0.var], callees=[reader])
+    return main, reader
+
+
+@pytest.mark.parametrize("write_at, read_at", [
+    (0x404060, 0x504060),   # an absolute (link) write, a reader BN refers at the view
+    (0x504060, 0x404060),   # a write at the view, a reader naming the link address
+], ids=["link-write", "view-write"])
+def test_a_write_through_one_spelling_reaches_a_reader_of_the_other(models, write_at, read_at):
+    # D5a-01: the two spellings were two unrelated objects, so the write's
+    # taint and the reader's reference never met.
+    main, reader = _copy_then_reader(write_at, read_at)
+    refs = {read_at: [FRef(reader, READ_INS)]} if read_at == 0x504060 else {}
+    bv = FRebasedBV({READER_AT: reader}, refs, read_at)
+    result = te.TaintEngine(bv, models).forward(main, [te.parse_locator("param:0")])
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["global"]["address"] == hex(0x504060), leaf["global"]
+    assert [(r["display_name"], r["access"], r["offset"]) for r in leaf["references"]] == [
+        ("reader", "call_arg", 0)], leaf["references"]
 
 
 def test_a_fixed_address_image_at_its_link_base_declares_one_address(models):
