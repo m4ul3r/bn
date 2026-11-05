@@ -123,6 +123,10 @@ def test_a_backward_origin_names_the_called_symbol_and_its_model():
     (_strcpy_shape, "__strcpy_chk", "arg:__strcpy_chk:2", "strcpy_chk", "constant"),
     # The model key IS the symbol: no `model`.
     (_strcpy_shape, "strcpy", "arg:strcpy:1", None, "seeded"),
+    # D5c-02: an address-form locator spells no model; the model is the one
+    # the called symbol matches.
+    (_strcpy_shape, "__strcpy_chk", f"arg:{CALL:#x}:1", "strcpy_chk", "seeded"),
+    (_sscanf_shape, "__isoc99_sscanf", f"arg:{CALL:#x}:2", "sscanf", "seeded"),
 ])
 def test_a_backward_call_site_row_names_the_called_symbol_and_its_model(
         shape, callee, locator, model, status):

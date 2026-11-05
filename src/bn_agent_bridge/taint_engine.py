@@ -16266,15 +16266,16 @@ class TaintEngine:
         by the rule every forward row follows: ``callee`` is the symbol this
         site calls (``__isoc99_sscanf`` for a query on ``arg:sscanf:2``) --
         through a thunk, the symbol the thunk calls, as a forward finding
-        names it -- and ``model`` the model key the locator names when it
-        differs. A site whose call names no symbol -- an indirect call the
-        locator matched through a pin or value set -- keeps the locator's
-        spelling."""
-        key, _ = lookup_model(self.models, str(locator_callee))
+        names it -- and ``model`` the key of the model THAT symbol matches,
+        when it differs, however the locator spelled the callee (an address
+        form included, D5c-02). A site whose call names no symbol -- an
+        indirect call the locator matched through a pin or value set -- keeps
+        the locator's spelling and its model."""
         target = (resolve_call_target(self.bv, site, follow_thunks=True).address
                   if self.bv is not None else None)
         name = self._callee_name(target if target is not None
                                  else self._resolve_direct_target(site))
+        key, _ = lookup_model(self.models, str(name) if name else str(locator_callee))
         callee = called_name(key, name) if name else str(locator_callee)
         return {"callee": callee, **({"model": key} if key and key != callee else {})}
 
