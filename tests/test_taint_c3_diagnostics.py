@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -30,6 +31,7 @@ from test_taint_backward_coverage import (
 )
 from test_taint_caller_advice import _outer_program
 from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSAFunc, _indirect_sink_program, te
+from test_taint_truncation_vocabulary import _bound_names, _Crawler, _Unresolved
 
 from bn.taint_vocabulary import BLOCKING_LEAF_KINDS
 from bn_agent_bridge import taint_result
@@ -63,7 +65,6 @@ _LEAF_CLASS = {
     "field_load_unresolved": "reached",
     "seed_unused": "seed",
     "source_seed_misanchored": "seed",
-    "weak_buffer_seed": "seed",
     "indirect_call_unchecked": "seed",
     "format_destination_unrecovered": "seed",
     "scanf_arity_residual": "seed",
@@ -84,31 +85,171 @@ _LEAF_CLASS = {
 # `"kind": "<x>"` literals the engine uses for things that are not leaves:
 # origins, objects a pointer demand may read, slice steps and model rows.
 _NON_LEAF_KINDS = {
-    "call", "constant", "entry", "global", "got_or_extern", "indirect_call",
-    "loaded_pointer", "local", "param", "parameter", "recurrence_initializer",
+    "call", "constant", "constant_address", "entry", "global", "got_or_extern",
+    "indirect_call", "literal", "loaded_pointer", "local", "param", "parameter",
+    "recurrence_initializer",
     "returned", "source", "unknown", "unresolved",
 }
 
 
-def _engine_kind_literals() -> set[str]:
-    """Every kind the engine spells: `"kind": "<x>"` literals, and the
-    module-level constants it names leaf kinds through (`_EXTENT_LEAF = ...`)."""
+class _KindCrawler(_Crawler):
+    """The truncation crawler's reduction (literals, conditionals, names
+    bound to them, dict tables) for the value a ``"kind"`` entry or a
+    ``kind=`` argument holds, plus the shapes leaf constructors use:
+
+    * either operand of a boolean (`a or "fallback"`);
+    * a parameter: its default and every argument a call to its function in
+      the module passes it (by keyword, or by position when it may be
+      positional) -- `_buffer_leaf(..., kind="...")`;
+    * a value read out of another object (`w[0]`, `sink.get("kind")`): a
+      COPY of a kind constructed elsewhere, which this crawl reads there.
+
+    Anything else raises :class:`_Unresolved`, which the guard reports with
+    the call site, as the truncation crawler does -- a constructor skipped
+    silently is exactly how an unregistered kind escapes (D5c drift)."""
+
+    def __init__(self, tree: ast.AST) -> None:
+        super().__init__(tree)
+        self.tree = tree
+        # (function, parameter) pairs being reduced: a function forwarding
+        # its own parameter to itself adds nothing new.
+        self.reducing: set[tuple[int, str]] = set()
+
+    def strings(self, expr: ast.expr) -> set[str]:
+        if isinstance(expr, ast.BoolOp):
+            return set().union(*(self.strings(v) for v in expr.values))
+        if isinstance(expr, ast.Name):
+            fn = self.parameter_of(expr)
+            if fn is not None:
+                return self.arguments(fn, expr.id)
+        if isinstance(expr, ast.Subscript) and not self.is_table(expr.value):
+            return set()
+        if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+                and expr.func.attr == "get" and not self.is_table(expr.func.value)):
+            return set()
+        return super().strings(expr)
+
+    def is_table(self, expr: ast.expr) -> bool:
+        try:
+            self.dict_literal(expr)
+        except _Unresolved:
+            return False
+        return True
+
+    def parameter_of(self, name: ast.Name) -> ast.AST | None:
+        """The function whose parameter *name* is, when the nearest scope
+        that binds it binds it as one."""
+        for scope in self.scopes(name):
+            args = getattr(scope, "args", None)
+            if args is not None and name.id in {
+                    a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)}:
+                return scope if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+            if any(isinstance(n, (ast.Assign, ast.For, ast.comprehension))
+                   and self.owner(n) is scope
+                   and name.id in _bound_names(n.targets[0] if isinstance(n, ast.Assign)
+                                               else n.target)
+                   for n in ast.walk(scope)):
+                return None
+        return None
+
+    def arguments(self, fn: ast.AST, param: str) -> set[str]:
+        key = (id(fn), param)
+        if key in self.reducing:
+            return set()
+        self.reducing.add(key)
+        args = fn.args
+        positional = [a.arg for a in (*args.posonlyargs, *args.args)]
+        defaults = dict(zip(positional[len(positional) - len(args.defaults):], args.defaults))
+        defaults.update({a.arg: d for a, d in zip(args.kwonlyargs, args.kw_defaults) if d})
+        out = self.strings(defaults[param]) if param in defaults else set()
+        index = positional.index(param) if param in positional else None
+        for call in ast.walk(self.tree):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                    and call.func.id == fn.name):
+                continue
+            for kw in call.keywords:
+                if kw.arg == param:
+                    out |= self.strings(kw.value)
+            if index is not None and index < len(call.args):
+                out |= self.strings(call.args[index])
+        return out
+
+
+def _kind_literals(path: Path) -> set[str]:
+    """Every kind *path* CONSTRUCTS: the value of a `"kind": ...` dict entry or
+    a `kind=` argument. A value the crawler cannot reduce fails naming its
+    site; a kind named only in a classification set is not constructed
+    (R4-05)."""
+    tree = ast.parse(path.read_text())
+    crawler = _KindCrawler(tree)
     found: set[str] = set()
-    for name in ("taint_engine.py", "taint_result.py"):
-        text = (_SRC / name).read_text()
-        found.update(re.findall(r'"kind":\s*"([a-z_]+)"', text))
-        found.update(re.findall(r'^_[A-Z_]+ = "([a-z_]+)"$', text, re.M))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            values = [v for k, v in zip(node.keys, node.values)
+                      if isinstance(k, ast.Constant) and k.value == "kind"]
+        elif isinstance(node, ast.keyword) and node.arg == "kind":
+            values = [node.value]
+        else:
+            continue
+        for value in values:
+            try:
+                found |= crawler.strings(value)
+            except _Unresolved as exc:
+                pytest.fail(f"{path.name}:{value.lineno}: cannot tell which kind "
+                            f"`{ast.unparse(value)}` constructs ({exc}); pass a literal or a "
+                            "name bound to literals, or teach this crawler the shape")
     return found
+
+
+def _engine_kind_literals() -> set[str]:
+    return _kind_literals(_SRC / "taint_engine.py") | _kind_literals(_SRC / "taint_result.py")
 
 
 def test_every_engine_leaf_kind_is_classified_for_propagation():
     literals = _engine_kind_literals()
     unregistered = sorted(literals - BLOCKING_LEAF_KINDS - _NON_LEAF_KINDS)
     assert unregistered == [], unregistered
+    # R4-05: and every registered kind has a constructor -- a kind kept only in
+    # the classification sets (and so in the docs the drift test holds to
+    # them) is a frontier no run can produce.
+    unconstructed = sorted(BLOCKING_LEAF_KINDS - literals)
+    assert unconstructed == [], unconstructed
     assert set(_LEAF_CLASS) == set(BLOCKING_LEAF_KINDS), (
         sorted(set(BLOCKING_LEAF_KINDS) ^ set(_LEAF_CLASS)))
     seed_side = {k for k, c in _LEAF_CLASS.items() if c == "seed"}
     assert set(taint_result._NO_PROPAGATION_KINDS) == seed_side
+
+
+_CONSTRUCTORS = '''
+_EXTENT = "from_module_constant"
+def build(at, *, kind="from_default"):
+    return {"kind": kind, "address": at}
+def run(p, rows):
+    build(1, kind="from_keyword")
+    local = "from_local" if p else "from_arm"
+    leaves = [{"kind": local}, {"kind": _EXTENT}, {"kind": p or "from_bool"}]
+    for row in rows:
+        leaves.append({"kind": row["kind"]})
+    return leaves
+'''
+
+
+def test_the_kind_crawler_follows_every_constructor_shape(tmp_path):
+    module = tmp_path / "engine.py"
+    module.write_text(_CONSTRUCTORS)
+    assert _kind_literals(module) == {
+        "from_module_constant", "from_default", "from_keyword", "from_local", "from_arm",
+        "from_bool"}
+
+
+def test_the_kind_crawler_refuses_a_kind_it_cannot_follow_naming_the_site(tmp_path):
+    # A kind computed by a call silently contributed nothing, so a new leaf
+    # kind built that way escaped both the registry and the docs.
+    module = tmp_path / "engine.py"
+    module.write_text("def run(self):\n    return {'address': 1,\n"
+                      "            'kind': self.pick_kind()}\n")
+    with pytest.raises(pytest.fail.Exception, match=r"engine\.py:3: .*pick_kind"):
+        _kind_literals(module)
 
 
 @pytest.mark.parametrize("kind", sorted(k for k, c in _LEAF_CLASS.items() if c != "backward"))

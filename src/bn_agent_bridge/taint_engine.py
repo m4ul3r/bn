@@ -4822,18 +4822,25 @@ class TaintEngine:
             # the same resolution the forward descent already performs for the call.
             if resolve_indirect and target is None \
                     and self._indirect_target_matches(ins, callee, wrapper_arg=wrapper_arg):
+                # The pin (if it supplied the candidates) now anchors a
+                # selected source/sink: only now is it matched (D5c-01).
+                self.resolve_map.select(int(getattr(ins, "address", 0)))
                 hits.append(ins)
         return hits
 
     def _indirect_call_resolution(self, ins: Any) -> tuple[list[int], str | None]:
         """Resolve an indirect call *ins* to candidate target addresses and the
         provenance (`agent-map` / `value-set`), mirroring the forward-descent
-        resolution. Returns ``([], None)`` for a direct call or no resolution."""
+        resolution. Returns ``([], None)`` for a direct call or no resolution.
+
+        A question, not a use: discovery asks it of every indirect call in
+        the region, so it never marks a pin matched -- the caller that
+        anchors a site through the answer does (D5c-01)."""
         if const_target(getattr(ins, "dest", None)) is not None:
             return [], None
-        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
+        mapped = list(self.resolve_map.get(int(getattr(ins, "address", 0))) or ())
         if mapped:
-            return list(mapped), "agent-map"
+            return mapped, "agent-map"
         cands = self._call_targets_from_pvs(
             getattr(getattr(ins, "dest", None), "possible_values", None))
         return (cands, "value-set") if cands else ([], None)
@@ -9051,8 +9058,8 @@ class TaintEngine:
                     # (round-3 review R2).
                     cfn for cfn in (
                         function_at(self.bv, int(t))
-                        for t in (self.resolve_map.get(
-                            int(getattr(defn, "address", 0))) or ()))
+                        for t in self.resolve_map.select(
+                            int(getattr(defn, "address", 0))))
                     if cfn is not None]
                 for cand in bodies:
                     if self._fn_returns_pointer(
@@ -11795,7 +11802,7 @@ class TaintEngine:
             elif not self._is_indirect_transfer(ins):
                 continue
             addr = int(getattr(ins, "address", 0))
-            targets = tuple(self.resolve_map.get(addr) or ()) or tuple(
+            targets = tuple(self.resolve_map.select(addr)) or tuple(
                 self._call_targets_from_pvs(
                     getattr(getattr(ins, "dest", None), "possible_values", None)))
             if targets:
@@ -13089,7 +13096,7 @@ class TaintEngine:
                 if target is not None:
                     cands = (target,)
                 else:
-                    cands = tuple(self.resolve_map.get(addr) or ()) or tuple(
+                    cands = tuple(self.resolve_map.select(addr)) or tuple(
                         self._call_targets_from_pvs(
                             getattr(getattr(ins, "dest", None), "possible_values", None)))
                 global_call_targets[addr] = cands
@@ -14632,9 +14639,9 @@ class TaintEngine:
                     if target is not None:
                         candidates, via = [target], None
                     else:
-                        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
+                        mapped = self.resolve_map.select(int(getattr(ins, "address", 0)))
                         if mapped:
-                            candidates = list(mapped)
+                            candidates = mapped
                             via = "agent-map"
                         else:
                             candidates = self._call_targets_from_pvs(
@@ -16340,6 +16347,24 @@ class TaintEngine:
         key, _ = lookup_model(self.models, str(callee) if callee else None)
         return {"model": key} if key and key != str(callee) else {}
 
+    def _site_naming(self, site: Any, locator_callee: Any) -> dict[str, Any]:
+        """``callee``/``model`` for one call site a backward locator selected,
+        by the rule every forward row follows: ``callee`` is the symbol this
+        site calls (``__isoc99_sscanf`` for a query on ``arg:sscanf:2``) --
+        through a thunk, the symbol the thunk calls, as a forward finding
+        names it -- and ``model`` the key of the model THAT symbol matches,
+        when it differs, however the locator spelled the callee (an address
+        form included, D5c-02). A site whose call names no symbol -- an
+        indirect call the locator matched through a pin or value set -- keeps
+        the locator's spelling and its model."""
+        target = (resolve_call_target(self.bv, site, follow_thunks=True).address
+                  if self.bv is not None else None)
+        name = self._callee_name(target if target is not None
+                                 else self._resolve_direct_target(site))
+        key, _ = lookup_model(self.models, str(name) if name else str(locator_callee))
+        callee = called_name(key, name) if name else str(locator_callee)
+        return {"callee": callee, **({"model": key} if key and key != callee else {})}
+
     def _symbol_names(self, name: Any) -> tuple[str, str]:
         """``(raw symbol name, display name)`` for a name a taint result prints
         (#1001 item 4); both fall back to *name* itself when no symbol has it.
@@ -16458,7 +16483,13 @@ class TaintEngine:
         for sink, site in selections:
             desc = self._describe_locator(sink)
             site_instrs = instrs if site is None else [site]
+            # A row for one call site names it as a forward row would: the
+            # symbol it calls, the model key beside it (R3 residual). Only the
+            # top-level `sinks[]` echoes the query as written.
+            naming = ({"callee": sink.get("callee")} if site is None
+                      else self._site_naming(site, sink["callee"]))
             if site is not None:
+                desc.update(naming)
                 desc["address"] = hex(int(site.address))
                 params = self._call_params(site)
                 idx = int(sink["index"])
@@ -16540,7 +16571,7 @@ class TaintEngine:
                         entry = {
                             "sink": {
                                 "kind": sink.get("kind"),
-                                "callee": sink.get("callee"),
+                                **naming,
                                 "address": sink_addr,
                                 "seed": seed_label,
                             },
@@ -17728,7 +17759,8 @@ class TaintEngine:
                             defn, cparams[fi], d, mv, var_label(v),
                             f"argument {fi} of {mkey or name} returned by", arg_dem))
                     if not states:
-                        _set_origin({"kind": "call", "callee": name,
+                        _set_origin({"kind": "call", "callee": called_name(mkey, name),
+                                     **self._model_field(called_name(mkey, name)),
                                      "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
                     elif all(s == "literal" for s in states):

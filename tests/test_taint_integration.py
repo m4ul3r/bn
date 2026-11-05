@@ -1026,23 +1026,41 @@ def _forward_prose(result) -> str:
     return "\n".join(parts)
 
 
+def _printed_commands(prose: str) -> list[tuple[int, str]]:
+    """``(offset, command)`` for each `bn` command *prose* prints, read as
+    the code span `code_span` writes: a fence one backtick longer than the
+    longest run inside, and one CommonMark pad space each side when the
+    command starts or ends with a backtick. A one-backtick reading stopped
+    at a selector's own backtick and checked only a prefix."""
+    from bn.formatters import CODE_SPAN_RE
+
+    out = []
+    for match in CODE_SPAN_RE.finditer(prose):
+        body = match.group(2)
+        if len(body) > 2 and body[0] == body[-1] == " " and body.strip():
+            body = body[1:-1]
+        if body.startswith("bn "):
+            out.append((match.start(), body))
+    return out
+
+
 def _run_or_check_template(shared_bn, prose: str) -> tuple[int, int]:
-    """Run each backticked `bn` command exactly as printed; a command marked as
+    """Run each fenced `bn` command exactly as printed; a command marked as
     a template must instead parse as shell words with no `<...>` placeholder
     and name its blanks in UPPER-CASE (#1033 item 6)."""
     from conftest import _BN_CLI
 
     ran = templates = 0
-    for match in re.finditer(r"`(bn [^`]+)`", prose):
-        argv = shlex.split(match.group(1))
-        if prose[:match.start()].endswith(_TEMPLATE[:-1]):
-            assert not any(c in match.group(1) for c in "<>"), match.group(1)
-            assert any(w.isupper() or w.split(":")[-1].isupper() for w in argv), match.group(1)
+    for start, command in _printed_commands(prose):
+        argv = shlex.split(command)
+        if prose[:start].endswith(_TEMPLATE[:-1]):
+            assert not any(c in command for c in "<>"), command
+            assert any(w.isupper() or w.split(":")[-1].isupper() for w in argv), command
             templates += 1
             continue
         res = subprocess.run([*_BN_CLI, *argv[1:]], capture_output=True, text=True,
                              env=shared_bn.env(), timeout=300.0)
-        assert res.returncode == 0, f"{match.group(1)}: {res.stderr}"
+        assert res.returncode == 0, f"{command}: {res.stderr}"
         ran += 1
     return ran, templates
 
@@ -1361,6 +1379,16 @@ def test_format_proven_fifth_destination_withholds_the_all_clear(tmp_path, share
     called = symbol.replace("sscanf", "scanf")
     assert (short["callee"], short.get("model"), _lost(short)) == (called, "scanf", 1), short
     assert preset["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # Backward, the per-call-site rows follow the same rule (R3 residual):
+    # the query `arg:sscanf:0` is echoed in `sinks[]`, but the row for the
+    # call names the symbol it calls and the model beside it.
+    sliced = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "parse_five",
+                      "--sink", "arg:sscanf:0")
+    assert [s["callee"] for s in sliced["sinks"]] == ["sscanf"]
+    assert {(r["callee"], r.get("model")) for r in sliced["sink_status"]} == {(symbol, "sscanf")}
+    assert {(sl["sink"]["callee"], sl["sink"].get("model")) for sl in sliced["slices"]} <= {
+        (symbol, "sscanf")}
 
 
 def test_a_synthetic_c23_alias_symbol_uses_the_same_model(tmp_path, shared_bn):
@@ -3180,6 +3208,16 @@ N void span_case(char *p) { memcpy(span_global + 40, p, 16); span_reader(); }
 N void fgets_case(char *p) { memcpy(tracked, p, 64); use_fgets_alias(); }
 N void fgets_ignored_case(char *p) { memcpy(tracked, p, 64); ignore_fgets(); }
 N void chain_case(char *p) { memcpy(tracked, p, 64); use_relay4(); }
+char deep_tracked[128] = "seed";
+N char *deep_relay0(void) { return memset(deep_tracked, 0, 1); }
+N char *deep_relay1(void) { return deep_relay0(); }
+N char *deep_relay2(void) { return deep_relay1(); }
+N char *deep_relay3(void) { return deep_relay2(); }
+N char *deep_relay4(void) { return deep_relay3(); }
+N char *deep_relay5(void) { return deep_relay4(); }
+N char *deep_relay6(void) { return deep_relay5(); }
+N void use_deep_relay6(void) { system(deep_relay6() + 24); }
+N void deep_chain_case(char *p) { memcpy(deep_tracked, p, 64); use_deep_relay6(); }
 int main(int argc, char **argv) {
     if (argc < 2) return 0;
     switch (argc) {
@@ -3189,7 +3227,8 @@ int main(int argc, char **argv) {
     case 5: span_case(argv[1]); break;
     case 6: fgets_case(argv[1]); break;
     case 7: fgets_ignored_case(argv[1]); break;
-    default: chain_case(argv[1]); break;
+    case 8: chain_case(argv[1]); break;
+    default: deep_chain_case(argv[1]); break;
     }
     return 0;
 }
@@ -3209,8 +3248,9 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
     ALIAS-01: `fgets` hands its destination back, so a partial refill
     followed by `system(p + 8)` reads bytes it never touched; an ignored
     refill is no continuation, its live bytes end in the P2-11.1 exit store.
-    BOUND-03: a returning-wrapper chain past the INTERNAL pointer-return
-    depth is unknown, not "no alias"."""
+    BOUND-03: a returning-wrapper chain within the INTERNAL pointer-return
+    depth is followed to the reader at its end; one past it is unknown, not
+    "no alias"."""
     src = tmp_path / "r3astra.c"
     src.write_text(_ASTRA_SRC)
     binary = tmp_path / "r3astra"
@@ -3259,12 +3299,23 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
         == [("use_fgets_alias", 8)], store
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
-    # BOUND-03: the internal return-pointer depth is a disclosed bound
+    # BOUND-03: five returning wrappers are within the internal pointer-return
+    # depth -- the chain resolves and its consumer is the named reader...
     result, leaves = gmc("chain_case")
     [leaf] = leaves
-    assert leaf["reachability"]["cause"] in ("pointer_return_depth", "depth_budget"), leaf
+    assert [(r["display_name"], r["access"], r["offset"]) for r in leaf["references"]] \
+        == [("use_relay4", "call_arg", 24)], leaf
+    assert (leaf["reachability"]["status"], leaf["reachability"]["causes"]) == ("complete", [])
+    assert result["stats"]["truncated"] is False, result
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    assert result["stats"]["truncated"] is True, result
+    # ...and seven run past it: the bound is disclosed, never read as "no alias".
+    result, leaves = gmc("deep_chain_case")
+    [leaf] = leaves
+    assert leaf["references"] == [], leaf
+    assert leaf["reachability"]["status"] == "truncated", leaf
+    assert leaf["reachability"]["cause"] == "pointer_return_depth", leaf
+    assert result["stats"]["truncation_cause"] == ["pointer_return_depth"], result["stats"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 _UNREAD_OVERLAY_SRC = r"""
