@@ -3050,7 +3050,7 @@ class TaintEngine:
         mkey, model = lookup_model(self.models, name)
         if model and not model_is_benign_marker(model) and any(
                 str(s.get("to") or "").startswith("*arg:") for s in (model.get("sources") or [])):
-            return ("may_source", mkey or name)
+            return ("may_source", called_name(mkey, name))
         return ("opaque",)
 
     def _writer_call_ref(self, call_ins: Any) -> dict[str, Any]:
@@ -6109,7 +6109,7 @@ class TaintEngine:
 
     def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
                                src_expr: Any) -> tuple[str, int] | None:
-        """``(model key, call address)`` when the copy length IS the return value
+        """``(called symbol, call address)`` when the copy length IS the return value
         of a modeled fill of the copy's own source pointer, else None (W01-10).
 
         A fill model is one declaring ``return_bound`` (its return counts the
@@ -6150,7 +6150,7 @@ class TaintEngine:
                     and cf is not None and cs is not None and cf[:2] == cs[:2])
         if not same:
             return None
-        return str(mkey or callee), int(getattr(d, "address", 0))
+        return str(called_name(mkey, callee)), int(getattr(d, "address", 0))
 
     # The integer ops whose result wraps in their own width. A length computed
     # by one of them in fewer bytes than the sink's parameter wraps BEFORE the
@@ -9152,15 +9152,43 @@ class TaintEngine:
             return _Use(int(getattr(ins, "address", 0)) if at is None else int(at),
                         kind, offset, seed, span, known, forward)
 
+        def load_seed(ins: Any) -> str | None:
+            """`var:<name>` for the variable a load fills -- the value the
+            reader goes on to use, its input (W07-13) -- or for the variable
+            a plain copy chain moves it into (`rax = [g]; n = rax`), the first
+            one the seeder's own resolver names; else None, so the advice
+            never prints a locator `--source` refuses."""
+            dest = getattr(ins, "dest", None) if "SET_VAR" in op_name(ins) else None
+            for _hop in range(4):
+                name = getattr(getattr(dest, "var", None), "name", None)
+                if not isinstance(name, str) or not name:
+                    return None
+                try:
+                    if self._resolve_var(fn, name) is not None:
+                        return f"var:{name}"
+                except Exception:
+                    pass
+                try:
+                    uses = list(ssaf.get_ssa_var_uses(dest) or [])
+                except Exception:
+                    return None
+                copies = [u for u in uses if "SET_VAR" in op_name(u)
+                          and op_name(getattr(u, "src", None)) == "MLIL_VAR_SSA"]
+                if len(copies) != 1:
+                    return None
+                dest = getattr(copies[0], "dest", None)
+            return None
+
         def load_verdict(ins: Any, node: Any, kind: str = "load") -> Any:
             """A verdict for a LOAD: cited at the instruction that performs
             it and as wide as the load itself, falling back to the
-            enclosing instruction where the IL node says nothing."""
+            enclosing instruction where the IL node says nothing; seeded on
+            the variable it fills (`load_seed`)."""
             at = getattr(node, "address", None) if node is not None else None
             width = getattr(node, "size", None) if node is not None else None
             if not isinstance(width, int) or width <= 0:
                 width = int(getattr(ins, "size", 0) or 0)
-            return verdict(ins, kind,
+            return verdict(ins, kind, load_seed(ins),
                            expr=getattr(node, "src", None) if node is not None else None,
                            span=width or None,
                            at=at if isinstance(at, int) else None)
@@ -9175,13 +9203,22 @@ class TaintEngine:
             resolves no source and the advertised command exits 2 ("no taint
             sources resolved"), which is worse than no command at all
             (round-20 review F53). Seedability is asked of the SAME helper
-            the seeder uses, so the advice and the run cannot disagree."""
+            the seeder uses, so the advice and the run cannot disagree.
+
+            Never an argument the callee's model arms as a sink: seeding
+            `strcpy(d, g)`'s source re-finds that one call in one step and
+            says nothing about what the consumer does with the bytes
+            (W07-13)."""
             name = self._callee_name(self._resolve_direct_target(ins))
             if not name or not hit:
                 return None
             params = self._call_params(ins)
-            idx = hit[0]
-            if idx >= len(params):
+            sink = (lookup_model(self.models, name)[1] or {}).get("sink") or {}
+            armed = {i for i in [*(sink.get("tainted_args") or []),
+                                 sink.get("len_arg"), sink.get("format_arg")]
+                     if model_arg_index(i) is not None}
+            idx = next((i for i in hit if i not in armed), None)
+            if idx is None or idx >= len(params):
                 return None
             # Asking is a QUESTION, not a write: `_buffer_target` records
             # the offset an object was reached at, which is evidence about
@@ -11195,6 +11232,21 @@ class TaintEngine:
                 f"the lower bound and not the real size; widen it to the "
                 f"object's true extent before relying on it, and re-run)")
 
+    def _global_label(self, ga: int) -> str:
+        """The ``global.label`` of a tainted-global leaf: the display name of
+        the data symbol at *ga* (``g_copy``) when it has one, else
+        ``glob_<address>`` (W07-13)."""
+        get = getattr(self.bv, "get_symbol_at", None)
+        try:
+            sym = get(int(ga)) if get is not None else None
+        except Exception:
+            sym = None
+        for attr in ("short_name", "name"):
+            nm = getattr(sym, attr, None) if sym is not None else None
+            if isinstance(nm, str) and nm:
+                return nm
+        return f"glob_{hex(int(ga))}"
+
     def _global_reference_rows(self, ga: int, references: tuple
                                ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """``(reference rows, unfinished scans)`` for ``(start, at, kind,
@@ -11469,7 +11521,7 @@ class TaintEngine:
             "address": hex(int(getattr(write_ins, "address", 0))),
             "dest_expr": str(dest) if dest is not None else gtxt,
             "il_text": str(write_ins),
-            "global": {"address": gtxt, "label": f"glob_{gtxt}",
+            "global": {"address": gtxt, "label": self._global_label(ga),
                        "written_offsets": [
                            hex(o) for o in
                            sorted(self._global_keyed_offsets.get(ga) or ())[:8]]},
@@ -11644,7 +11696,7 @@ class TaintEngine:
         return {
             "kind": "global_memory_continuation",
             "address": hex(int(getattr(ins, "address", 0))),
-            "global": {"address": hex(ga), "label": f"glob_{hex(ga)}",
+            "global": {"address": hex(ga), "label": self._global_label(ga),
                        # WHICH bytes of the object the walk keyed here: an
                        # interior write (`memcpy(g + 8, ..)`) is the same
                        # object, and naming the offset keeps a partial write
@@ -11674,7 +11726,9 @@ class TaintEngine:
             "reachability": reach,
             "call_descended": bool(descended),
             "il_text": str(ins),
-            "reseed": reseed,
+            # Only a seed of the reader's input; absent when there is none
+            # (W07-13) -- the text `next:` then names the xrefs audit.
+            **({"reseed": reseed} if reseed else {}),
             "detail": detail,
         }
 
@@ -12640,14 +12694,14 @@ class TaintEngine:
                         _gl = {
                             "kind": "gated_sink_reached",
                             "address": hex(addr),
-                            "callee": str(mkey or name or "?"),
+                            "callee": str(shown or "?"), **self._model_field(shown),
                             "class": str(sink.get("class") or "?"),
                             "gate": str(_gate),
                             "tainted_args": _armed,
                             "il_text": _gl_text,
                             "detail": (
                                 f"taint reaches arg {', '.join(map(str, _armed))} of "
-                                f"{self._prose_name(mkey or name)}, which arms its "
+                                f"{self._prose_name(shown)}, which arms its "
                                 f"opt-in `{sink.get('class')}` sink; that class is "
                                 f"reported only with `--sink-class {_gate}`, so this "
                                 "run neither reports nor rules it out -- NOT an "
@@ -15063,9 +15117,10 @@ class TaintEngine:
         return {
             "sink": {
                 "callee": callee,
-                # #1001 item 4: `callee` is the MODEL key, which drops a C++
-                # symbol's leading underscore; the real symbol and its demangled
-                # display name ride beside it (always present, like #978's).
+                # `callee` is the symbol the binary calls (`__strcpy_chk`), the
+                # model key it was judged by rides beside it as `model` when it
+                # differs; the raw symbol and its demangled display name are
+                # always present (#1001 item 4, #978).
                 "callee_symbol": self._symbol_names(callee)[0],
                 **self._model_field(callee),
                 "callee_display_name": self._display_for_name(callee),
@@ -15105,10 +15160,10 @@ class TaintEngine:
         }
 
     def _model_field(self, callee: Any) -> dict[str, str]:
-        """``{"model": <canonical key>}`` when the model that matched *callee*
-        is keyed by another name -- an ISO scanf alias (``__isoc99_fscanf``)
-        reports the symbol it calls as ``callee`` and the ``fscanf`` model it
-        was judged by here -- else ``{}``."""
+        """``{"model": <model key>}`` when the model that matched the called
+        symbol *callee* is keyed by another name -- ``strcpy_chk`` for
+        ``__strcpy_chk``, ``fscanf`` for ``__isoc99_fscanf``, ``pwrite`` for
+        ``pwrite64`` -- else ``{}``."""
         key, _ = lookup_model(self.models, str(callee) if callee else None)
         return {"model": key} if key and key != str(callee) else {}
 
@@ -16594,7 +16649,7 @@ class TaintEngine:
                                         "cannot prove disjoint from them")
                     elif kind == "may_source":
                         steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
-                        _set_origin({"kind": "source", "callee": w[2],
+                        _set_origin({"kind": "source", "callee": w[2], **self._model_field(w[2]),
                                      "address": hex(int(w[1].address))})
                         gaps.append(f"the source {self._writer_call_phrase(self._writer_call_ref(w[1]))} "
                                     "may have written them (no call's write extent is trusted)")

@@ -3131,15 +3131,14 @@ def test_global_continuation_interior_writes_pins_and_cycles(tmp_path, shared_bn
     assert any(r["display_name"] == "recursive_reader"
                for lf in leaves for r in lf["references"]), leaves
 
-    # R4: the advice names a locator that RUNS and reaches the sink
+    # R4: the advice names a locator that RUNS, or none. `reader` hands the
+    # global's constant address straight to `system`: seeding that argument
+    # would only re-find the sink (W07-13), so there is no reseed.
     result, leaves = gmc("baseline_case")
     [leaf] = leaves
     assert "var:VAR" not in leaf["detail"], leaf
-    assert leaf["reseed"] and "--source arg:system:0" in leaf["reseed"], leaf
-    inner = _bn_json(shared_bn, "-t", target, "taint", "forward",
-                     "-f", leaf["references"][0]["address"],
-                     "--source", leaf["references"][0]["seed"])
-    assert [s["sink"]["class"] for s in inner["reached_sinks"]] == ["command_injection"]
+    assert [r["seed"] for r in leaf["references"]] == [None], leaf["references"]
+    assert "reseed" not in leaf, leaf
 
 
 _ASTRA_SRC = r"""
@@ -4152,7 +4151,7 @@ N char *phi_producer(void) {
     if (selector) p = tracked + 8; else p = tracked + selector;
     return p;
 }
-N void phi_consumer(void) { system(phi_producer()); }
+N void phi_consumer(void) { char b[64]; memcpy(b, phi_producer(), sizeof b); system(b); }
 N void advice_case(char *s) { memcpy(tracked, s, 64); phi_consumer(); }
 int main(int argc, char **argv) { return argc > 100 ? argv[0][0] : 0; }
 """
@@ -6768,7 +6767,9 @@ def test_a_structured_reseed_command_runs_where_it_was_produced(tmp_path,
     the string it is handed. With a second bridge alive the unrouted
     spelling refuses, which is what this proves the routed one does not.
     """
-    target = _taint_target(tmp_path, shared_bn, _STORAGE_SRC, "r11seed", "-O0")
+    # A reader that LOADS the global: its reseed seeds the loaded value (a
+    # reader that hands the object straight to a sink has none, W07-13).
+    target = _taint_target(tmp_path, shared_bn, _NAMED_GLOBAL_SRC, "r11seed", "-O0")
     env = shared_bn.env()
     started = subprocess.run(
         [*_BN_CLI, "session", "start", str(tmp_path / "r11seed0"),
@@ -6778,7 +6779,7 @@ def test_a_structured_reseed_command_runs_where_it_was_produced(tmp_path,
     other = json.loads(started.stdout)["instance_id"]
     try:
         result = _bn_json(shared_bn, "-t", target, "taint", "forward",
-                          "-f", "upper_case", "--source", "param:0")
+                          "-f", "fill_count", "--source", "call:read")
         reseed = next(lf["reseed"] for lf in result["leaves"] if lf.get("reseed"))
         command = shlex.split(reseed.strip("`"))
         assert command[0] == "bn", reseed
@@ -7333,7 +7334,7 @@ def test_a_tail_call_wrapper_flagged_a_thunk_is_walked(tmp_path, shared_bn):
             args += ["--source", source]
         result = _bn_json(shared_bn, *args)
         reached = {s["sink"]["callee"] for s in result["reached_sinks"]}
-        assert {"memcpy_chk", "memmove_chk", "strncpy_chk"} <= reached, (fn, reached)
+        assert {"__memcpy_chk", "__memmove_chk", "__strncpy_chk"} <= reached, (fn, reached)
         assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
 
 
@@ -7605,3 +7606,76 @@ def test_backward_into_main_classifies_the_runtime_entry_handoff(tmp_path, share
     commands = [shlex.split(c) for c in re.findall(r"`(bn [^`]+)`",
                                                     result["diagnostics"]["next_action"])]
     assert not [c for c in commands if "xrefs" in c or "callsites" in c], commands
+
+
+_NAMED_GLOBAL_SRC = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#define N __attribute__((noinline))
+char g_text[64];
+int g_count;
+N void text_reader(void) { char d[16]; strcpy(d, g_text); puts(d); }
+N __attribute__((optimize("O0"))) void count_reader(void) {
+    int n = g_count;
+    char *p = malloc(n);
+    puts(p);
+}
+N void fill_text(int fd) { char buf[64]; read(fd, buf, 63); buf[63] = 0; strcpy(g_text, buf); text_reader(); }
+N void fill_count(int fd) { read(fd, &g_count, sizeof g_count); count_reader(); }
+N void scan_name(void) { char name[16]; scanf("%s", name); puts(name); }
+int main(void) { fill_text(0); fill_count(0); scan_name(); return 0; }
+"""
+
+
+def test_callee_rule_and_continuation_reseed_on_a_real_binary(tmp_path, shared_bn):
+    """V4-03: a fortified sink and an ISO scanf alias both name the symbol
+    the binary calls as `callee`, the model key as `model`. W07-13: a
+    continuation leaf is labelled with the global's data symbol, and its
+    reseed seeds the reader's input -- never the reader's sink argument --
+    or is absent."""
+    src = tmp_path / "named_global.c"
+    src.write_text(_NAMED_GLOBAL_SRC)
+    binary = tmp_path / "named_global"
+    _compile(src, binary, ["-O2", "-D_FORTIFY_SOURCE=2", "-std=gnu17"])
+    symbols = _dynamic_symbols(binary)
+    if "__strcpy_chk" not in symbols or "__isoc99_scanf" not in symbols:
+        refuse_silent_skip("this compiler/glibc emitted no __strcpy_chk / __isoc99_scanf")
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, source):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        "--source", source)
+
+    text = forward("fill_text", "call:read")
+    assert {(s["sink"]["callee"], s["sink"]["callee_symbol"], s["sink"].get("model"))
+            for s in text["reached_sinks"]} == {("__strcpy_chk", "__strcpy_chk", "strcpy_chk")}, \
+        text["reached_sinks"]
+    scanned = forward("scan_name", "call:scanf")
+    assert {(s["sink"]["callee"], s["sink"]["callee_symbol"], s["sink"].get("model"))
+            for s in scanned["reached_sinks"]} == \
+        {("__isoc99_scanf", "__isoc99_scanf", "scanf")}, scanned["reached_sinks"]
+
+    # The reader hands the global's constant address straight to its sink:
+    # no input to seed, so no reseed (the text follow-up is the xrefs audit).
+    [leaf] = [lf for lf in text["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["global"]["label"] == "g_text", leaf["global"]
+    assert [r["display_name"] for r in leaf["references"]] == ["text_reader"], leaf
+    assert [r["seed"] for r in leaf["references"]] == [None], leaf["references"]
+    assert "reseed" not in leaf, leaf
+
+    # The reader loads the global: the reseed is the loaded value, and it
+    # reaches the reader's sink through the reader's own flow.
+    count = forward("fill_count", "call:read")
+    [leaf] = [lf for lf in count["leaves"] if lf["kind"] == "global_memory_continuation"]
+    assert leaf["global"]["label"] == "g_count", leaf["global"]
+    [row] = leaf["references"]
+    assert (row["display_name"], row["access"]) == ("count_reader", "load"), row
+    assert row["seed"] and row["seed"].startswith("var:"), row
+    assert leaf["reseed"] and f"--source {row['seed']}" in leaf["reseed"], leaf
+    assert "--source arg:malloc:" not in leaf["reseed"], leaf["reseed"]
+    inside = forward(row["address"], row["seed"])
+    [hit] = inside["reached_sinks"]
+    assert (hit["sink"]["callee"], hit["sink"]["class"]) == ("malloc", "alloc_size"), hit
+    assert hit["metrics"]["steps"] > 1, hit

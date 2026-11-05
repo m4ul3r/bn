@@ -1966,12 +1966,12 @@ def test_pwrite64_lfs_alias_arms_file_write_sink_603(models):
     engine = te.TaintEngine(bv, models)
     result = engine.forward(func, [te.parse_locator("arg:read:1")],
                             enabled_sink_classes={"file_write"})
-    # The alias resolves to the base MODEL KEY, so the finding is reported under
-    # `pwrite` (the canonical convention, same as a mangled `_Znwm` reporting
-    # `Znwm`) -- i.e. it arms the identical sink as a bare `pwrite` call. Without
-    # the LFS64 canonicalization pwrite64 would be an unmodeled external and this
-    # file_write finding would NOT exist.
-    sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pwrite"]
+    # The alias resolves to the base MODEL, so the call arms the identical sink
+    # as a bare `pwrite` call; the finding names the symbol it calls and the
+    # model it was judged by. Without the LFS64 canonicalization pwrite64 would
+    # be an unmodeled external and this file_write finding would NOT exist.
+    sinks = [s for s in result["reached_sinks"]
+             if (s["sink"]["callee"], s["sink"].get("model")) == ("pwrite64", "pwrite")]
     assert len(sinks) == 1
     assert sinks[0]["sink"]["class"] == "file_write"
     assert sinks[0]["sink"]["tainted_arg_index"] == 1

@@ -405,12 +405,12 @@ _CXX_TAINT = {
     "sources": ["arg:recv:1"],
     "reached_sinks": [{
         "sink": {"class": "path_injection",
-                 "callee": "ZN5store4openEPKc", "callee_symbol": "_ZN5store4openEPKc",
+                 "callee": "_ZN5store4openEPKc", "callee_symbol": "_ZN5store4openEPKc",
                  "callee_display_name": "store::open",
                  "address": "0x402080", "tainted_arg_index": 1},
         "path": [],
         "metrics": {"steps": 4, "fns_spanned": 2, "traverses_unresolved": False},
-        "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] ZN5store4openEPKc",
+        "signature": {"rendered": "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc",
                       "rendered_display": "arg:recv:1 → read_key → [path_injection] store::open",
                       "rendered_symbol": "arg:recv:1 → _Z8read_keyPc → [path_injection] _ZN5store4openEPKc"},
     }],
@@ -10397,7 +10397,7 @@ def test_compact_flow_line_keeps_full_names_under_mangled_1041():
     from bn.formatters import _render_flow_line
     sig = {"rendered": "call:recv → _ZN3fooIiE3barEv → [alloc_size] _Znam",
            "rendered_display": "call:recv → foo<int>::bar() → [alloc_size] operator new[]"}
-    flow = {"sink": {"class": "alloc_size", "callee": "Znam", "address": "0x10",
+    flow = {"sink": {"class": "alloc_size", "callee": "_Znam", "model": "Znam", "address": "0x10",
                      "tainted_arg_index": 0}, "signature": sig, "metrics": {}}
     assert "foo<…>::bar()" in _render_flow_line(flow)
     assert "_ZN3fooIiE3barEv" in _render_flow_line(flow, mangled=True)

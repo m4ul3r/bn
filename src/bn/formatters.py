@@ -5533,11 +5533,8 @@ def _elide_template_args(text: str) -> str:
 
 def _sink_callee_text(sink: dict[str, Any], *, mangled: bool = False) -> Any:
     """A taint sink's callee as text prints it (#1001 item 4): the demangled
-    display name, or under ``--mangled`` the real raw symbol -- not the model
-    key, which drops a C++ symbol's leading underscore. Falls back to the key
-    (an older bridge, or no symbol by that name)."""
-    return _shown_name(sink, mangled=mangled,
-                       name_key="callee_symbol" if mangled and sink.get("callee_symbol") else "callee",
+    display name, or under ``--mangled`` the called symbol ``callee``."""
+    return _shown_name(sink, mangled=mangled, name_key="callee",
                        display_key="callee_display_name")
 
 

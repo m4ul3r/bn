@@ -915,15 +915,13 @@ def alias_spellings(key: str) -> tuple[str, ...]:
 
 def called_name(key: str | None, name: str | None) -> str | None:
     """The name a finding reports as its ``callee`` for a call to *name*
-    resolved to model *key*: the symbol the binary calls when it is an ISO
-    scanf alias of the key (``__isoc99_fscanf`` for ``fscanf``), else the key
-    -- the spelling ``callee`` carried before the aliases replaced their own
-    model entries. The canonical key is reported beside it as ``model``."""
-    if key and name:
-        base = str(name).split("@", 1)[0]
-        if _canonical_scanf(base.lstrip("_")) == key:
-            return base
-    return key or name
+    resolved to model *key*: always the symbol the binary calls, without a
+    ``@`` decoration (``__strcpy_chk``, ``__isoc99_fscanf``, ``pwrite64``),
+    else the key when no name is known. The model key it was judged by is
+    reported beside it as ``model`` when it differs."""
+    if name:
+        return str(name).split("@", 1)[0]
+    return key
 
 
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
