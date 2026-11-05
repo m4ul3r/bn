@@ -687,10 +687,12 @@ def _render_disasm_text(value: Any) -> str:
                    # linearly disassembles N units from any mapped address,
                    # even one BN left as data (a missed handler / vtable slot), so
                    # you can inspect the bytes before `function create` (#314).
-                   arg("--linear", nargs="?", const=32, type=_positive_int, default=None, metavar="N",
+                   arg("--linear", "--length", nargs="?", const=32, type=_positive_int,
+                       default=None, metavar="N", dest="linear",
                        help="Linear-disassemble up to N units (default 32): one physical "
                             "instruction or one undecodable byte (.byte) per unit, from "
-                            "any mapped address, independent of function membership")),
+                            "any mapped address, independent of function membership "
+                            "(--length is an accepted alias)")),
          ],
          estimable=True)
 def _disasm(args: argparse.Namespace) -> int:

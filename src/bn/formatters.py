@@ -5166,7 +5166,12 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool 
         hdr += f" in {ngroups} group(s)"
     hdr += "):"
     out = [hdr]
-    for gk in order[:top_n]:
+    # V4-01: a global-memory continuation group (one per global) is never
+    # folded into the elision count -- on a busy run it is the actionable row
+    # -- and --verbose (``full``) renders every group of every kind.
+    shown = [gk for i, gk in enumerate(order)
+             if full or i < top_n or gk[0] == "global_memory_continuation"]
+    for gk in shown:
         g = groups[gk]
         count = len(g["members"])
         if gk[0] == "global_memory_continuation":
@@ -5177,12 +5182,13 @@ def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12, mangled: bool 
             # Spelled out, never `x{count}`: on AArch64 `x3` is a register (#959).
             line += f"  [{count} leaves]"
         out.append(line)
-    if ngroups > top_n:
-        hidden = order[top_n:]
+    if len(shown) < ngroups:
+        rendered = set(shown)
+        hidden = [gk for gk in order if gk not in rendered]
         hidden_leaves = sum(len(groups[gk]["members"]) for gk in hidden)
         out.append(
             f"  ... and {len(hidden)} more group(s) ({hidden_leaves} leaf(s)); "
-            "see --format json for the full list")
+            "see --verbose or --format json for the full list")
     if width is None:
         return out
     return [wrapped for row in out for wrapped in _wrap_row(row, width)]
@@ -5995,6 +6001,14 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
     if msrc:
         lines.append("")
         lines.append(msrc)
+    # W07-14: a --resolve-map pin that is no call site the walk consulted pins
+    # nothing; JSON names it in run_params, and text must not stay silent.
+    rmap = _field_dict(_field_dict(value, "run_params"), "resolve_map")
+    unmatched = [str(a) for a in _field_list(rmap, "unmatched")]
+    if unmatched:
+        src = f" ({rmap['path']})" if rmap.get("path") else ""
+        lines.append(f"resolve-map{src}: {len(unmatched)} pin(s) matched no walked call "
+                     f"site: {', '.join(unmatched)}")
     if value.get("soundness"):
         lines.append("")
         lines.append(f"soundness: {value['soundness']}")
