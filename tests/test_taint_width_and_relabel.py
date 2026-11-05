@@ -187,3 +187,64 @@ def test_the_overread_still_fires_when_the_length_is_not_that_fills_return(model
     sink = _memcpy_sink(models, *_recv_then_dup(count="param", length=length, src=src))
     assert sink["class"] == "overread_len", sink
     assert "src_fill" not in sink
+
+
+# ---------------------------------------------------------------------------
+# V7-01: a modeled receive's return_bound bounds a copy only once proven
+# ---------------------------------------------------------------------------
+
+#: No branch narrows the return: recv's -1 failure is a possible length.
+UNCHECKED = _value_range(-0x8000000000000000, 0x7fffffffffffffff)
+
+
+def _recv_then_copy(*, width, at_copy):
+    """``n = recv(fd, buf, 0x40, 0); memcpy(dst, buf, <n>)`` with a fixed
+    destination: an 8-byte ``ssize_t n`` read as is, or a 4-byte ``int n``
+    read as ``sx.q(n)``. ``at_copy``: BN's value set for the length."""
+    buf = FVar("buf", typ="char[0x40]")
+    fd0, dst0, n1 = FSSA(FVar("fd"), 0), FSSA(FVar("dst"), 0), FSSA(FVar("n"), 1)
+    length = (_var(n1, 8) if width == 8 else
+              _sized(FExpr("MLIL_SX", "sx.q(n#1)", reads=[n1], src=_var(n1, 4)), 8))
+    instrs = [
+        FInstr(0, 0x1010, "MLIL_CALL_SSA", "n#1 = recv(fd#0, &buf, 0x40, 0)",
+               reads=[fd0], writes=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[_var(fd0, 4), FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(1, 0x1020, "MLIL_CALL_SSA", "memcpy(dst#0, &buf, n)", reads=[dst0, n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x3020", constant=0x3020),
+               params=[_var(dst0, 8), FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       _at_copy(length, at_copy)]),
+    ]
+    func = FFunc("pull", 0x1000, FSSAFunc(instrs), params=[FVar("fd"), FVar("dst")])
+    return func, FBV({0x3000: "recv", 0x3020: "memcpy"})
+
+
+@pytest.mark.parametrize("width", [8, 4], ids=["ssize_t", "int"])
+@pytest.mark.parametrize("at_copy, bounded", [
+    (GUARDED, True),        # `if (n <= 0) return;` dominates the copy
+    (UNCHECKED, False),     # nothing checks the return
+    (None, False),          # BN states nothing
+], ids=["guarded", "unchecked", "no-value-set"])
+def test_a_receive_return_bounds_the_copy_only_when_proven_a_count(models, width, at_copy,
+                                                                   bounded):
+    # V7-01: the 8-byte unchecked return was `bounded_len` by recv's count
+    # argument, though its -1 failure is SIZE_MAX at the copy.
+    sink = _memcpy_sink(models, *_recv_then_copy(width=width, at_copy=at_copy))
+    if bounded:
+        assert (sink["class"], sink.get("source_bound")) == ("bounded_len", "0x40"), sink
+        assert "return_unchecked" not in sink
+    else:
+        assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
+        assert "source_bound" not in sink
+
+
+def test_an_unchecked_fill_return_is_no_bound_on_its_source_either(models):
+    # The destination is sized by the length, the source is a 64-byte buffer
+    # the length is the unchecked fill return of: it no longer "provably
+    # holds" the copied length.
+    sink = _memcpy_sink(models, *_recv_then_dup(count="const", length="sx", src="other",
+                                                at_copy=UNCHECKED))
+    assert (sink["class"], sink.get("return_unchecked"), sink["src_capacity"]) == (
+        "overread_len", True, 0x40), sink

@@ -6573,6 +6573,14 @@ class TaintEngine:
                                       "__builtin_memcpy", "memcpy_chk", "memmove_chk",
                                       "mempcpy_chk"})
 
+    # V7-01: a copy length that is a modeled fill's return the copy never
+    # proves a count -- its failure value -1 is SIZE_MAX at the copy.
+    _RETURN_UNCHECKED = {"return_unchecked": True}
+    _RETURN_UNCHECKED_DETAIL = (
+        "; the length is the return of a modeled receive/fill that nothing on the "
+        "path checks: its failure value -1 is SIZE_MAX here, so the count argument "
+        "does not bound the copy")
+
     def _source_side_verdict(self, ssaf: Any, params: list[Any], length_idx: int,
                              mkey: str | None, model: dict[str, Any],
                              eff_sink: dict[str, Any]) -> dict[str, Any]:
@@ -6612,13 +6620,23 @@ class TaintEngine:
                     "detail": eff_sink["detail"] + f"; the length is the return value of the "
                     f"{_fill_callee}() at {hex(_fill_at)} that filled the copy source "
                     f"(arg{srcs[0]}), so the copy reads back only bytes that call wrote"}
+        # V7-01: a fill's return no branch or value set proves a count bounds
+        # nothing; the verdict below says so, whatever it is.
+        found = self._fill_return_bound(ssaf, len_expr)
+
+        def tagged(verdict: dict[str, Any]) -> dict[str, Any]:
+            if found is None or found[1]:
+                return verdict
+            return {**verdict, **self._RETURN_UNCHECKED,
+                    "detail": verdict["detail"] + self._RETURN_UNCHECKED_DETAIL}
+
         unchecked = {**eff_sink, "src_capacity": None,
                      "relabel": eff_sink["relabel"] + "; source capacity not checked",
                      "detail": eff_sink["detail"] + f"; the copy source (arg{srcs[0]}) could not "
                      "be sized against the length, so an over-read of it is NOT ruled out -- "
                      "check that it holds at least the copied length"}
         if cap is None:
-            return unchecked
+            return tagged(unchecked)
         size, where, alloc_size = cap
         bound = self._length_upper_bound(ssaf, len_expr)
         fits = ((alloc_size is not None and self._same_ssa_value(ssaf, alloc_size, len_expr))
@@ -6633,13 +6651,13 @@ class TaintEngine:
         # length with no upper bound at all. An allocation of some other unknown
         # size could be large enough, so it stays unchecked.
         if size is None and (alloc_size is not None or bound is not None):
-            return {**unchecked, "src_capacity_source": where}
-        return {**eff_sink, "class": "overread_len", "src_capacity": size,
-                "src_capacity_source": where,
-                "relabel": eff_sink["relabel"] + f"; source is {where}, not provably >= length",
-                "detail": eff_sink["detail"] + f"; BUT the copy source (arg{srcs[0]}) is {where} "
-                "and the attacker-derived length is not provably within it -- an over-read of "
-                "the source"}
+            return tagged({**unchecked, "src_capacity_source": where})
+        return tagged({**eff_sink, "class": "overread_len", "src_capacity": size,
+                       "src_capacity_source": where,
+                       "relabel": eff_sink["relabel"] + f"; source is {where}, not provably >= length",
+                       "detail": eff_sink["detail"] + f"; BUT the copy source (arg{srcs[0]}) is "
+                       f"{where} and the attacker-derived length is not provably within it -- an "
+                       "over-read of the source"})
 
     def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
                                src_expr: Any) -> tuple[str, int] | None:
@@ -6652,9 +6670,8 @@ class TaintEngine:
         ``*arg:N`` source. The length may reach the return through copies and
         width extensions only -- any arithmetic on it stops the proof. The
         return bound holds only when the fill SUCCEEDED: a failure returns -1,
-        which a sign extension turns into SIZE_MAX, so the length must be
-        proven non-negative in the return's own width where the copy uses it
-        (:meth:`_proven_non_negative`). The source must be the very pointer
+        which a sign extension turns into SIZE_MAX, so the copy must prove the
+        return a count (:meth:`_fill_count_proven`). The source must be the very pointer
         the fill was given: the same SSA value, or the same object at the
         same offset (equal buffer key AND equal capacity description, which
         carries the offset)."""
@@ -6672,7 +6689,7 @@ class TaintEngine:
         mkey, model = lookup_model(self.models, callee)
         if not model or not model.get("return_bound"):
             return None
-        if not self._proven_non_negative(len_expr, getattr(chain[-1], "size", None)):
+        if not self._fill_count_proven(ssaf, len_expr, getattr(chain[-1], "size", None), d):
             return None
         buf_idx = (model.get("sink") or {}).get("buf_arg")
         if buf_idx is None:
@@ -7055,17 +7072,26 @@ class TaintEngine:
         return None
 
     def _syscall_bound_for_length(self, ssaf: Any, length_expr: Any) -> int | None:
-        """If the copy length is the return value of a modeled receive call whose
-        bounding count argument is a constant, return that constant max, else
-        None. Recognizes e.g. ``n = read(fd, buf, 0x1000); memcpy(dst, buf, n)``
-        -- the length is attacker-derived but provably ``<= 0x1000``, so it is a
-        bounded copy, not an unbounded overflow (#159). Mirrors
-        ``_alloc_size_expr``'s def-chain walk."""
-        var = length_expr if is_ssa_var(length_expr) else None
+        """The constant count a modeled receive's return is bounded by, when
+        the copy length IS that return AND the copy proves it a byte count
+        (:meth:`_fill_return_bound`); else None. ``n = read(fd, buf, 0x1000);
+        if (n <= 0) return; memcpy(dst, buf, n)`` is attacker-derived but
+        provably ``<= 0x1000`` (#159); without the check the failure return is
+        -1, which the copy reads as SIZE_MAX (V7-01)."""
+        found = self._fill_return_bound(ssaf, length_expr)
+        return found[0] if found is not None and found[1] else None
+
+    def _fill_return_bound(self, ssaf: Any, length_expr: Any) -> tuple[int, bool] | None:
+        """``(bound, proven)`` when the copy length is -- through copies and
+        width extensions -- the return of a modeled fill whose ``return_bound``
+        count argument is a constant; None otherwise. ``proven`` is whether
+        the copy proves that return a byte count rather than the failure
+        value (:meth:`_fill_count_proven`): the bound holds only then."""
+        chain = self._def_chain(ssaf, length_expr)
+        var = self._as_single_ssa_var(chain[-1]) if chain else None
         if var is None:
             reads = expr_reads(length_expr)
-            if len(reads) == 1:
-                var = reads[0]
+            var = reads[0] if len(reads) == 1 else None
         if var is None:
             return None
         var = self._canonical_ssa_var(ssaf, var)
@@ -7084,7 +7110,80 @@ class TaintEngine:
         aparams = self._call_params(d)
         if bidx >= len(aparams):
             return None
-        return self._const_value(aparams[bidx])
+        bound = self._const_value(aparams[bidx])
+        if bound is None:
+            return None
+        width = getattr(chain[-1], "size", None) if chain else None
+        return int(bound), self._fill_count_proven(ssaf, length_expr, width, d)
+
+    def _fill_count_proven(self, ssaf: Any, len_expr: Any, width: Any, fill: Any) -> bool:
+        """Whether the copy proves the fill's return *len_expr* is the count it
+        wrote and not its failure value -1 (SIZE_MAX once a copy reads it):
+        BN's value set for it is non-negative in the return's own *width*
+        (:meth:`_proven_non_negative`, which a dominating ``n <= 0`` guard
+        narrows), or a branch on the return that excludes -1 dominates the
+        copy -- ``if (n == -1) return;`` leaves BN's set unnarrowed, yet a
+        fill returns -1 or a count, so it is proof all the same."""
+        return (self._proven_non_negative(len_expr, width)
+                or self._failure_excluded(ssaf, fill, len_expr))
+
+    # A comparison of the fill's return against a constant, by the value -1
+    # (the failure return) makes it take: the branch it does NOT take is
+    # the one on which the return is a count.
+    _FAILURE_TESTS: dict[str, Any] = {
+        "MLIL_CMP_E": lambda v, c: v == c, "MLIL_CMP_NE": lambda v, c: v != c,
+        "MLIL_CMP_SLT": lambda v, c: v < c, "MLIL_CMP_SLE": lambda v, c: v <= c,
+        "MLIL_CMP_SGT": lambda v, c: v > c, "MLIL_CMP_SGE": lambda v, c: v >= c,
+    }
+
+    def _failure_excluded(self, ssaf: Any, fill: Any, len_expr: Any) -> bool:
+        """Whether a signed or equality test of the fill's return against a
+        constant dominates the copy reading *len_expr* on its count side: the
+        branch target where the return cannot be -1 is entered only from that
+        test, and no path from the fill reaches the copy without passing it.
+        False whenever the IL exposes no blocks to prove it with."""
+        returned = {(var_key(w), getattr(w, "version", None)) for w in ssa_writes(fill)}
+        if not returned:
+            return False
+        copy_idx = getattr(len_expr, "instr_index", None)
+        instrs = self._instrs(ssaf)
+        copy = next((i for i in instrs if getattr(i, "instr_index", None) == copy_idx), None)
+        if copy is None:
+            return False
+        names = set(returned)
+        for ins in instrs:
+            # Copies and width extensions of the return name it too.
+            if op_name(ins) == "MLIL_SET_VAR_SSA":
+                src = self._def_chain(ssaf, getattr(ins, "src", None))
+                last = self._as_single_ssa_var(src[-1]) if src else None
+                if last is not None and (var_key(last), getattr(last, "version", None)) in names:
+                    names.update((var_key(w), getattr(w, "version", None)) for w in ssa_writes(ins))
+        for ins in instrs:
+            if op_name(ins) != "MLIL_IF":
+                continue
+            cond = getattr(ins, "condition", None)
+            test = self._FAILURE_TESTS.get(op_name(cond))
+            if test is None:
+                continue
+            chain = self._def_chain(ssaf, getattr(cond, "left", None))
+            var = self._as_single_ssa_var(chain[-1]) if chain else None
+            const = self._int_const(getattr(cond, "right", None))
+            if var is None or const is None \
+                    or (var_key(var), getattr(var, "version", None)) not in names:
+                continue
+            width = getattr(getattr(cond, "left", None), "size", None)
+            if isinstance(width, int) and width > 0 and const >= 1 << (8 * width - 1):
+                const -= 1 << (8 * width)
+            target = getattr(ins, "false" if test(-1, const) else "true", None)
+            entry = next((i for i in instrs if getattr(i, "instr_index", None) == target), None)
+            block = getattr(entry, "il_basic_block", None)
+            edges = list(getattr(block, "incoming_edges", None) or [])
+            if entry is None or len(edges) != 1 \
+                    or getattr(edges[0], "source", None) != getattr(ins, "il_basic_block", None):
+                continue
+            if self._reaches_avoiding(fill, copy, [entry]) is False:
+                return True
+        return False
 
     def _local_definition_for(self, name: str | None) -> Any | None:
         """An in-binary DEFINED function with this name, or None.
@@ -14053,18 +14152,24 @@ class TaintEngine:
                                 # Length is the return of a modeled receive
                                 # call bounded by a constant count arg
                                 # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
-                                # attacker-derived but provably <= MAX (#159).
-                                _bnd = self._syscall_bound_for_length(ssaf, params[argidx])
-                                if _bnd is not None:
+                                # attacker-derived but provably <= MAX (#159)
+                                # once the copy proves the return a count; an
+                                # unchecked failure return is SIZE_MAX (V7-01).
+                                _fill = self._fill_return_bound(ssaf, params[argidx])
+                                if _fill is not None and _fill[1]:
                                     eff_sink = {
                                         **sink,
                                         "class": "bounded_len",
-                                        "source_bound": hex(_bnd),
+                                        "source_bound": hex(_fill[0]),
                                         "detail": (sink.get("detail") or "")
                                         + f" (length is a modeled receive return provably "
-                                        f"bounded by {hex(_bnd)} -- bounded copy, not an "
+                                        f"bounded by {hex(_fill[0])} -- bounded copy, not an "
                                         "unbounded overflow)",
                                     }
+                                elif _fill is not None:
+                                    eff_sink = {**sink, **self._RETURN_UNCHECKED,
+                                                "detail": (sink.get("detail") or "")
+                                                + self._RETURN_UNCHECKED_DETAIL}
                             # Reserve overflow_* for buffer/length-operand
                             # taint: if the taint reaches this sink only
                             # through an array index/offset (`base + i*stride`)
@@ -16448,6 +16553,9 @@ class TaintEngine:
                 # W01-10: the copy length is the return of the modeled fill of
                 # this same source (so no overread_len).
                 **({"src_fill": sink["src_fill"]} if sink.get("src_fill") else {}),
+                # V7-01: the length is a modeled fill's return nothing on the
+                # path proves a count (its failure -1 is SIZE_MAX here).
+                **({"return_unchecked": True} if sink.get("return_unchecked") else {}),
                 # W10-04: the length's last arithmetic is narrower than the
                 # parameter (widths in bytes).
                 **({"width_narrowing": sink["width_narrowing"]} if sink.get("width_narrowing") else {}),
@@ -17922,6 +18030,21 @@ class TaintEngine:
                                      **self._model_field(called_name(mkey, name)),
                                      "address": hex(int(defn.address))})
                         _returned_object(defn, v, d, mv, anchor, name, model, fresh=True)
+                        # `k = f(k)` read straight off the call (-O2): the
+                        # slice stops at the call, but the argument it was
+                        # handed is a loop-carried value -- its literal start
+                        # is a recurrence beside the call (V7-03).
+                        for arg in self._call_params(defn):
+                            avar = next((x for x in map(self._as_single_ssa_var,
+                                                        reversed(self._def_chain(ssaf, arg)))
+                                         if x is not None), None)
+                            try:
+                                adef = (ssaf.get_ssa_var_definition(avar)
+                                        if avar is not None else None)
+                            except Exception:
+                                adef = None
+                            if adef is not None and op_name(adef) == "MLIL_VAR_PHI":
+                                _note_recurrence(adef)
                     elif all(s == "literal" for s in states):
                         _set_origin({"kind": "call", "callee": called_name(mkey, name),
                                      **self._model_field(called_name(mkey, name)),
