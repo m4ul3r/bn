@@ -170,6 +170,48 @@ def test_a_non_constant_trip_step_has_no_increments(monkeypatch):
     assert len(result["assumptions"]) == 1
 
 
+def test_a_recurrence_through_a_call_names_the_call(monkeypatch):
+    # `len = grow(len)` in the loop body: the trip's step is whatever `grow`
+    # returns, so no increments, and the step, its roll-up example and the
+    # caveat all name the call the recurrence passes through.
+    instrs, defs = _accumulator(lambda v: None)
+    l2, l3 = (next(v for v in defs if v.name == n) for n in ("len#2", "len#3"))
+    call = _FakeMLILInsn(0x2018, operation="MLIL_CALL_SSA",
+                         dest=_const(0x3000, 0x2018, op="MLIL_CONST_PTR"),
+                         params=[_var(l2, 0x2018)], vars_read=[l2], vars_written=[l3])
+    call.output = [l3]
+    instrs[2], defs[l3] = call, call
+    sym = types.SimpleNamespace(address=0x3000, name="grow", full_name="grow")
+    result = _slice(monkeypatch, instrs, defs, 0x2030, symbols=[sym])
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert (start["reason"], start["increments"], start["calls"]) == \
+        ("recurrence_initializer", None, ["grow"])
+    [frontier] = [g for g in result["frontiers"] if g["reason"] == "recurrence_initializer"]
+    assert (frontier["count"], frontier["examples"][0]["calls"]) == (1, ["grow"])
+    assert len([a for a in result["assumptions"] if "grow" in a]) == 1
+
+
+def test_an_exhausted_recurrence_search_is_disclosed_not_ruled_out(monkeypatch):
+    # The search stops after _RECURRENCE_NODES variables: a recurrence is not
+    # ruled out, so the literal is still only a start, with no increments and
+    # `search_exhausted` on the step and its roll-up example.
+    instrs, defs = _accumulator(_plus(4))
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge.read_taint_slice._taint.TaintEngine, "_RECURRENCE_NODES", 1)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x2000, "parse_packet")
+    fn.medium_level_il = _FakeMLILFunction(instrs, definitions=defs)
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "parse_packet", "0x2030", arg_index=0)
+    [start] = [s for s in result["trace"] if s["ssa_label"] == "len#1"]
+    assert (start["reason"], start["increments"], start["search_exhausted"]) == \
+        ("recurrence_initializer", None, True)
+    [frontier] = [g for g in result["frontiers"] if g["reason"] == "recurrence_initializer"]
+    assert frontier["examples"][0]["search_exhausted"] is True
+    assert len(result["assumptions"]) == 1
+
+
 def test_a_phi_of_literals_stays_constants(monkeypatch):
     # `len = n > 3 ? 16 : 0`: no arm cycles back -- a plain choice.
     l1, l2, l3 = (_ver("len", k) for k in (1, 2, 3))
