@@ -6614,7 +6614,8 @@ def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
                       "export": True, "default_save_path": orig + ".bndb",
                       "default_cache_fallback": str(bridge._cache_bndb_path(orig)),
                       "default_cache_fallback_refused": False,
-                      "restart_path": orig, "restart_path_is_database": False}
+                      "restart_path": orig, "restart_path_is_database": False,
+                      "backing_database": None, "unsaved": False}
     assert out.exists()
     assert bv.created_with == str(out.resolve())   # the copy WAS written
     assert bv.file.filename == orig                # ...but identity is preserved

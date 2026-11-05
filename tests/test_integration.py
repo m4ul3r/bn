@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import refuse_silent_skip
+from conftest import _pid_is_gone, refuse_silent_skip
 
 from bn.paths import instances_dir
 
@@ -403,6 +403,77 @@ class TestSessionStopUnsavedGuard:
             _session_stop(inst)
 
 
+def _session_row(instance_id: str) -> dict | None:
+    """*instance_id*'s `session list` row, or None once it is gone. `session
+    list` is an idle probe, so polling it never restarts the idle window."""
+    listing = _bn("session", "list", "--format", "json")
+    assert listing.returncode == 0, listing.stderr
+    rows = json.loads(listing.stdout).get("items") or []
+    return next((row for row in rows if row.get("instance_id") == instance_id), None)
+
+
+def _wait_for_row(instance_id: str, predicate, *, budget: float) -> dict | None:
+    deadline = time.monotonic() + budget
+    while True:
+        row = _session_row(instance_id)
+        if predicate(row) or time.monotonic() >= deadline:
+            return row
+        time.sleep(0.5)
+
+
+class TestIdleReaperUnsavedGuard:
+    """The idle reaper must not discard unsaved work (D2-01). An auto-started
+    bridge gets a finite BN_IDLE_TIMEOUT by default, so this is the path an
+    unattended agent's mutations take. A private session with a 2 s window,
+    because the bridge's own shutdown IS the subject."""
+
+    _IDLE = 2.0
+
+    def test_an_unsaved_rename_holds_an_expired_idle_window_until_saved(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BN_IDLE_TIMEOUT", str(self._IDLE))
+        copy = tmp_path / "parser"
+        shutil.copyfile(HELLO_BINARY, copy)
+        copy.chmod(0o755)
+        inst = _session_start(str(copy))["instance_id"]
+        try:
+            listing = json.loads(
+                _bn("--instance", inst, "function", "list", "--format", "json").stdout)
+            items = listing.get("items") if isinstance(listing, dict) else listing
+            renamed = _bn("--instance", inst, "rename", items[0]["name"],
+                          "IDLE_GUARD_MARKER", "--format", "json")
+            assert renamed.returncode == 0, f"{renamed.stdout}\n{renamed.stderr}"
+
+            # Several windows pass with nothing but idle probes: the bridge
+            # stays up and says why.
+            held = _wait_for_row(
+                inst, lambda row: row is None or row.get("idle_deferred_unsaved_targets"),
+                budget=10 * self._IDLE)
+            assert held is not None, "the idle reaper discarded an unsaved rename"
+            assert held["idle_deferred_unsaved_targets"] == 1
+            time.sleep(3 * self._IDLE)
+            assert _session_row(inst) is not None
+            found = _bn("--instance", inst, "function", "search", "IDLE_GUARD_MARKER",
+                        "--format", "json")
+            assert found.returncode == 0, found.stderr
+            payload = json.loads(found.stdout)
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            assert [row["name"] for row in rows] == ["IDLE_GUARD_MARKER"]
+
+            # Saved: nothing is left to lose, so the next full window reaps it.
+            saved = _bn("--instance", inst, "save", "--format", "json")
+            assert saved.returncode == 0, f"{saved.stdout}\n{saved.stderr}"
+            gone = _wait_for_row(inst, lambda row: row is None, budget=10 * self._IDLE)
+            assert gone is None, f"the saved bridge was not reaped: {gone}"
+            # The registry goes first; the process then finishes BN's teardown.
+            deadline = time.monotonic() + _SESSION_STOP_TIMEOUT
+            while not _pid_is_gone(int(held["pid"])) and time.monotonic() < deadline:
+                time.sleep(0.5)
+            assert _pid_is_gone(int(held["pid"])), "the reaped bridge never exited"
+        finally:
+            _session_stop(inst)
+
+
 class TestSavePathIdentity:
     """Regression for #256: `save --path` writes a COPY and must not re-home the
     live target, so the original selector keeps resolving afterward. Needs real BN
@@ -618,6 +689,42 @@ class TestBatchManifestTarget:
             code, payload = preview(*ops)
             assert code == 0, (ops, payload)
             assert [r["status"] for r in payload["results"]] == ["verified", "verified"], payload
+
+    def test_a_noop_rename_stays_noop_when_a_later_op_fails_to_apply(self, shared_bn, tmp_path):
+        """P2-02: `[rename greet -> greet, rename main -> main_reviewed, rename
+        an absent symbol]`. The third op fails at apply and the batch rolls back;
+        the first wrote nothing, so it stays `noop` and is counted, the second is
+        `reverted`, and the run exits 3 for the failing op alone. The noop used
+        to be stamped `reverted` with `noop_count: 0`. The `--out` envelope and
+        the failure card state the same outcome."""
+        shared_bn.load(HELLO_BINARY)
+        mf = tmp_path / "noop_then_apply_failure.json"
+        mf.write_text(json.dumps({"ops": [
+            {"op": "rename_symbol", "identifier": "greet", "new_name": "greet"},
+            {"op": "rename_symbol", "identifier": "main", "new_name": "main_reviewed"},
+            {"op": "rename_symbol", "identifier": "absent_symbol_zz", "new_name": "x"}]}))
+
+        summary_run = shared_bn.run("batch", "apply", str(mf), "--format", "json", "--summary")
+        assert summary_run.returncode == 3, f"{summary_run.stdout}\n{summary_run.stderr}"
+        summary = json.loads(summary_run.stdout)
+        assert (summary["noop_count"], summary["reverted_count"], summary["failed_count"],
+                summary["rolled_back"], summary["dirty_after"]) == (1, 1, 1, True, False), summary
+
+        out = tmp_path / "detail.json"
+        full = shared_bn.run("batch", "apply", str(mf), "--format", "json", "--out", str(out))
+        assert full.returncode == 3, f"{full.stdout}\n{full.stderr}"
+        envelope = json.loads(full.stdout)
+        assert (envelope["ok"], envelope["written"]) == (False, True), envelope
+        detail = json.loads(out.read_text())
+        assert [r["status"] for r in detail["results"]] == [
+            "noop", "reverted", "unsupported"], detail["results"]
+
+        card = shared_bn.run("batch", "apply", str(mf), "--verbose")
+        assert card.returncode == 3, f"{card.stdout}\n{card.stderr}"
+        assert card.stdout.splitlines()[0] == "rolled back: apply failed", card.stdout
+        names = shared_bn.run("function", "list", "--format", "json", "--limit", "200")
+        listed = {f["name"] for f in json.loads(names.stdout)["items"]}
+        assert {"greet", "main"} <= listed and "main_reviewed" not in listed, listed
 
 
 class TestProtoSetUnnamedParams:
@@ -1993,6 +2100,84 @@ class TestDisasmThumbIT741:
         assert [row["length"] for row in decoded["instructions"]] == [4, 4]
         assert [row["text"].split()[0] for row in decoded["instructions"]] == ["nop", "bx"]
         assert bytes.fromhex(" ".join(row["bytes"] for row in decoded["instructions"])) == raw
+
+
+class TestFunctionReadProvenance:
+    """`function info` / `proto get` provenance, address span and Thumb
+    normalization, and their reference counts, on real Binary Ninja."""
+
+    def test_thumb_reads_report_normalization_span_and_type_source(self, shared_bn, tmp_path):
+        # b.n over six data bytes to `movs r0, #0; bx lr`: two blocks with a
+        # gap, 6 block bytes over a 12-byte span.
+        raw = bytes.fromhex("02e0" "ffffffffffff" "0020" "7047")
+        selector, start = TestDisasmThumbIT741._load_raw(shared_bn, tmp_path, raw, "linux-thumb2")
+        for argv in (("function", "info"), ("proto", "get")):
+            res = shared_bn.run(*argv, hex(start + 1), "--format", "json", "--target", selector)
+            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+            info = json.loads(res.stdout)
+            assert info["function"]["address"] == hex(start)
+            assert info["resolved_from"] == {
+                "requested_address": hex(start + 1), "normalized": hex(start), "offset": "+0x0"}
+            assert info["size"] == 6
+            assert (info["span_start"], info["span_end"], info["contiguous"]) == (
+                hex(start), hex(start + 12), False)
+            assert info["type_source"] == "auto"
+            assert isinstance(info["return_type_confidence"], int)
+            assert 0 <= info["prototype_confidence"] <= info["return_type_confidence"] <= 255
+
+        res = shared_bn.run("proto", "set", hex(start), "int32_t probe(void)", "--target", selector)
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        info = shared_bn.json("function", "info", hex(start), "--target", selector)
+        assert (info["has_user_type"], info["type_source"]) == (True, "user")
+        assert info["prototype_confidence"] == info["return_type_confidence"] == 255
+
+    def test_a_reopened_database_claims_no_analyst_prototype(self, shared_bn):
+        """D4-04: `type_source` mapped BN's has_user_type to `user`, but after a
+        save and reopen BN reports that flag whatever set the prototype. Only
+        this bridge's own verified `proto set` proves `user`, and a reopened
+        view carries no such record."""
+        target = shared_bn.load(HELLO_BINARY)
+        before = shared_bn.json("function", "info", "main", "--target", target)
+        assert before["type_source"] in ("auto", "unknown"), before
+        res = shared_bn.run("proto", "set", "main", "int32_t main(int32_t argc, char** argv)",
+                            "--target", target)
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        set_here = shared_bn.json("function", "info", "main", "--target", target)
+        assert set_here["type_source"] == "user", set_here
+
+        database = shared_bn.json("save", "--target", target)["path"]
+        assert shared_bn.run("close", target).returncode == 0
+        reopened_target = shared_bn.load(database, copy=False)
+        reopened = shared_bn.json("function", "info", "main", "--target", reopened_target)
+        assert reopened["type_source"] == "unknown", reopened
+        # The flag BN reports is still there, beside the origin it cannot prove.
+        assert (before["type_source"] == "auto") is (before["has_user_type"] is False)
+        assert (set_here["has_user_type"], reopened["has_user_type"]) == (True, True)
+
+    def test_function_info_counts_match_xrefs_for_a_vtable_only_method(self, shared_bn):
+        # A virtual method is reached through its vtable slot: a data reference.
+        shared_bn.load(CLASSES_BINARY)
+        info = shared_bn.json("function", "info", "svc::EchoHandler::name")
+        xrefs = shared_bn.json("xrefs", "svc::EchoHandler::name")
+        assert (info["code_ref_count"], info["data_ref_count"]) == (
+            xrefs["code_ref_count"], xrefs["data_ref_count"])
+        assert info["data_ref_count"] >= 1
+        assert "xref_count" not in info
+
+    def test_ambiguous_class_show_is_the_uniform_refusal_envelope(self, shared_bn):
+        shared_bn.load(CLASSES_BINARY)
+        declared = shared_bn.run("types", "declare", "struct `dup::Handler` { int a; };")
+        assert declared.returncode == 0, f"{declared.stdout}\n{declared.stderr}"
+        res = shared_bn.run("class", "show", "Handler", "--format", "json")
+        assert res.returncode == 2, (res.stdout, res.stderr)
+        envelope = json.loads(res.stdout)
+        assert envelope["ok"] is False
+        assert envelope["status"] == "ambiguous_class"
+        assert envelope["requested"] == {"name": "Handler"}
+        assert sorted(m["name"] for m in envelope["observed"]["matches"]) == [
+            "dup::Handler", "svc::Handler"]
+        # The full name still answers with the one card.
+        assert shared_bn.json("class", "show", "svc::Handler")["name"] == "svc::Handler"
 
 
 def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
@@ -7361,3 +7546,71 @@ def test_a_negative_address_is_an_exit_2_refusal_on_a_real_view(shared_bn, argv)
     res = shared_bn.run(*argv)
     assert res.returncode == 2, res.stdout
     assert "negative address" in res.stderr and "internal error" not in res.stderr
+
+
+class TestIdentityAcrossARestart:
+    """D2: a restarted bridge never hands a pre-restart view id to another
+    target (P1-02), and an export leaves the unsaved work it did not persist
+    guarded by `session restart` (P2-03). A private session: the restart IS the
+    subject."""
+
+    def test_a_view_id_listed_before_a_restart_is_refused_after_it(self, tmp_path):
+        from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+        from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+        first, second = tmp_path / "first", tmp_path / "second"
+        for source, copy in ((HELLO_BINARY, first), (ADD_BINARY, second)):
+            shutil.copyfile(source, copy)
+            copy.chmod(0o755)
+        inst = None
+        try:
+            inst = _session_start(str(first), str(second))["instance_id"]
+
+            def rows():
+                listing = _bn("--instance", inst, "target", "list", "--format", "json")
+                assert listing.returncode == 0, listing.stderr
+                return {Path(r["filename"]).name: r for r in json.loads(listing.stdout)["items"]}
+
+            # Close and reopen `first` so the old process numbered past its
+            # open views: the restart reloads `second` before `first`.
+            assert _bn("--instance", inst, "-t", str(first), "close").returncode == 0
+            loaded = _bn("--instance", inst, "load", str(first))
+            assert loaded.returncode == 0, loaded.stderr
+            before = rows()
+            stale = before["second"]["view_id"]
+
+            # P2-03: rename, then export -- the work is still not in the
+            # target's own database, so it stays unsaved and guarded.
+            renamed = _bn("--instance", inst, "-t", str(second), "rename", "main",
+                          "D2_EXPORT_MARKER", "--format", "json")
+            assert renamed.returncode == 0, f"{renamed.stdout}\n{renamed.stderr}"
+            export = _bn("--instance", inst, "-t", str(second), "save",
+                         str(tmp_path / "copy.bndb"), "--format", "json")
+            assert export.returncode == 0, export.stderr
+            exported = json.loads(export.stdout)
+            assert (exported["export"], exported["unsaved"]) == (True, True), exported
+            assert rows()["second"]["unsaved"] is True
+            refused = _bn("session", "restart", inst, "--format", "json",
+                          timeout=_SESSION_STOP_TIMEOUT)
+            assert refused.returncode == 2, f"{refused.stdout}\n{refused.stderr}"
+
+            restarted = _bn(
+                "session", "restart", inst, "--discard-unsaved", "--format", "json",
+                timeout=_SHUTDOWN_TEARDOWN_TIMEOUT + 2.0 + _SESSION_START_TIMEOUT,
+            )
+            assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
+            after = rows()
+            old_ids = {int(r["view_id"]) for r in before.values()}
+            assert min(int(r["view_id"]) for r in after.values()) > max(old_ids), (before, after)
+
+            # P1-02: the old number names nothing now, and says why.
+            reused = _bn("--instance", inst, "-t", stale, "target", "info")
+            assert reused.returncode == 2, f"{reused.stdout}\n{reused.stderr}"
+            assert PROCESS_LOCAL_VIEW_ID_NOTE in reused.stderr.splitlines()
+            current = _bn("--instance", inst, "-t", after["second"]["view_id"],
+                          "target", "info", "--format", "json")
+            assert current.returncode == 0, current.stderr
+            assert Path(json.loads(current.stdout)["filename"]).name == "second"
+        finally:
+            if inst:
+                _session_stop(inst)

@@ -61,7 +61,6 @@ from .taint_locators import (  # noqa: F401
     derive_flow_facts, normalize_resolve_map,
 )
 from .taint_result import (  # noqa: F401
-    BLOCKING_LEAF_KINDS,
     CALLER_ADVICE_LIMIT,
     coalesce_global_continuations,
     backward_diagnostics,
@@ -70,6 +69,7 @@ from .taint_result import (  # noqa: F401
     indirect_pointer_slot_leaf,
     misanchored_recv_leaf,
 )
+from .taint_vocabulary import BLOCKING_LEAF_KINDS
 
 # Module aliases so tests/callers can patch a moved symbol on its OWNER module
 # (a re-exported binding on the engine is a separate name -- rebinding it would
@@ -395,7 +395,7 @@ class _ScanBudget:
     the request's sweep allowance, charged alongside while a classifying
     scan runs inside a continuation sweep."""
 
-    __slots__ = ("nodes", "cause", "pointer_route", "shared", "settled", "cuts")
+    __slots__ = ("nodes", "cause", "pointer_route", "shared", "settled", "proven", "cuts")
 
     # A pointer-return chain costs `_PTR_RETURN_STEP` levels per hop, so the
     # depth limit is a WRAPPER-CHAIN limit, not a CLI `--max-depth`. Reaching
@@ -406,11 +406,13 @@ class _ScanBudget:
         self.pointer_route = False
         self.shared = shared
         # SSA variables this scan already proved can NOT hold the pointer it
-        # asks about, and how many times a cycle cut an answer short: a scan
-        # asks about the same register at every instruction that uses it,
-        # and each ask used to re-walk its whole definition chain (R3 sweep
-        # economy). Only answers no cycle or bound shaped are kept.
+        # asks about, those it proved DO hold it, and how many times a cycle
+        # cut an answer short: a scan asks about the same register at every
+        # instruction that uses it, and each ask used to re-walk its whole
+        # definition chain (R3 sweep economy, P1-01). A "no" is kept only
+        # when no cycle or bound shaped it; a "yes" always is.
         self.settled: set = set()
+        self.proven: set = set()
         self.cuts = 0
 
     def spend(self) -> bool:
@@ -839,13 +841,11 @@ class TaintEngine:
         # references" was never established for them.
         self._global_refs_truncated: set[int] = set()
         self._global_reach: dict[tuple[int, int, int], tuple] = {}
-        # global -> the bodies that could read it, and the bodies whose call
-        # edges reach one of those (V2-02); (function start, global) -> the
-        # prefilter verdict. Derived from the object's references, so they
-        # go with its extent; BN's call edges alone (`_edges_only_cache`) do
-        # not.
+        # global -> the bodies that could read it (V2-02); (function start,
+        # global) -> the prefilter verdict. Derived from the object's
+        # references, so they go with its extent; BN's call edges alone
+        # (`_edges_only_cache`) do not.
         self._reader_candidates_cache: dict[int, frozenset | None] = {}
-        self._reader_ancestors_cache: dict[int, frozenset | None] = {}
         self._may_see_cache: dict[tuple[int, int], bool] = {}
         self._edges_only_cache: dict[int, bool] = {}
         # (function start, global) -> the first use that can READ the global,
@@ -865,6 +865,10 @@ class TaintEngine:
         # function start -> (indirect targets this run can pin, unresolved
         # indirect call addresses) inside that body.
         self._indirect_sites_cache: dict[int, tuple] = {}
+        # (IL function, expression index) -> the integer constants in that
+        # expression's tree: structural, so shared by every global a scan
+        # tests it against.
+        self._expr_constants_cache: dict[tuple[int, int], tuple] = {}
 
     # -- global-continuation sweep allowance --------------------------------
 
@@ -930,6 +934,19 @@ class TaintEngine:
         with contextlib.suppress(TypeError):
             self._ssa_cache[func] = ssaf
         return ssaf
+
+    def _ssa_or_none(self, func: Any) -> Any:
+        """:meth:`_ssa_func`, or None for a body with no MLIL SSA form.
+
+        Every lift goes through the one per-request cache: Binary Ninja
+        regenerates a function's IL each time a fresh wrapper is asked for
+        it while nothing holds the last one, so a body classified, then
+        resolved as a thunk, then scanned paid for its IL three times
+        (P1-01)."""
+        try:
+            return self._ssa_func(func)
+        except TaintError:
+            return None
 
     def _instrs(self, ssaf: Any) -> list[Any]:
         """*ssaf*'s instructions, listed once per SSA object (see
@@ -2247,6 +2264,9 @@ class TaintEngine:
                 # partial write is never read as covering the whole object.
                 self._global_keyed_offsets.setdefault(ga, set()).add(int(raw) - ga)
             return (("global", ga), f"glob_{hex(ga)}")
+        ga = self._indexed_global(ssaf, expr)
+        if ga is not None:
+            return (("global", ga), f"glob_{hex(ga)}")
         hk = self._heap_buffer_key(ssaf, expr)
         if hk is not None:
             return (hk, f"heap_{hex(hk[1])}")
@@ -2294,6 +2314,46 @@ class TaintEngine:
                 return self._global_addr(ssaf, getattr(d, "src", None), depth + 1,
                                          canon=canon)
         return None
+
+    def _indexed_global(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+        """The writable global OBJECT ``g + i`` points into, for an index
+        nothing makes constant, or None.
+
+        A copy into `&buf[strlen(buf)]` of a static buffer lifts to
+        ``0x40c000 + n`` with `n` a call's result. The index selects a byte
+        within the object, so the object is the one coarse key -- as it is
+        for a stack buffer at `&buf + i` and a heap block at `p + i`. Leaving
+        it unkeyed made the write a `coarse_memory_store`: a body that fills
+        the buffer and returns its address handed back a CLEAN pointer once
+        descended, while the same call cut by `--max-depth` was assumed to
+        return taint -- so a deeper run lost the copy of those bytes that a
+        shallower one found (V5-01). Only the left operand of a subtraction
+        points into the object. The offset is unknown; callers record the
+        write as reaching anywhere in it."""
+        if expr is None or depth > 6:
+            return None
+        opn = op_name(expr)
+        if opn in ("MLIL_ADD", "MLIL_SUB"):
+            operands = [getattr(expr, "left", None)]
+            if opn == "MLIL_ADD":
+                operands.append(getattr(expr, "right", None))
+            for operand in operands:
+                ga = self._global_addr(ssaf, operand)
+                if ga is None:
+                    ga = self._indexed_global(ssaf, operand, depth + 1)
+                if ga is not None:
+                    return ga
+            return None
+        var = expr if is_ssa_var(expr) else self._as_single_ssa_var(expr)
+        if var is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            return None
+        if d is None or op_name(d) != "MLIL_SET_VAR_SSA":
+            return None
+        return self._indexed_global(ssaf, getattr(d, "src", None), depth + 1)
 
     def _canon_global(self, addr: int) -> int | None:
         """Canonicalize a global address to its data-variable base (so different
@@ -4696,12 +4756,12 @@ class TaintEngine:
         once does NOT match -- no over-anchoring."""
         if not self._is_internal(fn):
             return False
-        ssaf = _mlil_ssa(fn)
+        ssaf = self._ssa_or_none(fn)
         if ssaf is None:
             return False
         # Direct/thunk callsites of `callee` inside the wrapper body only
         # (resolve_indirect=False avoids recursing back through this resolver).
-        sites = self._find_callsites(_ssa_instructions(ssaf), callee, resolve_indirect=False)
+        sites = self._find_callsites(self._instrs(ssaf), callee, resolve_indirect=False)
         if len(sites) != 1:
             return False
         cparams = self._call_params(sites[0])
@@ -5462,7 +5522,7 @@ class TaintEngine:
         cache = self._thunk_cache
         if key in cache:
             return cache[key]
-        resolved = follow_thunk(self.bv, fn)
+        resolved = follow_thunk(self.bv, fn, ssa_of=self._ssa_or_none)
         cache[key] = resolved
         return resolved
 
@@ -6117,10 +6177,10 @@ class TaintEngine:
         something else (a fixed scratch buffer) is not."""
         if fn is None or not self._is_internal(fn):
             return False
-        ssaf = _mlil_ssa(fn)
+        ssaf = self._ssa_or_none(fn)
         if ssaf is None:
             return False
-        instrs = list(_ssa_instructions(ssaf))
+        instrs = list(self._instrs(ssaf))
         calls = [i for i in instrs if "CALL" in op_name(i)]
         allocs = []
         for call in calls:
@@ -6847,7 +6907,9 @@ class TaintEngine:
         # answers False for a stub that IS one and True for every caller
         # that asks after something lifted it (BN25-META-01) -- lifting
         # first makes the verdict a property of the binary rather than of
-        # what ran first.
+        # what ran first. The lift goes through the request's SSA cache, so
+        # the body stays held for whatever reads it next (P1-01).
+        self._ssa_or_none(fn)
         try:
             has_body = len(list(fn.mlil.instructions)) > 0
         except Exception:
@@ -6876,8 +6938,8 @@ class TaintEngine:
                 # A linker stub at the end of the chain is the import's
                 # business; its own MLIL is not this binary's code.
                 return True
-            ssa = _mlil_ssa(cur)
-            instructions = _ssa_instructions(ssa) if ssa is not None else []
+            ssa = self._ssa_or_none(cur)
+            instructions = self._instrs(ssa) if ssa is not None else []
             if len(instructions) != 1 or "TAILCALL" not in op_name(instructions[0]):
                 # The end of the chain: a body follow_thunk stopped at.
                 return cur is not fn
@@ -7812,7 +7874,7 @@ class TaintEngine:
     def _mlil_entry_value_registers(self, callee: Any) -> frozenset[str] | None:
         """The full-width registers whose entry value *callee*'s MLIL-SSA
         USES, or None when it has no MLIL-SSA (:meth:`_value_is_used`)."""
-        ssa = _mlil_ssa(callee)
+        ssa = self._ssa_or_none(callee)
         if ssa is None:
             return None
         arch = getattr(callee, "arch", None) or self.bv.arch
@@ -8182,6 +8244,92 @@ class TaintEngine:
             self._global_write_span[ga] = offset + size
             self._invalidate_object(ga)
 
+    def _note_indexed_write(self, ga: int) -> None:
+        """Record a tainted write at an index nothing makes constant into the
+        object at *ga* (:meth:`_indexed_global`): it may have reached any of
+        its bytes, so the interval runs from the base with no end -- an
+        interval at the one place it COULD have landed would let a reader
+        elsewhere in the object be proven disjoint, the clearing direction."""
+        ranges = self._global_tainted_ranges.setdefault(ga, [])
+        if (0, None) not in ranges:
+            ranges.append((0, None))
+        if ga not in self._global_write_unbounded:
+            self._global_write_unbounded.add(ga)
+            self._invalidate_object(ga)
+
+    @staticmethod
+    def _pointer_range(expr: Any) -> tuple[int, int] | None:
+        """``(lowest, highest)`` address BN's value set gives *expr*, or None
+        when it states no bounded set."""
+        pvs = getattr(expr, "possible_values", None)
+        kind = str(getattr(getattr(pvs, "type", None), "name", ""))
+        try:
+            if kind in ("ConstantValue", "ConstantPointerValue"):
+                return int(pvs.value), int(pvs.value)
+            if kind in ("UnsignedRangeValue", "SignedRangeValue"):
+                ranges = list(pvs.ranges)
+                if ranges:
+                    return (min(int(r.start) for r in ranges),
+                            max(int(r.end) for r in ranges))
+            if kind == "InSetOfValues":
+                values = [int(v) for v in pvs.values]
+                if values:
+                    return min(values), max(values)
+        except Exception:
+            return None
+        return None
+
+    def _indexed_write_in_object(self, dest: Any, ga: int, reach: int | None) -> bool:
+        """Whether a write of at most *reach* bytes at *dest* -- ``g + i``
+        into the object at *ga* -- provably stays inside the object's
+        DECLARED extent: BN's value set bounds the address, and the declared
+        width holds the furthest byte. Anything less (an index nothing
+        bounds, a length nothing states, an object of inferred width) may
+        land in the neighbouring object, which the object's taint does not
+        cover (D1-01)."""
+        width = self._authoritative_width(ga)
+        bounds = self._pointer_range(dest)
+        if reach is None or width <= 0 or bounds is None:
+            return False
+        lo, hi = bounds
+        return ga <= lo and hi + int(reach) <= ga + width
+
+    def _modeled_write_reach(self, ssaf: Any, params: list, idx: int,
+                             model: dict[str, Any] | None, name: str | None) -> int | None:
+        """The most bytes a modeled copy writes through argument *idx*, when
+        its length is bounded and bounds THIS argument; None otherwise (an
+        append writes at a terminator it finds, so it never has one)."""
+        append = (model or {}).get("append")
+        if isinstance(append, dict) and model_arg_index(append.get("dest")) == idx:
+            return None
+        length = self._model_len_index(model)
+        scope = self._model_len_scope(model)
+        if length is None or length >= len(params) or (scope is not None and idx not in scope):
+            return None
+        bound = self._length_upper_bound(ssaf, params[length])
+        return None if bound is None or bound < 0 else bound * self._count_scale(name)
+
+    def _indexed_write_frontier(self, ga: int, ins: Any, dest: Any) -> dict[str, Any]:
+        """The blocking leaf for a tainted write through ``g + i`` that is not
+        proven to stay inside the object at *ga*: the object itself is
+        tainted, but the bytes the write may have reached outside it are
+        not followed (D1-01)."""
+        label = self._global_label(ga)
+        return {
+            "kind": "coarse_memory_store",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "dest_expr": str(dest),
+            "il_text": str(ins),
+            "global": {"address": hex(ga), "label": label},
+            "index_bounded": False,
+            "detail": (
+                f"a tainted write through {label} plus an index nothing bounds to "
+                f"its declared extent may land outside it, in a neighbouring "
+                f"object; {label} itself is tainted, but bytes outside it are not "
+                "followed -- a 'no sinks reached' result past this point is not "
+                "proof of safety"),
+        }
+
     def _copy_length_is_zero(self, ssaf: Any, params: list,
                              model: dict[str, Any] | None) -> bool:
         """Whether this modeled copy states a length of exactly zero.
@@ -8197,18 +8345,27 @@ class TaintEngine:
 
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
                          model: dict[str, Any] | None,
-                         name: str | None = None) -> None:
+                         name: str | None = None) -> int | None:
         """Record how far a modeled copy writes into a global object.
 
         An untyped global's extent is otherwise inferred from LAYOUT, which
         an alias/subobject symbol inside the object silently halves
         (BN21-OBJ-01). What the program copies is direct evidence of how wide
-        the object is, so it is kept as a lower bound on the extent."""
+        the object is, so it is kept as a lower bound on the extent.
+
+        Returns the global a write through ``g + i`` (:meth:`_indexed_global`)
+        is NOT proven to stay inside, for the caller's frontier (D1-01);
+        None otherwise."""
         if idx >= len(params):
-            return
+            return None
         ga = self._global_addr(ssaf, params[idx])
         if ga is None:
-            return
+            gi = self._indexed_global(ssaf, params[idx])
+            if gi is None or self._copy_length_is_zero(ssaf, params, model):
+                return None
+            self._note_indexed_write(gi)
+            reach = self._modeled_write_reach(ssaf, params, idx, model, name)
+            return None if self._indexed_write_in_object(params[idx], gi, reach) else gi
         raw = self._global_addr(ssaf, params[idx], canon=False)
         offset = (int(raw) - ga) if raw is not None and int(raw) >= ga else 0
         length = self._model_len_index(model)
@@ -8277,32 +8434,14 @@ class TaintEngine:
         this offset rather than losing which bytes the consumer reached
         (round-3 review F8)."""
         best: int | None = None
-        stack: list[tuple[Any, int]] = [(expr, 0)]
-        while stack:
-            node, depth = stack.pop()
-            if node is None or depth > 10:
-                continue
-            raw = getattr(node, "constant", None)
-            if raw is not None:
-                try:
-                    value = int(raw)
-                except (TypeError, ValueError, OverflowError):
-                    value = None
-                if value is not None and ga <= value and (
-                        value < ga + self._global_extent(ga)
-                        or self._canon_global(value) == ga):
-                    off = value - ga
-                    best = off if best is None else min(best, off)
-            for attr in ("src", "dest", "left", "right", "params"):
-                sub = getattr(node, attr, None)
-                if isinstance(sub, (list, tuple)):
-                    stack.extend((s, depth + 1) for s in sub)
-                elif sub is not None:
-                    stack.append((sub, depth + 1))
-            stack.extend((s, depth + 1) for s in (getattr(node, "operands", None) or ()))
+        for value in self._expr_constants(expr):
+            if ga <= value and (value < ga + self._global_extent(ga)
+                                or self._canon_global(value) == ga):
+                off = value - ga
+                best = off if best is None else min(best, off)
         return best or 0
 
-    def _names_global(self, expr: Any, ga: int, depth: int = 0) -> bool:
+    def _names_global(self, expr: Any, ga: int) -> bool:
         """Whether *expr* carries a CONSTANT inside the global at *ga*.
 
         A pure constant scan: no SSA definitions are followed, so asking it
@@ -8310,29 +8449,60 @@ class TaintEngine:
         questions a chain walk cannot be afforded for -- "is the object
         named in this call outside any recovered argument" and "is it named
         by a use this scan could not classify"."""
-        if expr is None or depth > 10:
-            return False
-        raw = getattr(expr, "constant", None)
-        if raw is not None:
-            try:
-                value = int(raw)
-            except (TypeError, ValueError, OverflowError):
-                # OverflowError: an MLIL FLOAT constant can be `inf`, which
-                # names no address and used to escape the whole op (P1-03).
-                value = None
-            if value is not None and (
-                    ga <= value < ga + self._global_extent(ga)
-                    or self._canon_global(value) == ga):
-                return True
-        for attr in ("src", "dest", "left", "right", "params"):
-            sub = getattr(expr, attr, None)
-            if isinstance(sub, (list, tuple)):
-                if any(self._names_global(x, ga, depth + 1) for x in sub):
-                    return True
-            elif sub is not None and self._names_global(sub, ga, depth + 1):
-                return True
-        return any(self._names_global(x, ga, depth + 1)
-                   for x in (getattr(expr, "operands", None) or ()))
+        return any(ga <= value < ga + self._global_extent(ga)
+                   or self._canon_global(value) == ga
+                   for value in self._expr_constants(expr))
+
+    def _expr_constants(self, expr: Any) -> tuple[int, ...]:
+        """Every integer constant in *expr*'s tree, ten levels deep -- the
+        named operands and ``operands`` both, as BN lists the same child
+        under each.
+
+        Structural, so it is read once per expression and every tainted
+        global is tested against the same answer: a body that names several
+        of them, or that several continuation sweeps classify, walked its
+        operand trees through BN's API once per global (P1-01). An MLIL
+        FLOAT constant can be `inf`, which names no address (P1-03)."""
+        owner = getattr(expr, "function", None)
+        idx = getattr(expr, "expr_index", None)
+        key = (id(owner), idx) if owner is not None and isinstance(idx, int) else None
+        if key is not None:
+            hit = self._expr_constants_cache.get(key)
+            if hit is not None and hit[0] is owner:
+                return hit[1]
+        found: list[int] = []
+        # BN lists one child under a named operand AND under ``operands``:
+        # a node already reached at no greater depth has nothing further to
+        # give, and walking both routes doubled the work per level.
+        reached: dict = {}
+        stack: list[tuple[Any, int]] = [(expr, 0)]
+        while stack:
+            node, depth = stack.pop()
+            if node is None or depth > 10:
+                continue
+            nidx = getattr(node, "expr_index", None)
+            nkey = ("expr", nidx) if isinstance(nidx, int) and hasattr(node, "operation") \
+                else ("obj", id(node))
+            if reached.get(nkey, 11) <= depth:
+                continue
+            reached[nkey] = depth
+            raw = getattr(node, "constant", None)
+            if raw is not None:
+                try:
+                    found.append(int(raw))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            for attr in ("src", "dest", "left", "right", "params"):
+                sub = getattr(node, attr, None)
+                if isinstance(sub, (list, tuple)):
+                    stack.extend((s, depth + 1) for s in sub)
+                elif sub is not None:
+                    stack.append((sub, depth + 1))
+            stack.extend((s, depth + 1) for s in (getattr(node, "operands", None) or ()))
+        out = tuple(sorted(set(found)))
+        if key is not None:
+            self._expr_constants_cache[key] = (owner, out)
+        return out
 
     def _global_ref_functions(self, ga: int) -> dict[int, int]:
         """``{function start: lowest referencing address}`` for every code
@@ -8525,21 +8695,33 @@ class TaintEngine:
 
         An SSA variable proved NOT to hold the pointer -- no cycle cut its
         walk short and no bound was reached -- is settled for the rest of the
-        scan, so the many instructions that use one register ask once."""
+        scan, so the many instructions that use one register ask once. One
+        proved to HOLD it is settled too: a cycle or a bound can only cut a
+        walk short, never invent a path, and every instruction derived from a
+        register that holds the object used to re-walk its whole chain back
+        to the constant (P1-01)."""
         if budget is None:
             budget = _ScanBudget(self._PTR_RESOLVE_NODES)
         var = expr if is_ssa_var(expr) else (
             expr_reads(expr)[0] if op_name(expr) == "MLIL_VAR_SSA"
             and len(expr_reads(expr)) == 1 else None)
-        if var is not None and (id(ssaf), id(base), var_key(var),
-                                getattr(var, "version", None), alias) in budget.settled:
-            return False
+        vkey = None if var is None else (id(ssaf), id(base), var_key(var),
+                                         getattr(var, "version", None), alias)
+        if vkey is not None:
+            if vkey in budget.proven:
+                return True
+            if vkey in budget.settled:
+                return False
         root = seen is None
         seen = set() if root else seen
         cuts = budget.cuts
         got = self._ptr_resolves_step(ssaf, expr, base, depth, seen,
                                       alias=alias, budget=budget)
-        if got or budget.cause is not None or budget.nodes <= 0:
+        if got:
+            if vkey is not None:
+                budget.proven.add(vkey)
+            return got
+        if budget.cause is not None or budget.nodes <= 0:
             return got
         if root:
             # The whole definition graph under a root ask was explored and
@@ -8548,9 +8730,8 @@ class TaintEngine:
             for k in seen:
                 if k[:1] != ("expr",):
                     budget.settled.add((id(ssaf), id(base), k[0], k[1], alias))
-        elif var is not None and budget.cuts == cuts:
-            budget.settled.add((id(ssaf), id(base), var_key(var),
-                                getattr(var, "version", None), alias))
+        elif vkey is not None and budget.cuts == cuts:
+            budget.settled.add(vkey)
         return got
 
     def _ptr_resolves_step(self, ssaf: Any, expr: Any, base: Any, depth: int,
@@ -9140,10 +9321,20 @@ class TaintEngine:
         slots = self._alias_slots(ga)
 
         def base(expr: Any) -> bool:
-            if slots and "LOAD" in op_name(expr):
-                slot = self._global_addr(None, getattr(expr, "src", None), canon=False)
-                if slot is not None and int(slot) in slots:
-                    return True
+            # Only a constant pointer names an address by itself: every other
+            # node is resolved by the def-chain walk calling this, and asking
+            # `_global_addr` about it (which has no SSA function here to
+            # follow a definition with) cost two failed lookups per node of
+            # every scan (P1-01).
+            opn = op_name(expr)
+            if slots and "LOAD" in opn:
+                src = getattr(expr, "src", None)
+                if src is not None and "CONST_PTR" in op_name(src):
+                    slot = self._global_addr(None, src, canon=False)
+                    if slot is not None and int(slot) in slots:
+                        return True
+            if "CONST_PTR" not in opn:
+                return False
             if self._global_addr(None, expr) == ga:
                 return True
             raw = self._global_addr(None, expr, canon=False)
@@ -10577,7 +10768,6 @@ class TaintEngine:
         self._global_refs.clear()
         self._global_reach.clear()
         self._reader_candidates_cache.clear()
-        self._reader_ancestors_cache.clear()
         self._may_see_cache.clear()
         self._global_access_cache.clear()
         self._param_access_cache.clear()
@@ -10595,7 +10785,6 @@ class TaintEngine:
         self._unverified_neighbours.pop(ga, None)
         self._alias_chain_cache.pop(ga, None)
         self._reader_candidates_cache.pop(ga, None)
-        self._reader_ancestors_cache.pop(ga, None)
         for key in [k for k in self._may_see_cache if k[1] == ga]:
             del self._may_see_cache[key]
         for key in [k for k in self._global_reach if k[1] == ga]:
@@ -11281,36 +11470,6 @@ class TaintEngine:
         cache[ga] = out
         return out
 
-    def _reader_ancestors(self, ga: int) -> frozenset | None:
-        """Every body from which BN's call edges reach a possible reader of
-        the global at *ga* (:meth:`_reader_candidates`, closed over callers).
-        None when the candidates cannot be established or the closure grows
-        past a bound. Cached per global."""
-        cache = self._reader_ancestors_cache
-        if ga in cache:
-            return cache[ga]
-        readers = self._reader_candidates(ga)
-        out: frozenset | None = None
-        if readers is not None:
-            closure: set | None = set(readers)
-            work = [function_at(self.bv, s) for s in readers]
-            while work and closure is not None:
-                f = work.pop()
-                callers = getattr(f, "callers", None) if f is not None else None
-                if callers is None:
-                    closure = None
-                    break
-                for c in callers:
-                    s = int(getattr(c, "start", 0))
-                    if s not in closure:
-                        closure.add(s)
-                        work.append(c)
-                if len(closure) > 8 * self._GLOBAL_REACH_FUNCS:
-                    closure = None
-            out = frozenset(closure) if closure is not None else None
-        cache[ga] = out
-        return out
-
     def _edges_only(self, fn: Any) -> bool:
         """Whether BN's recorded call edges speak for every call *fn* makes:
         a body BN analysed, not flagged a thunk, whose every call site has a
@@ -11334,6 +11493,50 @@ class TaintEngine:
                 got = False
         cache[key] = got
         return got
+
+    def _sweep_successors(self, fn: Any, cheap: bool) -> tuple[tuple, tuple]:
+        """``(the (start, body) pairs a reachability walk goes on to from
+        *fn*, the indirect call addresses in it nothing pins)``, in walk
+        order.
+
+        BN's recorded edges first; then, unless *fn* is examined on its edges
+        alone, the direct targets its body names that BN recorded no edge
+        for (a veneer still CALLS something) and the indirect sites this run
+        can pin (I2: `callees` lists resolved edges only). Unpinned indirect
+        sites are named inside real BODIES only -- a PLT stub is a
+        register-indirect jump through the GOT by construction, and counting
+        it as a call bn failed to resolve would raise that boundary on every
+        library call in the walk.
+
+        Cached per (function, mode): every call site that discloses a tainted
+        global walks the call graph from its own callee, so the same bodies
+        were asked for their edges once per walk (P1-01)."""
+        cache = self.__dict__.setdefault("_sweep_successor_cache", {})
+        key = (int(getattr(fn, "start", 0)), bool(cheap))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            callees = list(getattr(fn, "callees", None) or ())
+        except Exception:
+            callees = []
+        unpinned: tuple = ()
+        if not cheap:
+            for extra in self._direct_callees(fn):
+                if all(int(getattr(c, "start", -1)) != int(
+                        getattr(extra, "start", -2)) for c in callees):
+                    callees.append(extra)
+            if self._is_internal(fn):
+                pinned, unpinned = self._indirect_sites(fn)
+                for taddr in pinned:
+                    pinned_fn = function_at(self.bv, taddr)
+                    if pinned_fn is not None:
+                        callees.append(pinned_fn)
+        out = (tuple((int(c.start), c) for c in callees
+                     if getattr(c, "start", None) is not None),
+               tuple(unpinned))
+        cache[key] = out
+        return out
 
     def _global_refs_reachable(self, fn: Any, ga: int, budget: int) -> tuple[tuple, dict]:
         """``(reads, reach)`` for the global at *ga* as seen from *fn*.
@@ -11385,7 +11588,7 @@ class TaintEngine:
         budget_cut: str | None = None
         swept_out = False
         wave, level, cut = [fn], 0, None
-        ancestors = None if self.resolve_map else self._reader_ancestors(ga)
+        readers = None if self.resolve_map else self._reader_candidates(ga)
         while wave:
             if level > budget:
                 cut = budget_cut = "depth_budget"
@@ -11400,11 +11603,14 @@ class TaintEngine:
                     break
                 cs = int(getattr(cur, "start", 0))
                 done.add(cs)
-                # V2-02: a body from which BN's call edges reach no possible
-                # reader of the object, and whose every call site BN resolved,
-                # holds nothing the classification below could find: it is
-                # examined on its edges alone, without lifting it.
-                cheap = (ancestors is not None and cs not in ancestors
+                # A body that is no possible reader of the object (the
+                # reference index and caller edges say it cannot obtain its
+                # address), and whose every call site BN resolved, has nothing
+                # the classification below could find and no call the edges
+                # do not name: it is examined on its edges alone, without
+                # lifting it -- whether or not a reader lies below it (V2-02,
+                # P1-01; the walk goes on through its edges either way).
+                cheap = (readers is not None and cs not in readers
                          and self._edges_only(cur))
                 reason = "" if cheap else str(self._not_internal_reason(cur) or "")
                 if reason.startswith("analysis_skipped:"):
@@ -11435,35 +11641,9 @@ class TaintEngine:
                     if use.at is not None:
                         if not self._use_misses_tainted(ga, use):
                             found[cs] = use
-                try:
-                    callees = list(getattr(cur, "callees", None) or ())
-                except Exception:
-                    callees = []
-                # A veneer BN did not record an edge for still CALLS
-                # something, and its target is right there in the body.
-                for extra in (() if cheap else self._direct_callees(cur)):
-                    if all(int(getattr(c, "start", -1)) != int(
-                            getattr(extra, "start", -2)) for c in callees):
-                        callees.append(extra)
-                # I2: `callees` lists resolved edges only. Follow the indirect
-                # sites this run CAN pin, and name the ones it cannot --
-                # inside real BODIES only. A PLT stub is a register-indirect
-                # jump through the GOT by construction; counting it as a call
-                # bn failed to resolve would raise this boundary on every
-                # library call in the walk.
-                pinned, unpinned = (
-                    self._indirect_sites(cur) if not cheap and self._is_internal(cur)
-                    else ((), ()))
+                successors, unpinned = self._sweep_successors(cur, cheap)
                 opaque.extend(unpinned)
-                for taddr in pinned:
-                    pinned_fn = function_at(self.bv, taddr)
-                    if pinned_fn is not None:
-                        callees.append(pinned_fn)
-                for callee in callees:
-                    nstart = getattr(callee, "start", None)
-                    if nstart is None:
-                        continue
-                    nstart = int(nstart)
+                for nstart, callee in successors:
                     if nstart in seen:
                         continue
                     if len(seen) >= self._GLOBAL_REACH_FUNCS:
@@ -13636,8 +13816,12 @@ class TaintEngine:
                     if k is not None:
                         if k < len(params):
                             propagated.add(k)
-                            self._note_write_span(ssaf, params, k, model,
-                                                  name or mkey)
+                            spilled = self._note_write_span(ssaf, params, k, model,
+                                                            name or mkey)
+                            if spilled is not None:
+                                _ixl = self._indexed_write_frontier(spilled, ins, params[k])
+                                if _ixl not in leaves:
+                                    leaves.append(_ixl)
                     # Visibility for a tainted copy *source* (#44): the buffer a
                     # source operand (arg N>=1) points at is copied into the
                     # destination buffer (arg 0). The flow is propagated -- so a
@@ -13792,8 +13976,12 @@ class TaintEngine:
                                 # extent must stop being clipped by what BN
                                 # inferred, exactly as for a copy (round-14
                                 # review F33).
-                                self._note_write_span(ssaf, params, k, model,
-                                                  name or mkey)
+                                spilled = self._note_write_span(ssaf, params, k, model,
+                                                                name or mkey)
+                                if spilled is not None:
+                                    _ixl = self._indexed_write_frontier(spilled, ins, params[k])
+                                    if _ixl not in leaves:
+                                        leaves.append(_ixl)
                     if eff_vsink is not None:
                         # record under the real param index i so this shares the
                         # recorded_sinks / top-level dedup with any static sink.
@@ -14332,6 +14520,15 @@ class TaintEngine:
                             if bt is not None and taint_node((bt[0], None), bt[1], ins,
                                                              f"out-param {j} written by callee", []):
                                 changed = True
+                            if (bt is not None and self._global_addr(ssaf, params[j]) is None
+                                    and (gi := self._indexed_global(ssaf, params[j])) is not None
+                                    and bt[0] == ("global", gi)):
+                                # The callee's write starts at `g + i` and its
+                                # length is the callee's: nothing here proves it
+                                # stays inside g (D1-01).
+                                _ixl = self._indexed_write_frontier(gi, ins, params[j])
+                                if _ixl not in leaves:
+                                    leaves.append(_ixl)
                             pidx = self._resolve_to_param_index(func, ssaf, params[j])
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
@@ -14650,6 +14847,26 @@ class TaintEngine:
                                 if pidx is not None and (pidx, parts[1]) not in out_param_elems:
                                     out_param_elems.add((pidx, parts[1]))
                                     changed = True
+                        elif (gi := self._indexed_global(ssaf, dest)) is not None:
+                            # `g[i] = c` at an index nothing makes constant: the
+                            # object is tainted wherever in it the byte landed
+                            # (V5-01), and an index nothing bounds to its
+                            # declared extent may have put it in the NEXT
+                            # object, which that taint does not cover (D1-01).
+                            self._note_indexed_write(gi)
+                            if taint_node(((("global", gi)), None), f"glob_{hex(gi)}",
+                                          ins, "store into tainted global at a "
+                                          "runtime index (object base, global_approx)",
+                                          reads):
+                                changed = True
+                                add_assumption(
+                                    "global buffer aliasing modeled coarsely by "
+                                    "object base (global_approx)")
+                            width = int(getattr(ins, "size", 0) or 0)
+                            if not self._indexed_write_in_object(dest, gi, width or None):
+                                _ixl = self._indexed_write_frontier(gi, ins, dest)
+                                if _ixl not in leaves:
+                                    leaves.append(_ixl)
                         else:
                             # tainted store through a pointer parameter -> out-param
                             pidx = self._resolve_to_param_index(func, ssaf, dest)

@@ -4843,7 +4843,9 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
 # 38 -> 37 (#1036 item 5): `_render_orient_text`'s
 # `ea.get('analysis_cache_restored', False)` matched as a count spelling
 # (`False == 0`); the split database flags now read through `_flag_field`.
-_RAW_COUNT_SPELLINGS = 37
+# 37 -> 36: `function info`'s `value.get('xref_count', 0)` is gone; its two
+# counts render `<unknown>` when absent instead of a fabricated 0.
+_RAW_COUNT_SPELLINGS = 36
 
 
 def test_the_raw_count_residue_is_exactly_this_big():
@@ -5323,11 +5325,9 @@ def test_class_show_skewed_primary_vtable_slots_say_more_than_the_empty_case():
     assert skewed != empty
 
 
-def test_class_show_discloses_a_skewed_method_list_on_both_paths():
-    # `methods`/`bases` are coerced in the single-class helper, which the
-    # renderer calls with its own payload on the non-ambiguous path and with a
-    # match ROW on the ambiguous one. A class whose method list arrives skewed
-    # must not render as a class that simply has no methods.
+def test_class_show_discloses_a_skewed_method_list():
+    # A class whose method list arrives skewed must not render as a class that
+    # simply has no methods.
     from bn.formatters import _render_class_show_text
     direct = _render_class_show_text(
         {"name": "Widget", "confidence": "rtti", "methods": "bad", "bases": "bad"})
@@ -5335,21 +5335,6 @@ def test_class_show_discloses_a_skewed_method_list_on_both_paths():
     assert "malformed bases, methods fields" in direct
     assert direct != _render_class_show_text(
         {"name": "Widget", "confidence": "rtti", "methods": [], "bases": []})
-
-    ambiguous = _render_class_show_text(
-        {"ambiguous": True, "query": "W",
-         "matches": [{"name": "Widget", "confidence": "rtti", "methods": "bad"}]})
-    assert "malformed methods field" in ambiguous
-
-
-def test_class_show_ambiguous_count_is_the_rows_rendered_not_the_raw_field():
-    # A skewed `matches` counted one match per CHARACTER of the string: invented
-    # data in the one line a reader uses to judge how ambiguous the query was.
-    from bn.formatters import _render_class_show_text
-    out = _render_class_show_text({"ambiguous": True, "query": "W", "matches": "bad"})
-    assert "0 matches" in out
-    assert "3 matches" not in out
-    assert "malformed matches field" in out
 
 
 def test_class_show_discloses_a_skewed_secondary_vtable_slot_list():
@@ -6338,7 +6323,7 @@ def test_save_text_says_an_export_is_not_the_targets_database():
         "default_save_path": "/ro/demod.bndb", "restart_path": "/ro/demod",
         "restart_path_is_database": False,
     })
-    assert out.splitlines()[0] == "saved: /out/demod.bndb"
+    assert out.splitlines()[0] == "saved: /out/demod.bndb  (export)"
     assert "an export, not this target's own database" in out
     assert "a plain `bn save` writes /ro/demod.bndb" in out
     assert "reopens /ro/demod (the raw file, without this analysis)" in out
@@ -10505,3 +10490,22 @@ def test_data_symbols_footer_states_the_rows_shown_and_the_next_offset():
             "total": 21, "offset": 3, "limit": 3, "returned": 3, "has_more": True}
     assert _render_data_symbols_text(page).splitlines()[-1] == (
         "// showing 3 of 21 (15 more); rerun with --offset 6 or a larger --limit")
+
+
+@pytest.mark.parametrize("unsaved, expected", [
+    (True, "unsaved: yes"), (False, "unsaved: no"),
+])
+def test_save_text_states_what_an_export_left_unchanged(unsaved, expected):
+    # P2-03: an export persisted nothing for the target; the text must say
+    # which database still backs it and that its unsaved state is as it was.
+    from bn.formatters import _render_save_text
+
+    out = _render_save_text({
+        "ok": True, "saved": True, "path": "/out/copy.bndb", "export": True,
+        "default_save_path": "/work/demod.bndb", "restart_path": "/work/demod.bndb",
+        "restart_path_is_database": True, "backing_database": "/work/demod.bndb",
+        "unsaved": unsaved,
+    })
+    lines = out.splitlines()
+    assert "backing database: /work/demod.bndb" in lines
+    assert any(line.startswith(expected) for line in lines)

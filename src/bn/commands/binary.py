@@ -9,8 +9,8 @@ from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT, _format_instance_choices
 from ..target_hint import (
-    LISTED_SELECTOR_LEAD, format_multi_target_hint, positional_selector,
-    respell_for_positional, target_option,
+    LISTED_SELECTOR_LEAD, active_close_headline, format_multi_target_hint,
+    positional_selector, respell_for_positional, target_option,
 )
 from ..formatters import (
     _render_close_text,
@@ -249,24 +249,26 @@ def _close(args: argparse.Namespace) -> int:
     if not (args.all or explicit_path is not None) and (
         explicit_target is None or explicit_target == "active"
     ):
+        target_close = getattr(args, "_close_spelling", None) == "target close"
         try:
             # Looked up on ``bn.cli`` at call time so tests patch one seam.
-            args.target = cli._implicit_target(args)
+            args.target = (
+                cli._implicit_target(args) if explicit_target is None
+                else cli._implicit_target(args, active_close_headline(
+                    "`active`" if target_close else "`-t active`"))
+            )
             params["pinned_target"] = True
         except cli.MultiTargetError as exc:
             if explicit_target == "active":
-                if getattr(args, "_close_spelling", None) == "target close":
+                if target_close:
                     raise BridgeError(
-                        f"{exc}\nnote: `active` follows the GUI selection, "
-                        "which is not honored for close: pass a concrete "
-                        f"selector from the list above (`bn {_routing(args)}close --all` closes "
-                        "every open target, including GUI tabs bn did not load)."
+                        f"{exc}\nnote: pass a concrete selector from the list above "
+                        f"(`bn {_routing(args)}close --all` closes every open target, "
+                        "including GUI tabs bn did not load)."
                     ) from None
                 raise BridgeError(
-                    f"{exc}\nnote: `-t active` follows the GUI selection, "
-                    "which is not honored for close: pass a concrete "
-                    "selector, a path, or --all (closes every open target, "
-                    "including GUI tabs bn did not load)."
+                    f"{exc}\nnote: pass a concrete selector, a path, or --all "
+                    "(closes every open target, including GUI tabs bn did not load)."
                 ) from None
             raise
     try:

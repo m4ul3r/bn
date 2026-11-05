@@ -1368,6 +1368,12 @@ class BridgeContext:
         offset. Exact bare-decimal inputs are also disclosed with offset zero so
         a digit-only token can never be silently mistaken for a symbol name.
         Exact ``0x`` starts and ordinary names need no annotation.
+
+        An odd address in a Thumb function is the interworking tag on an even
+        instruction address, never an instruction byte: ``normalized`` carries
+        the address with bit 0 cleared and ``offset`` is measured from it, so an
+        odd entry pointer reads as the exact start it names rather than as a
+        byte one past it.
         """
         try:
             addr = _parse_address(identifier)
@@ -1382,12 +1388,17 @@ class BridgeContext:
         start = int(func.start)
         if int(addr) == start and not decimal_input:
             return None
-        delta = int(addr) - start
+        arch_name = str(getattr(getattr(func, "arch", None), "name", "") or "")
+        thumb_tag = bool(int(addr) & 1) and "thumb" in arch_name.lower()
+        effective = int(addr) & ~1 if thumb_tag else int(addr)
+        delta = effective - start
         sign = "+" if delta >= 0 else "-"
         result = {
             "requested_address": hex(int(addr)),
             "offset": f"{sign}{hex(abs(delta))}",
         }
+        if thumb_tag:
+            result["normalized"] = hex(effective)
         if decimal_input:
             result["input_format"] = "decimal"
         return result

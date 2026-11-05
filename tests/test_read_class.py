@@ -1799,7 +1799,7 @@ def test_class_show_unknown_name_suggests_close_matches():
     assert "net::Session" in msg
 
 
-def test_class_show_ambiguous_returns_all_matches():
+def test_class_show_ambiguous_is_a_structured_refusal_carrying_every_match():
     # Two classes share a leaf name across namespaces.
     fns = [
         _Fn(0x1000, "_ZN1a3FooC1Ev", "a::Foo::Foo()"),
@@ -1822,9 +1822,14 @@ def test_class_show_ambiguous_returns_all_matches():
         def _instances_for(self, b, r):
             return {"construction_sites": [], "stored_globals": []}
 
-    out = read_class._class_show(_Ctx(), None, "Foo")
-    assert out["ambiguous"] is True
-    assert {m["name"] for m in out["matches"]} == {"a::Foo", "b::Foo"}
+    # The refusal every exit-2 read uses: a status, the request, and the
+    # candidates in `observed`, so the CLI renders `ok: false` + `status`.
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(_Ctx(), None, "Foo")
+    assert exc.value.status == "ambiguous_class"
+    assert exc.value.requested == {"name": "Foo"}
+    assert {m["name"] for m in exc.value.observed["matches"]} == {"a::Foo", "b::Foo"}
+    assert "bn class show -- a::Foo" in str(exc.value)
 
 
 def test_render_class_show_text_matches_mock_shape():
@@ -3260,18 +3265,20 @@ def test_class_show_resolves_a_declared_type_by_leaf_and_reports_ambiguity_675(
     monkeypatch,
 ):
     """Declared names go through the registry's OWN name resolution: a bare leaf
-    still reaches a namespaced declaration, and two of them are ambiguous (the
-    envelope the RTTI half already returns), not a silent first-wins pick."""
+    still reaches a namespaced declaration, and two of them are refused as
+    ambiguous (the refusal the RTTI half raises), not a silent first-wins pick."""
     bv = _declared_bv(**{"a::Widget": _DeclaredType(name="a::Widget"),
                          "b::Widget": _DeclaredType(name="b::Widget")})
     ctx = _declared_ctx(monkeypatch, bv)
 
-    out = read_class._class_show(ctx, None, "Widget")
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(ctx, None, "Widget")
 
-    assert out["ambiguous"] is True
-    assert out["query"] == "Widget"
-    assert {m["name"] for m in out["matches"]} == {"a::Widget", "b::Widget"}
-    assert all(m["confidence"] == "declared-only" for m in out["matches"])
+    assert exc.value.status == "ambiguous_class"
+    assert exc.value.requested == {"name": "Widget"}
+    matches = exc.value.observed["matches"]
+    assert {m["name"] for m in matches} == {"a::Widget", "b::Widget"}
+    assert all(m["confidence"] == "declared-only" for m in matches)
 
 
 def test_class_show_declared_record_carries_the_canonical_type_entry_675(monkeypatch):
@@ -3812,7 +3819,6 @@ def test_a_declared_class_is_not_SHADOWED_by_a_same_leaf_RTTI_class_675(monkeypa
     # ... and the exact name the user declared reaches the declaration, not the
     # RTTI class that merely shares its leaf.
     shown = read_class._class_show(ctx, None, "Session")
-    assert shown.get("ambiguous") is not True, shown
     assert shown["name"] == "Session", shown["name"]
     assert shown["confidence"] == "declared-only", shown["confidence"]
 
@@ -3820,9 +3826,11 @@ def test_a_declared_class_is_not_SHADOWED_by_a_same_leaf_RTTI_class_675(monkeypa
     # halves answer, and the card says so instead of picking one.
     bv2 = _declared_bv(**{"app::Session": _DeclaredType(name="app::Session")})
     ctx2 = _declared_ctx(monkeypatch, bv2)
-    amb = read_class._class_show(ctx2, None, "Session")
-    assert amb.get("ambiguous") is True, amb
-    assert sorted(m["name"] for m in amb["matches"]) == ["app::Session", "net::Session"]
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(ctx2, None, "Session")
+    assert exc.value.status == "ambiguous_class"
+    assert sorted(m["name"] for m in exc.value.observed["matches"]) == [
+        "app::Session", "net::Session"]
     # Each half still answers under its own exact name.
     assert read_class._class_show(
         ctx2, None, "app::Session")["confidence"] == "declared-only"

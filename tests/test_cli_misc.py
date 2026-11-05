@@ -1859,6 +1859,8 @@ def test_read_bytes_out_writes_envelope_and_creates_parents(fake_transport, caps
     assert "bytes: 4" in receipt
     assert f"path: {out}" in receipt
     assert "target: active" in receipt
+    # D4's delivery contract holds for the raw-byte envelope too.
+    assert "ok: true" in receipt and "written: true" in receipt
 
 
 def test_read_bytes_out_bad_dir_is_clean_error(fake_transport, capsys, tmp_path):
@@ -3494,7 +3496,8 @@ def test_the_output_reference_documents_the_estimate_preflight_796(monkeypatch):
                                             rerun_hint="rerun with --limit").artifact)
     envelopes.append(estimate_bytes_result(b"AAAA", fmt="json",
                                            summary={"kind": "bytes"},
-                                           rerun_hint="rerun with --length").artifact)
+                                           rerun_hint="rerun with --length",
+                                           outcome={"ok": True}).artifact)
     assert "spill_token_limit" in envelopes[1], (
         "the armed envelope no longer carries the conditional key this guard "
         "exists to reach")
@@ -3884,6 +3887,7 @@ def test_raw_byte_read_honors_an_armed_spill_threshold(
     lines = captured.out.splitlines()
     assert "spilled: true" in lines and "format: bytes" in lines
     assert "target: active" in lines
+    assert "ok: true" in lines and "written: true" in lines
     [path] = [line.split(": ", 1)[1] for line in lines if line.startswith("path: ")]
     assert Path(path).suffix == ".bin" and Path(path).read_bytes() == data
     meta = json.loads(Path(path + ".meta.json").read_text(encoding="utf-8"))

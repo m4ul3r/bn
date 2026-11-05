@@ -552,6 +552,41 @@ def resolve_spill_limit() -> int | None:
 # simply gets no `rerun` key -- there is no command to name a flag for.
 
 
+def outcome_fields(value: Any) -> dict[str, Any]:
+    """``ok`` (and a refusal's ``error``) of a BRIDGE payload an envelope stands for.
+
+    An envelope's ``ok`` is the OPERATION's outcome, never the file write's:
+    delivery is ``written``. A failed mutation written through ``--out`` used to
+    print ``ok: true`` on stdout over an artifact whose body said ``ok: false``
+    (W07), so an agent reading only stdout closed its loop on a rolled-back
+    batch. A bridge payload that states no ``ok`` is a read that succeeded; one
+    that states anything but ``true`` is not ok (a malformed ``ok`` must not
+    read as success). A not-ok payload's string ``error`` -- the refusal shape
+    :func:`render_error` emits -- rides along so stdout says why. A result the
+    CLI assembled itself states its outcome by exit code instead
+    (:func:`exit_outcome`)."""
+    if not isinstance(value, dict) or "ok" not in value:
+        return {"ok": True}
+    fields: dict[str, Any] = {"ok": value["ok"] is True}
+    if not fields["ok"] and isinstance(value.get("error"), str):
+        fields["error"] = value["error"]
+    return fields
+
+
+def exit_outcome(value: Any, exit_code: int) -> dict[str, Any]:
+    """The outcome of a command the CLI ran itself, as its exit code states it.
+
+    Local commands (`session stop`, `doctor`, `skill install`, ...) report a
+    failure as a result with no ``ok`` key and exit 1; read off the payload,
+    that absence was success, so an ``--out`` envelope said ``ok: true`` over a
+    teardown that failed (D4-01). ``ok`` is exit 0, and a failed result's
+    string ``error`` rides along as in :func:`outcome_fields`."""
+    fields: dict[str, Any] = {"ok": exit_code == 0}
+    if exit_code != 0 and isinstance(value, dict) and isinstance(value.get("error"), str):
+        fields["error"] = value["error"]
+    return fields
+
+
 def _artifact_payload(
     *,
     artifact_path: Path,
@@ -559,11 +594,13 @@ def _artifact_payload(
     encoded: bytes,
     token_count: int,
     value: Any,
+    outcome: dict[str, Any],
     spilled: bool,
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "ok": True,
+        **outcome,
+        "written": True,
         "spilled": spilled,
         "artifact_path": str(artifact_path),
         "format": fmt,
@@ -604,6 +641,10 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     lines = []
     if "ok" in payload:
         lines.append(f"ok: {str(bool(payload.get('ok'))).lower()}")
+    if "written" in payload:
+        lines.append(f"written: {str(bool(payload.get('written'))).lower()}")
+    if isinstance(payload.get("error"), str):
+        lines.append(f"error: {payload['error']}")
     # #796: a preflight ESTIMATE is not an artifact. It reuses this envelope
     # (bytes/tokens/tokenizer/rerun/summary all mean the same thing) but wrote
     # nothing, so it says so instead of carrying a path that does not exist --
@@ -698,13 +739,20 @@ def write_output_result(
     spill_token_limit: int | None = None,
     provenance: dict[str, Any] | None = None,
     rerun_hint: str | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> OutputWriteResult:
+    """*outcome* is the operation outcome the envelope states (:func:`outcome_fields`
+    of the payload a text rendering came from, or :func:`exit_outcome` of a
+    local command); without it, *value* itself is read with
+    :func:`outcome_fields`."""
     # #409: resolve the spill threshold from BN_SPILL_TOKENS when not explicitly set.
     if spill_token_limit is None:
         spill_token_limit = resolve_spill_limit()
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
     token_count = estimate_tokens(encoded)
+    if outcome is None:
+        outcome = outcome_fields(value)
 
     if out_path is not None:
         try:
@@ -724,6 +772,7 @@ def write_output_result(
             encoded=encoded,
             token_count=token_count,
             value=value,
+            outcome=outcome,
             spilled=False,
             provenance=provenance,
         )
@@ -789,6 +838,7 @@ def write_output_result(
         encoded=encoded,
         token_count=token_count,
         value=value,
+        outcome=outcome,
         spilled=True,
         provenance=provenance,
     )
@@ -846,6 +896,7 @@ def estimate_output_result(
     *,
     fmt: str,
     rerun_hint: str | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> OutputWriteResult:
     """Preflight an output's size WITHOUT emitting or writing it (#796).
 
@@ -865,11 +916,13 @@ def estimate_output_result(
     parser-derived slicing hint the spill envelope names, and
     ``spill_token_limit`` is stated only when ``BN_SPILL_TOKENS`` is armed, which
     is what makes "this read would have spilled" a comparison the caller can do
-    rather than a claim this module makes."""
+    rather than a claim this module makes. *outcome* is as for
+    :func:`write_output_result`."""
     return _estimate_envelope(
         render_value(value, fmt).encode("utf-8"),
         fmt=fmt, payload_format=fmt, summary=_summary(value),
-        rerun_hint=rerun_hint)
+        rerun_hint=rerun_hint,
+        outcome=outcome_fields(value) if outcome is None else outcome)
 
 
 def estimate_bytes_result(
@@ -878,6 +931,7 @@ def estimate_bytes_result(
     fmt: str,
     summary: dict[str, Any] | None = None,
     rerun_hint: str | None = None,
+    outcome: dict[str, Any],
 ) -> OutputWriteResult:
     """:func:`estimate_output_result` for a RAW BYTE payload (#796).
 
@@ -893,9 +947,10 @@ def estimate_bytes_result(
     It exists at all because that second emit path had no preflight: the
     command advertised ``--estimate-output``, its ``--encoding hex`` half
     honored it, and its ``--encoding bytes`` half wrote the payload to stdout at
-    rc 0 -- one command, two answers to what the flag means."""
+    rc 0 -- one command, two answers to what the flag means. *outcome* is as
+    for :func:`write_bytes_result`."""
     return _estimate_envelope(bytes(data), fmt=fmt, payload_format="bytes",
-                              summary=summary, rerun_hint=rerun_hint)
+                              summary=summary, rerun_hint=rerun_hint, outcome=outcome)
 
 
 def _estimate_envelope(
@@ -905,12 +960,16 @@ def _estimate_envelope(
     payload_format: str,
     summary: dict[str, Any] | None,
     rerun_hint: str | None,
+    outcome: dict[str, Any],
 ) -> OutputWriteResult:
     """The one estimate envelope, built once for both payload kinds so the two
-    preflights cannot state the same measurement in two different shapes."""
+    preflights cannot state the same measurement in two different shapes.
+    *outcome* is the operation outcome the estimate stands for; an
+    estimate writes nothing, so ``written`` is false."""
     token_count = estimate_tokens(encoded)
     payload: dict[str, Any] = {
-        "ok": True,
+        **outcome,
+        "written": False,
         "estimated": True,
         "format": payload_format,
         "bytes": len(encoded),
@@ -941,14 +1000,16 @@ def write_bytes_result(
     spill_token_limit: int | None = None,
     provenance: dict[str, Any] | None = None,
     rerun_hint: str | None = None,
+    outcome: dict[str, Any],
 ) -> OutputWriteResult:
     """:func:`write_output_result` for a RAW byte payload, with the same
     guarantees: ``--out`` creates parent dirs and wraps OSError in a clean
     OutputWriteError; a payload past an armed ``BN_SPILL_TOKENS`` threshold is
     written to a private spill artifact (``.bin``) with its provenance sidecar
     instead of reaching stdout; every envelope carries the producing
-    target/instance (P1-03). Otherwise ``raw`` holds the bytes the caller writes
-    to ``stdout.buffer`` verbatim."""
+    target/instance (P1-03), the operation *outcome* (:func:`outcome_fields` of
+    the read the bytes came from) and ``written`` for the delivery. Otherwise
+    ``raw`` holds the bytes the caller writes to ``stdout.buffer`` verbatim."""
     data = payload.data
     if spill_token_limit is None:
         spill_token_limit = resolve_spill_limit()
@@ -979,7 +1040,8 @@ def write_bytes_result(
                                  truncation_risk=True)
     spilled = out_path is None
     artifact: dict[str, Any] = {
-        "ok": True,
+        **outcome,
+        "written": True,
         "spilled": spilled,
         "artifact_path": str(path),
         "format": "bytes",

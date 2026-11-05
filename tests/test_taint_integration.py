@@ -7338,6 +7338,55 @@ def test_a_tail_call_wrapper_flagged_a_thunk_is_walked(tmp_path, shared_bn):
         assert not any("thunk" in a for a in result["assumptions"]), result["assumptions"]
 
 
+def test_a_deeper_budget_keeps_the_copy_a_shallower_one_reached(tmp_path, shared_bn):
+    """V5-01: `format_name` appends its tainted argument to a static buffer
+    at `strlen` of it and returns the buffer; the recursive `walk` copies the
+    result into a fixed-size global with `__strcpy_chk`. At a depth that cuts
+    `format_name` off its return is assumed tainted and the copy is reached;
+    every deeper budget descended `format_name`, found the write through
+    `buf + n` unkeyed, returned a clean pointer and lost the copy."""
+    binary = tmp_path / "fwd_depth_static_name"
+    _compile(CORPUS / "fwd_depth_static_name.c", binary,
+             ["-O2", "-fno-inline", "-D_FORTIFY_SOURCE=2"])
+    target = shared_bn.load(binary, copy=False)
+    reached = {}
+    for depth in (1, 2, 3, 4, 8):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "main",
+                          "--source", "param:1", "--max-depth", str(depth))
+        reached[depth] = {(s["sink"]["callee"], s["sink"]["address"])
+                          for s in result["reached_sinks"]}
+    depths = sorted(reached)
+    for shallow, deep in zip(depths, depths[1:]):
+        assert reached[shallow] <= reached[deep], (shallow, deep, reached)
+    assert "__strcpy_chk" in {callee for callee, _ in reached[8]}, reached
+
+
+def test_an_unbounded_index_into_a_global_keeps_the_out_of_object_frontier(tmp_path,
+                                                                          shared_bn):
+    """D1-01 on `taint_corpus/fwd_indexed_global.c`: `slots[i] = v[0];
+    system(command)` with `command` the declared object beside `slots`. Keying
+    the write to `slots` alone answered `safe_to_report_all_clear: true` with
+    no leaf, although the index may put the byte in `command`. A masked index
+    BN bounds inside `slots` raises no such frontier."""
+    binary = tmp_path / "fwd_indexed_global"
+    _compile(CORPUS / "fwd_indexed_global.c", binary, ["-O1", "-fno-inline"])
+    target = shared_bn.load(binary, copy=False)
+
+    def index_frontiers(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:0")
+        return result, [lf for lf in result["leaves"]
+                        if lf["kind"] == "coarse_memory_store"
+                        and lf.get("index_bounded") is False]
+
+    unbounded, frontiers = index_frontiers("stash")
+    assert [lf["global"]["label"] for lf in frontiers] == ["slots"], unbounded["leaves"]
+    assert unbounded["diagnostics"]["safe_to_report_all_clear"] is False
+
+    masked, frontiers = index_frontiers("stash_masked")
+    assert frontiers == [], masked["leaves"]
+
+
 def _armv7_build(tmp_path, name: str) -> Path:
     cc = shutil.which("arm-linux-gnueabihf-gcc")
     if cc is None:

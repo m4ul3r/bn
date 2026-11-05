@@ -89,6 +89,11 @@ DEFAULT_REQUEST_TIMEOUT = 600.0
 REFRESH_REQUEST_TIMEOUT = 3600.0
 SPAWN_LOCK_TIMEOUT = 30.0
 DEFAULT_SPAWN_TIMEOUT = 60.0
+# A bridge a command starts on its own (no `bn session start`) has no owner who
+# will stop it, so unless BN_IDLE_TIMEOUT says otherwise it stops itself after
+# this many idle seconds (P2-09). `session start` keeps BN_IDLE_TIMEOUT's own
+# default: off.
+AUTO_SPAWN_IDLE_TIMEOUT = 1800
 CANCEL_REQUEST_TIMEOUT = 0.25
 # After a timed-out request's cancel is sent, how long the CLI keeps listening
 # on the request's own connection to learn whether the bridge stopped the
@@ -1464,7 +1469,8 @@ def _auto_spawn_locked(timeout: float | None = SPAWN_LOCK_TIMEOUT) -> BridgeInst
         return _spawn_instance_unlocked(
             timeout=(
                 remaining if remaining is not None else DEFAULT_SPAWN_TIMEOUT
-            )
+            ),
+            auto_started=True,
         )
 
 
@@ -1500,6 +1506,7 @@ def choose_instance(
                 timeout=_spawn_timeout_within(
                     deadline, "starting the requested bridge instance"
                 ),
+                auto_started=True,
             )
         raise BridgeError(instance_not_found_message(
             instance_id,
@@ -1973,8 +1980,15 @@ def unwrap_result(response: Any, op: str) -> Any:
     return response["result"]
 
 
-def implicit_target_selector(response: Any) -> str:
-    """Pin the sole listed view; never substitute the volatile GUI focus."""
+MULTI_TARGET_HEADLINE = "This command requires --target when multiple targets are open."
+
+
+def implicit_target_selector(response: Any, headline: str = MULTI_TARGET_HEADLINE) -> str:
+    """Pin the sole listed view; never substitute the volatile GUI focus.
+
+    *headline* states why several open targets are a refusal: a caller whose
+    command DID carry a selector it cannot honor (`close -t active`) says
+    that, rather than that a selector is missing (W05)."""
     # Imported here because formatters itself uses BridgeError.
     from .formatters import _render_target_choices
     from .target_hint import SELECT_HINT_LINE
@@ -1990,7 +2004,7 @@ def implicit_target_selector(response: Any) -> str:
     if len(targets) > 1:
         raise MultiTargetError(
             "\n".join([
-                "This command requires --target when multiple targets are open.",
+                headline,
                 SELECT_HINT_LINE,
                 _render_target_choices(targets),
             ])
@@ -2060,6 +2074,9 @@ def spawn_instance(
     *,
     timeout: float | None = None,
     poll_interval: float = 0.2,
+    first_view_id: int | None = None,
+    numeric_view_ids: bool = True,
+    auto_started: bool = False,
 ) -> BridgeInstance:
     """Spawn a bridge within one lock-and-registration deadline."""
     if timeout is None:
@@ -2073,6 +2090,9 @@ def spawn_instance(
             instance_id,
             timeout=remaining if remaining is not None else timeout,
             poll_interval=poll_interval,
+            first_view_id=first_view_id,
+            numeric_view_ids=numeric_view_ids,
+            auto_started=auto_started,
         )
 
 
@@ -2201,8 +2221,17 @@ def _spawn_instance_unlocked(
     *,
     timeout: float = DEFAULT_SPAWN_TIMEOUT,
     poll_interval: float = 0.2,
+    first_view_id: int | None = None,
+    numeric_view_ids: bool = True,
+    auto_started: bool = False,
 ) -> BridgeInstance:
-    """Spawn-and-register core. MUST run under _spawn_lock()."""
+    """Spawn-and-register core. MUST run under _spawn_lock().
+
+    *first_view_id* seeds the child's numeric view ids (`session restart`,
+    P1-02); *numeric_view_ids* False makes the child accept no bare numeric
+    view id at all (a restart whose predecessor recorded no next id, D2-02);
+    *auto_started* marks a bridge no `session start` asked for, which
+    gets `AUTO_SPAWN_IDLE_TIMEOUT` unless BN_IDLE_TIMEOUT is set (P2-09)."""
     deadline = time.monotonic() + timeout
     # Collision detection MUST see unreachable records too (#694): a socket-less
     # registry is hidden from normal discovery, but its process can still be
@@ -2270,6 +2299,13 @@ def _spawn_instance_unlocked(
     # Attached, never `--instance-id <id>`: an id starting with `-` would be
     # read by bn-agent's parser as the next option (#1033 item 4).
     cmd = _find_bn_agent() + [f"--instance-id={instance_id}"]
+    if first_view_id is not None:
+        cmd.append(f"--first-view-id={int(first_view_id)}")
+    if not numeric_view_ids:
+        cmd.append("--no-numeric-view-ids")
+    child_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    if auto_started and "BN_IDLE_TIMEOUT" not in os.environ:
+        child_env["BN_IDLE_TIMEOUT"] = str(AUTO_SPAWN_IDLE_TIMEOUT)
     # From the Popen below this call OWNS the child until it hands back the
     # instance that child registered. Every other exit -- a refused registry, an
     # early exit, the registration timeout, but ALSO an exception escaping the
@@ -2304,7 +2340,7 @@ def _spawn_instance_unlocked(
                 start_new_session=True,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env=child_env,
             )
         finally:
             # The child inherits the fd across a successful Popen; close the

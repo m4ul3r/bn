@@ -81,5 +81,5 @@ def _parse_max_bytes(value: str) -> int:
 def _spill_gc(args: argparse.Namespace) -> int:
     result = gc_spills(older_than_days=args.older_than, max_bytes=args.max_bytes,
                        dry_run=bool(args.dry_run))
-    _emit_result(args, result, text_renderer=_render_spill_gc_text, stem="spill-gc")
-    return 0
+    return _emit_result(args, result, exit_code=0, text_renderer=_render_spill_gc_text,
+                        stem="spill-gc")

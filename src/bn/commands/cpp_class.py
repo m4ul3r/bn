@@ -8,34 +8,12 @@ from ..cli import (
     _effective_limit,
     _mutate,
     _refuse_count_only_slices,
-    _resolve_output_format,
     arg,
     command,
     mutation_output_args,
     preview_arg,
 )
 from ..formatters import _render_class_list_text, _render_class_show_text
-
-
-def _ambiguous_class_envelope(result: Any) -> Any:
-    """P3: an ambiguous `class show` under a machine format is a refusal and
-    says so in the shape every other refusal has -- `ok: false`, `status`,
-    `error`, `requested`, `observed` -- with the candidate cards in
-    `observed.matches`. It was a bare `{ambiguous, query, matches}` payload at
-    exit 2, which a consumer keyed on `ok` read as a result."""
-    if not (isinstance(result, dict) and result.get("ambiguous")):
-        return result
-    query = result.get("query")
-    matches = result.get("matches") if isinstance(result.get("matches"), list) else []
-    names = [str(m.get("name")) for m in matches if isinstance(m, dict)]
-    return {
-        "ok": False,
-        "status": "ambiguous_class",
-        "error": (f"ambiguous class {query!r}: {len(matches)} matches "
-                  f"({', '.join(names)}); rerun `bn class show` with one full name"),
-        "requested": {"name": query},
-        "observed": {"matches": matches},
-    }
 
 
 @command("class", "list", help="List C++ classes recovered from symbols/RTTI",
@@ -122,16 +100,10 @@ def _class_list(args: argparse.Namespace) -> int:
          args=[arg("name")],
          estimable=True)
 def _class_show(args: argparse.Namespace) -> int:
-    machine = _resolve_output_format(args) != "text"
     return _call(
         args, "class_show", {"name": args.name},
         require_target=True,
         text_renderer=_render_class_show_text,
-        # #413: an ambiguous leaf still renders its matches, but exits non-zero so
-        # it can't be misread as a clean single-class success.
-        result_exit_code=lambda r: 2 if isinstance(r, dict) and (
-            r.get("ambiguous") or r.get("ok") is False) else 0,
-        result_transform=_ambiguous_class_envelope if machine else None,
         stem="class-show",
     )
 

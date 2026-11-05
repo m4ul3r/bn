@@ -28,8 +28,9 @@ from .formatters import (
     _render_mutation_text,
     command_routing,
 )
-from .output import (RawBytes, estimate_bytes_result, estimate_output_result, render_envelope,
-                     render_error, render_value, write_bytes_result, write_output_result)
+from .output import (RawBytes, estimate_bytes_result, estimate_output_result, exit_outcome,
+                     outcome_fields, render_envelope, render_error, render_value,
+                     write_bytes_result, write_output_result)
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -51,6 +52,7 @@ from .transport import (  # noqa: F401
     BridgeError,
     BridgeProcessSignal,
     DEFAULT_REQUEST_TIMEOUT,
+    MULTI_TARGET_HEADLINE,
     MultiTargetError,
     _resolve_timeout,
     _send_request_to_instance,
@@ -67,7 +69,9 @@ from .transport import (  # noqa: F401
     wait_for_teardown,
 )
 from .target_hint import SELECT_HINT_LINE, instance_option, respell_for_option
-from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
+from .version import (  # noqa: F401
+    VERSION, build_id_for_file, build_id_for_package, build_id_for_tree,
+)
 
 
 class _HelpFullAction(argparse.Action):
@@ -499,14 +503,16 @@ def _common_io_options(
     )
 
 
-def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
+def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False,
+                     listed: bool = True) -> None:
     parser.add_argument(
         "-i",
         "--instance",
         default=os.environ.get("BN_INSTANCE") if is_root else argparse.SUPPRESS,
-        help="Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
-             "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
-             "BN_CACHE_DIR also scopes the instance registry and sticky session",
+        help=("Target a specific bridge instance by ID (env: BN_INSTANCE). Instances "
+              "are looked up in $BN_CACHE_DIR/instances when BN_CACHE_DIR is set: "
+              "BN_CACHE_DIR also scopes the instance registry and sticky session")
+        if listed else argparse.SUPPRESS,
     )
 
 
@@ -680,6 +686,7 @@ def command(
     fanout: bool = False,
     estimable: bool = False,
     analysis_bounds: tuple[str, ...] = (),
+    routes_instance: bool = True,
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -709,6 +716,11 @@ def command(
     output: taint's ``--max-depth`` changes which calls are descended, and a
     tighter cap can grow the result rather than shrink it. They are never
     offered as the way to bound a read, and the hint says so by name.
+
+    ``routes_instance=False`` marks a command that does not run on an existing
+    bridge (`session start` creates one). Its own help then does not list
+    ``-i/--instance``; the option is still parsed so the handler can refuse it
+    and name the flag that does what was meant (W10).
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -739,6 +751,7 @@ def command(
             # estimate then replaces with a byte count).
             "estimable": estimable,
             "analysis_bounds": tuple(analysis_bounds),
+            "routes_instance": routes_instance,
         })
         return fn
 
@@ -840,7 +853,7 @@ def _build_from_commands(root: BnArgumentParser) -> None:
                            estimable=(bool(spec.get("estimable"))
                                       and path not in estimate_withheld),
                            analysis_bounds=tuple(spec.get("analysis_bounds", ())))
-        _instance_option(cmd)
+        _instance_option(cmd, listed=spec["routes_instance"])
         # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
         # read surveys), not inferred from fmt -- several write/side-effecting
         # commands (save/close/refresh/py exec/load) also default to text, so a
@@ -914,6 +927,7 @@ def _render_result(
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
     estimate_only: bool = False,
+    outcome: dict[str, Any] | None = None,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
@@ -926,14 +940,19 @@ def _render_result(
     nothing is written and there is nothing to spill. It sits ABOVE the
     ``artifact_path`` passthrough because an already-materialized artifact
     envelope is a payload like any other -- a caller asking what it costs gets
-    its size, not a re-render of a file it may not have."""
+    its size, not a re-render of a file it may not have.
+
+    *outcome* is the operation outcome an envelope states (see
+    :func:`write_output_result`): the rendered text no longer carries it."""
     if estimate_only:
         if isinstance(value, RawBytes):
-            result = estimate_bytes_result(value.data, fmt=fmt, summary=value.summary,
-                                           rerun_hint=slice_hint)
+            result = estimate_bytes_result(
+                value.data, fmt=fmt, summary=value.summary, rerun_hint=slice_hint,
+                outcome=outcome_fields(value) if outcome is None else outcome)
         else:
             result = _apply_result_transform(
-                lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
+                lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint,
+                                                       outcome=outcome),
                 value, f"estimate the {stem} output size as {fmt}")
         sys.stdout.write(result.rendered)
         return False
@@ -945,7 +964,10 @@ def _render_result(
     # precisely because of this site.
     if out_path is None and isinstance(value, dict) and isinstance(value.get("artifact_path"), str):
         artifact = dict(value)
+        # The bridge wrote this file itself (its `--out`), so delivery happened;
+        # `ok` is the read's own outcome, which the bridge states.
         artifact.setdefault("ok", True)
+        artifact.setdefault("written", True)
         artifact.setdefault("spilled", False)
         for key, val in (provenance or {}).items():   # #653.8
             if val is not None:
@@ -958,13 +980,15 @@ def _render_result(
     if isinstance(value, RawBytes):
         # P1-03: a raw byte payload takes the same --out / spill / provenance
         # decisions as a rendered one; only the final stdout write differs.
-        result = write_bytes_result(value, out_path=out_path, fmt=fmt, stem=stem,
-                                    provenance=provenance, rerun_hint=slice_hint)
+        result = write_bytes_result(
+            value, out_path=out_path, fmt=fmt, stem=stem, provenance=provenance,
+            rerun_hint=slice_hint,
+            outcome=outcome_fields(value) if outcome is None else outcome)
     else:
         result = _apply_result_transform(
             lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
                                                stem=stem, provenance=provenance,
-                                               rerun_hint=slice_hint),
+                                               rerun_hint=slice_hint, outcome=outcome),
             value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
@@ -1155,10 +1179,12 @@ def _emit_result(
     args: argparse.Namespace,
     result: Any,
     *,
+    exit_code: int,
     text_renderer: Callable[[Any], str] | None = None,
     stem: str,
-) -> None:
-    """Render a locally-built result for handlers that can't go through :func:`_call`.
+) -> int:
+    """Render a locally-built result for handlers that can't go through :func:`_call`;
+    return *exit_code*.
 
     The admin commands (doctor, session/instance/target management) orchestrate
     several bridge requests, so they assemble the result themselves instead of
@@ -1168,15 +1194,20 @@ def _emit_result(
     bridge response becomes a clean :class:`BridgeError` pointing at ``--format
     json``, never a raw traceback), then writes via :func:`_render_result`. With no
     *text_renderer* the value renders as-is in every format.
+
+    *exit_code* is the command's outcome: an ``--out``/spill/estimate envelope
+    states ``ok`` as exit 0 (:func:`exit_outcome`), so the envelope and the exit
+    status can never disagree (D4-01). Handlers ``return`` this call.
     """
     text_renderer = _guarded_transform(
         text_renderer, f"render the {stem} result as text",
         advice="Rerun with --format json to see the raw result.")
     fmt = _resolve_output_format(args)
+    shown = result
     if text_renderer is not None and fmt == "text":
-        result = text_renderer(result)
+        shown = text_renderer(result)
     _render_result(
-        result,
+        shown,
         fmt=fmt,
         out_path=args.out,
         stem=stem,
@@ -1185,7 +1216,9 @@ def _emit_result(
         # envelope falls back to the stem guesses while their stderr note uses the
         # derived one, and one run offers two different remedies (dogfood pass 4).
         slice_hint=_slice_hint_for_args(args, fmt),
+        outcome=exit_outcome(result, exit_code),
     )
+    return exit_code
 
 
 # Regex metacharacters that make a literal substring query likely to be a
@@ -1635,7 +1668,8 @@ def _empty_target_advice(args: argparse.Namespace, lead: str) -> str:
                       _render_target_choices(targets)])
 
 
-def _implicit_target(args: argparse.Namespace) -> str:
+def _implicit_target(args: argparse.Namespace,
+                     headline: str = MULTI_TARGET_HEADLINE) -> str:
     """Resolve the single open target to its pinned ``target_id``, else refuse.
 
     Returns the stable ``target_id`` from the peek row -- never the volatile
@@ -1663,7 +1697,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         target=None,
         instance_id=getattr(args, "instance", None),
     )
-    return implicit_target_selector(response)
+    return implicit_target_selector(response, headline)
 
 
 def _resolve_target(
@@ -2660,14 +2694,16 @@ def _call(
     # accepts (dogfood pass 3: the hand-maintained lists disagreed and named
     # flags that exit 2).
     slice_hint = _slice_hint_for_args(args, fmt)
+    shown = result
     if text_renderer is not None and fmt == "text":
         if route_rendered_commands:
             with command_routing(target=target, instance=getattr(args, "instance", None)):
-                result = text_renderer(result)
+                shown = text_renderer(result)
         else:
-            result = text_renderer(result)
+            shown = text_renderer(result)
     spilled = _render_result(
-        result,
+        shown,
+        outcome=outcome_fields(result),
         fmt=fmt,
         out_path=None if bridge_writes_output else args.out,
         stem=stem,
@@ -3475,8 +3511,33 @@ def _single_call_argv(argv: list[str], instance: str | None) -> list[str]:
     return [*routing, *options, *argv[end:]]
 
 
+# D2-03: `bn doctor` runs the `bn` executable found on PATH with this variable
+# set to a fresh nonce; that executable answers with the code it actually runs.
+IDENTITY_PROBE_ENV = "BN_IDENTITY_PROBE"
+
+
+def _answer_identity_probe(nonce: str) -> int:
+    """Print which package this process imported and the bridge it would
+    spawn, echoing *nonce*, and do nothing else.
+
+    Answered before argument parsing and before any command runs, so the probe
+    cannot recurse: a wrapper that itself invokes `bn doctor` inherits the
+    variable and answers the probe instead of probing again. It runs through the
+    PATH executable rather than its shebang interpreter, so a broken shim fails
+    here and a wrapper that changes `sys.path` reports the package it imports."""
+    sys.stdout.write(json.dumps({
+        "identity_probe": nonce,
+        "module_dir": str(Path(__file__).resolve().parent),
+        "plugin_source_dir": str(plugin_source_dir()),
+    }) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     global _MACHINE_ERROR_FORMAT
+    probe = os.environ.get(IDENTITY_PROBE_ENV)
+    if probe:
+        return _answer_identity_probe(probe)
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
     # Capture --format before parsing so argparse usage/type errors (which fire

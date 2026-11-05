@@ -66,12 +66,13 @@ from .paths import (
     PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
     instances_dir, project_root,
 )
-from .proc_identity import identity_payload
+from .proc_identity import identity_payload, process_started_at
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .target_hint import (
-    LISTED_SELECTOR_LEAD, format_multi_target_hint, instance_option, open_target_lines,
-    target_option, target_row,
+    LISTED_SELECTOR_LEAD, NUMERIC_VIEW_IDS_OFF_NOTE, PROCESS_LOCAL_VIEW_ID_NOTE,
+    format_multi_target_hint,
+    instance_option, open_target_lines, target_option, target_row,
 )
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -216,12 +217,25 @@ def _check_peer_credentials(connection) -> str | None:
 GO_RENAME_CHUNK_SIZE = 256
 
 
-def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
+def _is_numeric_selector(selector: Any) -> bool:
+    """Whether *selector* names a view by its numeric view_id, normalised the
+    way matching normalises it (``str(selector).strip()``), so ``' 1 '`` is as
+    numeric here as it is to the resolver (D2-04)."""
+    candidate = str(selector).strip()
+    return candidate.isascii() and candidate.isdigit()
+
+
+def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]], *,
+                                 numeric_view_ids: bool = True) -> str:
     lines = [f"Unknown target selector: {selector}"]
-    if not targets:
+    if targets:
+        lines.extend(open_target_lines(targets))
+    else:
         lines.append("No BinaryView targets are open.")
-        return "\n".join(lines)
-    lines.extend(open_target_lines(targets))
+    if _is_numeric_selector(selector):
+        lines.append(PROCESS_LOCAL_VIEW_ID_NOTE)
+        if not numeric_view_ids:
+            lines.append(NUMERIC_VIEW_IDS_OFF_NOTE)
     return "\n".join(lines)
 
 
@@ -723,7 +737,7 @@ class TargetRecord:
 
 
 class TargetManager:
-    def __init__(self):
+    def __init__(self, first_view_id: int = 1, *, numeric_view_ids: bool = True):
         self._lock = threading.RLock()
         self._records: dict[str, TargetRecord] = {}
         # bv -> stable view_id, keyed by the view OBJECT itself rather than
@@ -739,7 +753,17 @@ class TargetManager:
         # transient collecting call's local list going out of scope can no
         # longer make resolve() see a dead reference.
         self._ids_by_object: dict[Any, str] = {}
-        self._next_id = 1
+        # Numeric view ids are process-local, so a restarted headless bridge is
+        # seeded with its predecessor's next id (`session restart`): a number
+        # one generation listed is never handed to a different target by the
+        # next one, where `-t <n>` would silently select it (P1-02).
+        self._next_id = first_view_id
+        # False when this bridge was restarted from a predecessor that recorded
+        # no `next_view_id`: its high-water mark is unknown, and the ids it
+        # lists now say nothing about the ones it closed, so a bare number is
+        # never accepted as a selector (D2-02). `target_id` and filenames
+        # still resolve.
+        self._numeric_view_ids = numeric_view_ids
         # Stable view_ids of views with a committed-but-unsaved mutation. BN's
         # bv.file.modified does NOT flip True after our verified rename/comment/
         # retype writes, so `close` could not tell an agent it was about to
@@ -789,6 +813,12 @@ class TargetManager:
         # shares a location or a spelling with one is never credited to this
         # session.
         self._session_annotations: dict[str, dict[tuple[str, int], str]] = {}
+        # Stable view_id -> the function starts whose prototype a committed
+        # `set_prototype` of THIS bridge verified. BN's has_user_type cannot
+        # say who set a prototype -- after a save and reopen it reads True for
+        # nearly every function -- so this is the one proof `type_source:
+        # user` rests on (D4-04). In-process only: a reopened view has none.
+        self._session_prototypes: dict[str, set[int]] = {}
         # The manager that took this one's ledger over in a GUI bridge restart
         # (`succeed`). A request the old bridge admitted can still commit -- or
         # save, or close -- after the handover; its ledger change is forwarded
@@ -814,6 +844,7 @@ class TargetManager:
         with predecessor._lock, self._lock:
             self._ids_by_object = dict(predecessor._ids_by_object)
             self._next_id = max(self._next_id, predecessor._next_id)
+            self._numeric_view_ids = self._numeric_view_ids and predecessor._numeric_view_ids
             self._dirty_view_ids = set(predecessor._dirty_view_ids)
             self._database_paths = dict(predecessor._database_paths)
             self._database_identities = dict(predecessor._database_identities)
@@ -827,10 +858,31 @@ class TargetManager:
                 vid: dict(ledger)
                 for vid, ledger in predecessor._session_annotations.items()
             }
+            self._session_prototypes = {
+                vid: set(starts) for vid, starts in predecessor._session_prototypes.items()
+            }
             predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
         return self._ids_by_object.get(bv)
+
+    def next_view_id(self) -> int:
+        """The number the next newly seen view will be given."""
+        with self._lock:
+            return self._next_id
+
+    def numeric_view_ids(self) -> bool:
+        """Whether a bare numeric view_id is accepted as a selector (D2-02)."""
+        with self._lock:
+            return self._numeric_view_ids
+
+    def unsaved_view_ids(self) -> list[str]:
+        """The stable view_ids holding a committed mutation not yet saved --
+        the ledger `session stop`/`restart` refuse on -- read under the
+        manager's own lock and without touching Binary Ninja, so a background
+        thread (the idle reaper) can ask it safely (D2-01)."""
+        with self._lock:
+            return sorted(self._dirty_view_ids, key=int)
 
     def mark_dirty(self, bv) -> None:
         """Record that *bv* has a committed mutation not yet written to a .bndb."""
@@ -852,32 +904,38 @@ class TargetManager:
             successor.clear_dirty(bv)
 
     def note_session_annotations(self, bv, results) -> None:
-        """Record the comments a committed mutation verified on *bv* (#977).
+        """Record the comments and prototypes a committed mutation verified on
+        *bv* (#977, D4-04).
 
         Only ``verified`` rows count: a ``noop`` set means the body was already
         stored, which is exactly the inherited case the redaction exists for.
         A verified delete forgets the location."""
         entries: list[tuple[tuple[str, int], str | None]] = []
+        prototypes: set[int] = set()
         for row in results or []:
             if not isinstance(row, dict) or row.get("status") != "verified":
                 continue
             op_name = row.get("op")
-            if op_name not in ("set_comment", "delete_comment"):
+            if op_name not in ("set_comment", "delete_comment", "set_prototype"):
                 continue
             try:
                 address = int(str(row.get("address")), 16)
             except (TypeError, ValueError):
+                continue
+            if op_name == "set_prototype":
+                prototypes.add(address)
                 continue
             scope = "function_doc" if row.get("scope") == "function_doc" else "address"
             body = None
             if op_name == "set_comment":
                 body = str((row.get("requested") or {}).get("comment") or "")
             entries.append(((scope, address), body or None))
-        if not entries:
+        if not entries and not prototypes:
             return
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
+                self._session_prototypes.setdefault(vid, set()).update(prototypes)
                 ledger = self._session_annotations.setdefault(vid, {})
                 for key, body in entries:
                     if body is None:
@@ -893,6 +951,13 @@ class TargetManager:
         with self._lock:
             vid = self._stable_view_id(bv)
             return dict(self._session_annotations.get(vid, {})) if vid is not None else {}
+
+    def session_prototype(self, bv, start: int) -> bool:
+        """Whether this bridge set and verified the prototype of the function
+        at *start* on *bv*."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return vid is not None and start in self._session_prototypes.get(vid, set())
 
     def note_database(self, bv, path: str) -> None:
         """Record that *path* is the database backing *bv*'s analysis.
@@ -1065,6 +1130,7 @@ class TargetManager:
                 self._database_identities.pop(vid, None)
                 self._exports.pop(vid, None)
                 self._session_annotations.pop(vid, None)
+                self._session_prototypes.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
             successor = self._successor
@@ -1150,10 +1216,11 @@ class TargetManager:
     def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
         """Every exact-string alias of *record* with its kind."""
         aliases = [
-            (record.view_id, self._STRONG),
             (record.filename, self._STRONG),
             (record.basename, self._STRONG),
         ]
+        if self._numeric_view_ids:
+            aliases.insert(0, (record.view_id, self._STRONG))
         # A .bndb corpus loads <binary>.bndb, but the obvious selector is
         # <binary>; `-t foo` resolves `foo.bndb` (#312).
         if record.basename.endswith(".bndb"):
@@ -1456,6 +1523,10 @@ class TargetManager:
                 self._exports = {
                     vid: paths for vid, paths in self._exports.items() if vid in alive
                 }
+                self._session_prototypes = {
+                    vid: starts for vid, starts in self._session_prototypes.items()
+                    if vid in alive
+                }
                 self._session_annotations = {
                     vid: ledger for vid, ledger in self._session_annotations.items()
                     if vid in alive
@@ -1512,6 +1583,8 @@ class TargetManager:
                         # which does NOT flip for our verified writes and also
                         # covers analysis churn, so the two stay separate.
                         "unsaved": view_id in self._dirty_view_ids,
+                        # D2-02: whether `-t <view_id>` resolves on this bridge.
+                        "view_id_selects": self._numeric_view_ids,
                         "engine_modified": _view_engine_modified(view),
                         # #753: the database that BACKS this view's analysis when
                         # it is not the file `filename` names -- i.e. after a save
@@ -1556,6 +1629,12 @@ class TargetManager:
         """
         targets = self.refresh()
         if not targets:
+            # A numeric selector is still a view_id from SOME listing -- possibly
+            # a previous process's -- so it gets the process-local note even
+            # when nothing is open now (D2-04).
+            if selector is not None and _is_numeric_selector(selector):
+                raise RuntimeError(_format_unknown_target_error(
+                    selector, targets, numeric_view_ids=self._numeric_view_ids))
             raise RuntimeError("No BinaryView targets are open")
 
         if selector in (None, "", "active"):
@@ -1568,7 +1647,8 @@ class TargetManager:
             matches = self._matching_records(self._records, selector)
 
         if not matches:
-            raise RuntimeError(_format_unknown_target_error(selector, targets))
+            raise RuntimeError(_format_unknown_target_error(
+                selector, targets, numeric_view_ids=self._numeric_view_ids))
         if len(matches) > 1:
             selectors_by_view = {t["view_id"]: t["selector"] for t in targets}
             candidates = ", ".join(
@@ -2001,10 +2081,19 @@ def _function_name_summary(bv) -> dict[str, int]:
 
 
 class BinaryNinjaBridge:
-    def __init__(self, instance_id: str | None = None):
+    def __init__(self, instance_id: str | None = None, first_view_id: int = 1, *,
+                 numeric_view_ids: bool = True):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
-        self._started_at = datetime.now(timezone.utc).isoformat()
+        # The PROCESS's start, not this object's: a GUI "Restart Bridge" builds
+        # a new bridge inside the same process, and `session list` pairs the
+        # time with the pid (P2-07). Platforms without /proc fall back to now.
+        self._started_at = (
+            process_started_at(os.getpid()) or datetime.now(timezone.utc).isoformat()
+        )
+        # Seconds of inactivity after which the idle reaper stops this bridge,
+        # or None while it is not armed; published in the registry (P2-09).
+        self._idle_timeout: float | None = None
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
@@ -2017,7 +2106,7 @@ class BinaryNinjaBridge:
         # _load_jobs_lock -- stop() latches, then refuses queued jobs.
         self._teardown_lock = threading.Lock()
         self._stopped: bool = False
-        self.targets = TargetManager()
+        self.targets = TargetManager(first_view_id, numeric_view_ids=numeric_view_ids)
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
         self.registry_path = bridge_registry_path(instance_id)
@@ -2051,6 +2140,9 @@ class BinaryNinjaBridge:
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
+        # D2-01: the number of unsaved targets that last held an expired idle
+        # window open, or None while the reaper is not deferring a shutdown.
+        self._idle_deferred_unsaved: int | None = None
         # Retired GUI bridges this one succeeded (`succeed`), held weakly: a
         # request one of them admitted may still be running, and a cancel for it
         # now arrives HERE, on the socket path it used to own (#992). Weak, so a
@@ -2508,6 +2600,16 @@ class BinaryNinjaBridge:
         except Exception:
             binaries = []
         payload["binaries"] = binaries
+        # Read after the refresh above, which numbers any view it saw first:
+        # `session restart` seeds the next process with it (P1-02).
+        payload["next_view_id"] = self.targets.next_view_id()
+        # D2-02: a successor that could not learn its predecessor's high-water
+        # mark refuses numeric selectors; the next restart inherits that.
+        payload["numeric_view_ids"] = self.targets.numeric_view_ids()
+        payload["idle_timeout"] = self._idle_timeout
+        # D2-01: how many unsaved targets are holding an expired idle window
+        # open (null while the reaper is not deferring), for `session list`.
+        payload["idle_deferred_unsaved_targets"] = self._idle_deferred_unsaved
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists. Under the
         # teardown latch (#694): a detached load worker that finishes after stop()
@@ -2681,12 +2783,26 @@ class BinaryNinjaBridge:
     def _try_idle_shutdown(self, now: float, timeout: float) -> bool:
         """Atomically decide whether to self-shutdown. Returns True (and latches
         _shutting_down so _enter_request refuses new work) only when nothing is in
-        flight, no detached load job is still queued/running, AND the bridge has
-        been idle >= timeout. A non-zero _inflight covers every operation that runs
-        inside a request's own dispatch (including update_analysis_and_wait there),
-        but a detached load job (started via load_binary_async) runs on its own
-        worker thread outside any request's dispatch, so _load_jobs must be
-        checked too or the reaper could shut down mid-load (#694)."""
+        flight, no detached load job is still queued/running, no target holds
+        unsaved work, AND the bridge has been idle >= timeout. A non-zero
+        _inflight covers every operation that runs inside a request's own
+        dispatch (including update_analysis_and_wait there), but a detached load
+        job (started via load_binary_async) runs on its own worker thread outside
+        any request's dispatch, so _load_jobs must be checked too or the reaper
+        could shut down mid-load (#694).
+
+        An expired window with unsaved targets is DEFERRED, not taken (D2-01):
+        teardown would discard them with none of the `session stop`/`restart`
+        refusal, and an auto-started bridge reaps itself by default. The count
+        is kept in ``_idle_deferred_unsaved`` for the log and the registry; the
+        window restarts when the save or close that clears them -- a request --
+        finishes and stamps ``_last_activity``."""
+        # Read the unsaved ledger BEFORE taking _request_state_lock, so this
+        # thread never holds that lock while waiting on the TargetManager's.
+        # Reading first is still sound: a request that dirties a view after
+        # this read is either still in flight below or has finished and stamped
+        # _last_activity, and either keeps the decision from latching.
+        unsaved = len(self.targets.unsaved_view_ids())
         with self._request_state_lock:
             if self._inflight > 0:
                 return False
@@ -2699,7 +2815,12 @@ class BinaryNinjaBridge:
                 self._last_activity = now
                 return False
             if (now - self._last_activity) < timeout:
+                self._idle_deferred_unsaved = None
                 return False
+            if unsaved:
+                self._idle_deferred_unsaved = unsaved
+                return False
+            self._idle_deferred_unsaved = None
             self._shutting_down = True
             return True
 
@@ -2717,6 +2838,7 @@ class BinaryNinjaBridge:
             self._last_activity = time.monotonic()
 
         def _loop() -> None:
+            published: int | None = None
             while not self._shutdown_event.is_set():
                 # wait() doubles as the sleep and as prompt wake-up on external
                 # shutdown: it returns True the moment _shutdown_event is set.
@@ -2729,6 +2851,26 @@ class BinaryNinjaBridge:
                     )
                     self._shutdown_event.set()
                     return
+                deferred = self._idle_deferred_unsaved
+                if deferred == published:
+                    continue
+                if deferred:
+                    bn.log_info(
+                        f"BN Agent Bridge idle for >= {timeout}s (BN_IDLE_TIMEOUT) "
+                        f"but {deferred} target(s) hold unsaved changes; not "
+                        "shutting down until they are saved or closed "
+                        "(`bn session stop --discard-unsaved` discards them)"
+                    )
+                # Publish each change for `session list`. A failed write loses
+                # only that disclosure -- the deferral itself is decided above --
+                # and must not end this thread, which would leave the bridge with
+                # no idle policy at all.
+                try:
+                    self._write_registry()
+                except OSError as exc:
+                    bn.log_warn(f"BN Agent Bridge could not publish its idle state: {exc}")
+                    continue
+                published = deferred
 
         thread = threading.Thread(target=_loop, name="bn-idle-reaper", daemon=True)
         thread.start()
@@ -2741,7 +2883,10 @@ class BinaryNinjaBridge:
         if timeout is None:
             return None
         bn.log_info(f"BN Agent Bridge idle reaper armed: self-shutdown after {timeout}s idle")
-        return self._start_idle_reaper(timeout)
+        thread = self._start_idle_reaper(timeout)
+        self._idle_timeout = timeout
+        self._write_registry()
+        return thread
 
     def _is_request_cancelled(self, request_id: Any) -> bool:
         if not isinstance(request_id, str) or not request_id:
@@ -3891,7 +4036,6 @@ class BinaryNinjaBridge:
             _disclose_open_target_collision(self.targets, bv, saved, degraded)
             self._stamp_cache_writer(saved, degraded)
             return degraded
-        self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         # #753: the live filename was just restored to the ORIGINAL path, so from
         # here on nothing in the view says where its analysis actually lives.
         # Record it, or `session restart` reopens the raw bytes and discards this
@@ -3906,6 +4050,7 @@ class BinaryNinjaBridge:
         # (#857 round-4 regression, introduced by this change).
         result = {"ok": True, "saved": True, "path": saved}
         if own_primary or in_place:
+            self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
             self.targets.note_database(bv, saved)
         else:
             # An EXPORT (#1036 items 4-5): recorded in its own ledger so a
@@ -3930,6 +4075,13 @@ class BinaryNinjaBridge:
             result["restart_path"] = self.targets.recorded_database(bv) or filename or None
             result["restart_path_is_database"] = bool(
                 self.targets.recorded_database(bv) or filename.endswith(".bndb"))
+            # P2-03: the copy persisted nothing for THIS target -- its own
+            # database (None while it has none) is unchanged, and so is its
+            # unsaved ledger: a restart still reopens that database, so the
+            # mutations stay unsaved until a plain `bn save`.
+            result["backing_database"] = self.targets.recorded_database(bv) or (
+                filename if filename.endswith(".bndb") else None)
+            result["unsaved"] = self.targets.is_dirty(bv)
         self._stamp_cache_writer(saved, result)
         _disclose_open_target_collision(self.targets, bv, saved, result)
         return result
@@ -4798,13 +4950,13 @@ class BinaryNinjaBridge:
                     except Exception as exc:  # noqa: BLE001 - preserve all-or-nothing rename
                         failed_rows.append(self._go_rename_failure_row(
                             candidate, "verification_failed",
-                            f"Live rename failed: {_serialize_error(exc)}",
+                            f"Rename failed: {_serialize_error(exc)}",
                         ))
                         break
                     observed = str(getattr(fn, "name", "") or "")
                     if observed != candidate["new_name"]:
                         failed_rows.append(self._go_rename_failure_row(
-                            candidate, "verification_failed", "Live rename readback disagreed",
+                            candidate, "verification_failed", "Post-state rename readback disagreed",
                         ))
                         break
                     verified_count += 1
@@ -7307,6 +7459,8 @@ def start_headless(
     instance_id: str | None = None,
     quick: bool = False,
     prefer_bndb: bool = True,
+    first_view_id: int = 1,
+    numeric_view_ids: bool = True,
 ):
     """Start the bridge in headless mode (no GUI required).
 
@@ -7316,6 +7470,10 @@ def start_headless(
     With ``prefer_bndb`` (the default), a binary with an adjacent
     ``<binary>.bndb`` loads the sidecar instead of re-analyzing -- matching
     ``bn load``; pass ``--no-bndb`` (prefer_bndb=False) to open the raw binary.
+    ``first_view_id`` is the first numeric view id this process assigns:
+    `session restart` passes its predecessor's next id (P1-02). With
+    ``numeric_view_ids`` False (a predecessor that recorded no next id) no bare
+    numeric view_id is accepted as a selector (D2-02).
     """
     global _bridge
     if _bridge is not None:
@@ -7327,7 +7485,8 @@ def start_headless(
 
     ensure_private_dir(instances_dir())
 
-    bridge = BinaryNinjaBridge(instance_id=instance_id)
+    bridge = BinaryNinjaBridge(instance_id=instance_id, first_view_id=first_view_id,
+                               numeric_view_ids=numeric_view_ids)
     bridge.start()
     _bridge = bridge
     bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")

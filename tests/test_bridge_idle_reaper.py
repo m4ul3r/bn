@@ -278,6 +278,67 @@ def test_shutdown_latched_first_refuses_new_requests(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Unsaved targets defer an expired idle window (D2-01)
+# --------------------------------------------------------------------------
+
+def _dirty_target(bridge, inst):
+    """One open view holding a committed-but-unsaved mutation, in the same
+    ledger `session stop` refuses on."""
+    from _bridge_fakes import _FakeFileBV, _register_views
+
+    bv = _FakeFileBV("/srv/fw/svc", session_id="1")
+    _register_views(bridge, bv)
+    inst.targets.refresh()
+    inst.targets.mark_dirty(bv)
+    return bv
+
+
+@pytest.mark.parametrize("cleared_by", ["save", "close"])
+def test_an_unsaved_target_defers_idle_shutdown_until_saved_or_closed(monkeypatch, cleared_by):
+    # D2-01: an auto-started bridge reaps itself after 1800 idle seconds; a
+    # dirty target must survive the expiry, and once the save or close that
+    # clears it finishes (a request), a FULL window runs again.
+    bridge, inst = _instance(monkeypatch)
+    bv = _dirty_target(bridge, inst)
+    inst._last_activity = time.monotonic() - 10_000.0
+
+    assert inst._try_idle_shutdown(time.monotonic(), timeout=30.0) is False
+    assert inst._shutting_down is False
+    assert inst._idle_deferred_unsaved == 1
+
+    assert inst._enter_request() is True          # the save / close request
+    if cleared_by == "save":
+        inst.targets.clear_dirty(bv)
+    else:
+        inst.targets.forget(bv)
+    inst._leave_request()
+    stamped = inst._last_activity
+
+    assert inst._try_idle_shutdown(stamped + 29.0, timeout=30.0) is False
+    assert inst._idle_deferred_unsaved is None
+    assert inst._try_idle_shutdown(stamped + 31.0, timeout=30.0) is True
+    bridge._headless_views.clear()
+
+
+def test_the_reaper_keeps_an_unsaved_bridge_alive_and_publishes_why(monkeypatch):
+    bridge, inst = _instance(monkeypatch)
+    bv = _dirty_target(bridge, inst)
+    t = inst._start_idle_reaper(timeout=0.01, poll_interval=0.01)
+
+    assert inst._shutdown_event.wait(0.5) is False
+    payload = json.loads(inst.registry_path.read_text(encoding="utf-8"))
+    assert payload["idle_deferred_unsaved_targets"] == 1
+
+    inst._enter_request()
+    inst.targets.clear_dirty(bv)
+    inst._leave_request()
+    assert inst._shutdown_event.wait(2.0) is True
+    t.join(timeout=2.0)
+    bridge._headless_views.clear()
+
+
+
+# --------------------------------------------------------------------------
 # Watcher thread
 # --------------------------------------------------------------------------
 
