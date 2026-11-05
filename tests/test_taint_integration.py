@@ -7873,14 +7873,22 @@ def test_trace_reports_observed_truncation_and_quick_view_state(tmp_path, shared
     function's only parameter. Budgets 4 and 5 are the same complete answer;
     3 leaves the parameter pending. Budget 4 used to say `truncated: true`.
     BN6-C010: the same trace on a quick-loaded copy discloses
-    `analysis_state: quick` / `partial: true`; it carried no state at all."""
+    `analysis_state: quick` / `partial: true`; it carried no state at all.
+    The quick copy has a saved database beside it, as a primed fixture does:
+    the quick view must still be the raw bytes, never that full analysis."""
     built = {}
     for name in ("trace_budget", "trace_budget_quick"):
         built[name] = tmp_path / name
         # -fno-builtin: GCC inlines an 8-byte memcpy even at -O0.
         _compile(CORPUS / "trace_budget.c", built[name], ["-fno-builtin"])
     full = shared_bn.load(built["trace_budget"], copy=False)
-    quick = shared_bn.load(built["trace_budget_quick"], copy=False, quick=True)
+    sidecar = tmp_path / "trace_budget_quick.bndb"
+    primed = shared_bn.load(built["trace_budget_quick"], copy=False)
+    saved = shared_bn.run("save", "--target", primed, "--path", str(sidecar), "--format", "json")
+    assert saved.returncode == 0 and sidecar.exists(), saved.stderr
+    closed = shared_bn.run("close", primed)
+    assert closed.returncode == 0, closed.stderr
+    quick = shared_bn.load(built["trace_budget_quick"], quick=True)
 
     sites = _bn_json(shared_bn, "-t", full, "callsites", "memcpy",
                      "--within", "publish_banner")["items"]
@@ -7900,3 +7908,5 @@ def test_trace_reports_observed_truncation_and_quick_view_state(tmp_path, shared
 
     partial = trace(quick)
     assert (partial["analysis_state"], partial["partial"]) == ("quick", True)
+    # The raw binary was opened, not the database beside it.
+    assert Path(quick).suffix != ".bndb", quick
