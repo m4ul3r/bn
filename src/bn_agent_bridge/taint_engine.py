@@ -11359,7 +11359,11 @@ class TaintEngine:
         new assumptions. An assumption only ever rises from False -- a yes
         only adds a neighbour to scan, it never removes a read -- so every
         repeated pass turns at least one more answer True and the passes
-        end. An access that is in no cycle settles in one pass, as before."""
+        end. For the same reason a yes computed from low assumptions is a
+        yes asked fresh: a cycle whose every access came out True is settled
+        though an assumption it was lent was low, and a cycle whose accesses
+        all reach one another settles in two passes, not three. An access
+        that is in no cycle settles in one pass, as before."""
         root = (int(getattr(fn, "start", 0)), int(ga))
         order: dict[tuple[int, int], int] = {}    # unsettled access -> discovery number
         unsettled: list[tuple[int, int]] = []     # in discovery order (Tarjan's stack)
@@ -11416,8 +11420,10 @@ class TaintEngine:
                     value = assumed[top.key]
                     continue
                 cycle = unsettled[top.base:]
-                if any(assumed[k] for k in lent_false.intersection(cycle)):
-                    # A False lent inside the cycle came out True: ask again.
+                if any(assumed[k] for k in lent_false.intersection(cycle)) \
+                        and not all(assumed[k] for k in cycle):
+                    # A False lent inside the cycle came out True, and an
+                    # answer computed from it may still be a no: ask again.
                     del unsettled[top.base:]
                     for k in cycle:
                         del order[k]

@@ -223,11 +223,25 @@ def test_a_chain_of_thousands_of_accesses_settles_without_recursion(monkeypatch)
     assert all(engine._reaches_object_cache[(SCAN.start, g)] for g in nodes)
 
 
-def test_a_cycle_thousands_of_accesses_long_settles_without_recursion(monkeypatch):
-    # The same chain closed into a cycle, proven at its far end: the answer
-    # found there must reach every access in the cycle, the head included.
-    nodes = [0x500000 + 8 * i for i in range(N_CHAIN)]
-    graph = {g: [nodes[(i + 1) % N_CHAIN]] for i, g in enumerate(nodes)}
-    engine, _ran = _graph_engine(monkeypatch, graph, {nodes[-1]})
-    assert engine._settle_access(SCAN, nodes[1], reach=True) is True
+N_DENSE = 240
+
+
+def test_a_complete_graph_of_accesses_settles_each_access_at_most_twice(monkeypatch):
+    # Every access asks about every other, so each is entered while the rest
+    # are unfinished; only the root reaches the proven access, and asks it
+    # LAST -- after every other access has finished on the root's unsettled
+    # no. Asked fresh, each of them reaches the root, so each is a yes; and no
+    # access's body may run more than twice (once inside the cycle, once to
+    # settle) however many of its N-1 dependencies changed.
+    nodes = [0x500000 + 8 * i for i in range(N_DENSE)]
+    proven = 0x600000
+    graph = {g: [h for h in nodes if h != g] for g in nodes}
+    graph[nodes[0]].append(proven)
+    graph[proven] = []
+    engine, ran = _graph_engine(monkeypatch, graph, {proven})
+    assert engine._settle_access(SCAN, nodes[0], reach=True) is True
     assert all(engine._reaches_object_cache[(SCAN.start, g)] for g in nodes)
+    assert all(engine._global_access_cache[(SCAN.start, g)].at == HIT for g in nodes)
+    runs = {g: ran.count(g) for g in set(ran)}
+    assert set(runs) == {*nodes, proven}
+    assert max(runs.values()) <= 2, sorted(runs.items(), key=lambda kv: -kv[1])[:5]
