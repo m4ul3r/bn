@@ -342,24 +342,18 @@ def test_message_queue_input_reaches_path_and_spawn_sinks_957():
 
 
 def test_build_catalog_includes_underscore_prefixed_real_models_849():
-    # #849: build_catalog must NOT skip models whose names start with a single
-    # `_` but are NOT doc-key prefixed (_comment). Real model names like
-    # ``__isoc99_scanf`` / ``__isoc99_fscanf`` / ``__isoc99_vsscanf`` start
-    # with ``_`` but are genuine sources/propagators -- the engine resolves them
-    # on real binaries while the catalog used to omit them entirely. The fix
-    # matches only the doc-key prefix (``_comment``), not every leading ``_``.
+    # #849: build_catalog must NOT skip models whose names start with `_` but
+    # are NOT doc-key prefixed (_comment). ``__builtin_memset`` starts with
+    # ``_`` but is a genuine propagator and sink the engine applies on real
+    # binaries; the catalog used to omit such names entirely. The fix matches
+    # only the doc-key prefix (``_comment``), not every leading ``_``.
     from bn_agent_bridge.taint_engine import load_models
     models = load_models()
-    src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
-    for name in ("__isoc99_scanf", "__isoc99_fscanf"):
-        assert name in src_syms, (
-            f"{name} must appear in the source catalog (starts with '_' but is "
-            "a real model, not a _comment doc key)"
-        )
     prop_syms = {p["symbol"] for p in build_catalog(models, role="propagator")["propagators"]}
-    assert "__isoc99_vsscanf" in prop_syms, (
-        "__isoc99_vsscanf must appear as a propagator in the catalog"
-    )
+    assert "__builtin_memset" in prop_syms
+    sink_syms = {e["symbol"] for lst in build_catalog(models, role="sink")["sinks_by_class"].values()
+                 for e in lst}
+    assert "__builtin_memset" in sink_syms
 
 
 def test_recv_overflow_comment_names_pread_603():
@@ -1361,10 +1355,10 @@ def test_scanf_family_models_carry_arity_capped_flag_851():
     # so the engine can emit a weak-seed note when a real call has more actual
     # params than the unrolled *arg:N run covers, rather than silently reporting
     # a clean all-clear for the unmodeled destinations.
-    from bn_agent_bridge.taint_engine import load_models
+    from bn_agent_bridge.taint_engine import load_models, lookup_model
     models = load_models()
     for name in ("scanf", "__isoc99_scanf", "fscanf", "__isoc99_fscanf"):
-        assert models[name].get("arity_capped") is True, (
+        assert lookup_model(models, name)[1].get("arity_capped") is True, (
             f"{name} must carry arity_capped=true so the engine can detect "
             "extra destinations beyond the modeled run"
         )
@@ -1375,28 +1369,28 @@ def test_scanf_family_models_carry_arity_capped_flag_851():
     # have landed). Pinning the OPPOSITE here is what let the first cut of the
     # #851 fix ship the scanf half only, with this test certifying the gap.
     for name in ("sscanf", "__isoc99_sscanf"):
-        assert models[name].get("arity_capped") is True, (
+        assert lookup_model(models, name)[1].get("arity_capped") is True, (
             f"{name} propagates into its destinations and its run is unrolled "
             "like scanf's, so it must carry arity_capped=true"
         )
 
 
 @pytest.mark.parametrize("spelling,canonical", [
-    ("__isoc23_scanf", "scanf"),
-    ("__isoc23_fscanf", "fscanf"),
-    ("__isoc23_sscanf", "sscanf"),
-    ("__isoc23_vsscanf", "vsscanf"),
+    (f"__isoc{std}_{base}", base)
+    for std in ("99", "23") for base in ("scanf", "fscanf", "sscanf", "vsscanf")
+] + [
     # The decorations lookup_model already handled must keep working through
-    # the alias: a PLT-imported C23 spelling lands on the same model.
+    # the alias: a PLT-imported ISO spelling lands on the same model.
     ("__isoc23_sscanf@plt", "sscanf"),
+    ("__isoc99_sscanf@plt", "sscanf"),
     ("_isoc23_sscanf", "sscanf"),
 ])
-def test_glibc_c23_scanf_spellings_alias_the_legacy_models(spelling, canonical):
-    # glibc 2.38+ exports __isoc23_* for the scanf family when a translation
-    # unit is built under C23. It is the same call -- same arguments, same
-    # destinations -- so it must resolve to the canonical model by the alias
-    # table, not to a hand-maintained duplicate that can drift in source,
-    # propagation, sink class or arity cap.
+def test_glibc_iso_scanf_spellings_alias_the_canonical_models(spelling, canonical):
+    # glibc exports __isoc99_* (C99) and __isoc23_* (C23, glibc 2.38+) for the
+    # scanf family. Each is the same call -- same arguments, same destinations
+    # -- so it must resolve to the canonical model by the alias table, not to a
+    # hand-maintained duplicate that can drift in source, propagation, sink
+    # class or arity cap.
     from bn_agent_bridge.taint_engine import load_models, lookup_model
     models = load_models()
     key, model = lookup_model(models, spelling)
@@ -1413,10 +1407,10 @@ def test_glibc_c23_scanf_spellings_alias_the_legacy_models(spelling, canonical):
         assert model.get("destinations_unmodeled") is True
 
 
-def test_c23_scanf_aliases_are_not_catalog_entries_of_their_own():
+def test_iso_scanf_aliases_are_not_catalog_entries_of_their_own():
     # The catalog is a catalog of MODELS, keyed by the canonical name the
     # engine reports (and --present annotates). An alias is a way to reach
-    # that model, so the C23 spelling must not appear as a second row that
+    # that model, so neither ISO spelling may appear as a second row that
     # could describe different semantics.
     from bn_agent_bridge.taint_engine import load_models
     models = load_models()
@@ -1424,7 +1418,7 @@ def test_c23_scanf_aliases_are_not_catalog_entries_of_their_own():
     symbols = {e["symbol"] for e in cat["sources"]}
     symbols |= {e["symbol"] for e in cat["propagators"]}
     symbols |= {e["symbol"] for lst in cat["sinks_by_class"].values() for e in lst}
-    assert not any(s.startswith("__isoc23_") for s in symbols), symbols
+    assert not any(s.startswith(("__isoc23_", "__isoc99_")) for s in symbols), symbols
     assert {"scanf", "fscanf", "sscanf"} <= symbols
 
 

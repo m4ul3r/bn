@@ -8754,7 +8754,9 @@ def test_sscanf_c99_spelling_is_not_bypassed_809(models):
         func, [te.parse_locator("param:0")])
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == ["command_injection"], result
     assert not [l for l in result["leaves"] if l["kind"] == "unmodeled_callee"], result["leaves"]
-    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "__isoc99_sscanf"
+    # One model for every ISO-C spelling: the C99 symbol resolves to the
+    # canonical key, exactly as the C23 one does.
+    assert te.lookup_model(models, "__isoc99_sscanf")[0] == "sscanf"
 
 
 @pytest.mark.parametrize(("callee", "key"), [
@@ -8814,8 +8816,10 @@ def test_scanf_c23_spelling_seeds_every_destination_in_the_run_809(models):
 @pytest.mark.parametrize(("callee", "model_key", "stream"), [
     ("__isoc23_scanf", "scanf", False),
     ("__isoc23_fscanf", "fscanf", True),
+    ("__isoc99_scanf", "scanf", False),
+    ("__isoc99_fscanf", "fscanf", True),
 ])
-def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
+def test_iso_call_preset_shortfall_is_reported_once(models, callee, model_key, stream):
     # The `call:` preset resolves the C23 alias to the canonical model, and the
     # application-level check names that same key. Seeding a source spelling
     # used to produce two leaves at one address -- the raw `__isoc23_*` name
@@ -8836,8 +8840,8 @@ def test_c23_call_preset_shortfall_is_reported_once(models, callee, model_key, s
              if lf["kind"] == "format_destination_unrecovered"]
     assert len(short) == 1, short
     assert short[0]["callee"] == model_key
-    assert (short[0]["destinations"], short[0]["modeled"],
-            short[0]["recovered"], short[0]["missing"]) == (5, 4, 4, 1), short[0]
+    assert (short[0]["destinations"], short[0]["recovered"], short[0]["missing"]) == \
+        (5, 4, 1), short[0]
 
 
 def test_vsscanf_is_a_disclosed_partial_not_a_destination_source_809(models):

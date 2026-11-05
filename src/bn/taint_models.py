@@ -667,35 +667,43 @@ def _canonical_lfs64(name: str) -> str | None:
     return _LFS64_ALIASES.get(name)
 
 
-# glibc's C23 scanf-family spellings, exported since glibc 2.38. When the
-# translation unit is built under C23 (`-std=c2x`, or `_GNU_SOURCE`), glibc
-# redirects `scanf`/`fscanf`/`sscanf`/`vsscanf` to these symbols: the C23
-# conversions (%b, sized integer length prefixes) are handled by the same
-# call, with the same arguments and destinations. They therefore resolve to
-# the canonical model through the alias table rather than a duplicated JSON
-# entry that can drift. Only spellings whose canonical model EXISTS are
-# listed -- the wide family and vscanf/vfscanf have no model yet, and an
-# unmodeled callee is correctly surfaced as a frontier instead of being given
-# a fabricated one.
+# glibc's ISO-C scanf-family spellings. Under C99 (`-std=gnu17` and earlier)
+# stdio.h redirects `scanf`/`fscanf`/`sscanf`/`vsscanf` to `__isoc99_*`; under
+# C23 (`-std=c2x`, glibc 2.38+) to `__isoc23_*`. Both are the same call, with
+# the same arguments and destinations, so every spelling resolves to the ONE
+# canonical model through this table rather than a duplicated JSON entry that
+# can drift -- and a `call:scanf` / `arg:sscanf:N` locator matches a callsite
+# of either spelling, because callsite matching goes through `lookup_model`
+# too. The C99 family used to be four duplicated JSON models, so `call:scanf`
+# found `__isoc23_scanf` but not `__isoc99_scanf` (W04-04, W07-15). Only
+# spellings whose canonical model EXISTS are listed -- the wide family and
+# vscanf/vfscanf have no model yet, and an unmodeled callee is correctly
+# surfaced as a frontier instead of being given a fabricated one.
 # Keys are the symbol spelling after leading underscores are stripped, the
 # same normalization `_LFS64_ALIASES` uses, so the DWARF/symtab spelling
 # `__isoc23_sscanf` and the plain `isoc23_sscanf` both resolve.
-_C23_SCANF_ALIASES: dict[str, str] = {
-    "isoc23_scanf": "scanf",
-    "isoc23_fscanf": "fscanf",
-    "isoc23_sscanf": "sscanf",
-    "isoc23_vsscanf": "vsscanf",
+_SCANF_ALIASES: dict[str, str] = {
+    f"isoc{std}_{base}": base
+    for std in ("99", "23")
+    for base in ("scanf", "fscanf", "sscanf", "vsscanf")
 }
 
 
-def _canonical_c23_scanf(name: str) -> str | None:
-    """Canonical model key for a glibc C23 scanf-family spelling, or None.
+def _canonical_scanf(name: str) -> str | None:
+    """Canonical model key for a glibc ISO-C scanf-family spelling, or None.
 
     *name* is expected already stripped of a leading ``_``/decorations, as
     ``lookup_model`` passes it; the alias is adopted only when the canonical
     key is a real model (the final membership check in ``lookup_model``).
     """
-    return _C23_SCANF_ALIASES.get(name)
+    return _SCANF_ALIASES.get(name)
+
+
+def alias_spellings(key: str) -> tuple[str, ...]:
+    """The symbol spellings (``__isoc99_sscanf``, ``__isoc23_sscanf``) that
+    resolve to canonical model *key* through ``_SCANF_ALIASES``, so a finding
+    keyed ``sscanf`` can name the symbol the binary actually calls."""
+    return tuple(f"__{alias}" for alias, base in _SCANF_ALIASES.items() if base == key)
 
 
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
@@ -706,9 +714,9 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     C++ allocator key (so mangled ``_Znam`` and demangled ``operator new[]``
     both resolve to the ``Znam`` model -- #204), then the transitional LFS64
     base key (so ``pwrite64`` / ``pread64`` resolve to ``pwrite`` / ``pread`` --
-    #603), then the glibc C23 scanf-family spelling (so ``__isoc23_sscanf``
-    resolves to ``sscanf`` with the identical source/propagate/sink/arity
-    semantics rather than a duplicated model entry).
+    #603), then the glibc ISO-C scanf-family spelling (so ``__isoc99_sscanf``
+    and ``__isoc23_sscanf`` resolve to ``sscanf`` with the identical
+    source/propagate/sink/arity semantics rather than a duplicated model entry).
     """
     if not name:
         return None, None
@@ -725,9 +733,9 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     lfs64 = _canonical_lfs64(stripped or base)
     if lfs64 and lfs64 not in candidates:
         candidates.append(lfs64)
-    c23_scanf = _canonical_c23_scanf(stripped or base)
-    if c23_scanf and c23_scanf not in candidates:
-        candidates.append(c23_scanf)
+    scanf = _canonical_scanf(stripped or base)
+    if scanf and scanf not in candidates:
+        candidates.append(scanf)
     for cand in candidates:
         if cand in models:
             return cand, models[cand]

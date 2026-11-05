@@ -102,12 +102,11 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
     for name, model in models.items():
         # #849: skip the DOC-key prefix only, the way the engine's own coercion
         # does (``taint_models._coerce_model_map``). Skipping every ``_``-leading
-        # key also dropped real models -- the four ``__isoc99_*`` scanf-family
-        # spellings and ``__builtin_bswap{16,32,64}``, which the engine resolves on
-        # a real binary, so the catalog (and the ``--present`` audit built on it)
-        # under-reported the models actually applied. The eighth such key,
-        # ``__builtin_memset``, is modeled like ``memset``: a propagator
-        # (``arg:1->*arg:0``) and an ``overflow_len`` sink.
+        # key also dropped real models -- ``__builtin_bswap{16,32,64}`` and
+        # ``__builtin_memset``, which the engine resolves on a real binary, so
+        # the catalog (and the ``--present`` audit built on it) under-reported
+        # the models actually applied. (The ISO ``__isoc99_*``/``__isoc23_*``
+        # scanf spellings are aliases of the plain models, not keys.)
         if str(name).startswith("_comment") or not isinstance(model, dict):
             continue
         if model.get("sources") and want in (None, "source"):

@@ -41,7 +41,7 @@ from .taint_models import (  # noqa: F401
     _BROAD_SOURCE_BYTES, _BROAD_SOURCE_MEMBERS, _BUILTIN_MODELS,
     _model_buffer_source_args, TaintError,
     _coerce_model_map, _validate_model_interior, load_models,
-    model_overlay_sources, _canonical_cxx_alloc, lookup_model,
+    model_overlay_sources, _canonical_cxx_alloc, lookup_model, alias_spellings,
     _try_arg_index, model_arg_indices, model_is_benign_marker,
     model_arg_index, parse_model_token, validate_model_arguments,
 )
@@ -5010,23 +5010,19 @@ class TaintEngine:
         return variadic, advice
 
     def _format_destination_shortfall(self, ins: Any, ssaf: Any, callee: str, model: Any,
-                                      params: list[Any]) -> dict | None:
-        """A blocking `format_destination_unrecovered` leaf when the call's fully
-        read constant format writes a destination that was never seeded.
+                                      params: list[Any]) -> list[dict[str, Any]]:
+        """The blocking leaves for destinations a call's fully read constant
+        format writes that were never seeded -- one leaf per CAUSE, because
+        the two causes have different remedies (P2-12):
 
-        Two independent shortfalls are compared here, because the format is
-        evidence of its own (#1050 review round 8; IC04 follow-up):
-
-        * **unrecovered** -- BN's MLIL call lists fewer arguments than the
-          format writes; a forwarded incoming pointer left in its argument
-          register is passed, yet never appears in ``params``.
-        * **unmodeled** -- the model's unrolled destination run ends before the
-          format does, even when BN recovered every argument. An arity-capped
-          model unrolls a fixed run ``*arg:first..first+N-1``; a five-conversion
-          format with a four-slot run loses the fifth output even though the
-          call's fifth destination is a perfectly recovered argument, and the
-          old rule-vs-params comparison never even ran for it because no rule
-          named that index.
+        * ``format_destination_unrecovered`` -- BN's MLIL call lists fewer
+          arguments than the format writes; a forwarded incoming pointer left
+          in its argument register is passed, yet never appears in
+          ``params``. The fix is reading the call's disassembly and seeding
+          those pointers by hand.
+        * ``scanf_arity_residual`` -- BN recovered the destination, but the
+          arity-capped model's unrolled run ``*arg:first..first+N-1`` ends
+          before it. The fix is a model overlay that extends the run.
 
         The required destinations come from the format alone: a suppressed
         ``%*`` conversion consumes no destination, ``%n`` does, a ``%%`` is
@@ -5035,20 +5031,20 @@ class TaintEngine:
         past a shorter format stays silent: fewer conversions than the model's
         run is exactly the capped shape, not a loss. Missing arguments are not
         guessed and the model range is not widened; the gap is disclosed by
-        count. It only adds a leaf, never removes a seed (round 9 removed
-        destination trimming). The constant-format test checks only the
-        format's START address: a format whose suffix lies in writable storage
-        can be under-counted, which then yields no leaf, as on base."""
+        count. It only adds leaves, never removes a seed. The constant-format
+        test checks only the format's START address: a format whose suffix
+        lies in writable storage can be under-counted, which then yields no
+        leaf."""
         sink = (model or {}).get("sink") or {}
         fa, first = sink.get("format_arg"), sink.get("first_dest")
         if fa is None or first is None or int(fa) >= len(params):
-            return None
+            return []
         fmt = self._const_format_string(ssaf, params[int(fa)])
         if fmt is None:
-            return None
+            return []
         specs = _format_specs(fmt, is_scanf=True)
         if any(s.positional for s in specs):
-            return None
+            return []
         first = int(first)
         # Destination ARGUMENT indices, in format order. A suppressed
         # conversion consumes no argument, so it advances neither k nor the
@@ -5059,7 +5055,7 @@ class TaintEngine:
                 continue
             required.append(first + len(required))
         if not required:
-            return None
+            return []
         modeled_dests: set[int] = set()
         for role in ("sources", "propagates"):
             for rule in (model or {}).get(role) or []:
@@ -5068,29 +5064,41 @@ class TaintEngine:
                     idx = _try_arg_index(to)
                     if idx is not None:
                         modeled_dests.add(idx)
-        recovered = sum(1 for i in required if i < len(params))
-        modeled = sum(1 for i in required if i in modeled_dests)
-        covered = sum(1 for i in required if i < len(params) and i in modeled_dests)
-        missing = len(required) - covered
-        if missing <= 0:
-            return None
+        unrecovered = [i for i in required if i >= len(params)]
+        residual = [i for i in required if i < len(params) and i not in modeled_dests]
         at = hex(int(getattr(ins, "address", 0)))
-        return {
-            "kind": "format_destination_unrecovered",
-            "address": at,
-            "callee": str(callee),
-            "il_text": str(ins),
-            "destinations": len(required),
-            "recovered": recovered,
-            "modeled": modeled,
-            "missing": missing,
-            "detail": (
-                f"{self._prose_name(callee)}() at {at}: its constant format writes "
-                f"{len(required)} destination(s); the model enumerates {modeled} of "
-                f"them and Binary Ninja recovered {recovered} of those arguments, so "
-                f"{missing} destination(s) were not seeded -- what they receive is "
-                f"unchecked"),
-        }
+        who = f"{self._prose_name(callee)}() at {at}"
+        common = {"address": at, "callee": str(callee), "il_text": str(ins),
+                  "destinations": len(required)}
+        out: list[dict[str, Any]] = []
+        if unrecovered:
+            out.append({
+                "kind": "format_destination_unrecovered", **common,
+                "recovered": len(required) - len(unrecovered),
+                "missing": len(unrecovered),
+                "detail": (
+                    f"{who}: its constant format writes {len(required)} destination(s), "
+                    f"but Binary Ninja recovered only {len(required) - len(unrecovered)} of "
+                    f"them as arguments of this call, so {len(unrecovered)} destination "
+                    f"pointer(s) passed in registers or on the stack were never seeded -- "
+                    f"what they receive is unchecked. Read the call "
+                    f"(`bn disasm {at} --linear 8`) for the pointers it passes, and seed "
+                    f"each one"),
+            })
+        if residual:
+            out.append({
+                "kind": "scanf_arity_residual", **common,
+                "modeled": sum(1 for i in required if i in modeled_dests),
+                "residual": len(residual),
+                "residual_args": residual,
+                "detail": (
+                    f"{who}: its constant format writes {len(required)} destination(s) and "
+                    f"Binary Ninja recovered them, but the model's destination run does not "
+                    f"cover argument(s) {residual}, so what they receive is unchecked. A "
+                    f"`--models` overlay whose rules name those `*arg:N` destinations "
+                    f"seeds them"),
+            })
+        return out
 
     def _unchecked_indirect_calls(self, instrs: list[Any], fills: list[Any], callee: str,
                                   add_leaf: Any) -> None:
@@ -10536,13 +10544,21 @@ class TaintEngine:
         # local to this run, so a descended callee's run keeps its own.
         buffer_slots: dict = {}
         correlated_slots: set = set()
+        before = len(leaves)
         seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption,
                                     buffer_slots, leaves)
         if not seeded:
-            if top:
+            # P2-12: a seed that reached its call but could key nothing there
+            # still found a frontier (a format proving destinations BN did not
+            # recover); refusing the locator discarded exactly that leaf. The
+            # run goes on with nothing tainted, so the leaf is reported and
+            # withholds the all-clear. A seed that found nothing at all is
+            # still a bad locator.
+            if top and len(leaves) == before:
                 raise TaintError("no taint sources resolved; check --source locator")
-            return {"reached_return": False, "out_params": set(), "findings": [],
-                    "leaves": [], "assumptions": []}
+            if not top:
+                return {"reached_return": False, "out_params": set(), "findings": [],
+                        "leaves": [], "assumptions": []}
 
         # Honesty signal: a visited function with unlifted instructions is a
         # potential silent dataflow hole -- BN couldn't model those ops, so taint
@@ -10957,10 +10973,10 @@ class TaintEngine:
                 input_args.update(i for i in (model.get("sink") or {}).get("tainted_args") or []
                                   if isinstance(i, int) and not isinstance(i, bool))
                 if any(i < len(params) and arg_taint(params[i]) for i in input_args):
-                    short = self._format_destination_shortfall(
-                        ins, ssaf, mkey or name or "?", model, params)
-                    if short is not None and short not in leaves:
-                        leaves.append(short)
+                    for short in self._format_destination_shortfall(
+                            ins, ssaf, mkey or name or "?", model, params):
+                        if short not in leaves:
+                            leaves.append(short)
 
             def apply_token(tok, parents):
                 # Tail calls have no SSA result: a modeled return instead exits
@@ -11025,10 +11041,10 @@ class TaintEngine:
                     # What says an argument exists is the call's own constant
                     # format; when it writes more destinations than were
                     # recovered, that shortfall is the boundary (#1050 round 8).
-                    short = self._format_destination_shortfall(
-                        ins, ssaf, mkey or name or "?", model, params)
-                    if short is not None and short not in leaves:
-                        leaves.append(short)
+                    for short in self._format_destination_shortfall(
+                            ins, ssaf, mkey or name or "?", model, params):
+                        if short not in leaves:
+                            leaves.append(short)
                     return
                 taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
                 callee_ref = hex(int(taddr)) if taddr is not None else None
@@ -11751,8 +11767,13 @@ class TaintEngine:
                     if str(rule.get("to", "")).startswith("*arg:")
                 ]
                 _prop_dests = [i for i in _prop_dests if i is not None]
-                if _prop_dests and len(params) > max(_prop_dests) + 1:
-                    _ca = hex(int(getattr(ins, "address", 0)))
+                _ca = hex(int(getattr(ins, "address", 0)))
+                # A format-proven residual at this call is already a blocking
+                # leaf naming the arguments; the param-count guess would only
+                # repeat it less precisely (P2-12).
+                proven = any(lf.get("kind") == "scanf_arity_residual"
+                             and lf.get("address") == _ca for lf in leaves)
+                if _prop_dests and len(params) > max(_prop_dests) + 1 and not proven:
                     _mx, _mn = max(_prop_dests), min(_prop_dests)
                     add_assumption(
                         f"scanf_arity_residual @ {_ca}: {self._prose_name(name or '?')} model "
@@ -12910,6 +12931,18 @@ class TaintEngine:
             if leaf and leaf not in leaves:
                 leaves.append(leaf)
 
+        def format_shortfall(calls: list[Any], callee: str) -> None:
+            # P2-12: a format that proves destinations this seed cannot reach
+            # is a blocking frontier whichever callee locator named the call
+            # -- `call:` seeds the model's run, `ret:`/`arg:` seed less. The
+            # canonical model key names the leaf, so the application-level
+            # check (which uses the key too) dedupes against it.
+            mkey, model = lookup_model(self.models, callee)
+            for c in calls:
+                for short in self._format_destination_shortfall(
+                        c, ssaf, mkey or callee, model, self._call_params(c)):
+                    add_leaf(short)
+
         seeded = False
         for src in sources:
             kind = src.get("kind")
@@ -13032,6 +13065,7 @@ class TaintEngine:
                 elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {self._prose_name(callee)}; seeded from all")
                 self._seed_callsites += len(calls)   # #559 frontier diagnostics
+                format_shortfall(calls, callee)
                 ret_seeded = False
                 for c in calls:
                     if kind == "ret":
@@ -13137,7 +13171,7 @@ class TaintEngine:
                 elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {self._prose_name(callee)}; seeded from all")
                 self._seed_callsites += len(calls)   # #559 frontier diagnostics
-                mkey, model = lookup_model(self.models, callee)
+                _mkey, model = lookup_model(self.models, callee)
                 src_defs = (model or {}).get("sources") or []
                 if not src_defs:
                     raise TaintError(
@@ -13145,18 +13179,9 @@ class TaintEngine:
                         f"declares no ret/*arg:N output); use ret:{callee} or "
                         f"arg:{callee}:<n> explicitly"
                     )
+                format_shortfall(calls, callee)
                 for c in calls:
                     params = self._call_params(c)
-                    # Name the canonical model key, not the raw locator: the
-                    # application-level check uses the key too, so the two
-                    # paths produce the SAME leaf dict and dictionary-equality
-                    # dedup keeps one at a call site. With the raw spelling
-                    # (`call:__isoc23_scanf`) the same shortfall used to be
-                    # reported twice, once under each name.
-                    short = self._format_destination_shortfall(
-                        c, ssaf, mkey or callee, model, params)
-                    if short is not None:
-                        add_leaf(short)
                     for sd in src_defs:
                         to = str(sd.get("to") or "")
                         if to == "ret" or to == "*ret":
@@ -13289,8 +13314,13 @@ class TaintEngine:
                             if str(sd.get("to", "")).startswith("*arg:")
                         ]
                         _modeled_idxs = [i for i in _modeled_idxs if i is not None]
-                        if _modeled_idxs and len(params) > max(_modeled_idxs) + 1:
-                            _ca = hex(int(getattr(c, "address", 0)))
+                        _ca = hex(int(getattr(c, "address", 0)))
+                        # A format-proven residual is already a blocking leaf
+                        # naming the arguments (P2-12).
+                        proven = any(lf.get("kind") == "scanf_arity_residual"
+                                     and lf.get("address") == _ca for lf in leaves)
+                        if (_modeled_idxs and len(params) > max(_modeled_idxs) + 1
+                                and not proven):
                             _mx = max(_modeled_idxs)
                             _mn = min(_modeled_idxs)
                             _n_extra = len(params) - (_mx + 1)
@@ -13426,7 +13456,10 @@ class TaintEngine:
         if name in cache:
             return cache[name]
         found = (name, name)
-        for cand in ((name, "_" + name, "__" + name) if name else ()):
+        # An ISO scanf alias (`__isoc99_sscanf`) is keyed by its plain model
+        # name, which is no symbol in the binary; try the alias spellings too.
+        cands = (name, "_" + name, "__" + name, *alias_spellings(name)) if name else ()
+        for cand in cands:
             sym = _symbol_by_raw_name(self.bv, cand)
             raw = getattr(sym, "name", None) if sym is not None else None
             if isinstance(raw, str) and raw:
