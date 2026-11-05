@@ -4358,9 +4358,14 @@ class TaintEngine:
         pointer itself or that pointer plus an offset, through SSA copies and
         every arm of a PHI -- or None. Says the buffer was handed in by the
         caller (a ``wrapper(fd, buf, n)`` -> ``read(fd, buf, n)``), so the
-        caller is where it can be keyed (W12-06)."""
+        caller is where it can be keyed (W12-06).
+
+        In a sum the parameter must be the BASE: the other operand is a
+        constant offset, or of unknown origin only when the parameter is
+        pointer-typed. ``c->buf + have`` is a buffer loaded from memory plus an
+        integer parameter -- not that parameter's buffer -- and names none."""
         visiting: set[tuple[Any, Any]] = set()
-        CYCLE = -1
+        CYCLE, OFFSET = -1, -2   # OFFSET: a constant, which is never the base
 
         def of_var(v: Any, depth: int) -> int | None:
             node = (var_key(v), getattr(v, "version", None))
@@ -4378,25 +4383,39 @@ class TaintEngine:
                 return of_expr(getattr(defn, "src", None), depth + 1)
             return None
 
+        def pointer_param(idx: int) -> bool:
+            params = list(getattr(func, "parameter_vars", []) or [])
+            ptype = getattr(params[idx], "type", None) if idx < len(params) else None
+            tclass = getattr(ptype, "type_class", None)
+            return (str(getattr(tclass, "name", tclass)) == "PointerTypeClass"
+                    or str(ptype or "").rstrip().endswith("*"))
+
         def of_expr(e: Any, depth: int) -> int | None:
             if e is None or depth > 8:
                 return None
             op = op_name(e)
+            if op == "MLIL_CONST":
+                return OFFSET
             if op in ("MLIL_VAR_SSA", "MLIL_VAR_ALIASED"):
                 reads = expr_reads(e)
                 return of_var(reads[0], depth) if len(reads) == 1 else None
             if op in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
                 return of_expr(getattr(e, "src", None), depth + 1)
             if op == "MLIL_ADD":
-                sides = {of_expr(getattr(e, "left", None), depth + 1),
-                         of_expr(getattr(e, "right", None), depth + 1)} - {None, CYCLE}
-                return sides.pop() if len(sides) == 1 else None
+                left = of_expr(getattr(e, "left", None), depth + 1)
+                right = of_expr(getattr(e, "right", None), depth + 1)
+                for base, other in ((left, right), (right, left)):
+                    if base is None or base < 0:
+                        continue
+                    if other in (OFFSET, CYCLE) or (other is None and pointer_param(base)):
+                        return base
+                return OFFSET if left == right == OFFSET else None
             if op == "MLIL_SUB":
                 return of_expr(getattr(e, "left", None), depth + 1)
             return None
 
         found = of_expr(expr, 0)
-        return None if found in (None, CYCLE) else found
+        return found if isinstance(found, int) and found >= 0 else None
 
     def _caller_seed_fields(self, func: Any, ssaf: Any, pointer: Any) -> dict[str, Any]:
         """The :func:`misanchored_recv_leaf` keyword arguments that name the
