@@ -17,6 +17,7 @@ import bn.cli
 import pytest
 
 from bn.formatters import _render_grouped_leaves, _render_taint_text
+from bn_agent_bridge import read_taint_slice as rts
 
 KIND = "global_memory_continuation"
 GLOBALS = ("0x60a100", "0x60a200", "0x60a300")
@@ -96,6 +97,47 @@ def test_unmatched_resolve_map_pins_get_one_text_line():
 ])
 def test_no_resolve_map_line_when_all_matched_or_no_map(resolve_map):
     assert _resolve_rows(_render_taint_text(_taint_result(resolve_map))) == []
+
+
+class _OpCtx:
+    """The bridge context the taint op reads: one view, functions by name."""
+
+    def __init__(self, bv, functions) -> None:
+        self._bv, self._functions = bv, functions
+
+    def _resolve_view(self, selector):
+        return self._bv
+
+    def _find_function(self, bv, name):
+        return self._functions[name]
+
+
+@pytest.mark.parametrize(("program", "pin", "unmatched"), [
+    # A pin on a DIRECT call: the walk follows the call's real target and the
+    # pin routes nothing, so it stays unmatched and the line names it.
+    ("direct", "0x10", ["0x10"]),
+    # A pin on the unresolved indirect call: it routes the call, so it is
+    # matched and no line prints.
+    ("indirect", "0x70c", []),
+])
+def test_an_engine_run_reports_a_pin_matched_only_when_it_routed_a_call(
+        program, pin, unmatched):
+    """R3-02, the engine-level twin of the formatter tests above: every map
+    lookup used to mark its key matched, so a pin on a direct call (a helper
+    asked what the call was pinned to) was reported matched and its text
+    warning disappeared."""
+    from test_taint_c3_callee_and_continuation import _strcpy_shape
+    from test_taint_forward_seed import _dispatch_program
+
+    func, bv = _strcpy_shape("strcpy") if program == "direct" else _dispatch_program()
+    result = rts._taint_op(_OpCtx(bv, {"walked": func}), "active", {
+        "function": "walked", "sources": ["param:0"],
+        "resolve_map": {pin: ["0x500"]}, "resolve_map_path": "pins.json"})
+    rm = result["run_params"]["resolve_map"]
+    assert (rm["matched"], rm["unmatched"]) == ([] if unmatched else [pin], unmatched)
+    rows = _resolve_rows(_render_taint_text(result))
+    assert len(rows) == (1 if unmatched else 0)
+    assert all(address in rows[0] for address in unmatched)
 
 
 def _estimate_help(argv: list[str], capsys) -> str:

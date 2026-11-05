@@ -4630,9 +4630,9 @@ class TaintEngine:
         resolution. Returns ``([], None)`` for a direct call or no resolution."""
         if const_target(getattr(ins, "dest", None)) is not None:
             return [], None
-        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
+        mapped = self.resolve_map.select(int(getattr(ins, "address", 0)))
         if mapped:
-            return list(mapped), "agent-map"
+            return mapped, "agent-map"
         cands = self._call_targets_from_pvs(
             getattr(getattr(ins, "dest", None), "possible_values", None))
         return (cands, "value-set") if cands else ([], None)
@@ -8627,8 +8627,8 @@ class TaintEngine:
                     # (round-3 review R2).
                     cfn for cfn in (
                         function_at(self.bv, int(t))
-                        for t in (self.resolve_map.get(
-                            int(getattr(defn, "address", 0))) or ()))
+                        for t in self.resolve_map.select(
+                            int(getattr(defn, "address", 0))))
                     if cfn is not None]
                 for cand in bodies:
                     if self._fn_returns_pointer(
@@ -11223,7 +11223,7 @@ class TaintEngine:
             elif not self._is_indirect_transfer(ins):
                 continue
             addr = int(getattr(ins, "address", 0))
-            targets = tuple(self.resolve_map.get(addr) or ()) or tuple(
+            targets = tuple(self.resolve_map.select(addr)) or tuple(
                 self._call_targets_from_pvs(
                     getattr(getattr(ins, "dest", None), "possible_values", None)))
             if targets:
@@ -12521,7 +12521,7 @@ class TaintEngine:
                 if target is not None:
                     cands = (target,)
                 else:
-                    cands = tuple(self.resolve_map.get(addr) or ()) or tuple(
+                    cands = tuple(self.resolve_map.select(addr)) or tuple(
                         self._call_targets_from_pvs(
                             getattr(getattr(ins, "dest", None), "possible_values", None)))
                 global_call_targets[addr] = cands
@@ -14021,9 +14021,9 @@ class TaintEngine:
                     if target is not None:
                         candidates, via = [target], None
                     else:
-                        mapped = self.resolve_map.get(int(getattr(ins, "address", 0)))
+                        mapped = self.resolve_map.select(int(getattr(ins, "address", 0)))
                         if mapped:
-                            candidates = list(mapped)
+                            candidates = mapped
                             via = "agent-map"
                         else:
                             candidates = self._call_targets_from_pvs(
