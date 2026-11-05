@@ -378,3 +378,90 @@ def test_a_user_type_still_outranks_a_declaration(models):
     assert FDataVar(G_DIR, 16, auto=False).auto_discovered is False
     eng = te.TaintEngine(bv, models)
     assert eng._global_extent(G_DIR) == 16
+
+
+# --------------------------------------------------------------------------
+# V3-01: the seeded function's own read of a static, before its store
+# --------------------------------------------------------------------------
+
+class _Block:
+    """One IL basic block, as `_reaches_avoiding` reads it."""
+
+    def __init__(self, start, end):
+        self.start, self.end = start, end
+        self.outgoing_edges = []
+
+
+def _static_index_fn(*, read_first):
+    """`int next_tok(int n) { x = n; c = g; g = n; return c; }`: the load of
+    the static `g` either precedes the tainting store (its NEXT activation
+    reads this call's input) or follows it (it reads this call's own value,
+    which the walk followed)."""
+    n, c, x = FVar("n"), FVar("c"), FVar("x")
+    n0, c1, x1 = FSSA(n, 0), FSSA(c, 1), FSSA(x, 1)
+    start = 0x401100
+    load = FExpr("MLIL_LOAD_SSA", f"[{hex(G_DIR)}].d", src=_gptr(G_DIR))
+    load.size = 4
+    copy = FInstr(0, start + 4, "MLIL_SET_VAR_SSA", "x#1 = n#0", reads=[n0], writes=[x1],
+                  src=_var(n0))
+    read = FInstr(0, 0, "MLIL_SET_VAR_SSA", f"c#1 = [{hex(G_DIR)}].d", writes=[c1], src=load)
+    store = FInstr(0, 0, "MLIL_STORE_SSA", f"[{hex(G_DIR)}].d = x#1",
+                   reads=[x1], dest=_gptr(G_DIR), src=_var(x1))
+    store.size = 4
+    body = [copy, read, store] if read_first else [copy, store, read]
+    ret = FInstr(3, start + 16, "MLIL_RET", "return c#1", reads=[c1], src=[_var(c1)])
+    instrs = [*body, ret]
+    block = _Block(0, len(instrs))
+    for i, ins in enumerate(instrs):
+        ins.instr_index = i
+        ins.address = start + 4 * (i + 1)
+        ins.il_basic_block = block
+    func = GFunc("next_tok", start, FSSAFunc(instrs), params=[n])
+    refs = {G_DIR: [FRef(func, int(read.address)), FRef(func, int(store.address))]}
+    return func, read, store, FGlobalBV({}, funcs={start: func}, refs=refs)
+
+
+def test_a_static_the_function_reads_before_storing_blocks(models):
+    func, read, store, bv = _static_index_fn(read_first=True)
+    result = _forward(bv, func, models, source="param:0")
+    [leaf] = _leaves(result, COARSE)
+    assert leaf["address"] == hex(int(store.address)), leaf
+    assert leaf["self_reread"] is True, leaf
+    assert [(r["name"], r["at"], r["access"], r["offset"], r["offset_known"])
+            for r in leaf["references"]] == [
+        ("next_tok", hex(int(read.address)), "load", 0, True)], leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+
+def test_a_static_read_only_after_its_store_stays_clear(models):
+    # The precision boundary: every read follows the tainting store, so it
+    # reads this activation's own value -- which the walk followed.
+    func, _read, _store, bv = _static_index_fn(read_first=False)
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result, COARSE) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+# --------------------------------------------------------------------------
+# V3-02: a code reference no lifted instruction names is no reader
+# --------------------------------------------------------------------------
+
+def test_a_reference_the_lifted_body_never_names_is_not_a_reader(models):
+    # On ARM a PC-relative base (`add r3, pc`) lands inside the tainted
+    # static while the load it feeds reads another object; BN records the
+    # base as a code reference and the MLIL folds it away. That reference
+    # was cited as an `unclassified` read at offset 0 of the static.
+    func, bv = _fill_program(other_reader=False)
+    flag = FExpr("MLIL_LOAD_SSA", f"[{hex(G_OTHER)}].d", src=_gptr(G_OTHER))
+    v1 = FSSA(FVar("v"), 1)
+    pic_user = GFunc("log_flagged", 0x401200, FSSAFunc([
+        FInstr(0, 0x401212, "MLIL_SET_VAR_SSA", f"v#1 = [{hex(G_OTHER)}].d",
+               writes=[v1], src=flag),
+        FInstr(1, 0x401216, "MLIL_RET", "return v#1", reads=[v1], src=[_var(v1)]),
+    ]), params=[])
+    bv._names[0x401200] = "log_flagged"
+    bv._funcs[0x401200] = pic_user
+    bv._refs[G_DIR].append(FRef(pic_user, 0x401210))
+    result = _forward(bv, func, models, source="param:0")
+    assert _leaves(result, COARSE) == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True

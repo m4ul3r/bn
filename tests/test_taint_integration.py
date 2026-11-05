@@ -7679,3 +7679,37 @@ def test_callee_rule_and_continuation_reseed_on_a_real_binary(tmp_path, shared_b
     [hit] = inside["reached_sinks"]
     assert (hit["sink"]["callee"], hit["sink"]["class"]) == ("malloc", "alloc_size"), hit
     assert hit["metrics"]["steps"] > 1, hit
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1"], ids=["O0", "O1"])
+def test_a_static_the_seeded_function_reads_before_its_store_blocks(tmp_path, shared_bn, opt):
+    """V3-01 on `taint_corpus/fwd_static_reread.c`.
+
+    `next_index` loads its static `cursor` to index a table, then stores this
+    call's `read()` input into it and returns. Head (b075c82c) and the first
+    fixed integration answered `safe_to_report_all_clear: true` with no leaf:
+    the exit frontier skipped the seeded function's own references as "already
+    walked", but this load ran BEFORE the store and sees it only on the next
+    activation. Base (632891c9) kept an unkeyed `coarse_memory_store`."""
+    binary = tmp_path / f"fwd_static_reread{opt[-1]}"
+    _compile(CORPUS / "fwd_static_reread.c", binary, [opt])
+    target = shared_bn.load(binary, copy=False)
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "next_index",
+                      "--source", "call:read")
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+    [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    assert store["self_reread"] is True, store
+    [row] = store["references"]
+    assert (row["display_name"], row["access"]) == ("next_index", "load"), store
+    xrefs = _bn_json(shared_bn, "-t", target, "xrefs", store["global"]["address"])
+    sites = {r["address"] for r in xrefs["items"]
+             if r.get("kind") == "code" and r.get("function") == "next_index"}
+    assert row["at"] in sites, (row, sites)
+    # The load precedes the tainting store in the body.
+    assert int(row["at"], 16) < int(store["address"], 16), store
+
+    control = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "latest_index",
+                       "--source", "call:read")
+    assert not [lf for lf in control["leaves"] if lf["kind"] == "coarse_memory_store"], \
+        control["leaves"]
