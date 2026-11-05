@@ -1050,13 +1050,23 @@ def _plain_length_program(callee, *, sized_destination=False):
             F.FBV({0x901: callee, 0x902: "malloc"}))
 
 
+def _counted(F, expr):
+    """*expr* read where `if (n <= 0) return;` dominates it: BN's value set is
+    ``1..0x40``, so the receive's return is a byte count, never its -1
+    failure (an unchecked return bounds nothing, V7-01)."""
+    expr.size = 8
+    expr.possible_values = F.FPVS("SignedRangeValue")
+    expr.possible_values.ranges = [F.types.SimpleNamespace(start=1, end=0x40, step=1)]
+    return expr
+
+
 def _bounded_receive_program(callee):
-    """``n = read(3, &src, 0x40); callee(3, &dst, n)``.
+    """``n = read(3, &src, 0x40); if (n <= 0) return; callee(3, &dst, n)``.
 
     The #159 idiom `_comment_recv_overflow` itself names as the ~100%-false-
-    positive one: the length is the return of a modeled receive provably
-    bounded by a constant count, so the honest verdict is `bounded_len` with
-    that bound, not an overflow.
+    positive one: the length is the checked return of a modeled receive
+    provably bounded by a constant count, so the honest verdict is
+    `bounded_len` with that bound, not an overflow.
     """
     F = _fakes()
     n1 = F.FSSA(F.FVar("n"), 1)
@@ -1066,7 +1076,8 @@ def _bounded_receive_program(callee):
                  params=[F.FExpr("MLIL_CONST", "3", constant=3),
                          F.FExpr("MLIL_ADDRESS_OF", "&src", src=F.FVar("src", typ="char[0x40]")),
                          F.FExpr("MLIL_CONST", "0x40", constant=0x40)]),
-        _call_under_test(F, callee, 1, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]), [n1],
+        _call_under_test(F, callee, 1, _counted(F, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])),
+                         [n1],
                          F.FExpr("MLIL_ADDRESS_OF", "&dst", src=F.FVar("dst", typ="char[0x10]"))),
     ]
     return (F.FFunc("handler", 0x10, F.FSSAFunc(instrs)),
@@ -1200,7 +1211,8 @@ def test_fortified_entries_whose_base_has_no_sink_stay_sinkless_876(base):
 
 
 def _twin_as_bounding_source_program(callee):
-    """``n = callee(3, &buf, 0x40); memcpy(&dst, &buf, n); system(&dst)``.
+    """``n = callee(3, &buf, 0x40); if (n <= 0) return; memcpy(&dst, &buf, n);
+    system(&dst)``.
 
     Drives the read-family entry as a SOURCE rather than as a sink, which is
     the half its `sources` and `return_bound` fields describe and the A/B
@@ -1231,7 +1243,7 @@ def _twin_as_bounding_source_program(callee):
                  dest=F.FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
                  params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
                          F.FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
-                         F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+                         _counted(F, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]))]),
         F.FInstr(2, 0x30, "MLIL_CALL_SSA", "system(&dst)", writes=[],
                  dest=F.FExpr("MLIL_CONST_PTR", "0x2020", constant=0x2020),
                  params=[F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)]),
@@ -1311,7 +1323,7 @@ def _copy_program(callee, *, tainted_length=True):
 
 
 def _bounded_copy_program(callee):
-    """``n = read(3, &src, 0x40); callee(&dst, &src, n[, guard])``.
+    """``n = read(3, &src, 0x40); if (n <= 0) return; callee(&dst, &src, n[, guard])``.
 
     The #159 idiom again, aimed at the copy family: the length is a modeled
     receive return provably bounded by a constant count, so the honest verdict
@@ -1323,7 +1335,7 @@ def _bounded_copy_program(callee):
     src = F.FVar("src", typ="char[0x40]"); dst = F.FVar("dst", typ="char[0x10]")
     params = [F.FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
               F.FExpr("MLIL_ADDRESS_OF", "&src", src=src),
-              F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]
+              _counted(F, F.FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]))]
     if callee.endswith("_chk"):
         params.append(F.FExpr("MLIL_CONST", "0x10", constant=0x10))
     instrs = [

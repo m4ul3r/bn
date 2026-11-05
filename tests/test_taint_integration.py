@@ -7719,29 +7719,71 @@ def _fill_copy_sink(tmp_path, shared_bn, arch, guard):
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])
+@pytest.mark.parametrize("guard", ["if (got <= 0) return 0;", "if (got == -1) return 0;"],
+                         ids=["count-checked", "minus-one-checked"])
 def test_a_fill_return_copied_back_out_of_its_own_buffer_is_not_an_overread(
-        tmp_path, shared_bn, arch):
+        tmp_path, shared_bn, arch, guard):
     """W01-10: `got = recv(s, scratch, sizeof scratch, 0); if (got <= 0)
     return 0;` then `memcpy(calloc(1, got), scratch, got)` reads back only the
     bytes recv wrote into `scratch`: the destination-bounded copy stays
-    bounded_len and names the fill, instead of an overread_len of `scratch`."""
-    sink = _fill_copy_sink(tmp_path, shared_bn, arch, "if (got <= 0) return 0;")
+    bounded_len and names the fill, instead of an overread_len of `scratch`.
+    A dominating `got == -1` test proves the same (V7-01): recv returns -1 or
+    a count, though BN's value set is not narrowed by it."""
+    sink = _fill_copy_sink(tmp_path, shared_bn, arch, guard)
     assert sink["class"] == "bounded_len", sink
     assert sink["src_fill"]["callee"] == "recv", sink
     assert int(sink["src_fill"]["at"], 16) < int(sink["address"], 16), sink
+    assert "return_unchecked" not in sink, sink
 
 
 @pytest.mark.parametrize("arch", ["a64", "x64"])
-@pytest.mark.parametrize("guard", ["", "if (got == -1) return 0;"],
-                         ids=["unchecked", "minus-one-only"])
 def test_an_unchecked_fill_return_copied_back_out_of_its_buffer_overreads_it(
-        tmp_path, shared_bn, arch, guard):
-    """R3-01: without a check BN narrows to a non-negative range, recv's -1
-    reaches the copy as SIZE_MAX, so `scratch` is over-read: no `src_fill`."""
-    sink = _fill_copy_sink(tmp_path, shared_bn, arch, guard)
+        tmp_path, shared_bn, arch):
+    """R3-01: without a check, recv's -1 reaches the copy as SIZE_MAX, so
+    `scratch` is over-read: no `src_fill`, and `return_unchecked` (V7-01)."""
+    sink = _fill_copy_sink(tmp_path, shared_bn, arch, "")
     assert sink["class"] == "overread_len", sink
     assert "src_fill" not in sink, sink
     assert sink["src_capacity_source"], sink
+    assert sink.get("return_unchecked") is True, sink
+
+
+_RECV_COPY_SOURCE = """
+extern long recv(int, void *, unsigned long, int);
+extern void *memcpy(void *, const void *, unsigned long);
+__attribute__((noinline)) void pull(int sock, char *dst) {
+    char scratch[64];
+    TYPE got = recv(sock, scratch, sizeof(scratch), 0);
+    GUARD
+    memcpy(dst, scratch, got);
+}
+int main(void) { char out[128]; pull(0, out); return out[0]; }
+"""
+
+
+@pytest.mark.parametrize("arch", ["a64", "x64"])
+@pytest.mark.parametrize("width", ["long", "int"])
+@pytest.mark.parametrize("guard, bounded", [
+    ("", False), ("if (got == -1) return;", True), ("if (got <= 0) return;", True)],
+    ids=["unchecked", "minus-one-checked", "count-checked"])
+def test_a_receive_return_bounds_a_copy_only_when_the_path_checks_it(
+        tmp_path, shared_bn, arch, width, guard, bounded):
+    """V7-01: `long got = recv(s, scratch, 64, 0); memcpy(dst, scratch, got)`
+    with no check was `bounded_len` by recv's count, though BN's value set
+    for the length is undetermined and its -1 failure is SIZE_MAX at the
+    copy. Bounded only behind a check; otherwise `overflow_len` with
+    `return_unchecked`."""
+    source = _RECV_COPY_SOURCE.replace("TYPE", width).replace("GUARD", guard)
+    binary = _build_arch(tmp_path, arch, f"recv_copy_{width}", source)
+    target = shared_bn.load(binary, copy=False)
+    result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", "pull",
+                      "--source", "call:recv")
+    [sink] = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    if bounded:
+        assert (sink["class"], sink.get("source_bound")) == ("bounded_len", "0x40"), sink
+        assert "return_unchecked" not in sink, sink
+    else:
+        assert (sink["class"], sink.get("return_unchecked")) == ("overflow_len", True), sink
 
 
 _ARGV_COPY_SOURCE = """
