@@ -16286,18 +16286,13 @@ class TaintEngine:
         # frontier, which names the object the sink actually read.
         may_writers = 0
 
-        def _set_origin(o, *, weak: int | bool = 0):
+        def _place_origin(o, rank: int) -> None:
+            """Record origin *o* at *rank* (0 best): a formal is kept for the
+            ascent, anything else is a producer; a call's return at rank 1 is
+            a root of its own; the best-ranked origin represents the slice."""
             nonlocal origin, origin_rank
             o["function"] = fn_ref
-            if weak is True:
-                rank = 3
-            elif weak:
-                rank = int(weak) + 1
-            else:
-                rank = 0 if o.get("kind") == "parameter" else 1
-            if may_writers and rank == 1:
-                rank = 2
-            if rank == 0:
+            if rank == 0 and o.get("kind") == "parameter":
                 param_origins.setdefault(int(o["index"]), o)
             elif o not in producers:
                 producers.append(o)
@@ -16307,13 +16302,32 @@ class TaintEngine:
                 origin = o
                 origin_rank = rank
 
+        def _set_origin(o, *, weak: int | bool = 0):
+            if weak is True:
+                rank = 3
+            elif weak:
+                rank = int(weak) + 1
+            else:
+                rank = 0 if o.get("kind") == "parameter" else 1
+            if may_writers and rank == 1:
+                rank = 2
+            _place_origin(o, rank)
+
         def _set_source_origin(o):
             """A modeled source's return IS the value: it represents the slice
             over anything else, a formal found before or after it included.
             Pinned at the top rank, so a later weak origin cannot displace it
             (the outright assignment left a stale rank that could). A formal
-            beside it still ascends on its own (IC01)."""
+            beside it still ascends on its own (IC01).
+
+            Except behind a may-alias store: what that store wrote only MAY be
+            the loaded bytes, so the source is evidence ranked like any other
+            producer there, never the root over the load's own frontier
+            (R2-03)."""
             nonlocal origin, origin_rank
+            if may_writers:
+                _place_origin(o, 2)
+                return
             o["function"] = fn_ref
             if o not in producers:
                 producers.append(o)

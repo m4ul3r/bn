@@ -519,20 +519,41 @@ def test_backward_next_action_prints_only_a_complete_forward_command(leaf, comma
         assert command in text, text
 
 
-def test_a_global_load_behind_a_may_alias_store_is_the_origin():
+@pytest.mark.parametrize("stored", ["pointer_load", "modeled_source"])
+def test_a_global_load_behind_a_may_alias_store_is_the_origin(stored):
     # W02-10: the length is a byte loaded from a writable global; a later
     # store through a pointer the walk cannot prove disjoint MAY have written
-    # it. That store's value comes from another unresolved load, whose
-    # frontier used to represent the slice -- naming an anonymous pointer
-    # load instead of the global the sink actually read.
+    # it. What that store wrote -- another unresolved load, or a modeled
+    # source's return (R2-03) -- used to represent the slice, naming the
+    # store's value instead of the global the sink actually read.
     g = 0x402010
     p = _FieldProgram()
-    p.store(p.addr(p.n0, 0), 1, p.load(p.addr(p.m0, 0x28), 8))
+    if stored == "modeled_source":
+        r1 = FSSA(FVar("r", ident=6), 1)
+        i, a = p._at()
+        p.instrs.append(FInstr(i, a, "MLIL_CALL_SSA", "r#1 = recv(src#0, d, 8, 0)",
+                               reads=[p.src0], writes=[r1],
+                               dest=FExpr("MLIL_CONST_PTR", hex(_RECV), constant=_RECV),
+                               params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[p.src0]),
+                                       FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                                       FExpr("MLIL_CONST", "8", constant=8),
+                                       FExpr("MLIL_CONST", "0", constant=0)]))
+        value = FExpr("MLIL_VAR_SSA", "r#1", reads=[r1])
+    else:
+        value = p.load(p.addr(p.m0, 0x28), 8)
+    p.store(p.addr(p.n0, 0), 1, value)
     p.sink(p.load(FExpr("MLIL_CONST_PTR", hex(g), constant=g), 1))
     result, origins, reasons, fields = p.run(writable=True)
     assert any("may write the loaded bytes" in r for r in reasons), reasons
-    assert origins[0]["kind"] == "field_load_unresolved", origins
-    assert origins[0]["base"] == hex(g), origins
-    # The may-alias store's own provenance stays disclosed as a frontier.
-    assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
+    assert [(o["kind"], o.get("base")) for o in origins] == [("field_load_unresolved", hex(g))]
+    # The may-alias store's own provenance stays disclosed: the pointer
+    # load as its frontier; the source as a step of the slice, never its
+    # root.
+    if stored == "modeled_source":
+        steps = [st for sl in result["slices"] for st in sl["slice"]]
+        assert any(st.get("callee") == "recv" or "recv" in st.get("reason", "")
+                   for st in steps), steps
+    else:
+        assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
+    assert hex(g) in {lf["base"] for lf in fields}, fields
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
