@@ -6760,6 +6760,7 @@ def _render_data_symbols_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     syms = _field_list(value, "items")  # #275: was `syms`
+    page_unreadable = _field_skewed("items")
     if not syms:
         # #682 item 4: a bare "none" reads as "this view has no data symbols",
         # which is wrong -- and most misleading in the case that produces it,
@@ -6774,20 +6775,11 @@ def _render_data_symbols_text(value: Any) -> str:
     body = "\n".join(
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
         for sym in syms)
-    if value.get("has_more"):
-        # Reaches arithmetic, so it goes through the count choke point rather
-        # than a silent default: one count contract, not two (#619).
-        shown = _count_field(value, "offset") + len(syms)
-        if _field_skewed("offset"):
-            # An ACTIONABLE number: a resume offset fabricated from an
-            # unreadable page position sends a pager back over a window it
-            # already read, or loops it on page one (#722's harm class).
-            body += (f"\n// showing {len(syms)} of {value.get('total', '?')}"
-                     f"; page position unreadable -- re-read with --format json")
-        else:
-            body += (f"\n// showing {shown} of {value.get('total', '?')}"
-                     f"; resume with --offset {shown}")
-    return body
+    # P3: the shared footer every other listing prints. This one hand-rolled
+    # `// showing <offset + rows> of TOTAL`, so a second page of three read
+    # "showing 6 of 21": the NEXT offset where a reader expects the row count.
+    footer = _paging_footer(value, syms, page_unreadable)
+    return body if footer is None else f"{body}\n\n{footer}"
 
 
 @_discloses

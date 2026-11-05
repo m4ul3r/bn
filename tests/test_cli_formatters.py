@@ -4600,6 +4600,13 @@ def test_no_renderer_states_a_count_it_could_not_read_as_a_real_number():
         "stated in this context]",
         "_render_backward_diagnostics(unresolved) [count not stated in this "
         "context]",
+        # P3: the page footer now comes from `_paging_footer` (covered there),
+        # so the renderer's own `offset`/`total` reads are only the past-the-end
+        # note of an EMPTY page, which a probe that fills the page never opens.
+        # Covered by
+        # test_render_data_symbols_empty_page_past_the_end_discloses_the_total.
+        "_render_data_symbols_text(offset) [count not stated in this context]",
+        "_render_data_symbols_text(total) [count not stated in this context]",
         "_render_go_rename_text(defined_count) [count not stated in this context]",
         # The same branch for the #818 skip buckets: the recorded context opens
         # the detail branch (`go_renamed_candidates` readable and non-zero), and
@@ -10487,3 +10494,14 @@ def test_proto_text_prints_entry_value_and_undefined_type_notes_1013():
     })
     assert "\n\nnote: At 2 of 2 direct call sites ..." in text
     assert "\n\nnote: run `bn types declare 'struct `ns::Cls`;'` first." in text
+
+
+def test_data_symbols_footer_states_the_rows_shown_and_the_next_offset():
+    # P3: the second page of three printed "showing 6 of 21" -- the next
+    # offset where the row count belongs. The footer is the shared one.
+    from bn.formatters import _render_data_symbols_text
+    page = {"kind": "data_symbols", "items": [{"a": "0x404010", "n": f"g_slot{i}"}
+                                              for i in range(3)],
+            "total": 21, "offset": 3, "limit": 3, "returned": 3, "has_more": True}
+    assert _render_data_symbols_text(page).splitlines()[-1] == (
+        "// showing 3 of 21 (15 more); rerun with --offset 6 or a larger --limit")
