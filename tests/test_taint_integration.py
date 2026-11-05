@@ -787,13 +787,17 @@ char g_buf[64];
 volatile int sink_seen;
 N void consume(const char *p, int n) { sink_seen = n + (p != 0); }
 N char *make_rec(int n) { char *r = malloc(32); memset(r, 0, 32); r[0] = (char)n; return r; }
+__attribute__((noinline, optimize("O2"))) char *acquire(size_t n) { return malloc(n); }
 N void case_literal(int c) { consume(c ? (const char *)0 : (const char *)1, c); }
 N void case_wrapper(int n) { char *r = make_rec(n); consume(r, n); }
 N void case_malloc(int n) { char *r = malloc(n); consume(r, n); }
+N void case_sized(int n) { char *r = malloc(48); consume(r, n); }
+N void case_tail_wrapper(int n) { char *r = acquire((size_t)n); consume(r, n); }
+N void case_realloc(char *old, int n) { char *r = realloc(old, (size_t)n); consume(r, n); }
 N void case_rodata(void) { consume("hello", 2); }
 N void case_global(void) { consume(g_buf, 3); }
-int main(int c, char **v) { case_literal(c); case_wrapper(c); case_malloc(c);
-    case_rodata(); case_global(); return v != 0; }
+int main(int c, char **v) { case_literal(c); case_wrapper(c); case_malloc(c); case_sized(c);
+    case_tail_wrapper(c); case_realloc(v[0], c); case_rodata(); case_global(); return v != 0; }
 """
 
 
@@ -802,7 +806,9 @@ def test_pointer_object_kinds_say_what_bn_maps(tmp_path, shared_bn):
     by what BN says about it. `0`/`1` were "literal ... in a read-only
     segment" though nothing is mapped there; a block `malloc` returned "may
     point into" its size argument, and a wrapper's never named the
-    allocator."""
+    allocator. G5c: the block's size is stated (a constant, or the size
+    argument), a wrapper that is one `jmp malloc` names it too, and the
+    block `realloc` returns may be the one it was handed."""
     src = tmp_path / "objs.c"
     src.write_text(_POINTER_OBJECTS_SRC)
     binary = tmp_path / "objs"
@@ -817,10 +823,15 @@ def test_pointer_object_kinds_say_what_bn_maps(tmp_path, shared_bn):
 
     assert {(o["kind"], o.get("value"), "address" in o) for o in objects("case_literal")} \
         == {("literal_value", 0, False), ("literal_value", 1, False)}
-    for fn, callee in [("case_wrapper", "make_rec"), ("case_malloc", "malloc")]:
+    for fn, callee, size in [("case_wrapper", "make_rec", 32), ("case_malloc", "malloc", None),
+                             ("case_sized", "malloc", 48), ("case_tail_wrapper", "acquire", None)]:
         [obj] = objects(fn)
         assert (obj["kind"], obj["callee"], obj["allocator"], obj["may_point_into"]) \
             == ("returned", callee, "malloc", []), (fn, obj)
+        assert obj.get("size") == size and ("size_expr" in obj) is (size is None), (fn, obj)
+    [obj] = objects("case_realloc")
+    assert (obj["kind"], obj["allocator"]) == ("returned", "realloc"), obj
+    assert [(o["kind"], o.get("index")) for o in obj["may_point_into"]] == [("parameter", 0)], obj
     assert [(o["kind"], o["segment_writable"]) for o in objects("case_rodata")] \
         == [("literal", False)]
     assert [(o["kind"], o["segment_writable"]) for o in objects("case_global")] \

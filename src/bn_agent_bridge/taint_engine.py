@@ -30,6 +30,7 @@ import bisect
 import contextlib
 import itertools
 import json
+import math
 import re
 import shlex
 from typing import Any, NamedTuple
@@ -354,6 +355,19 @@ class _Recurrence(NamedTuple):
     increments: list[int] | None
     calls: tuple[str, ...]
     exhausted: bool
+
+
+class _Allocation(NamedTuple):
+    """The fresh block a call returns (:meth:`TaintEngine._returned_allocator`).
+
+    ``allocator``: the allocator named (several, comma-joined, when a
+    wrapper's returns come from different ones); ``size``: the operands whose
+    product is the requested size, each ``("arg", i)`` -- the call's own
+    argument *i* -- or ``("const", n)``, or None when no single size is
+    recoverable (G5-R4)."""
+
+    allocator: str
+    size: tuple[tuple[str, int], ...] | None
 
 
 class _SettleFrame:
@@ -2552,16 +2566,31 @@ class TaintEngine:
     _ALLOCATOR_SINK_CLASS = "alloc_size"
 
     def _returned_allocator(self, call: Any, name: str | None,
-                            model: dict[str, Any] | None) -> str | None:
+                            model: dict[str, Any] | None) -> _Allocation | None:
         """The allocator whose fresh block the call *call* returns: *name*
         itself when its model is an allocator's (``sink.class ==
         "alloc_size"``: malloc, calloc, g_slice_alloc, ...), else -- for an
-        in-binary callee -- the allocator every one of its returns yields
-        (`rec = g_slice_alloc0(n); rec->x = ..; return rec;`). None
-        otherwise. Describes a pointer only; never decides completeness."""
-        if self._is_allocator_model(model):
-            return name
+        in-binary callee -- the allocator every one of its exits yields: each
+        return hands back an allocator's result (`rec = g_slice_alloc0(n);
+        rec->x = ..; return rec;`), or the exit IS a tail call to one (an
+        optimised `return malloc(n)`, G5-R2). The size is the model's size
+        operands, mapped through a wrapper to the call's own arguments where
+        the wrapper passes them straight through (G5-R4). None otherwise.
+        Describes a pointer only; never decides completeness."""
+        if name and self._is_allocator_model(model):
+            return _Allocation(name, tuple(("arg", i) for i in self._size_args(model)))
         fn = function_at(self.bv, const_target(getattr(call, "dest", None)))
+        if fn is not None and self._not_internal_reason(fn) == "thunk":
+            # A pure veneer (`jmp malloc`) forwards every formal in order, so
+            # the allocator it fronts sizes the block by the call's own
+            # arguments (G5-R2).
+            target = self._follow_thunk_cached(fn)
+            tname = (self._callee_name(int(getattr(target, "start", 0)))
+                     if target is not None else None)
+            tmodel = lookup_model(self.models, tname)[1] if tname else None
+            if self._is_allocator_model(tmodel):
+                return _Allocation(tname, tuple(("arg", i) for i in self._size_args(tmodel)))
+            fn = target
         if fn is None or not self._is_internal(fn):
             return None
         ssaf = self._ssa_or_none(fn)
@@ -2569,21 +2598,87 @@ class TaintEngine:
             return None
         instrs = list(self._instrs(ssaf))
         allocs: dict[tuple, str] = {}
+        sites: list[tuple[Any, str]] = []
+        tails = 0
         for ins in instrs:
             if not self._is_call(ins):
                 continue
             inner = self._callee_name(self._resolve_direct_target(ins))
-            if inner and self._is_allocator_model(lookup_model(self.models, inner)[1]):
+            allocating = bool(inner) and self._is_allocator_model(
+                lookup_model(self.models, inner)[1])
+            if "TAILCALL" in op_name(ins):
+                if not allocating:
+                    return None
+                tails += 1
+                sites.append((ins, inner))
+            elif allocating:
+                sites.append((ins, inner))
                 for w in ssa_writes(ins):
                     allocs[self._ssa_var_key(w)] = inner
         rets = [i for i in instrs if op_name(i) in ("MLIL_RET", "MLIL_RET_SSA")]
-        if not allocs or not rets:
+        if not rets and not tails:
             return None
-        if not all(srcs and all(self._value_is_one_of(ssaf, s, set(allocs)) for s in srcs)
-                   for srcs in (self._ret_sources(r) for r in rets)):
+        if rets and (not allocs or not all(
+                srcs and all(self._value_is_one_of(ssaf, s, set(allocs)) for s in srcs)
+                for srcs in (self._ret_sources(r) for r in rets))):
             return None
-        names = sorted(set(allocs.values()))
-        return names[0] if len(names) == 1 else ", ".join(names)
+        names = sorted({inner for _ins, inner in sites})
+        sizes = {self._wrapper_size(fn, ssaf, ins, inner) for ins, inner in sites}
+        return _Allocation(names[0] if len(names) == 1 else ", ".join(names),
+                           sizes.pop() if len(sizes) == 1 else None)
+
+    def _size_args(self, model: dict[str, Any] | None) -> list[int]:
+        """The arguments an allocator model sizes the block by (its
+        ``alloc_size`` sink's ``tainted_args``: `malloc`'s 0, `calloc`'s 0
+        and 1, `realloc`'s 1)."""
+        return [i for i in ((model or {}).get("sink") or {}).get("tainted_args") or []
+                if isinstance(i, int) and not isinstance(i, bool)]
+
+    def _wrapper_size(self, fn: Any, ssaf: Any, call: Any,
+                      name: str) -> tuple[tuple[str, int], ...] | None:
+        """The size operands of the allocator call *call* inside wrapper
+        *fn*, in terms of *fn*'s own arguments (``("arg", i)``) or constants
+        (``("const", n)``); None when one is computed in the body."""
+        params = self._call_params(call)
+        out: list[tuple[str, int]] = []
+        for i in self._size_args(lookup_model(self.models, name)[1]):
+            if i >= len(params):
+                return None
+            const = self._int_const(params[i])
+            pidx = None if const is not None else self._resolve_to_param_index(
+                fn, ssaf, params[i])
+            if const is not None:
+                out.append(("const", int(const)))
+            elif pidx is not None:
+                out.append(("arg", int(pidx)))
+            else:
+                return None
+        return tuple(out) or None
+
+    def _allocation_fields(self, allocation: _Allocation, params: list) -> dict[str, Any]:
+        """A `returned` object's allocator fields at the call whose arguments
+        are *params*: ``allocator``, and the requested size -- ``size`` (bytes)
+        when every size operand is a constant, else ``size_expr`` (the
+        operands' product as BN prints them). No size key when none is
+        recoverable (G5-R4)."""
+        out: dict[str, Any] = {"allocator": allocation.allocator}
+        operands: list[Any] = []
+        for kind, value in allocation.size or ():
+            if kind == "const":
+                operands.append(value)
+                continue
+            if value >= len(params):
+                return out
+            const = self._int_const(params[value])
+            operands.append(int(const) if const is not None else params[value])
+        if not operands:
+            return out
+        if all(isinstance(o, int) for o in operands):
+            out["size"] = math.prod(operands)
+        else:
+            out["size_expr"] = " * ".join(hex(o) if isinstance(o, int) else str(o)
+                                          for o in operands)
+        return out
 
     def _is_allocator_model(self, model: dict[str, Any] | None) -> bool:
         sink = (model or {}).get("sink")
@@ -18818,12 +18913,15 @@ class TaintEngine:
             if o["kind"] == "returned":
                 inner = ", ".join(say(i) for i in o["may_point_into"])
                 return (f"the pointer {_code(o['object'])} returned"
-                        + (f" (a block {_code(o['allocator'])} allocated)"
+                        + (f" (a block {_code(o['allocator'])} allocated"
+                           + (f", {o['size']:#x} bytes" if isinstance(o.get("size"), int)
+                              else f", {_code(o['size_expr'])} bytes" if o.get("size_expr")
+                              else "") + ")"
                            if o.get("allocator") else "")
                         + (f", into {inner}" if inner else "")
                         + (f" ({o['note']})" if o.get("note") else ""))
             if o["kind"] == "literal_value":
-                return f"literal value {_code(o['object'])} (no mapped address)"
+                return f"literal value {_code(o['object'])} (not an address)"
             extra = []
             if "offset" in o:
                 extra.append(f"offset {o['offset']:#x}" if isinstance(o["offset"], int)
@@ -19042,10 +19140,14 @@ class TaintEngine:
             c = self._int_const(expr)
             if c is None:
                 return [{"kind": "unknown", "object": str(expr)}]
-            if self._is_unmapped(c):
+            if self._is_unmapped(c) or ("PTR" not in op
+                                        and not self._pointer_width(getattr(expr, "size", None))):
                 # `consume(0)`, `consume((char *)1)`: no byte lives there, so
                 # it is a literal VALUE, never an address the sink may read --
-                # nor one "in a read-only segment" (V8-01).
+                # nor one "in a read-only segment" (V8-01). So is a constant
+                # narrower than a pointer that BN did not type as one, whatever
+                # its number happens to map to (G5-R3): only a `CONST_PTR` or a
+                # pointer-width constant in this pointer role is an address.
                 return [{"kind": "literal_value", "object": str(expr), "value": c}]
             storage = self._const_ptr_storage(c)
             seg = None
@@ -19121,9 +19223,9 @@ class TaintEngine:
                 # of which is one's result -- hands back a block of its own:
                 # its arguments are a size, not objects it points into, so
                 # only what its model names is listed (V8-01).
-                allocator = self._returned_allocator(d, name, model)
+                allocation = self._returned_allocator(d, name, model)
                 picked = ([params[i] for i in want if i < len(params)]
-                          if want or allocator else params)
+                          if want or allocation else params)
                 inner: list[dict[str, Any]] = []
                 for p in picked:
                     if expr_reads(p) or any(t in op_name(p) for t in (
@@ -19133,10 +19235,11 @@ class TaintEngine:
                                     and o not in inner:
                                 inner.append(o)
                 note = ({"note": "BN recovered no argument the return may point into"}
-                        if not allocator and (not picked or any(i >= len(params) for i in want))
+                        if not allocation and (not picked or any(i >= len(params) for i in want))
                         else {})
                 return [{"kind": "returned", "object": f"{name or 'an indirect call'}()",
-                         "callee": name, **({"allocator": allocator} if allocator else {}),
+                         "callee": name,
+                         **(self._allocation_fields(allocation, params) if allocation else {}),
                          "may_point_into": inner, **note}]
             return [{"kind": "unknown", "object": var_label(expr)}]
         reads = expr_reads(expr)
