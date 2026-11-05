@@ -224,16 +224,65 @@ def argument_register_provenance(func: Any, addr: int, reg: str, bn: Any, *,
             # ARGUMENT register. Bridging to it would hand the walk the
             # wrong value entirely; a clobbered register is unproven.
             return ("unproven", [])
+        defs = [definition]
+        if _mlil_seeds(definition) == [] and getattr(definition, "operation", None) \
+                == getattr(bn.LowLevelILOperation, "LLIL_REG_PHI", object()):
+            # A phi of the register's definitions on each incoming path --
+            # armv7 conditional execution (`itet hi; adds r2, ..; mov r2, ..`)
+            # leaves one -- has no MLIL instruction of its own: the value
+            # the call receives is one of its arms', so each arm bridges.
+            defs = _reg_phi_arms(definition, bn) or []
         seeds: list[tuple[Any, Any]] = []
-        mapped = getattr(definition, "mlil", None)
-        mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-        if mssa is not None:
-            for w in (getattr(mssa, "vars_written", None) or []):
-                if is_ssa_var(w):
-                    seeds.append((w, mssa))
+        for d in defs:
+            arm = _mlil_seeds(d)
+            if not arm:
+                # One arm that bridges to nothing (an entry value, a call's
+                # clobber) leaves the argument's other values unknown: claim
+                # none rather than a subset.
+                return ("defined", [])
+            seeds.extend(arm)
         return ("defined", seeds)
     except Exception:
         return ("unproven", [])
+
+
+def _mlil_seeds(definition: Any) -> list[tuple[Any, Any]]:
+    """``[(mlil_ssa_var, mlil_instr), ...]`` an LLIL-SSA register definition
+    maps to: the SSA variables its MLIL instruction writes."""
+    mapped = getattr(definition, "mlil", None)
+    mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
+    if mssa is None:
+        return []
+    return [(w, mssa) for w in (getattr(mssa, "vars_written", None) or []) if is_ssa_var(w)]
+
+
+def _reg_phi_arms(phi: Any, bn: Any, depth: int = 0, seen: set | None = None) -> list[Any] | None:
+    """The non-phi LLIL-SSA definitions an ``LLIL_REG_PHI`` merges, nested
+    phis flattened; None when an arm has no definition (the register's entry
+    value) or is a call that clobbered it -- the merged value is then not
+    only what the definitions wrote."""
+    seen = set() if seen is None else seen
+    lssa = getattr(phi, "function", None)
+    if lssa is None or depth > 8:
+        return None
+    Op = bn.LowLevelILOperation
+    out: list[Any] = []
+    for src in (getattr(phi, "src", None) or []):
+        key = (str(getattr(src, "reg", "")), getattr(src, "version", None))
+        if key in seen:
+            continue            # a loop back edge brings nothing new
+        seen.add(key)
+        d = lssa.get_ssa_reg_definition(src)
+        if d is None or getattr(d, "operation", None) in _call_like_ops(bn):
+            return None
+        if getattr(d, "operation", None) == Op.LLIL_REG_PHI:
+            nested = _reg_phi_arms(d, bn, depth + 1, seen)
+            if nested is None:
+                return None
+            out.extend(nested)
+        else:
+            out.append(d)
+    return out
 
 
 def llil_call_sites(func: Any, bn: Any) -> dict[int, Any] | None:
