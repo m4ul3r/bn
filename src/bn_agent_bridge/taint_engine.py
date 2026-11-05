@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import itertools
 import json
 import re
 import shlex
@@ -340,6 +341,21 @@ class _Use(NamedTuple):
     # ruled out from its START alone when its length is unknown; a pointer
     # handed to something that may index either way cannot (BN23/F76).
     forward: bool = False
+
+
+class _SettleFrame:
+    """One access on :meth:`TaintEngine._settle_access`'s stack: its
+    suspended steps, which (function, global) it answers, the lowest
+    discovery number of an unsettled access it depends on (`low`, as in
+    Tarjan's algorithm) and where its cycle starts in the unsettled list
+    (`base`)."""
+
+    __slots__ = ("steps", "key", "fn", "ga", "low", "base")
+
+    def __init__(self, steps: Any, key: tuple[int, int], fn: Any, ga: int,
+                 low: int, base: int) -> None:
+        self.steps, self.key, self.fn, self.ga = steps, key, fn, ga
+        self.low, self.base = low, base
 
 
 # What a reached pointer-scan bound is REPORTED as. Both are blocking: the
@@ -10954,6 +10970,7 @@ class TaintEngine:
             collect=uses)
         self._neighbour_uses_cache[key] = uses
         return uses
+
     def _settle_access(self, fn: Any, ga: int, *, reach: bool) -> Any:
         """Run :meth:`_global_access_steps` for *(fn, ga)* on an explicit stack.
 
@@ -10964,42 +10981,106 @@ class TaintEngine:
         object and hit Python's frame limit on an ordinary `main` (P1-02);
         here each question is a stack entry, so the depth stays constant.
 
-        A ``reach`` entry is :meth:`_reaches_object`'s answer: while it is
-        in progress it reads False (the cycle guard), and a body that cannot
-        be read answers False instead of raising."""
-        def frame(f: Any, g: int, as_reach: bool) -> tuple[Any, tuple | None]:
-            rkey = (int(getattr(f, "start", 0)), int(g)) if as_reach else None
-            if rkey is not None:
-                self._reaches_object_cache[rkey] = False   # cycle guard
-            return self._global_access_steps(f, g), rkey
+        A ``reach`` entry is :meth:`_reaches_object`'s answer, and a body
+        that cannot be read answers False instead of raising.
 
-        stack = [frame(fn, ga, reach)]
+        The questions may form a cycle: an access asking, through others,
+        about one still unsettled. That question is answered with the
+        unsettled access's current assumption -- False until it has an
+        answer -- so whatever is computed from it is provisional, and
+        caching it as final once left an access False that a fresh question
+        answers True (R1-Q3). The accesses of one cycle (a strongly
+        connected component, found the way Tarjan's algorithm finds one)
+        are therefore cached together, when the first of them settles, and
+        only if no assumption lent inside the cycle was below the answer
+        that access came to; otherwise the cycle is asked again under the
+        new assumptions. An assumption only ever rises from False -- a yes
+        only adds a neighbour to scan, it never removes a read -- so every
+        repeated pass turns at least one more answer True and the passes
+        end. An access that is in no cycle settles in one pass, as before."""
+        root = (int(getattr(fn, "start", 0)), int(ga))
+        order: dict[tuple[int, int], int] = {}    # unsettled access -> discovery number
+        unsettled: list[tuple[int, int]] = []     # in discovery order (Tarjan's stack)
+        assumed: dict[tuple[int, int], bool] = {}  # answer lent while unsettled
+        lent_false: set[tuple[int, int]] = set()  # unsettled accesses lent as False
+        reach_keys: set[tuple[int, int]] = {root} if reach else set()
+        stack: list[_SettleFrame] = []
+        tickets = itertools.count()
+
+        def push(f: Any, g: int) -> None:
+            key = (int(getattr(f, "start", 0)), int(g))
+            order[key] = next(tickets)
+            unsettled.append(key)
+            stack.append(_SettleFrame(self._global_access_steps(f, g), key, f, g,
+                                      order[key], len(unsettled) - 1))
+
+        push(fn, ga)
         value: Any = None
-        while stack:
-            steps, rkey = stack[-1]
-            try:
-                ask = steps.send(value)
-            except StopIteration as done:
+        try:
+            while True:
+                top = stack[-1]
+                try:
+                    ask = top.steps.send(value)
+                except StopIteration as done:
+                    use = done.value
+                    answer = use.at is not None
+                except TaintError:
+                    if top.key == root and not reach:
+                        raise      # the root access: its caller's to handle
+                    use, answer = None, False
+                else:
+                    qfn, qga = ask
+                    qkey = (int(getattr(qfn, "start", 0)), int(qga))
+                    reach_keys.add(qkey)
+                    if qkey in order:
+                        value = assumed.get(qkey, False)
+                        if not value:
+                            lent_false.add(qkey)
+                        top.low = min(top.low, order[qkey])
+                        continue
+                    known = self._reaches_object_cache.get(qkey)
+                    if known is not None:
+                        value = known
+                        continue
+                    self._check_cancelled()
+                    push(qfn, qga)
+                    value = None
+                    continue
                 stack.pop()
-                value = done.value
-                if rkey is not None:
-                    value = self._reaches_object_cache[rkey] = value.at is not None
-                continue
-            except TaintError:
-                stack.pop()
-                if rkey is None:
-                    raise          # the root access: its caller's to handle
-                value = self._reaches_object_cache[rkey] = False
-                continue
-            qfn, qga = ask
-            known = self._reaches_object_cache.get(
-                (int(getattr(qfn, "start", 0)), int(qga)))
-            if known is not None:
-                value = known
-                continue
-            self._check_cancelled()
-            stack.append(frame(qfn, qga, True))
-            value = None
+                assumed[top.key] = assumed.get(top.key, False) or answer
+                if top.low < order[top.key]:
+                    # Rests on an access below it that is still unsettled.
+                    stack[-1].low = min(stack[-1].low, top.low)
+                    value = assumed[top.key]
+                    continue
+                cycle = unsettled[top.base:]
+                if any(assumed[k] for k in lent_false.intersection(cycle)):
+                    # A False lent inside the cycle came out True: ask again.
+                    del unsettled[top.base:]
+                    for k in cycle:
+                        del order[k]
+                        self._global_access_cache.pop(k, None)
+                    lent_false.difference_update(cycle)
+                    push(top.fn, top.ga)
+                    value = None
+                    continue
+                value = assumed[top.key]
+                del unsettled[top.base:]
+                for k in cycle:
+                    del order[k]
+                    lent_false.discard(k)
+                    settled = assumed.pop(k)
+                    if k in reach_keys:
+                        self._reaches_object_cache[k] = settled
+                if not stack:
+                    if not reach:
+                        value = use
+                    break
+        except BaseException:
+            # Nothing computed from an unsettled access stays cached.
+            for k in unsettled:
+                self._global_access_cache.pop(k, None)
+            raise
         self._drain_region_checks()
         return value
 

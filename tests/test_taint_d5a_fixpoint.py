@@ -122,3 +122,112 @@ def test_a_called_frame_that_revisits_a_call_carries_each_sink_once(models):
     [summary] = [v for k, v in engine._cache.items() if k[0] == main.start]
     assert [f["sink"]["address"] for f in summary["findings"]] == [
         hex(USE_BOTH + 8), hex(USE_BOTH + 16)]
+
+
+# --------------------------------------------------------------------------
+# `_settle_access`: a cycle of accesses settles to the fresh answers
+# --------------------------------------------------------------------------
+
+SCAN = SimpleNamespace(start=0x402000, name="scan")
+HIT = 0x402010          # where a reaching access is found
+
+
+def _graph_engine(monkeypatch, graph, proven, **kw):
+    """An engine whose access question for global *g* asks, in order,
+    whether ``SCAN`` reaches each of ``graph[g]``, and is answered (reached)
+    when *g* is in *proven* or any of those answers is yes -- the shape
+    `_overlap_access` gives `_global_access_steps`, on an arbitrary graph.
+    Returns the engine and the list of globals whose body ran, in order."""
+    ran: list[int] = []
+
+    def steps(self, fn, ga):
+        key = (int(fn.start), int(ga))
+        cached = self._global_access_cache.get(key)
+        if cached is not None:
+            return cached
+        ran.append(ga)
+        found = ga in proven
+        for dep in graph[ga]:
+            if (yield (fn, dep)):
+                found = True
+        out = (_Use(HIT, "read", 0, None, None, True) if found
+               else _Use(None, "unused", 0, None, None, True))
+        self._global_access_cache[key] = out
+        return out
+
+    monkeypatch.setattr(te.TaintEngine, "_global_access_steps", steps)
+    return te.TaintEngine(SimpleNamespace(), {}, **kw), ran
+
+
+def _fresh(monkeypatch, graph, proven, g):
+    engine, _ran = _graph_engine(monkeypatch, graph, proven)
+    return engine._settle_access(SCAN, g, reach=True)
+
+
+A, B, C, D = 0x404000, 0x404100, 0x404200, 0x404300
+# A asks B then C; B asks A back; C is proven; D asks B (outside the cycle).
+CYCLE = {A: [B, C], B: [A], C: [], D: [B]}
+
+
+@pytest.mark.parametrize("root", [A, B, D])
+@pytest.mark.parametrize("reach", [True, False])
+def test_every_answer_cached_inside_a_cycle_is_the_fresh_answer(monkeypatch, root, reach):
+    # Asked from A, B consulted A while A was still unfinished (its guard
+    # read False) and was cached False for good, though B asked fresh is
+    # True: it reaches A, which reaches the proven C.
+    engine, _ran = _graph_engine(monkeypatch, CYCLE, {C})
+    got = engine._settle_access(SCAN, root, reach=reach)
+    assert (got if reach else got.at is not None) is True
+    cached = {g: engine._global_access_cache[(SCAN.start, g)].at is not None
+              for g in CYCLE if (SCAN.start, g) in engine._global_access_cache}
+    reached = {g: v for (_s, g), v in engine._reaches_object_cache.items()}
+    fresh = {g: _fresh(monkeypatch, CYCLE, {C}, g) for g in CYCLE}
+    assert fresh == {A: True, B: True, C: True, D: True}
+    assert cached and all(cached[g] == fresh[g] for g in cached), (cached, fresh)
+    assert all(reached[g] == fresh[g] for g in reached), (reached, fresh)
+
+
+def test_a_cycle_that_reaches_nothing_settles_unreached(monkeypatch):
+    # The same cycle with nothing proven: every answer is a final no.
+    engine, _ran = _graph_engine(monkeypatch, CYCLE, set())
+    assert engine._settle_access(SCAN, D, reach=True) is False
+    assert {g: v for (_s, g), v in engine._reaches_object_cache.items()} == {
+        A: False, B: False, C: False, D: False}
+
+
+def test_a_cancelled_cycle_leaves_no_provisional_answer_cached(monkeypatch):
+    # Cancelled while A waits on C, B's answer (computed from A's unsettled
+    # False) is provisional; it must not survive as a cached access for the
+    # next question to read.
+    checks = []
+    engine, _ran = _graph_engine(monkeypatch, CYCLE, {C},
+                                 cancel_check=lambda: checks.append(1) or len(checks) >= 2)
+    with pytest.raises(te.TaintCancelled):
+        engine._settle_access(SCAN, A, reach=True)
+    assert (SCAN.start, B) not in engine._global_access_cache
+    assert (SCAN.start, B) not in engine._reaches_object_cache
+
+
+N_CHAIN = 5000
+
+
+def test_a_chain_of_thousands_of_accesses_settles_without_recursion(monkeypatch):
+    # Each global asks about the next; only the last is proven. Settled by
+    # recursion this is one frame chain per access; on the explicit stack
+    # every access runs exactly once.
+    nodes = [0x500000 + 8 * i for i in range(N_CHAIN)]
+    graph = {g: [nodes[i + 1]] if i + 1 < N_CHAIN else [] for i, g in enumerate(nodes)}
+    engine, ran = _graph_engine(monkeypatch, graph, {nodes[-1]})
+    assert engine._settle_access(SCAN, nodes[0], reach=True) is True
+    assert sorted(ran) == nodes
+    assert all(engine._reaches_object_cache[(SCAN.start, g)] for g in nodes)
+
+
+def test_a_cycle_thousands_of_accesses_long_settles_without_recursion(monkeypatch):
+    # The same chain closed into a cycle, proven at its far end: the answer
+    # found there must reach every access in the cycle, the head included.
+    nodes = [0x500000 + 8 * i for i in range(N_CHAIN)]
+    graph = {g: [nodes[(i + 1) % N_CHAIN]] for i, g in enumerate(nodes)}
+    engine, _ran = _graph_engine(monkeypatch, graph, {nodes[-1]})
+    assert engine._settle_access(SCAN, nodes[1], reach=True) is True
+    assert all(engine._reaches_object_cache[(SCAN.start, g)] for g in nodes)
