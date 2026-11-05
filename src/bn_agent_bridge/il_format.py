@@ -209,6 +209,89 @@ def _iter_llil_instructions(func) -> list[Any]:
     return instructions
 
 
+# Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
+# placeholder symbol per compiler builtin its MLIL may synthesise
+# (`__builtin_memcpy`, `__builtin_strcpy`, ...). The placeholder proves nothing
+# about the binary; the builtin is in it only where code references it (a
+# store run or a `rep movs` BN lifted to an inline builtin call).
+SYNTHETIC_BUILTIN_SECTIONS = frozenset({".synthetic_builtins"})
+
+
+def in_synthetic_builtin_section(bv, address: int) -> bool:
+    """Whether *address* is a synthetic-builtin placeholder; False when the
+    view cannot answer."""
+    try:
+        sections = bv.get_sections_at(int(address)) or []
+    except Exception:
+        return False
+    return any(str(getattr(s, "name", "")) in SYNTHETIC_BUILTIN_SECTIONS for s in sections)
+
+
+_LLIL_CALL_OPS = frozenset({"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"})
+
+
+def inline_expansion_intrinsics(func, address: int) -> list[Any]:
+    """The ``LLIL_INTRINSIC`` instructions BN lifted at *address* when that
+    instruction is a string operation it expands inline: x86 ``rep movs`` /
+    ``rep stos`` lift to ``__memcpy_u64`` / ``__memfill_u64`` (count in
+    ``rcx``), and MLIL renders each as a synthesised ``__builtin_memcpy`` /
+    ``__builtin_memset`` call -- two of them at one address, one per value of
+    the direction flag. Empty for a real call, an instruction with no
+    intrinsic, or a function with no LLIL to read."""
+    get = getattr(func, "get_llils_at", None)
+    if not callable(get):
+        return []
+    try:
+        llils = list(get(int(address)) or [])
+    except Exception:
+        return []
+    if any(_il_op_name(item) in _LLIL_CALL_OPS for item in llils):
+        return []
+    return [item for item in llils if _il_op_name(item) == "LLIL_INTRINSIC"]
+
+
+def intrinsic_name(intrinsics: list[Any]) -> str | None:
+    """The intrinsic's name (``__memcpy_u64``) shared by *intrinsics*, or None."""
+    for item in intrinsics:
+        name = getattr(getattr(item, "intrinsic", None), "name", None)
+        if name:
+            return str(name)
+    return None
+
+
+def intrinsic_operand_register(intrinsics: list[Any], index: int) -> str | None:
+    """The register operand *index* of an inline expansion reads (``rcx`` for
+    a ``rep movs`` count): the first lifted variant whose operand there is a
+    bare register -- the other variant may offset it (``rdi - (rcx << 3)``)."""
+    for item in intrinsics:
+        params = list(getattr(item, "params", None) or [])
+        if 0 <= index < len(params) and _il_op_name(params[index]) == "LLIL_REG":
+            reg = getattr(params[index], "src", None)
+            name = getattr(reg, "name", None) or (str(reg) if reg is not None else None)
+            if name:
+                return str(name)
+    return None
+
+
+def intrinsic_pointer_operands(intrinsics: list[Any], count_index: int) -> set[int]:
+    """The operands of an inline expansion that are the pointers it walks:
+    each register operand the intrinsic also writes back (``rep movs``
+    advances ``rdi`` and ``rsi``, ``rep stos`` only ``rdi``) other than the
+    count at *count_index*. ``rep stos``'s fill value (``rax``) is read, not
+    written, so it is never one."""
+    found: set[int] = set()
+    for item in intrinsics:
+        written = {str(getattr(reg, "name", None) or reg)
+                   for reg in (getattr(item, "output", None) or [])}
+        for i, operand in enumerate(getattr(item, "params", None) or []):
+            if i == count_index or _il_op_name(operand) != "LLIL_REG":
+                continue
+            reg = getattr(operand, "src", None)
+            if str(getattr(reg, "name", None) or reg) in written:
+                found.add(i)
+    return found
+
+
 def _hlil_candidates_for_llil(insn) -> list[Any]:
     candidates = []
     seen: set[tuple[str, int]] = set()

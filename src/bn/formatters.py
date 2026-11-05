@@ -4616,7 +4616,10 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False,
         call_index = row.get("call_index")
         # A tailcall (tail-branch into the target) has no real return site, so flag
         # it -- its caller_static is the byte after the branch, not a return addr (#47).
-        kind_tag = "  [tailcall]" if row.get("call_kind") == "tailcall" else ""
+        # An inline expansion (`rep movs` lifted to a builtin call) is no call at all.
+        call_kind = row.get("call_kind")
+        kind_tag = (f"  [{call_kind}]" if call_kind in ("tailcall", "inline_expansion")
+                    else "")
         # #979: every label is the row's JSON key, so a filter written from the
         # text (`.containing_function`, `.hlil_statement`) finds the field.
         primary = (
@@ -6251,7 +6254,7 @@ def _sink_arg_spec(e: dict[str, Any]) -> str:
 
 
 _HIDDEN_KIND_LABELS = {"self_stub": "self stub",
-                       "inline_builtin": "constant-argument inline builtin"}
+                       "inline_builtin": "fixed-length inline builtin"}
 
 
 def _render_callsite_rows(e: dict[str, Any], *, indent: str, mangled: bool = False,

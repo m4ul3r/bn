@@ -195,7 +195,7 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
     top-level ``presence_catalog``/``is_finding`` markers (#555)."""
     present_only = bool(params.get("present"))
     # #958: `--all-sites` shows the non-audit rows (import stubs, self stubs,
-    # constant-argument inline builtins) that are otherwise only counted.
+    # fixed-length inline builtins) that are otherwise only counted.
     all_sites = bool(params.get("all_sites"))
     want_callsites = bool(params.get("callsites")) or all_sites
     if (present_only or want_callsites) and selector is None:
@@ -318,41 +318,98 @@ def _branch_target(dest) -> int | None:
     return None
 
 
-def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -> str | None:
+def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int],
+                    judge: _ExpansionJudge) -> str | None:
     """How the instruction at *addr* (a code reference to the modeled symbol)
     uses that symbol (#958):
 
-    * ``"call"``   -- a call or tail branch whose target is one of *targets*;
+    * ``"call"``   -- a call or tail branch whose target is one of *targets*,
+      or an instruction BN's MLIL synthesised a builtin call from with an
+      argument the model flags that taint can arm (an inline `rep movs` whose
+      length adds a variable size, V8-06);
     * ``"inline"`` -- not a call in LLIL, but BN's MLIL synthesised an inline
-      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`) and
-      every argument the model flags is a constant, so no taint can arm it;
+      builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`, a
+      fixed-size `rep stos`) and every argument the model flags is settled
+      (:meth:`_ExpansionJudge.settled`), so no taint can arm it;
     * ``"data"``   -- anything else: the `adrp` that loads the GOT page the
       import's slot sits on, the stub's own `ldr`/`add` of its slot;
     * ``None``     -- the view cannot answer (no function, no IL API), so the
-      caller keeps the row rather than dropping a site it could not judge."""
+      caller keeps the row rather than dropping a site it could not judge.
+
+    Every LLIL instruction at *addr* is judged, not only the first: BN lifts
+    one `rep movs` to an `if` on the direction flag and an intrinsic per arm,
+    and only the intrinsics carry the synthesised calls."""
+    get_llils = getattr(fn, "get_llils_at", None) if fn is not None else None
     get_llil = getattr(fn, "get_llil_at", None) if fn is not None else None
-    if not callable(get_llil):
-        return None
     try:
-        llil = get_llil(int(addr))
+        if callable(get_llils):
+            llils = list(get_llils(int(addr)) or [])
+        elif callable(get_llil):
+            llils = [get_llil(int(addr))]
+        else:
+            return None
     except Exception:
         return None
-    if llil is None:
+    llils = [llil for llil in llils if llil is not None]
+    if not llils:
         return None
-    if il_format._il_op_name(llil) in _CALL_OPS:
-        return "call" if _branch_target(getattr(llil, "dest", None)) in targets else "data"
-    try:
-        mlil = getattr(llil, "mlil", None)
-    except Exception:
-        mlil = None
-    if mlil is not None and il_format._il_op_name(mlil) in _CALL_OPS \
-            and _branch_target(getattr(mlil, "dest", None)) in targets:
-        params = list(getattr(mlil, "params", []) or [])
-        flagged = [params[i] for i in flagged_args if 0 <= i < len(params)]
-        if flagged and all("CONST" in il_format._il_op_name(p) for p in flagged):
-            return "inline"
-        return "call"
-    return "data"
+    real_calls = [llil for llil in llils if il_format._il_op_name(llil) in _CALL_OPS]
+    if real_calls:
+        return ("call" if any(_branch_target(getattr(llil, "dest", None)) in targets
+                              for llil in real_calls) else "data")
+    synthesised = []
+    for llil in llils:
+        try:
+            mlils = list(getattr(llil, "mlils", None) or []) or [getattr(llil, "mlil", None)]
+        except Exception:
+            mlils = []
+        synthesised.extend(m for m in mlils
+                           if m is not None and il_format._il_op_name(m) in _CALL_OPS
+                           and _branch_target(getattr(m, "dest", None)) in targets)
+    if not synthesised:
+        return "data"
+    for call in synthesised:
+        params = list(getattr(call, "params", []) or [])
+        flagged = [i for i in flagged_args if 0 <= i < len(params)]
+        if not flagged or not all(judge.settled(fn, addr, call, i) for i in flagged):
+            return "call"
+    return "inline"
+
+
+class _ExpansionJudge:
+    """Whether taint can arm a flagged argument of a synthesised builtin call,
+    for ONE catalog request: a constant, or the length of an inline string
+    expansion that is a constant total split by its own pointer's alignment
+    (``alignment_split``, the length forward taint reports ``bounded_len``) --
+    gcc's `rep stos` of a fixed-size `memset`. A masked attacker value
+    (``n & 7``) is not settled. SSA forms come from one engine's per-request
+    cache, and each (function, address, argument) is judged once: a `rep stos`
+    lifts to two calls, and a catalog asks about every site of every builtin.
+    Nothing outlives the request."""
+
+    def __init__(self, bv, models) -> None:
+        self._engine = _taint.TaintEngine(bv, models)
+        self._verdicts: dict[tuple[int, int, int], bool] = {}
+
+    def settled(self, fn, addr: int, call, index: int) -> bool:
+        param = list(getattr(call, "params", []) or [])[index]
+        if "CONST" in il_format._il_op_name(param):
+            return True
+        key = (int(getattr(fn, "start", -1)), int(addr), index)
+        if key not in self._verdicts:
+            self._verdicts[key] = self._expansion_split(fn, call, index)
+        return self._verdicts[key]
+
+    def _expansion_split(self, fn, call, index: int) -> bool:
+        ssaf = self._engine._ssa_or_none(fn)
+        try:
+            ssa_call = call.ssa_form
+        except Exception:
+            return False
+        if ssaf is None or ssa_call is None:
+            return False
+        verdict = _taint.inline_expansion_length(ssaf, ssa_call, index, self._engine._ssa_def)
+        return verdict is not None and verdict["length_kind"] == "alignment_split"
 
 
 def _flagged_args(model: dict[str, Any] | None) -> list[int]:
@@ -392,14 +449,6 @@ def _disasm_at(bv, addr: int, container=None) -> str:
     return text or ""
 
 
-# Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
-# placeholder symbol per compiler builtin its MLIL may synthesise
-# (`__builtin_memcpy`, `__builtin_strcpy`, ...). The placeholder proves nothing
-# about the binary; the builtin is in it only where code references it (a
-# store run BN lifted to an inline builtin call).
-_SYNTHETIC_SECTIONS = frozenset({".synthetic_builtins"})
-
-
 def _synthetic_unreferenced(bv, name: str) -> bool:
     """True when every symbol spelled *name* is a synthetic-builtin placeholder
     and no code references any of them, so the name must not mark its model
@@ -410,11 +459,7 @@ def _synthetic_unreferenced(bv, name: str) -> bool:
     if not addrs:
         return False
     for addr in addrs:
-        try:
-            sections = bv.get_sections_at(addr) or []
-        except Exception:
-            return False
-        if not any(str(getattr(s, "name", "")) in _SYNTHETIC_SECTIONS for s in sections):
+        if not il_format.in_synthetic_builtin_section(bv, addr):
             return False
     get_refs = getattr(bv, "get_code_refs", lambda a: [])
     return not any(list(get_refs(addr) or []) for addr in addrs)
@@ -432,7 +477,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
     `memcpy` "callsites" for a binary with three. An import stub's own forwarding
     jump (the x86 `.plt.sec` `jmp [GOT]`) is not a caller either, and AArch64's
     `br x17` never was one, so neither is counted and the count is the same on
-    both. The remaining non-audit rows (self stubs and constant-argument inline
+    both. The remaining non-audit rows (self stubs and fixed-length inline
     builtins) are counted but, unless ``all_sites``, left out of ``callsites``
     so the list is the work queue it is used as."""
     present: set[str] = set()
@@ -458,6 +503,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
         if want_callsites:
             keyed.setdefault(key, []).extend(
                 getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or [])
+    judge = _ExpansionJudge(bv, models) if keyed else None
     for key, syms in keyed.items():
         slot = info[key]
         # Every address the symbol answers to (stub, GOT slot, extern) is a call
@@ -475,7 +521,7 @@ def _present_models(bv, models, want_callsites, *, all_sites: bool = False):
                     continue
                 seen.add(ai)
                 container = _containing_fn(bv, ai)
-                shape = _callsite_shape(container, ai, targets, flagged)
+                shape = _callsite_shape(container, ai, targets, flagged, judge)
                 if shape == "data":
                     continue
                 fname, kind = _classify_callsite(bv, ai, key, models)
@@ -1044,6 +1090,21 @@ def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any
     the callsite, not necessarily anything the callee's parameter is named,
     so renderers must key headers off ``callee``, not ``name``."""
     label: dict[str, Any] = {"index": arg_index}
+    # V8-05: an inline string expansion (`rep movs`) is no call. Its operands
+    # are the registers the lifted intrinsic reads (the count is `rcx`, not the
+    # convention's third argument register), and its callee is the synthetic
+    # builtin MLIL names -- the symbol forward/backward taint report.
+    intrinsics = il_format.inline_expansion_intrinsics(
+        caller_func, int(getattr(call_insn, "address", 0) or 0))
+    if intrinsics:
+        reg = il_format.intrinsic_operand_register(intrinsics, arg_index)
+        if reg:
+            label["register"] = reg
+        dest = _branch_target(getattr(call_insn, "dest", None))
+        sym = bv.get_symbol_at(dest) if dest is not None else None
+        if sym is not None and getattr(sym, "name", None):
+            label["callee"] = label["callee_display_name"] = str(sym.name)
+        return label
     reg = _arg_register(caller_func, arg_index)
     if reg:
         label["register"] = reg
