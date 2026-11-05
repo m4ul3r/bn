@@ -265,7 +265,10 @@ _SINK_LOCATOR_HELP = (
                       "recv_overflow (read/recv/recvfrom length -> undersized buffer). "
                       "Use when auditing persistence / file-corruption / exfiltration, or "
                       "recv-into-fixed-buffer overflows. recv_overflow is high-FP on the "
-                      "read-loop idiom (#499) -- enable it only when deliberately hunting."),
+                      "read-loop idiom (#499) -- enable it only when deliberately hunting. "
+                      "Without it, calls of file_write/net_write that taint reaches are "
+                      "listed in `opt_in_sinks_reached`, not reported, and the all-clear "
+                      "covers only the enabled classes."),
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),

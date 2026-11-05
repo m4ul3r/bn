@@ -3887,34 +3887,37 @@ class TestBatchSiblingCreateGuard:
 
 
 class TestTaintEmptyVerdictHonesty:
-    """Regression for #310.1: a genuinely empty forward-taint result (no sink, no
-    frontier) must carry the same loud 'NOT an all-clear' caveat the
-    partial-coverage paths do -- it's exactly the shape a structurally-invisible
-    bug produces, so it must be the most caveated case, not the least."""
+    """#310.1 / IC07 TT-PILOT-HOST04-01: a forward result with no sink and no
+    frontier states, in its text verdict, the claim its JSON gate makes. The
+    verdict used to say "NOT an all-clear" for every such result while the
+    JSON said `safe_to_report_all_clear: true`, so a text reader and a JSON
+    reader of one run drew opposite conclusions."""
 
-    def test_empty_forward_verdict_is_caveated(self, shared_bn):
+    def test_empty_forward_verdict_agrees_with_the_json_gate(self, shared_bn):
         shared_bn.load(HELLO_BINARY)
         fns = json.loads(shared_bn.run("function", "list", "--format", "json").stdout)
         names = [f["name"] for f in (fns.get("items") if isinstance(fns, dict) else fns)]
         saw_empty = False
         for name in names[:30]:
-            out = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0")
-            # Only reason about a clean, non-spilled text result: a spilled
-            # (truncated) render can cut the verdict line mid-string, which is
-            # not a real "bare phrase without caveat". (No break: the caveat
-            # invariant must hold for EVERY empty verdict, not just the first.)
-            if out.returncode != 0 or "__BN_SPILLED__" in out.stdout:
+            res = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0",
+                                "--format", "json")
+            if res.returncode != 0:
                 continue
-            if "no taint reached any sink or frontier" in out.stdout:
-                saw_empty = True
-                assert "NOT an all-clear" in out.stdout, out.stdout
-                assert "structurally see" in out.stdout, out.stdout
+            payload = json.loads(res.stdout)
+            if payload["reached_sinks"] or payload["leaves"]:
+                continue
+            out = shared_bn.run("taint", "forward", "-f", name, "--source", "param:0")
+            assert out.returncode == 0, out.stderr
+            saw_empty = True
+            [verdict] = [line for line in out.stdout.splitlines()
+                         if line.startswith("verdict:")]
+            safe = payload["diagnostics"]["safe_to_report_all_clear"]
+            assert ("NOT an all-clear" in verdict) is (safe is not True), (name, verdict)
         if not saw_empty:
             refuse_silent_skip(
                 "no function in this fixture yields an empty forward-taint "
-                "verdict, so the 'NOT an all-clear' caveat #310.1 added is "
-                "unexercised; restore a fixture function whose taint run "
-                "reaches no sink and no frontier")
+                "result, so the verdict/gate agreement is unexercised; restore a "
+                "fixture function whose taint run reaches no sink and no frontier")
 
 
 class TestTaintUnderRecoveredArgFrontier:

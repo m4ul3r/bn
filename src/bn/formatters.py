@@ -5511,18 +5511,32 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
         classes = ", ".join(cls + _marks(cls)
                             for cls in sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+    # IC07: every zero-finding verdict is scoped to the sink classes the run
+    # enabled (the default catalog plus `run_params.sink_classes`) and names
+    # the opt-in calls taint reached that the run does not report -- a run
+    # with a frontier said "NO modeled sink reached" above a listed `net_write`
+    # call it had reached.
+    enabled = [str(c) for c in _field_list(_field_dict(value, "run_params"), "sink_classes")]
+    scope = "the default sink classes" + (f" + {', '.join(enabled)}" if enabled else "")
+    opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
+    skipped = (f"; {len(opt_in)} call(s) of opt-in sink class(es) "
+               f"{', '.join(sorted({str(r.get('class')) for r in opt_in}))} reached, "
+               "not reported" if opt_in else "")
     if leaves:
-        return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
-                f"(NOT an all-clear){fns_part}{trunc}")
-    # Genuinely empty: no sink AND no frontier. This is the MOST caveated case, not
-    # the least -- the engine reaching nothing does not mean the function is safe;
-    # it is exactly the shape a structurally-invisible bug (use-after-free,
-    # temporal, or an unmodeled source) produces. Carry the same "NOT an
-    # all-clear" qualifier the partial-coverage paths do (#310).
+        return (f"verdict: no sink of {scope} reached — {len(leaves)} tainted frontier(s) "
+                f"(NOT an all-clear{skipped}){fns_part}{trunc}")
+    # No sink AND no frontier. The verdict states the SAME claim the JSON gate
+    # (`diagnostics.safe_to_report_all_clear`) makes: it said "NOT an
+    # all-clear" beside a gate that said all-clear. An absent or false gate is
+    # no all-clear.
     visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
-    return (f"verdict: no taint reached any sink or frontier — NOT an all-clear "
-            f"({visited}; no modeled sink or tainted frontier found — also how a bug "
-            f"the engine can't structurally see appears){trunc}")
+    diag = _field_dict(value, "diagnostics")
+    if diag.get("safe_to_report_all_clear") is not True:
+        return (f"verdict: no sink of {scope} reached and no tainted frontier — NOT an "
+                f"all-clear ({visited}; see diagnostics{skipped}){trunc}")
+    return (f"verdict: no sink of {scope} reached and no tainted frontier — all-clear "
+            f"for those classes only, a may-analysis and not a proof ({visited}{skipped})"
+            f"{trunc}")
 
 
 def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
@@ -5686,6 +5700,13 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     if _sm:
         _fr += f", {_sm} seed-misanchored"
     out.append(_fr)
+    # IC07: where taint left the function -- callers use it, a forward run
+    # from here does not follow it there.
+    exits = _field_dict(diag, "exits")
+    ways = (["return value"] if exits.get("return") else []) + [
+        f"out-parameter {i}" for i in _field_list(exits, "out_params")]
+    if ways:
+        out.append(f"  leaves the function through: {', '.join(ways)} (not followed)")
     # #562 honesty gate, folded into the same block: the anti-verdict, never a
     # vulnerability claim. Only present when the diagnostics carry it.
     if "safe_to_report_all_clear" in diag:
@@ -6090,6 +6111,18 @@ def _render_taint_text(value: Any, full: bool = False, *, mangled: bool = False)
         lines.extend(_render_grouped_leaves(
             leaves, mangled=mangled, full=full,
             width=_text_width() if direction == "forward" else None))
+    # IC07: calls of an opt-in sink class the run did not enable that taint
+    # armed -- outside its question, so neither a flow nor a frontier, but
+    # named so the scope of what was reported is visible.
+    opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
+    if opt_in:
+        lines.append("")
+        lines.append(f"opt-in sinks reached, not reported ({len(opt_in)}; "
+                     "add --sink-class <class> to report them):")
+        for r in opt_in:
+            args = ", ".join(str(i) for i in _field_list(r, "tainted_args"))
+            lines.append(f"  [{r.get('class')}] {r.get('callee')} @ {r.get('address')} "
+                         f"(arg {args})")
     assumptions = _field_list(value, "assumptions")
     if assumptions:
         lines.append("")

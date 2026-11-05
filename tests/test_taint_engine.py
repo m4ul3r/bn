@@ -620,7 +620,7 @@ def test_forward_attributed_gate_recomputed_over_union_leaves(models):
     def _run(leaves, safe):
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": leaves, "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
             "diagnostics": {"safe_to_report_all_clear": safe, "all_clear_reason": "x",
                             "tainted_values": 1, "last_use": None, "source_callsites": 2},
@@ -659,7 +659,7 @@ def test_forward_attributed_source_callsites_is_total_not_first_run(models):
     def _run():
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": [], "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
             "diagnostics": {"safe_to_report_all_clear": True, "all_clear_reason": "x",
                             "tainted_values": 1, "last_use": None, "source_callsites": 1},
@@ -9939,7 +9939,7 @@ def test_forward_attributed_row_frontier_counts_every_blocking_kind_812(models):
     def _run(leaves):
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": leaves, "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
             "diagnostics": {"safe_to_report_all_clear": False, "all_clear_reason": "x",
                             "tainted_values": 1, "last_use": None, "source_callsites": 1},
@@ -9989,7 +9989,7 @@ def test_forward_attributed_union_keeps_the_unread_callee_disclosure_811(models)
     def _run(incomplete):
         return {
             "direction": "forward", "function": {"name": "parse"}, "sources": sources,
-            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "reached_sinks": [], "opt_in_sinks_reached": [], "leaves": [], "assumptions": [],
             "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0,
                       "truncated": False,
                       "analysis_incomplete": bool(incomplete),
