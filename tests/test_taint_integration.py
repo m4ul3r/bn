@@ -7444,6 +7444,42 @@ def test_an_unbounded_index_into_a_global_keeps_the_out_of_object_frontier(tmp_p
     assert frontiers == [], masked["leaves"]
 
 
+def test_a_sink_reached_only_through_an_object_tainted_at_an_unknown_offset_says_so(
+        tmp_path, shared_bn):
+    """V6-01 on `taint_corpus/fwd_object_wide.c`: `rec.tag[i] = v[0]` taints the
+    record at an unknown offset, and the copy of `rec.note` that follows was a
+    flow indistinguishable from one into `rec.note` itself. It is kept and says
+    so: `sink.object_taint` names the store and the field read, and the text
+    flow line is tagged. Copying the string into `rec.note` and back out is
+    field-precise and carries neither."""
+    binary = tmp_path / "fwd_object_wide"
+    _compile(CORPUS / "fwd_object_wide.c", binary)
+    target = shared_bn.load(binary, copy=False)
+    stamp = _bn_json(shared_bn, "-t", target, "function", "info", "stamp")
+    span = range(int(stamp["span_start"], 16), int(stamp["span_end"], 16))
+
+    def sinks(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:0")
+        return [hit["sink"] for hit in result["reached_sinks"]]
+
+    for fn in ("object_wide", "object_wide_returned"):
+        [sink] = sinks(fn)
+        tag = sink["object_taint"]
+        assert (tag["kind"], tag["field_read"]) == ("unknown_offset", 32), sink
+        assert int(tag["store"], 16) in span, (tag, stamp["span_start"])
+
+    precise = sinks("field_precise")
+    assert len(precise) == 2 and not [s for s in precise if "object_taint" in s], precise
+
+    text = shared_bn.run("-t", target, "taint", "forward", "-f", "object_wide",
+                         "--source", "param:0")
+    assert text.returncode == 0, text.stderr
+    flows = [ln.split() for ln in text.stdout.splitlines() if ln.startswith("  [")]
+    assert len(flows) == 1 and "[object-wide]" in flows[0], text.stdout
+
+
+
 def test_a_loop_count_length_is_a_recurrence_not_a_constant(tmp_path, shared_bn):
     """IC08 on `taint_corpus/bw_loop_count.c`: a length `k` that starts at 0
     and grows on loop trips the comma test picks was a `constant 0` origin

@@ -828,6 +828,12 @@ class TaintEngine:
         self._global_keyed_offsets: dict[int, set[int]] = {}
         self._global_write_span: dict[int, int] = {}
         self._global_tainted_ranges: dict[int, list[tuple]] = {}
+        # V6-01: the intervals tainted by writes at an offset the program
+        # states (a subset of `_global_tainted_ranges`), and the first tainted
+        # write at an offset nothing makes constant, per object. A read the
+        # first does not cover is reached only through the second.
+        self._known_offset_ranges: dict[int, list[tuple]] = {}
+        self._unknown_offset_stores: dict[int, int] = {}
         self._global_write_unbounded: set[int] = set()
         self._global_search_truncated: set[int] = set()
         self._touches_global_cache: dict[int, bool] = {}
@@ -7562,6 +7568,9 @@ class TaintEngine:
                 f"-- investigate"))
         out["assumptions"] = list(sub["assumptions"])
         out["reached_return"] = sub["reached_return"]
+        # V6-01: what the callee returns only through an object tainted at an
+        # unknown offset, for the caller's sinks to say so.
+        out["return_object_taint"] = sub.get("return_object_taint")
         out["out_params"] = sub.get("out_params", frozenset())
         out["out_param_elems"] = sub.get("out_param_elems", frozenset())
         # A global the callee wrote is an effect on the program, not on its
@@ -8455,10 +8464,8 @@ class TaintEngine:
             # WHICH bytes this store reached, reported beside the object --
             # the same field a modeled copy into an interior address fills.
             self._global_keyed_offsets.setdefault(ga, set()).add(offset)
-        ranges = self._global_tainted_ranges.setdefault(ga, [])
         interval = (offset, offset + size) if size > 0 else (offset, None)
-        if interval not in ranges:
-            ranges.append(interval)
+        self._note_known_offset_range(ga, interval)
         if size <= 0:
             if ga not in self._global_write_unbounded:
                 self._global_write_unbounded.add(ga)
@@ -8468,18 +8475,83 @@ class TaintEngine:
             self._global_write_span[ga] = offset + size
             self._invalidate_object(ga)
 
-    def _note_indexed_write(self, ga: int) -> None:
+    def _note_known_offset_range(self, ga: int, interval: tuple) -> None:
+        """Record bytes of the object at *ga* a tainted write reached at an
+        offset the program states -- the evidence a read of one field needs
+        to be field-precise rather than object-wide (V6-01)."""
+        for ranges in (self._global_tainted_ranges.setdefault(ga, []),
+                       self._known_offset_ranges.setdefault(ga, [])):
+            if interval not in ranges:
+                ranges.append(interval)
+
+    def _note_indexed_write(self, ga: int, at: int) -> None:
         """Record a tainted write at an index nothing makes constant into the
-        object at *ga* (:meth:`_indexed_global`): it may have reached any of
-        its bytes, so the interval runs from the base with no end -- an
-        interval at the one place it COULD have landed would let a reader
-        elsewhere in the object be proven disjoint, the clearing direction."""
+        object at *ga* (:meth:`_indexed_global`), made by the instruction at
+        *at*: it may have reached any of its bytes, so the interval runs from
+        the base with no end -- an interval at the one place it COULD have
+        landed would let a reader elsewhere in the object be proven disjoint,
+        the clearing direction. It is kept apart from the known-offset
+        intervals, so a read it alone reaches is reported as object-wide."""
         ranges = self._global_tainted_ranges.setdefault(ga, [])
         if (0, None) not in ranges:
             ranges.append((0, None))
+        self._unknown_offset_stores.setdefault(ga, at)
         if ga not in self._global_write_unbounded:
             self._global_write_unbounded.add(ga)
             self._invalidate_object(ga)
+
+    def _object_wide_use(self, ga: int, offset: int) -> dict[str, Any] | None:
+        """``sink.object_taint`` for a read at *offset* into the object at *ga*
+        when only a write at an unknown offset tainted the bytes there, else
+        None (V6-01). Such a flow is a may-flow: the write could have landed
+        in the field read, so it is kept, but nothing shows it did."""
+        store = self._unknown_offset_stores.get(ga)
+        if store is None:
+            return None
+        for lo, hi in self._known_offset_ranges.get(ga) or ():
+            if lo <= offset and (hi is None or offset < hi):
+                return None
+        return {"kind": "unknown_offset", "object": hex(ga), "store": hex(store),
+                "field_read": int(offset)}
+
+    def _object_wide_taint(self, nodes: list[tuple], why: dict,
+                           consumer: Any) -> dict[str, Any] | None:
+        """The ``object_taint`` of a value *consumer* computes from *nodes*,
+        or None when any of them is backed field-precisely (V6-01).
+
+        Walks the provenance graph `taint_node` records. A tainted global is
+        read at the offset its consumer names (:meth:`_global_use_offset`):
+        when only a write at an unknown offset covers that offset it is an
+        object-wide barrier, otherwise it is field-precise evidence. A value
+        a descended callee returned or handed back carries its own
+        ``object_taint`` (`why[node]["object_taint"]`). Any other node with
+        no parents is a seed -- field-precise. The flow is object-wide only
+        when every chain stops at a barrier; the first barrier is reported."""
+        stack = [(node, consumer) for node in reversed(nodes)]
+        seen: set = set()
+        barrier: dict[str, Any] | None = None
+        while stack:
+            node, used_by = stack.pop()
+            if node is None or node in seen:
+                continue
+            seen.add(node)
+            key = node[0]
+            if type(key) is tuple and len(key) == 2 and key[0] == "global":
+                ga = int(key[1])
+                info = self._object_wide_use(ga, self._global_use_offset(used_by, ga))
+                if info is None:
+                    return None
+                barrier = barrier or info
+                continue
+            entry = why.get(node) or {}
+            if entry.get("object_taint"):
+                barrier = barrier or entry["object_taint"]
+                continue
+            parents = entry.get("parents") or []
+            if not parents:
+                return None
+            stack.extend((parent, entry.get("instr")) for parent in reversed(parents))
+        return barrier
 
     @staticmethod
     def _pointer_range(expr: Any) -> tuple[int, int] | None:
@@ -8568,9 +8640,9 @@ class TaintEngine:
         return n is not None and int(n) == 0
 
     def _note_write_span(self, ssaf: Any, params: list, idx: int,
-                         model: dict[str, Any] | None,
+                         model: dict[str, Any] | None, at: int,
                          name: str | None = None) -> int | None:
-        """Record how far a modeled copy writes into a global object.
+        """Record how far a modeled copy at *at* writes into a global object.
 
         An untyped global's extent is otherwise inferred from LAYOUT, which
         an alias/subobject symbol inside the object silently halves
@@ -8587,7 +8659,7 @@ class TaintEngine:
             gi = self._indexed_global(ssaf, params[idx])
             if gi is None or self._copy_length_is_zero(ssaf, params, model):
                 return None
-            self._note_indexed_write(gi)
+            self._note_indexed_write(gi, at)
             reach = self._modeled_write_reach(ssaf, params, idx, model, name)
             return None if self._indexed_write_in_object(params[idx], gi, reach) else gi
         raw = self._global_addr(ssaf, params[idx], canon=False)
@@ -8605,9 +8677,7 @@ class TaintEngine:
             # is the one case this does know.
             if n is not None and int(n) == 0:
                 return
-            ranges = self._global_tainted_ranges.setdefault(ga, [])
-            if (offset, None) not in ranges:
-                ranges.append((offset, None))
+            self._note_known_offset_range(ga, (offset, None))
             if ga not in self._global_write_unbounded:
                 self._global_write_unbounded.add(ga)
                 self._invalidate_object(ga)
@@ -8633,10 +8703,8 @@ class TaintEngine:
             # constant is not this case: as an unsigned size it is huge, so
             # it stays on the unbounded side below.
             return
-        ranges = self._global_tainted_ranges.setdefault(ga, [])
-        interval = (offset, None if n is None or int(n) < 0 else offset + int(n))
-        if interval not in ranges:
-            ranges.append(interval)
+        self._note_known_offset_range(
+            ga, (offset, None if n is None or int(n) < 0 else offset + int(n)))
         if n is None or int(n) < 0:
             # An unbounded write is evidence about the object too: it is
             # recorded so the extent stops being clipped by an inferred
@@ -11106,6 +11174,8 @@ class TaintEngine:
         not what a source wrote into it."""
         self._global_write_span.clear()
         self._global_tainted_ranges.clear()
+        self._known_offset_ranges.clear()
+        self._unknown_offset_stores.clear()
         self._global_write_unbounded.clear()
         self._global_layout_truncated.clear()
         self._global_keyed_offsets.clear()
@@ -12936,6 +13006,11 @@ class TaintEngine:
         def ins_key(i: Any) -> int:
             return int(getattr(i, "instr_index", getattr(i, "address", 0)))
         reached_return = False
+        # RET / tail call -> (the tainted nodes it returns, the returned
+        # expression, the callee's `return_object_taint` for a tail call): the
+        # summary's `return_object_taint` is read from them once the walk has
+        # converged (V6-01).
+        tainted_returns: dict[int, tuple[list[tuple], Any, dict[str, Any] | None]] = {}
 
         def add_assumption(msg: str) -> None:
             if msg not in assumptions:
@@ -13388,9 +13463,14 @@ class TaintEngine:
                             self._truncated = True
                             self._truncation_causes.add(aggregate)
 
-        def cons_return(ins: Any, reason: str) -> bool:
+        def cons_return(ins: Any, reason: str,
+                        object_taint: dict[str, Any] | None = None) -> bool:
+            """Taint what the call at *ins* returns. *object_taint* is the
+            callee's own `return_object_taint` when it is the only way the
+            value is tainted (V6-01)."""
             nonlocal reached_return
             if "TAILCALL" in op_name(ins):
+                tainted_returns.setdefault(ins_key(ins), ([], ins, object_taint))
                 if reached_return:
                     return False
                 reached_return = True
@@ -13399,6 +13479,8 @@ class TaintEngine:
             for w in ssa_writes(ins):
                 node = (var_key(w), getattr(w, "version", None))
                 if taint_node(node, var_label(w), ins, reason, []):
+                    if object_taint:
+                        why[node]["object_taint"] = object_taint
                     done = True
             return done
 
@@ -13471,7 +13553,8 @@ class TaintEngine:
                 # Tail calls have no SSA result: a modeled return instead exits
                 # this function. Only invoke this after the model's source hit.
                 if tok in ("ret", "*ret") and "TAILCALL" in op_name(ins):
-                    return cons_return(ins, f"return of {name or '?'} (model propagate)")
+                    return cons_return(ins, f"return of {name or '?'} (model propagate)",
+                                       self._object_wide_taint(parents, why, ins))
                 return self._apply_to_token(
                     ssaf, ins, params, tok, taint_node, name or "?", parents=parents)
             addr = int(getattr(ins, "address", 0))
@@ -14272,8 +14355,9 @@ class TaintEngine:
                     if k is not None:
                         if k < len(params):
                             propagated.add(k)
-                            spilled = self._note_write_span(ssaf, params, k, model,
-                                                            name or mkey)
+                            spilled = self._note_write_span(
+                                ssaf, params, k, model, int(getattr(ins, "address", 0)),
+                                name or mkey)
                             if spilled is not None:
                                 _ixl = self._indexed_write_frontier(spilled, ins, params[k])
                                 if _ixl not in leaves:
@@ -14432,8 +14516,9 @@ class TaintEngine:
                                 # extent must stop being clipped by what BN
                                 # inferred, exactly as for a copy (round-14
                                 # review F33).
-                                spilled = self._note_write_span(ssaf, params, k, model,
-                                                                name or mkey)
+                                spilled = self._note_write_span(
+                                    ssaf, params, k, model, int(getattr(ins, "address", 0)),
+                                    name or mkey)
                                 if spilled is not None:
                                     _ixl = self._indexed_write_frontier(spilled, ins, params[k])
                                     if _ixl not in leaves:
@@ -14499,9 +14584,11 @@ class TaintEngine:
                     srcs = getattr(ins, "src", None)
                     if not isinstance(srcs, (list, tuple)):
                         srcs = [] if srcs is None else [srcs]
-                    if (read_taint(ins) or any(arg_taint(src) for src in srcs)
-                            or self._return_buffer_tainted(ssaf, ins, tainted)):
+                    ret_nodes = read_taint(ins) + [n for src in srcs for n in arg_taint(src)]
+                    if ret_nodes or self._return_buffer_tainted(ssaf, ins, tainted):
                         reached_return = True
+                        tainted_returns[ins_key(ins)] = (
+                            ret_nodes, srcs[0] if len(srcs) == 1 else ins, None)
                     continue
 
                 if self._is_call(ins):
@@ -14730,6 +14817,10 @@ class TaintEngine:
                         continue
 
                     ret_tainted = False
+                    # One entry per candidate that taints the return: its
+                    # `object_taint`, or None when it is field-precise or no
+                    # body was walked to say (V6-01).
+                    ret_object_taints: list[dict[str, Any] | None] = []
                     descend_outparams: set[int] = set()
                     descend_outparam_elems: set = set()  # (param_idx, field) #319b
                     resolved_names: list[str] = []
@@ -14840,6 +14931,12 @@ class TaintEngine:
                             # the descent went (the merge at each intervening level
                             # re-applies this same check with its own hand-off nodes, so
                             # multi-level descent composes).
+                            # V6-01: a callee walk seeds its parameters as
+                            # field-precise, so what reached it through an
+                            # object-wide argument is said here, against the
+                            # CALLER's why-chain, like the unconditional tag.
+                            handoff_wide = self._object_wide_taint(
+                                d.get("handoff_node") or [], why, ins)
                             for f in d["findings"]:
                                 # A revisit with a grown context re-reaches
                                 # the first context's sinks: one finding each.
@@ -14847,6 +14944,8 @@ class TaintEngine:
                                 if sig in descended_sinks:
                                     continue
                                 descended_sinks.add(sig)
+                                if handoff_wide and not f["sink"].get("object_taint"):
+                                    f = {**f, "sink": {**f["sink"], "object_taint": handoff_wide}}
                                 findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
                                 # One callee site reached from several argument
@@ -14855,6 +14954,9 @@ class TaintEngine:
                             for a in d["assumptions"]:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
+                            if d["reached_return"]:
+                                ret_object_taints.append(
+                                    d.get("return_object_taint") or handoff_wide)
                             descend_outparams |= set(d.get("out_params") or ())
                             descend_outparam_elems |= set(d.get("out_param_elems") or ())
                             for _ga in sorted(d.get("globals") or ()):
@@ -14908,6 +15010,7 @@ class TaintEngine:
                                 _stop_desc = "external"
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
+                                ret_object_taints.append(None)
                                 add_assumption(_caveat)
                             else:
                                 # F4/#562: `stop` deliberately does NOT propagate taint
@@ -14979,7 +15082,10 @@ class TaintEngine:
                         # the "resolved via ... to:" assumption (#290 pins its form).
                         resolved_names.append(report_name)
 
-                    if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):
+                    if ret_tainted and cons_return(
+                            ins, "return of resolved call propagates taint",
+                            ret_object_taints[0] if ret_object_taints
+                            and all(ret_object_taints) else None):
                         changed = True
                     # callee wrote tainted data through pointer arg(s) -> taint the
                     # caller's buffer, and bubble up if that buffer is our own param
@@ -14992,12 +15098,28 @@ class TaintEngine:
                             if bt is not None and taint_node((bt[0], None), bt[1], ins,
                                                              f"out-param {j} written by callee", []):
                                 changed = True
-                            if (bt is not None and self._global_addr(ssaf, params[j]) is None
+                            out_ga = (self._global_addr(ssaf, params[j])
+                                      if bt is not None else None)
+                            if out_ga is not None and bt[0] == ("global", out_ga):
+                                # The callee wrote the object from a stated
+                                # offset: a read there is field-precise (V6-01).
+                                # Only that classification reads it; how far the
+                                # write reached is the callee's own evidence.
+                                raw = self._global_addr(ssaf, params[j], canon=False)
+                                known = self._known_offset_ranges.setdefault(out_ga, [])
+                                interval = ((int(raw) - out_ga) if raw is not None
+                                            and int(raw) >= out_ga else 0, None)
+                                if interval not in known:
+                                    known.append(interval)
+                            if (bt is not None and out_ga is None
                                     and (gi := self._indexed_global(ssaf, params[j])) is not None
                                     and bt[0] == ("global", gi)):
                                 # The callee's write starts at `g + i` and its
                                 # length is the callee's: nothing here proves it
-                                # stays inside g (D1-01).
+                                # stays inside g (D1-01), nor which field it
+                                # tainted (V6-01).
+                                self._unknown_offset_stores.setdefault(
+                                    gi, int(getattr(ins, "address", 0)))
                                 _ixl = self._indexed_write_frontier(gi, ins, params[j])
                                 if _ixl not in leaves:
                                     leaves.append(_ixl)
@@ -15325,7 +15447,7 @@ class TaintEngine:
                             # (V5-01), and an index nothing bounds to its
                             # declared extent may have put it in the NEXT
                             # object, which that taint does not cover (D1-01).
-                            self._note_indexed_write(gi)
+                            self._note_indexed_write(gi, int(getattr(ins, "address", 0)))
                             if taint_node(((("global", gi)), None), f"glob_{hex(gi)}",
                                           ins, "store into tainted global at a "
                                           "runtime index (object base, global_approx)",
@@ -15608,7 +15730,18 @@ class TaintEngine:
                     break
             diag = {"tainted_values": len(tainted), "last_use": last_use}
 
+        # V6-01: a value returned only through objects tainted at an unknown
+        # offset says so to the caller, as a sink reading one does. A return
+        # with no node to walk (a buffer reached through a divergent merge)
+        # is not shown to be object-wide.
+        return_object_taint = None
+        if tainted_returns:
+            returned = [self._object_wide_taint(nodes, why, consumer) if nodes else preset
+                        for nodes, consumer, preset in tainted_returns.values()]
+            if all(returned):
+                return_object_taint = returned[0]
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
+                "return_object_taint": return_object_taint,
                 "out_param_elems": frozenset(out_param_elems),
                 # The globals this body made tainted. A write into a global
                 # is an effect on the PROGRAM, not on this function's
@@ -16355,6 +16488,12 @@ class TaintEngine:
             last["callee"] = callee
         else:
             path.append(_instr_dict(ins, reason=reason, tainted=tainted_labels, callee=callee))
+        # V6-01: the field this sink reads, when an object tainted only at an
+        # unknown offset is the one way the bytes could have got there.
+        params = self._call_params(ins) if argidx is not None else []
+        object_taint = self._object_wide_taint(
+            hit_nodes, why, params[argidx] if argidx is not None and argidx < len(params)
+            else ins)
         return {
             "sink": {
                 "callee": callee,
@@ -16396,6 +16535,7 @@ class TaintEngine:
                 # W10-04: the length's last arithmetic is narrower than the
                 # parameter (widths in bytes).
                 **({"width_narrowing": sink["width_narrowing"]} if sink.get("width_narrowing") else {}),
+                **({"object_taint": object_taint} if object_taint else {}),
             },
             "path": path,
         }
