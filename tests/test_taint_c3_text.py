@@ -17,6 +17,7 @@ import bn.cli
 import pytest
 
 from bn.formatters import _render_grouped_leaves, _render_taint_text
+from bn_agent_bridge import read_taint_slice as rts
 
 KIND = "global_memory_continuation"
 GLOBALS = ("0x60a100", "0x60a200", "0x60a300")
@@ -96,6 +97,79 @@ def test_unmatched_resolve_map_pins_get_one_text_line():
 ])
 def test_no_resolve_map_line_when_all_matched_or_no_map(resolve_map):
     assert _resolve_rows(_render_taint_text(_taint_result(resolve_map))) == []
+
+
+class _OpCtx:
+    """The bridge context the taint op reads: one view, functions by name."""
+
+    def __init__(self, bv, functions) -> None:
+        self._bv, self._functions = bv, functions
+
+    def _resolve_view(self, selector):
+        return self._bv
+
+    def _find_function(self, bv, name):
+        return self._functions[name]
+
+
+@pytest.mark.parametrize(("program", "pin", "unmatched"), [
+    # A pin on a DIRECT call: the walk follows the call's real target and the
+    # pin routes nothing, so it stays unmatched and the line names it.
+    ("direct", "0x10", ["0x10"]),
+    # A pin on the unresolved indirect call: it routes the call, so it is
+    # matched and no line prints.
+    ("indirect", "0x70c", []),
+])
+def test_an_engine_run_reports_a_pin_matched_only_when_it_routed_a_call(
+        program, pin, unmatched):
+    """R3-02, the engine-level twin of the formatter tests above: every map
+    lookup used to mark its key matched, so a pin on a direct call (a helper
+    asked what the call was pinned to) was reported matched and its text
+    warning disappeared."""
+    from test_taint_c3_callee_and_continuation import _strcpy_shape
+    from test_taint_forward_seed import _dispatch_program
+
+    func, bv = _strcpy_shape("strcpy") if program == "direct" else _dispatch_program()
+    result = rts._taint_op(_OpCtx(bv, {"walked": func}), "active", {
+        "function": "walked", "sources": ["param:0"],
+        "resolve_map": {pin: ["0x500"]}, "resolve_map_path": "pins.json"})
+    rm = result["run_params"]["resolve_map"]
+    assert (rm["matched"], rm["unmatched"]) == ([] if unmatched else [pin], unmatched)
+    rows = _resolve_rows(_render_taint_text(result))
+    assert len(rows) == (1 if unmatched else 0)
+    assert all(address in rows[0] for address in unmatched)
+
+
+def test_a_pin_on_a_call_the_walk_never_reaches_is_unmatched_though_discovery_saw_it():
+    """D5c-01: finding the `call:read` source examines every indirect call
+    for a pin that might route it to `read`. That lookup marked the pin on a
+    clean `fp(7)` at 0x108 matched -- pinned to `system`, which neither
+    anchors the source nor is followed, while the only reached sink is the
+    direct `system(n)` at 0x104 -- so its warning disappeared."""
+    from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar
+
+    fd, n, fp = FVar("fd"), FVar("n"), FVar("fp")
+    fd0, n1 = FSSA(fd, 0), FSSA(n, 1)
+    func = FFunc("walked", 0x100, FSSAFunc([
+        FInstr(0, 0x100, "MLIL_CALL_SSA", "n#1 = 0x800(fd#0, buf, 8)", reads=[fd0], writes=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_VAR_SSA", "buf"), FExpr("MLIL_CONST", "8", constant=8)]),
+        FInstr(1, 0x104, "MLIL_CALL_SSA", "0x900(n#1)", reads=[n1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+        FInstr(2, 0x108, "MLIL_CALL_SSA", "fp#1(7)",
+               dest=FExpr("MLIL_VAR_SSA", "fp#1"), params=[FExpr("MLIL_CONST", "7", constant=7)]),
+    ]), params=[fd])
+    bv = FBV({0x800: "read", 0x900: "system"})
+    result = rts._taint_op(_OpCtx(bv, {"walked": func}), "active", {
+        "function": "walked", "sources": ["call:read"],
+        "resolve_map": {"0x108": ["0x900"]}, "resolve_map_path": "pins.json"})
+    assert [s["sink"]["address"] for s in result["reached_sinks"]] == ["0x104"]
+    rm = result["run_params"]["resolve_map"]
+    assert (rm["matched"], rm["unmatched"]) == ([], ["0x108"])
+    (row,) = _resolve_rows(_render_taint_text(result))
+    assert "0x108" in row
 
 
 def _estimate_help(argv: list[str], capsys) -> str:

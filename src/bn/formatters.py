@@ -5278,7 +5278,8 @@ def _wrap_row(row: str, width: int) -> list[str]:
     first line whole, so a reader or a grep that takes a frontier's first line
     gets every fact it states (it runs past the width only when it alone is
     wider). A backticked command is never split either: it is the one span a
-    reader pastes, so it moves to the next line whole."""
+    reader pastes, so it moves to the next line whole, its text verbatim --
+    every whitespace character in it, a tab in a selector included (D5c-03)."""
     if len(row) <= width:
         return [row]
     indent = row[:len(row) - len(row.lstrip(" "))]
@@ -5287,14 +5288,27 @@ def _wrap_row(row: str, width: int) -> list[str]:
     head, sep, tail = body.partition("  -- ")
     if sep:
         body = head.replace(" ", glue) + glue * 2 + "-- " + tail
-    # The space before a command glues too, so `next: <command>` stays one
-    # line, and a `[N leaves]` count stays one token a reader can grep for.
-    protected = re.sub(r" ?`[^`]*`|\[\d+ leaves\]",
-                       lambda m: m.group(0).replace(" ", glue), body)
+    # Each command -- with the space before it, so `next: <command>` stays
+    # one line -- is an opaque token while the row wraps, as wide as the
+    # command, and is restored verbatim after: textwrap expands tabs and
+    # breaks at any whitespace, so gluing only its spaces split a selector
+    # holding a tab. A command is recognised by its fence (`code_span`),
+    # never by "the next backtick": a selector may carry one (R4-02).
+    spans: list[str] = []
+
+    def opaque(m: re.Match[str]) -> str:
+        spans.append(m.group(0))
+        tag = f"\x01{len(spans) - 1}"
+        return tag + "\x02" * max(1, len(m.group(0)) - len(tag))
+
+    protected = re.sub(rf" ?{CODE_SPAN_RE.pattern}", opaque, body)
+    # A `[N leaves]` count stays one token a reader can grep for.
+    protected = re.sub(r"\[\d+ leaves\]", lambda m: m.group(0).replace(" ", glue), protected)
     lines = textwrap.wrap(protected, width=width, initial_indent=indent,
                           subsequent_indent=indent + "    ", break_long_words=False,
                           break_on_hyphens=False)
-    return [line.replace(glue, " ") for line in lines] or [row]
+    return [re.sub(r"\x01(\d+)\x02+", lambda m: spans[int(m.group(1))], line)
+            .replace(glue, " ") for line in lines] or [row]
 
 
 def _counted(items: list[str], what: str) -> str:
@@ -5385,7 +5399,7 @@ def _render_continuation_group(leaves: list[dict[str, Any]], *, mangled: bool = 
     if reseed:
         out.append(f"      next: {reseed}")
     elif glob.get("address"):
-        out.append(f"      next: `{_bn_command('xrefs', str(glob['address']))}`")
+        out.append(f"      next: {code_span(_bn_command('xrefs', str(glob['address'])))}")
     if full and rep.get("detail"):
         out.append(f"      detail: {rep['detail']}")
     return out
@@ -6230,14 +6244,16 @@ def _presence_tag(e: dict[str, Any]) -> str:
     """` [present]` / ` [absent]` for a catalog row checked against a target,
     naming the spelling that matched when it is not the model's own name
     (W07-15): `scanf [present as __isoc99_scanf]` tells the reader which
-    symbol `xrefs`/`callsites` find, while `call:scanf` still names the call."""
+    symbol `xrefs`/`callsites` find, while `call:scanf` still names the call.
+    That spelling is `resolved_symbol`, the one the bridge selected (R4-03):
+    `accepted_aliases` lists every spelling present, and naming another one --
+    `memcpy@plt` beside an exact `memcpy` -- sent the follow-up to the stub."""
     if "present" not in e:
         return ""
     if not e.get("present"):
         return " [absent]"
-    symbol = e.get("symbol")
-    aliases = [str(a) for a in _field_list(e, "accepted_aliases") if a != symbol]
-    return f" [present as {', '.join(aliases)}]" if aliases else " [present]"
+    resolved = _text_value(e, "resolved_symbol")
+    return f" [present as {resolved}]" if resolved and resolved != e.get("symbol") else " [present]"
 
 
 def _render_taint_sink_entry(e: dict[str, Any], *, mangled: bool = False,
@@ -6435,6 +6451,24 @@ def _bn_command(*words: str) -> str:
     return " ".join(["bn", *flags, *(shlex.quote(w) for w in words)])
 
 
+def code_span(command: str) -> str:
+    """*command* as ONE inline code span (R4-02): the fence is one backtick
+    longer than the longest backtick run inside it, and a command that starts
+    or ends with a backtick is padded by a space (CommonMark), so a selector
+    such as ``'audit`copy.bndb'`` cannot close the span early. Every command
+    a reader is to paste is printed through here; `CODE_SPAN_RE` is the one
+    reader of the result."""
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", command)), default=0) + 1)
+    pad = " " if command.startswith("`") or command.endswith("`") else ""
+    return f"{fence}{pad}{command}{pad}{fence}"
+
+
+#: One code span as `code_span` writes it: an opening backtick run and the
+#: first closing run of exactly that length. The body is group 2, padding
+#: included.
+CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+
+
 # #1037 item 1: the characters of one string value a text row shows. One
 # `strings --query` matched inside five 16 KB blobs and printed all of them in
 # one turn; the size note came after the flood. JSON keeps the value whole.
@@ -6469,7 +6503,7 @@ def _render_strings_rows(value: Any, *, mangled: bool = False) -> str:
             else:
                 command = _bn_command("read", str(address), "--encoding", "escaped")
             clipped = (f" … (+{len(text) - _STRING_VALUE_CLIP} chars; full value: "
-                       f"--format json or `{command}`)")
+                       f"--format json or {code_span(command)})")
             text = text[:_STRING_VALUE_CLIP]
         rendered = json.dumps(text, ensure_ascii=True) + clipped
         if chars is not None and isinstance(length, int) and chars != length:
@@ -8414,7 +8448,7 @@ def _render_mutation_summary_text(value: Any, *,
         # claims nothing about the outcome: the save's own gates (open-target
         # collision, cache fallback) decide, and its output says why and what
         # to do (predicting them failed review round 3 in both directions).
-        line += (f"\nnext: `{save_command()}` to persist it; if it is refused, "
+        line += (f"\nnext: {code_span(save_command())} to persist it; if it is refused, "
                  "its output says why and what to do")
     return line
 

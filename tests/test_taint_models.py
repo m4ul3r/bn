@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from bn_agent_bridge.read_taint_models import build_catalog
@@ -864,6 +866,28 @@ def test_present_exposes_portable_identifiers_556():
     assert mc["resolved_symbol"] == "memcpy"              # exact key preferred over @plt
     assert mc["raw_symbol"] == "memcpy"
     assert set(mc["accepted_aliases"]) == {"memcpy", "memcpy@plt"}
+
+
+@pytest.mark.parametrize("spellings,label", [
+    (("memcpy", "memcpy@plt"), "present"),
+    (("memcpy@plt",), "present as memcpy@plt"),
+])
+def test_a_presence_row_names_the_spelling_the_bridge_selected(spellings, label):
+    """R4-03: with both `memcpy` and `memcpy@plt` in the image the bridge
+    selects the exact `memcpy` (`resolved_symbol`), but the text row read
+    `accepted_aliases` and printed `[present as memcpy@plt]`, sending the
+    `xrefs`/`callsites` follow-up to the stub. The label follows the selection;
+    JSON keeps every spelling."""
+    from bn.formatters import _render_taint_models_text
+
+    bv = _BVSpellings()
+    bv.functions = [_FakeFn(name) for name in spellings]
+    bv._syms = {name: syms for name, syms in bv._syms.items() if name in spellings}
+    res = rts._taint_models_op(_CtxWithBV(bv), "active", {"present": True})
+    assert set(_sink_entry(res, "memcpy")["accepted_aliases"]) == set(spellings)
+    [row] = [line for line in _render_taint_models_text(res).splitlines()
+             if line.strip().startswith("memcpy (")]
+    assert re.findall(r"\[(present[^\]]*)\]", row) == [label]
 
 
 def test_catalog_only_has_model_name_but_no_raw_symbol_556():

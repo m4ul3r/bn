@@ -7,22 +7,24 @@ compile-time constant as a pointer.
 """
 from __future__ import annotations
 
+import pytest
 from test_taint_engine import FBV, FExpr, FFunc, FInstr, FSSA, FSSAFunc, FVar, _ext_call, te
 
 RE, MEMCPY, CHK, APP = 0x900, 0x901, 0x902, 0x903
 
 
-def _match_sized_copy():
-    """get_field(s): regexec(&re, s, 3, &m, 0); n = m; memcpy(&d, s, n) --
-    the copy length is a match offset regexec wrote into `m`."""
+def _match_sized_copy(api: str = "regexec", subject: int = 1, offsets: int = 3,
+                      arity: int = 5):
+    """get_field(s): <api>(..., s at `subject`, ..., &m at `offsets`, ...);
+    n = m; memcpy(&d, s, n) -- the copy length is a match offset the match API
+    wrote into `m` (regexec: `regexec(&re, s#0, 3, &m, 0)`)."""
     s, m, n, d = FVar("s"), FVar("m", typ="regmatch_t[3]"), FVar("n"), FVar("d", typ="char[0x40]")
     s0, m1, n1 = FSSA(s, 0), FSSA(m, 1), FSSA(n, 1)
+    args = [FExpr("MLIL_CONST", hex(0x5000 + i), constant=0x5000 + i) for i in range(arity)]
+    args[subject] = FExpr("MLIL_VAR_SSA", "s#0", reads=[s0])
+    args[offsets] = FExpr("MLIL_ADDRESS_OF", "&m", src=m)
     instrs = [
-        _ext_call(0, 0x10, "regexec(&re, s#0, 3, &m, 0)", RE,
-                  [FExpr("MLIL_CONST_PTR", "&re", constant=0x5000),
-                   FExpr("MLIL_VAR_SSA", "s#0", reads=[s0]), FExpr("MLIL_CONST", "3", constant=3),
-                   FExpr("MLIL_ADDRESS_OF", "&m", src=m), FExpr("MLIL_CONST", "0", constant=0)],
-                  reads=[s0]),
+        _ext_call(0, 0x10, f"{api}(.., s#0, .., &m, ..)", RE, args, reads=[s0]),
         FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "n#1 = m @ mem#1", reads=[m1], writes=[n1],
                src=FExpr("MLIL_VAR_ALIASED", "m @ mem#1", reads=[m1], src=m1)),
         _ext_call(2, 0x18, "memcpy(&d, s#0, n#1)", MEMCPY,
@@ -30,7 +32,7 @@ def _match_sized_copy():
                    FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])], reads=[s0, n1]),
         FInstr(3, 0x1c, "MLIL_RET", "return"),
     ]
-    return FFunc("get_field", 0x10, FSSAFunc(instrs), params=[s]), FBV({RE: "regexec",
+    return FFunc("get_field", 0x10, FSSAFunc(instrs), params=[s]), FBV({RE: api,
                                                                       MEMCPY: "memcpy"})
 
 
@@ -57,6 +59,25 @@ def test_every_regex_match_api_names_its_offset_array_from_its_subject():
                                    ("pcre_exec", 2, 6), ("pcre2_match_8", 1, 5)):
         rules = {(r["from"], r["to"]) for r in models[name]["propagates"]}
         assert (f"*arg:{subject}", f"*arg:{offsets}") in rules, name
+
+
+@pytest.mark.parametrize(("api", "subject", "offsets", "arity"), [
+    ("re_search", 1, 5, 6), ("re_match", 1, 4, 5), ("pcre_exec", 2, 6, 8),
+    ("pcre2_match_8", 1, 5, 7),
+])
+def test_each_regex_match_api_carries_its_subject_into_the_offsets_it_writes(
+        api, subject, offsets, arity):
+    """The rule table above, run: the copy sized by an offset a non-`regexec`
+    match API wrote reaches its sink from the subject alone, as the
+    `regexec` run does -- and does not when that API's propagation is
+    overlaid away, so the reach is the builtin rule's doing."""
+    func, bv = _match_sized_copy(api, subject, offsets, arity)
+    builtin = te.TaintEngine(bv, te.load_models(), unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert ("memcpy", "overflow_len", 2) in _sinks(builtin)
+    inert = te.TaintEngine(bv, te.load_models({api: {}}), unknown_call_policy="stop").forward(
+        func, [te.parse_locator("param:0")])
+    assert ("memcpy", "overflow_len", 2) not in _sinks(inert)
 
 
 def test_a_sink_from_a_models_overlay_carries_a_detail_like_a_builtin():

@@ -34,8 +34,8 @@ class _Ctx:
 def unanalysed(monkeypatch):
     class _Engine(rts._taint.TaintEngine):
         def forward(self, func, locators, **kw):
-            # The walk reaches the indirect call at 0x4011f0 and consults its pin.
-            self.resolve_map.get(0x4011F0)
+            # The walk reaches the indirect call at 0x4011f0 and routes it by its pin.
+            self.resolve_map.select(0x4011F0)
             return {"direction": "forward", "reached_sinks": [], "leaves": [],
                     "run_params": {"max_depth": kw.get("max_depth")}}
 
