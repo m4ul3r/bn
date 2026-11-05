@@ -2030,6 +2030,46 @@ class TestDisasmThumbIT741:
         assert bytes.fromhex(" ".join(row["bytes"] for row in decoded["instructions"])) == raw
 
 
+class TestFunctionReadProvenance:
+    """`function info` / `proto get` provenance, address span and Thumb
+    normalization, and their reference counts, on real Binary Ninja."""
+
+    def test_thumb_reads_report_normalization_span_and_type_source(self, shared_bn, tmp_path):
+        # b.n over six data bytes to `movs r0, #0; bx lr`: two blocks with a
+        # gap, 6 block bytes over a 12-byte span.
+        raw = bytes.fromhex("02e0" "ffffffffffff" "0020" "7047")
+        selector, start = TestDisasmThumbIT741._load_raw(shared_bn, tmp_path, raw, "linux-thumb2")
+        for argv in (("function", "info"), ("proto", "get")):
+            res = shared_bn.run(*argv, hex(start + 1), "--format", "json", "--target", selector)
+            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+            info = json.loads(res.stdout)
+            assert info["function"]["address"] == hex(start)
+            assert info["resolved_from"] == {
+                "requested_address": hex(start + 1), "normalized": hex(start), "offset": "+0x0"}
+            assert info["size"] == 6
+            assert (info["span_start"], info["span_end"], info["contiguous"]) == (
+                hex(start), hex(start + 12), False)
+            assert info["type_source"] == "auto"
+            assert isinstance(info["return_type_confidence"], int)
+            assert 0 <= info["prototype_confidence"] <= info["return_type_confidence"] <= 255
+
+        res = shared_bn.run("proto", "set", hex(start), "int32_t probe(void)", "--target", selector)
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        info = shared_bn.json("function", "info", hex(start), "--target", selector)
+        assert info["type_source"] == "user"
+        assert info["prototype_confidence"] == info["return_type_confidence"] == 255
+
+    def test_function_info_counts_match_xrefs_for_a_vtable_only_method(self, shared_bn):
+        # A virtual method is reached through its vtable slot: a data reference.
+        shared_bn.load(CLASSES_BINARY)
+        info = shared_bn.json("function", "info", "svc::EchoHandler::name")
+        xrefs = shared_bn.json("xrefs", "svc::EchoHandler::name")
+        assert (info["code_ref_count"], info["data_ref_count"]) == (
+            xrefs["code_ref_count"], xrefs["data_ref_count"])
+        assert info["data_ref_count"] >= 1
+        assert "xref_count" not in info
+
+
 def _build_and_prime_aarch64_probe(bridge, tmp_path_factory) -> Path:
     """Cross-build the AArch64 probe and pay for its analysis ONCE.
 

@@ -4828,7 +4828,9 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
 # 38 -> 37 (#1036 item 5): `_render_orient_text`'s
 # `ea.get('analysis_cache_restored', False)` matched as a count spelling
 # (`False == 0`); the split database flags now read through `_flag_field`.
-_RAW_COUNT_SPELLINGS = 37
+# 37 -> 36: `function info`'s `value.get('xref_count', 0)` is gone; its two
+# counts render `<unknown>` when absent instead of a fabricated 0.
+_RAW_COUNT_SPELLINGS = 36
 
 
 def test_the_raw_count_residue_is_exactly_this_big():

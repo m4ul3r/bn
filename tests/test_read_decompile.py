@@ -762,6 +762,28 @@ def test_function_info_includes_metadata(monkeypatch):
     assert result["size"] is None
 
 
+def test_function_info_counts_code_and_data_refs_by_the_xrefs_definitions(monkeypatch):
+    """`function info` reports the two counts `xrefs` reports, by its
+    definitions: a function reached only through a stored pointer must not
+    read as unreferenced in the summary while `xrefs` lists the pointer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x402000, "dispatch_loop")
+    handler = _FakeFunction(0x401000, "on_packet")
+    bv = _FakeBV(functions=[handler, caller],
+                 code_refs={0x401000: [_FakeCodeRef(0x402010, caller)]},
+                 data_refs={0x401000: [0x404000, 0x404008]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    info = instance._function_info("active", "on_packet")
+    xrefs = instance._xrefs("active", "on_packet")
+
+    assert (info["code_ref_count"], info["data_ref_count"]) == (1, 2)
+    assert (info["code_ref_count"], info["data_ref_count"]) == (
+        xrefs["code_ref_count"], xrefs["data_ref_count"])
+    assert "xref_count" not in info
+
+
 def test_disasm_linear_walks_arbitrary_non_function_address(monkeypatch):
     # #314: linear disasm reads N instructions from a MAPPED address that BN never
     # made part of a function (a missed handler / vtable slot left as data), which
@@ -4050,6 +4072,103 @@ def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
 
     assert result["function"]["address"] == "0x401000"
     assert "resolved_from" not in result
+
+
+def _thumb_bv():
+    fn = _FakeFunction(0x8000, "parse_frame", arch=_FakeArch(name="thumb2"))
+    # Two blocks with a literal pool between them: 10 + 32 summed bytes over a
+    # 0x30-byte span.
+    fn.basic_blocks = [_FakeBasicBlock(0x8010, 0x8030), _FakeBasicBlock(0x8000, 0x800a)]
+    return _FakeBV(functions=[fn], memory={0x8000: b"\x00" * 0x30}), fn
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst, ident: inst._function_info("active", ident), id="function_info"),
+    pytest.param(lambda inst, ident: inst._get_prototype("active", ident), id="proto_get"),
+])
+def test_an_odd_thumb_address_reports_its_normalization_in_json(monkeypatch, call):
+    """An odd address in a Thumb function carries the interworking bit, not an
+    instruction byte: the read says so in `normalized` and measures `offset`
+    from it, so an odd entry pointer is the function's exact start (+0x0), not
+    a byte one past it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _thumb_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    entry = call(instance, "0x8001")
+    assert entry["function"]["address"] == "0x8000"
+    assert entry["resolved_from"] == {
+        "requested_address": "0x8001", "normalized": "0x8000", "offset": "+0x0"}
+
+    interior = call(instance, "0x8013")
+    assert interior["resolved_from"] == {
+        "requested_address": "0x8013", "normalized": "0x8012", "offset": "+0x12"}
+
+
+def test_an_odd_address_outside_thumb_code_is_not_normalized(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info("active", "0x401011")
+
+    assert result["resolved_from"] == {"requested_address": "0x401011", "offset": "+0x11"}
+
+
+class _Confident(str):
+    """A BN type/convention stand-in: renders as text, carries a confidence."""
+
+    def __new__(cls, text: str, confidence: int):
+        obj = super().__new__(cls, text)
+        obj.confidence = confidence
+        return obj
+
+
+class _ConfidentParams(list):
+    confidence = 255
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._function_info("active", "parse_frame"), id="function_info"),
+    pytest.param(lambda inst: inst._get_prototype("active", "parse_frame"), id="proto_get"),
+])
+@pytest.mark.parametrize("user", [False, True], ids=["auto", "user"])
+def test_prototype_reads_report_source_confidence_and_address_span(monkeypatch, call, user):
+    """BN's provenance travels with the prototype: `type_source` is its
+    has_user_type flag, `prototype_confidence` the weakest of the return type,
+    parameter list and calling convention confidences, and the address span
+    is reported apart from the summed block `size`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _thumb_bv()
+    fn.return_type = _Confident("char*", 128)
+    fn.calling_convention = _Confident("cdecl", 96 if not user else 255)
+    fn.parameter_vars = _ConfidentParams()
+    fn._has_user_type = user
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = call(instance)
+
+    assert result["type_source"] == ("user" if user else "auto")
+    assert result["return_type_confidence"] == 128
+    assert result["prototype_confidence"] == (128 if user else 96)
+    assert (result["span_start"], result["span_end"], result["contiguous"]) == (
+        "0x8000", "0x8030", False)
+
+
+def test_address_span_is_contiguous_when_blocks_abut(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _mid_function_bv()
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401010), _FakeBasicBlock(0x401010, 0x401040)]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info("active", "parse_packet")
+
+    assert (result["span_start"], result["span_end"], result["contiguous"]) == (
+        "0x401000", "0x401040", True)
 
 
 def test_containment_meta_decimal_matches_hex(monkeypatch):

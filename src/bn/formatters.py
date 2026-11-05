@@ -778,7 +778,7 @@ def _resolution_note(value: Any) -> str:
     """A leading note when a function-scoped read annotated how it resolved the
     requested address (#193 Part 4).
 
-    Two distinct disclosures share one `resolved_from` envelope, and text mode
+    Three distinct disclosures share one `resolved_from` envelope, and text mode
     must say exactly what the JSON says:
 
     * a non-zero offset means an INTERIOR address resolved to its containing
@@ -787,7 +787,10 @@ def _resolution_note(value: Any) -> str:
     * ``input_format: decimal`` means a digit-only token was read as an address
       rather than a symbol name. At offset ``+0x0`` that is the ONLY news: the
       read answered for exactly the function the caller named, so claiming
-      containment there contradicts the payload.
+      containment there contradicts the payload;
+    * ``normalized`` means the request's Thumb bit (bit 0) was cleared, and the
+      offset is measured from the cleared address: an odd entry pointer at
+      ``+0x0`` names the function's own start.
 
     Returns '' when not applicable.
     """
@@ -806,9 +809,16 @@ def _resolution_note(value: Any) -> str:
     name = function.get("name", "?")
     address = function.get("address", "?")
     requested = resolved_from.get("requested_address")
+    normalized = resolved_from.get("normalized")
     decimal = resolved_from.get("input_format") == "decimal"
     spelling = " (decimal input)" if decimal else ""
+    thumb = f", Thumb bit cleared to {normalized}" if normalized else ""
     if _is_exact_start(resolved_from):
+        if normalized:
+            return (
+                f"// bn: {requested}{spelling} is the Thumb-tagged entry of {name} "
+                f"@ {address} (bit 0 cleared)\n"
+            )
         if not decimal:
             return ""
         return (
@@ -817,7 +827,7 @@ def _resolution_note(value: Any) -> str:
         )
     return (
         f"// bn: {requested}{spelling} is inside {name} "
-        f"@ {address} ({resolved_from.get('offset')}); showing the containing function\n"
+        f"@ {address} ({resolved_from.get('offset')}{thumb}); showing the containing function\n"
     )
 
 
@@ -924,6 +934,19 @@ def _shown_name(entry: Any, *, mangled: bool = False, name_key: str = "name",
     return entry.get(name_key)
 
 
+def _prototype_provenance_line(value: dict[str, Any]) -> str:
+    """`type: auto, confidence 128 (return type 128)` -- who owns the prototype
+    and BN's confidence in it -- or '' when the read carried neither."""
+    source = value.get("type_source")
+    proto = value.get("prototype_confidence")
+    ret = value.get("return_type_confidence")
+    if source is None and proto is None and ret is None:
+        return ""
+    return (f"type: {source if source is not None else '<unknown>'}, confidence "
+            f"{proto if proto is not None else '<unknown>'} "
+            f"(return type {ret if ret is not None else '<unknown>'})")
+
+
 @_discloses
 def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool = False) -> str:
     if not isinstance(value, dict):
@@ -931,12 +954,21 @@ def _render_function_info_text(value: Any, verbose: bool = False, mangled: bool 
 
     function = _field_dict(value, "function")
     header_name = _shown_name(function, mangled=mangled) or "<unknown>"
+    size = f"size: {value.get('size', '<unknown>')}"
+    if value.get("span_start") is not None:
+        # `size` sums block bytes; the span bounds them, and a gap between
+        # blocks makes it the larger of the two.
+        size += f"  span {value['span_start']}..{value.get('span_end', '?')}"
+        if value.get("contiguous") is False:
+            size += " (discontiguous)"
     lines = [
         f"{_escape_control_chars(header_name)} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
+        *filter(None, [_prototype_provenance_line(value)]),
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
-        f"size: {value.get('size', '<unknown>')}",
-        f"xrefs: {value.get('xref_count', 0)}",
+        size,
+        f"xrefs: {value.get('code_ref_count', '<unknown>')} code, "
+        f"{value.get('data_ref_count', '<unknown>')} data",
     ]
 
     locals_only = _field_list(value, "locals")
@@ -1041,8 +1073,9 @@ def _render_proto_text(value: Any, *, mangled: bool = False) -> str:
         # return type (e.g. name "t" in "uint64_t") (#222 review).
         already_named = head.split()[-1:] == [name] if head else False
         if not already_named:
-            return note + f"{head} {name}({rest}" + width_note
-    return note + prototype + width_note
+            prototype = f"{head} {name}({rest}"
+    provenance = _prototype_provenance_line(value)
+    return note + prototype + (f"\n{provenance}" if provenance else "") + width_note
 
 
 @_discloses
