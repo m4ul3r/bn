@@ -196,3 +196,44 @@ def test_a_quick_load_note_routes_its_refresh_to_the_target_it_loaded():
     bn.cli._contextualize_diagnostic_hints(value, target=None, instance="X1")
     assert _printed_refreshes(value["loaded"][0]["notes"][0]) == [
         ["bn", "-i", "X1", "-t", "second copy", "refresh"]]
+
+
+# V8-07: every command that resolves a function name prints the bridge's
+# ambiguity refusal with its retry command routed to this call. `proto get`
+# printed a bare `bn function info 0x…` while `decompile` printed it routed.
+def _ambiguous_name_refusal() -> BridgeError:
+    from types import SimpleNamespace
+
+    from bn_agent_bridge._shared import _format_ambiguous_function_error
+    kind = SimpleNamespace(type=SimpleNamespace(name="FunctionSymbol"))
+    rows = [SimpleNamespace(start=a, name="helper", symbol=kind) for a in (0x401130, 0x401150)]
+    return BridgeError(_format_ambiguous_function_error("helper", rows))
+
+
+def _printed_commands(text: str) -> list[list[str]]:
+    from bn.formatters import CODE_SPAN_RE
+    return [shlex.split(m.group(2)) for m in CODE_SPAN_RE.finditer(text)
+            if m.group(2).startswith("bn ")]
+
+
+@pytest.mark.parametrize("argv", [
+    ["decompile", "helper"], ["il", "helper"], ["disasm", "helper"], ["xrefs", "helper"],
+    ["callsites", "helper"], ["callsites", "memcpy", "--within", "helper"],
+    ["trace", "helper", "0x401140", "--arg", "0"], ["rename", "helper", "scale"],
+    ["dataflow", "defuse", "helper", "--var", "x"], ["dataflow", "callgraph", "helper"],
+    ["dataflow", "values", "helper", "--at", "0x401140"],
+    ["taint", "backward", "-f", "helper", "--sink", "arg:memcpy:2"],
+    ["taint", "forward", "-f", "helper", "--source", "param:0"],
+    ["function", "info", "helper"], ["function", "structured-il", "helper"],
+    ["function", "cfg", "helper"], ["evidence", "function", "helper"],
+    ["evidence", "xrefs", "helper"], ["bundle", "function", "helper"],
+    ["symbol", "rename", "helper", "scale"], ["comment", "get", "--function", "helper"],
+    ["proto", "get", "helper"], ["proto", "set", "helper", "int helper(int x)"],
+    ["local", "list", "helper"], ["local", "rename", "helper", "var_8", "count"],
+    ["tag", "list", "--function", "helper"],
+], ids=" ".join)
+def test_an_ambiguous_name_refusal_prints_its_retry_routed(monkeypatch, capsys, argv):
+    _answering(monkeypatch, error=_ambiguous_name_refusal())
+    assert bn.cli.main(["-i", "X1", "-t", "my tgt", *argv]) == 2
+    printed = _printed_commands(capsys.readouterr().err)
+    assert printed and all(words[1:5] == ["-i", "X1", "-t", "my tgt"] for words in printed), printed
