@@ -425,7 +425,8 @@ def test_render_taint_grouped_leaves_top_n_cap():
     text = _render_taint_text(value)
     assert "frontiers (20)" in text
     assert "... and 8 more group(s)" in text
-    assert "see --format json" in text
+    # the elision must point at BOTH ways of seeing the rest
+    assert "--verbose" in text and "--format json" in text
 
 
 def test_render_taint_field_load_unresolved_leaf():
