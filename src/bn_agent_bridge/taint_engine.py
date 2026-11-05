@@ -11881,10 +11881,12 @@ class TaintEngine:
         argument a callee reads), and cites the first use that may read them
         only when none does -- the CRT's `deregister_tm_clones` handing back
         an address that coincides with the object is not the reader to name
-        when `reader()` loads it. The other referencing functions are listed
-        by the code reference BN records for them -- an established
+        when `reader()` loads it. The other functions BN records a reference
+        to THIS object from are listed at that reference -- an established
         reference, never a claimed read -- rather than each paying a full
-        pointer scan for a fact the verdict does not depend on."""
+        pointer scan for a fact the verdict does not depend on; a body that
+        names only a preceding object is no such reference and is never
+        listed (R1-04)."""
         gtxt = hex(int(ga))
         if any(lf.get("kind") == "global_memory_continuation"
                and isinstance(lf.get("global"), dict)
@@ -11909,7 +11911,9 @@ class TaintEngine:
             if start == own or self._is_crt_helper(start):
                 continue        # its own reads are judged below, by path; CRT markers read nothing
             if cited is not None:
-                others.append((start, site))
+                # Listed by BN's reference to THIS object, unclassified.
+                if start in own_refs:
+                    others.append((start, site))
                 continue
             rfn = function_at(self.bv, start)
             use = (_Use(site, "unreadable", 0, None, None, True) if rfn is None
