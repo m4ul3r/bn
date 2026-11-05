@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import itertools
 import json
 import re
 import shlex
@@ -340,6 +341,21 @@ class _Use(NamedTuple):
     # ruled out from its START alone when its length is unknown; a pointer
     # handed to something that may index either way cannot (BN23/F76).
     forward: bool = False
+
+
+class _SettleFrame:
+    """One access on :meth:`TaintEngine._settle_access`'s stack: its
+    suspended steps, which (function, global) it answers, the lowest
+    discovery number of an unsettled access it depends on (`low`, as in
+    Tarjan's algorithm) and where its cycle starts in the unsettled list
+    (`base`)."""
+
+    __slots__ = ("steps", "key", "fn", "ga", "low", "base")
+
+    def __init__(self, steps: Any, key: tuple[int, int], fn: Any, ga: int,
+                 low: int, base: int) -> None:
+        self.steps, self.key, self.fn, self.ga = steps, key, fn, ga
+        self.low, self.base = low, base
 
 
 # What a reached pointer-scan bound is REPORTED as. Both are blocking: the
@@ -690,6 +706,13 @@ def merge_unrecovered_leaves(leaves: list) -> list:
     return out
 
 
+def _sink_signature(finding: dict) -> tuple:
+    """What makes two findings the same report: the sink's callee, call site
+    and tainted argument -- not the path that reached it."""
+    s = finding.get("sink", {})
+    return (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -806,6 +829,14 @@ class TaintEngine:
         # what tells an interior ALIAS from the next object along; built
         # once from the raw image, never from this run's evidence.
         self._declared_objects: list[tuple[int, int]] | None = None
+        # `(link address, view address, size)` of each declared object of a
+        # rebased fixed-address image whose link-time address the view does
+        # not map: its absolute references still name the link address, and
+        # both spellings are ONE object, keyed at the view address (D5a-01).
+        self._link_spellings: list[tuple[int, int, int]] = []
+        # Their link-time spans merged, `(start, end, view - link)`, sorted.
+        self._link_spans: list[tuple[int, int, int]] = []
+        self._link_span_starts: list[int] = []
         self._declared_object_cache: dict[int, tuple[int, int] | None] = {}
         # Object widths a declaration states (image symbol table or debug
         # info), per address: facts about the binary, never this run's.
@@ -2289,7 +2320,7 @@ class TaintEngine:
                 v = getattr(expr, "value", None)
                 c = getattr(v, "value", v)
             try:
-                addr = int(c)
+                addr = self._view_spelling(int(c))
             except Exception:
                 return None
             if not canon:
@@ -2360,6 +2391,7 @@ class TaintEngine:
         offsets into one buffer share a taint location) and require it be writable,
         so rodata strings / code pointers are not treated as buffers. Permissive
         when the BinaryView lacks these APIs (the unit-test fakes)."""
+        addr = self._view_spelling(addr)
         cached = self._canon_global_cache.get(addr, _MISSING)
         if cached is not _MISSING:
             return cached
@@ -2514,13 +2546,16 @@ class TaintEngine:
         return all(hi is not None and (off + width <= lo or off >= hi) for lo, hi in ranges)
 
     def _int_const(self, expr: Any) -> int | None:
+        """*expr*'s integer constant, an address in the view's spelling
+        (:meth:`_view_spelling`: a rebased image's link-time address of a
+        declared object is that object), else None."""
         if expr is None or "CONST" not in op_name(expr):
             return None
         c = getattr(expr, "constant", None)
         if c is None:
             return None
         try:
-            return int(c)
+            return self._view_spelling(int(c))
         except Exception:
             return None
 
@@ -3377,7 +3412,7 @@ class TaintEngine:
                     out.append(("entry", None))
                 pending.extend(arms)
                 continue
-            if self._writes_back_what_it_reads(defn):
+            if self._writes_back_what_it_reads(ssaf, defn):
                 # A stack probe: the bytes before it are the bytes after it.
                 pending.append(self._mem_in(defn))
                 continue
@@ -4022,9 +4057,8 @@ class TaintEngine:
             return inner
         return "no"
 
-    @staticmethod
-    def _writes_back_what_it_reads(defn: Any) -> bool:
-        """A store of the bytes it loads from the very address it writes
+    def _writes_back_what_it_reads(self, ssaf: Any, defn: Any) -> bool:
+        """A store of the bytes it loads from the very slot it writes
         (``[a].q = [a].q @ mem#k``): it changes no object's contents, so it is
         never a writer -- or may-writer -- of a buffer or of a pointer's object,
         and stores no pointer anywhere. Stack-clash probes are the producer:
@@ -4032,16 +4066,37 @@ class TaintEngine:
         frame by lifts to exactly this, and its address (off the stack pointer
         through a renamed register at -O0) is otherwise one the walk cannot
         pin, so every slice through the frame gained a blocking may-alias row
-        and a spurious origin."""
+        and a spurious origin.
+
+        The slot is the whole of it -- base, field offset and width. BN's
+        ``*_STRUCT`` forms keep the field offset beside a bare base, so
+        ``m->a = m->b`` prints one address on both sides; comparing the text
+        alone read that copy as a write-back and the older store became the
+        sole origin of a "complete" slice (R2-01)."""
         if "STORE" not in op_name(defn):
             return False
         dest, src = getattr(defn, "dest", None), getattr(defn, "src", None)
         if dest is None or src is None or "LOAD" not in op_name(src):
             return False
-        # SSA text is canonical, so equal text is the same address expression
-        # over the same SSA versions.
+        if getattr(src, "size", None) != getattr(defn, "size", None):
+            return False
+        written = self._mem_access_slot(ssaf, defn, exact=True)
+        read = self._mem_access_slot(ssaf, src, exact=True)
+        if written is not None or read is not None:
+            return written == read
+        # No exact identity for the address (a probe off the stack pointer
+        # plus a run-time size): SSA text is canonical, so equal text is the
+        # same address over the same SSA versions -- and the field offsets
+        # beside it must agree too.
+        def field(access: Any) -> int | None:
+            if "_STRUCT" not in op_name(access):
+                return 0
+            try:
+                return int(getattr(access, "offset", 0) or 0)
+            except (TypeError, ValueError):
+                return None
         return (str(getattr(src, "src", None)) == str(dest)
-                and getattr(src, "size", None) == getattr(defn, "size", None))
+                and field(defn) is not None and field(defn) == field(src))
 
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
                               base_size: int | None = None,
@@ -4347,7 +4402,7 @@ class TaintEngine:
                 cov, esc = memo.get(deps[0], ((), False))
                 addrs = escape_addrs.get(deps[0], frozenset())
                 op = op_name(defn)
-                if self._writes_back_what_it_reads(defn):
+                if self._writes_back_what_it_reads(ssaf, defn):
                     # A stack probe (`alloca`'s page touch): no object's
                     # contents change, so it is neither a writer nor an
                     # escape.
@@ -5163,8 +5218,7 @@ class TaintEngine:
         seen_sink: set[tuple] = set()
         unique_findings = []
         for f in sub["findings"]:
-            s = f.get("sink", {})
-            sig = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+            sig = _sink_signature(f)
             if sig in seen_sink:
                 continue
             seen_sink.add(sig)
@@ -6354,10 +6408,12 @@ class TaintEngine:
         srcs = [roles[0]]
         src_expr, len_expr = params[srcs[0]], params[length_idx]
         cap = self._buffer_capacity(ssaf, src_expr)
-        # W01-10: `n = recv(fd, buf, MAX, 0); memcpy(dst, buf, n)` reads back only
-        # the bytes the fill wrote into this same source -- its model bounds the
-        # return by the count it wrote -- so the length cannot over-read it,
-        # whatever the source's recovered size.
+        # W01-10: `n = recv(fd, buf, MAX, 0); if (n <= 0) return; memcpy(dst, buf, n)`
+        # reads back only the bytes the fill wrote into this same source -- its
+        # model bounds a successful return by the count it wrote -- so the length
+        # cannot over-read it, whatever the source's recovered size. Without the
+        # guard the failure return (-1) is SIZE_MAX here (R3-01), so the gate
+        # does not open and the copy is sized like any other.
         fill = self._fill_return_of_source(ssaf, len_expr, src_expr)
         if fill is not None:
             _fill_callee, _fill_at = fill
@@ -6401,15 +6457,20 @@ class TaintEngine:
     def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
                                src_expr: Any) -> tuple[str, int] | None:
         """``(called symbol, call address)`` when the copy length IS the return value
-        of a modeled fill of the copy's own source pointer, else None (W01-10).
+        of a modeled fill of the copy's own source pointer AND the copy proves
+        that return a byte count, else None (W01-10, R3-01).
 
         A fill model is one declaring ``return_bound`` (its return counts the
         bytes it wrote); its buffer is the sink's ``buf_arg``, else its single
         ``*arg:N`` source. The length may reach the return through copies and
         width extensions only -- any arithmetic on it stops the proof. The
-        source must be the very pointer the fill was given: the same SSA value,
-        or the same object at the same offset (equal buffer key AND equal
-        capacity description, which carries the offset)."""
+        return bound holds only when the fill SUCCEEDED: a failure returns -1,
+        which a sign extension turns into SIZE_MAX, so the length must be
+        proven non-negative in the return's own width where the copy uses it
+        (:meth:`_proven_non_negative`). The source must be the very pointer
+        the fill was given: the same SSA value, or the same object at the
+        same offset (equal buffer key AND equal capacity description, which
+        carries the offset)."""
         chain = self._def_chain(ssaf, len_expr)
         var = self._as_single_ssa_var(chain[-1]) if chain else None
         if var is None:
@@ -6423,6 +6484,8 @@ class TaintEngine:
         callee = self._callee_name(self._resolve_direct_target(d))
         mkey, model = lookup_model(self.models, callee)
         if not model or not model.get("return_bound"):
+            return None
+        if not self._proven_non_negative(len_expr, getattr(chain[-1], "size", None)):
             return None
         buf_idx = (model.get("sink") or {}).get("buf_arg")
         if buf_idx is None:
@@ -6442,6 +6505,29 @@ class TaintEngine:
         if not same:
             return None
         return str(called_name(mkey, callee)), int(getattr(d, "address", 0))
+
+    def _proven_non_negative(self, expr: Any, width: Any) -> bool:
+        """True when BN's value set for *expr* places every value in
+        ``[0, 2**(8*width - 1))`` -- non-negative read as a *width*-byte signed
+        integer, so no failure return hides behind a widening. The set BN
+        states for an operand is narrowed by the branches dominating its use
+        (measured: `if (n <= 0) return;` before the copy gives ``1..0x7fffffff``,
+        no guard ``-0x80000000..0x7fffffff``), which is what makes it the
+        proof of a guard. An unknown width or an unstated set proves nothing."""
+        if not isinstance(width, int) or width <= 0:
+            return False
+        pvs = getattr(expr, "possible_values", None)
+        kind = str(getattr(getattr(pvs, "type", None), "name", ""))
+        if kind in ("ConstantValue", "ConstantPointerValue"):
+            values = [int(pvs.value)]
+        elif kind in ("UnsignedRangeValue", "SignedRangeValue"):
+            values = [int(r.start) for r in pvs.ranges] + [int(r.end) for r in pvs.ranges]
+        elif kind == "InSetOfValues":
+            values = [int(v) for v in pvs.values]
+        else:
+            return False
+        limit = 1 << (8 * width - 1)
+        return bool(values) and all(0 <= v < limit for v in values)
 
     # The integer ops whose result wraps in their own width. A length computed
     # by one of them in fewer bytes than the sink's parameter wraps BEFORE the
@@ -6923,11 +7009,13 @@ class TaintEngine:
     def _is_pure_veneer(self, fn: Any) -> bool:
         """Whether *fn* is a stub the caller may resolve to its target: every
         hop of the chain ``follow_thunk`` walks is one MLIL tail call that
-        hands its own parameters on unchanged, in order. Anything else -- a
-        store, a call, an argument swap or a constant passed in a parameter's
-        place -- is a body of its own: mapping the caller's arguments straight
-        onto the target would hand them to the wrong formals, and what the
-        body does before its `jmp` would go unread."""
+        hands EVERY one of its own parameters on unchanged, in order. Anything
+        else -- a store, a call, an argument swap, a constant passed in a
+        parameter's place, or a formal it does not forward at all -- is a body
+        of its own: mapping the caller's arguments straight onto the target
+        would hand them to the wrong formals (an omitted formal's value lands
+        in a target slot it never reaches, R2-05), and what the body does
+        before its `jmp` would go unread."""
         if self._follow_thunk_cached(fn) is None:
             return False
         cur = fn
@@ -6944,7 +7032,10 @@ class TaintEngine:
                 # The end of the chain: a body follow_thunk stopped at.
                 return cur is not fn
             formals = list(getattr(cur, "parameter_vars", None) or [])
-            for i, param in enumerate(self._call_params(instructions[0])):
+            params = self._call_params(instructions[0])
+            if len(params) != len(formals):
+                return False
+            for i, param in enumerate(params):
                 src = getattr(param, "src", None)
                 if (op_name(param) != "MLIL_VAR_SSA" or i >= len(formals)
                         or getattr(src, "version", None) != 0
@@ -7078,7 +7169,8 @@ class TaintEngine:
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int,
                    fields: dict | None = None) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
-        result per (callee, tainted-param-set) so it is computed once."""
+        result per (callee, tainted-param-set, per-parameter field context) so
+        each context is computed once."""
         # P2-08: a parameter pointing at a partially tainted object is its own
         # context -- which bytes are tainted, and which members hold the
         # address of a place in the same object, decide what the body can
@@ -8499,7 +8591,7 @@ class TaintEngine:
                 elif sub is not None:
                     stack.append((sub, depth + 1))
             stack.extend((s, depth + 1) for s in (getattr(node, "operands", None) or ()))
-        out = tuple(sorted(set(found)))
+        out = tuple(sorted({self._view_spelling(value) for value in found}))
         if key is not None:
             self._expr_constants_cache[key] = (owner, out)
         return out
@@ -8574,6 +8666,12 @@ class TaintEngine:
                     at = start
                 if start not in out or at < out[start]:
                     out[start] = at
+            # D5a-01: a rebased fixed-address image's absolute references
+            # still name the object at its link-time spelling, where BN
+            # records no reference: the view does not map that address.
+            for start, at in self._link_spelling_refs(ga, extent):
+                if start not in out or at < out[start]:
+                    out[start] = at
         self._global_refs[ga] = out
         return out
 
@@ -8614,26 +8712,17 @@ class TaintEngine:
             except Exception:
                 data = b""
             needles = set()
-            if 0 <= ga < 1 << 32:
-                needles.add(ga.to_bytes(4, "little", signed=False))
-            if 0 <= ga < 1 << 64:
-                needles.add(ga.to_bytes(8, "little", signed=False))
-            length_at = getattr(self.bv, "get_instruction_length", None)
+            link = self._link_spelling(ga)
+            for spelling in (int(ga), *(() if link is None else (link[0],))):
+                if 0 <= spelling < 1 << 32:
+                    needles.add(spelling.to_bytes(4, "little", signed=False))
+                if 0 <= spelling < 1 << 64:
+                    needles.add(spelling.to_bytes(8, "little", signed=False))
             seen: set[int] = set()
             for needle in sorted(needles, key=len, reverse=True):
                 pos = data.find(needle)
                 while pos >= 0 and len(out) < 8:
-                    hit = start + pos
-                    site = hit
-                    if callable(length_at):
-                        for back in range(1, 16):
-                            try:
-                                size = int(length_at(hit - back) or 0)
-                            except Exception:
-                                break
-                            if size > back:
-                                site = hit - back
-                                break
+                    site = self._instruction_containing(start + pos)
                     if site not in seen:
                         seen.add(site)
                         out.append(site)
@@ -8641,6 +8730,74 @@ class TaintEngine:
         result = tuple(sorted(out))
         self._native_refs_cache[key] = result
         return result
+
+    def _instruction_containing(self, hit: int) -> int:
+        """The start of the instruction whose bytes include *hit*: the
+        nearest decode before it that runs past it, else *hit* itself."""
+        length_at = getattr(self.bv, "get_instruction_length", None)
+        if callable(length_at):
+            for back in range(1, 16):
+                try:
+                    size = int(length_at(hit - back) or 0)
+                except Exception:
+                    break
+                if size > back:
+                    return hit - back
+        return hit
+
+    # Code bytes one object's link-spelling search reads before it stops and
+    # records the sweep as truncated.
+    _LINK_SCAN_BYTES = 64 << 20
+
+    def _link_spelling_refs(self, ga: int, extent: int) -> list[tuple[int, int]]:
+        """``(function start, instruction)`` for each place an executable
+        segment's bytes carry an address inside the link-time spelling of
+        the object at *ga* (:meth:`_link_spelling`).
+
+        BN records references only to addresses the view maps, so an
+        unrelocated immediate naming the link address (`mov edi, 0x404020`
+        once the image is rebased to 0x500000) is in no code-reference DB
+        (measured). The bytes still carry it, little-endian, as for
+        :meth:`_native_global_refs`. The search keys on the encoding's
+        high bytes, which every address of a small object shares, and
+        checks each candidate's whole value, so one pass over the code
+        covers every interior offset."""
+        link = self._link_spelling(ga)
+        read = getattr(self.bv, "read", None)
+        containing = getattr(self.bv, "get_functions_containing", None)
+        if link is None or not callable(read) or not callable(containing):
+            return []
+        lo, end = link
+        hi = min(end, lo + max(1, int(extent)))
+        width = 4 if hi <= 1 << 32 else 8
+        out: list[tuple[int, int]] = []
+        budget = self._LINK_SCAN_BYTES
+        for seg in list(getattr(self.bv, "segments", None) or []):
+            if not getattr(seg, "executable", False):
+                continue
+            start = int(seg.start)
+            size = int(seg.end) - start
+            if size > budget:
+                self._global_refs_truncated.add(ga)
+                size = budget
+            budget -= size
+            try:
+                data = bytes(read(start, size) or b"")
+            except Exception:
+                continue
+            for prefix in range(lo >> 16, ((hi - 1) >> 16) + 1):
+                needle = prefix.to_bytes(width - 2, "little")
+                pos = data.find(needle, 2)
+                while 0 <= pos <= len(data) - width + 2:
+                    value = int.from_bytes(data[pos - 2:pos - 2 + width], "little")
+                    if lo <= value < hi:
+                        site = self._instruction_containing(start + pos - 2)
+                        for fn in containing(site) or []:
+                            out.append((int(fn.start), site))
+                    pos = data.find(needle, pos + 1)
+            if budget <= 0:
+                break
+        return out
 
     # Expression shapes a POINTER can be carried through without ceasing to
     # point at the same object: SSA copies, PHI merges, widening/narrowing
@@ -9257,7 +9414,12 @@ class TaintEngine:
     def _alias_slots(self, ga: int) -> frozenset:
         """Writable pointer-sized data words whose INITIAL value points into
         the object at *ga* -- `char *g_ptr = g_alias;` -- read from BN's data
-        cross-references. Empty on a view that cannot list them."""
+        cross-references. Empty on a view that cannot list them.
+
+        Every reference BN lists is checked: the list is already in hand and
+        each costs one pointer read, while a slot left out is a reader never
+        swept -- keeping the first 64 cleared a run whose only reader loaded
+        the 65th (R1-03)."""
         ga = int(ga)
         cached = self._alias_slots_cache.get(ga)
         if cached is not None:
@@ -9275,7 +9437,7 @@ class TaintEngine:
                     refs = list(get_refs(ga) or ())
                 except Exception:
                     refs = []
-            for ref in refs[:64]:
+            for ref in refs:
                 try:
                     slot = int(ref)
                     value = int(read_ptr(slot))
@@ -10055,39 +10217,90 @@ class TaintEngine:
         if self._declared_objects is not None:
             return self._declared_objects
         table: list[tuple[int, int]] = []
+        spellings: list[tuple[int, int, int]] = []
         try:
-            table = self._read_elf_object_sizes()
+            table, spellings = self._read_elf_object_sizes()
         except Exception:
-            table = []
+            table, spellings = [], []
         table.sort()
+        self._link_spellings = sorted(spellings)
+        # The link-time spans merged, for a bisect per constant: every
+        # spelling moved by the one load bias, so a span's delta is its own.
+        spans: list[list[int]] = []
+        for link, view, size in self._link_spellings:
+            if spans and link <= spans[-1][1]:
+                spans[-1][1] = max(spans[-1][1], link + size)
+            else:
+                spans.append([link, link + size, view - link])
+        self._link_spans = [(lo, hi, delta) for lo, hi, delta in spans]
+        self._link_span_starts = [lo for lo, _hi, _delta in spans]
         self._declared_objects = table
         return table
+
+    def _view_spelling(self, addr: int) -> int:
+        """*addr* in the view's address space: an address inside a declared
+        object's link-time spelling (:attr:`_link_spellings`) is the same
+        byte of the object where the view has it; any other address is
+        itself. Every question about WHICH storage an address names is asked
+        of this spelling, so the two spellings are one object (D5a-01)."""
+        addr = int(addr)
+        if self._declared_objects is None:
+            self._declared_object_table()
+        i = bisect.bisect_right(self._link_span_starts, addr) - 1
+        if i >= 0 and addr < self._link_spans[i][1]:
+            return addr + self._link_spans[i][2]
+        return addr
+
+    def _link_spelling(self, ga: int) -> tuple[int, int] | None:
+        """``(spelling, end)``: the link-time spelling of view address *ga*
+        and the end of its object's link-time span, when a rebased
+        fixed-address image's references may still name it there."""
+        self._declared_object_table()
+        for link, view, size in self._link_spellings:
+            if view <= int(ga) < view + size:
+                return int(ga) - view + link, link + size
+        return None
 
     # ELF data symbols only (`STT_OBJECT`), and only where the image states
     # a size: a zero `st_size` says nothing, which is not the same as 0.
     _ELF_STT_OBJECT = 1
+    # `e_type` of a fixed-address executable (a PIE or shared object is ET_DYN).
+    _ELF_ET_EXEC = 2
 
-    def _read_elf_object_sizes(self) -> list[tuple[int, int]]:
-        """The `(address, size)` pairs an ELF image's symbol tables state,
-        in the VIEW's address space.
+    def _read_elf_object_sizes(self) -> tuple[list[tuple[int, int]],
+                                              list[tuple[int, int, int]]]:
+        """The `(address, size)` pairs an ELF image's symbol tables state, in
+        the VIEW's address space, and the `(link, view, size)` spelling of
+        each one a rebased fixed-address image still names at its link-time
+        address.
 
-        `st_value` is a link-time address: a position-independent image the
-        view loaded at a non-zero base (BN maps PIEs at 0x400000) declares
-        every object 0x400000 below where the view has it, so the table is
-        moved by the load bias -- the view's start against the lowest
-        `PT_LOAD` address -- or it would size the wrong storage."""
+        `st_value` is a link-time address. BN maps the whole image by the
+        load bias -- the view's start against the lowest `PT_LOAD` address:
+        a PIE at 0x400000, or any image the user rebased -- so the object's
+        view address is `st_value + bias`, or the table sizes the wrong
+        storage. A position-independent image's code and data reach objects
+        only PC-relatively or through relocations, which BN applies, so the
+        view address is the only one its IL can name. A fixed-address image
+        (`ET_EXEC`) carries no relocations for its absolute references: once
+        rebased, its immediates and initialised pointers still hold
+        `st_value` (measured on BN: `mov esi, imm32` and a `.data` pointer
+        both keep the link address while the symbol moves). So such an
+        object's link address is a second SPELLING of it -- unless that
+        address is mapped in the view, where it is some other storage's
+        address."""
         import struct
 
         raw_view = getattr(self.bv, "parent_view", None)
         read = getattr(raw_view, "read", None)
         if not callable(read):
-            return []
+            return [], []
         head = read(0, 64) or b""
         if len(head) < 64 or head[:4] != b"\x7fELF":
-            return []
+            return [], []
         wide = head[4] == 2
         little = head[5] == 1
         end = "<" if little else ">"
+        e_type, = struct.unpack_from(end + "H", head, 0x10)
         if wide:
             shoff, = struct.unpack_from(end + "Q", head, 0x28)
             shentsize, shnum = struct.unpack_from(end + "HH", head, 0x3A)
@@ -10095,10 +10308,10 @@ class TaintEngine:
             shoff, = struct.unpack_from(end + "I", head, 0x20)
             shentsize, shnum = struct.unpack_from(end + "HH", head, 0x2E)
         if not shoff or not shnum or shentsize < (64 if wide else 40):
-            return []
+            return [], []
         table = read(shoff, shentsize * shnum) or b""
         if len(table) < shentsize * shnum:
-            return []
+            return [], []
         sections: list[tuple[int, int, int, int, int]] = []
         for i in range(shnum):
             at = i * shentsize
@@ -10115,7 +10328,9 @@ class TaintEngine:
             sections.append((int(s_type), int(offset), int(size), int(link),
                              int(entsize)))
         bias = self._elf_load_bias(head, read, wide, end)
+        view = self._view_span() if bias and e_type == self._ELF_ET_EXEC else None
         out: list[tuple[int, int]] = []
+        spellings: list[tuple[int, int, int]] = []
         for s_type, offset, size, link, entsize in sections:
             # SHT_SYMTAB (2) and SHT_DYNSYM (11).
             if s_type not in (2, 11) or not entsize or link >= len(sections):
@@ -10133,8 +10348,17 @@ class TaintEngine:
                     continue
                 if value:
                     out.append((int(value) + bias, int(st_size)))
+                    if view is not None and not view[0] <= int(value) < view[1]:
+                        spellings.append((int(value), int(value) + bias, int(st_size)))
             del step
-        return out
+        return out, spellings
+
+    def _view_span(self) -> tuple[int, int] | None:
+        """``(start, end)`` the view maps, None when either is unknown."""
+        try:
+            return int(getattr(self.bv, "start")), int(getattr(self.bv, "end"))
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def _elf_load_bias(self, head: bytes, read: Any, wide: bool, end: str) -> int:
         """How far the view moved the image: its start minus the lowest
@@ -10171,7 +10395,7 @@ class TaintEngine:
         The widest, because an alias declares its own byte and the object
         it names the inside of declares the whole buffer; the question
         here is which STORAGE the address belongs to."""
-        addr = int(addr)
+        addr = self._view_spelling(addr)
         if addr in self._declared_object_cache:
             return self._declared_object_cache[addr]
         best: tuple[int, int] | None = None
@@ -10201,7 +10425,7 @@ class TaintEngine:
         declares no sizes the LAYOUT answers as before: below, a distinct
         named object strictly between the two separates them; above, an arm
         that is itself a named object's base IS that object."""
-        addr, ga = int(addr), int(ga)
+        addr, ga = self._view_spelling(addr), self._view_spelling(ga)
         if addr == ga:
             return True
         key = (addr, ga)
@@ -11001,7 +11225,9 @@ class TaintEngine:
         declared width, while the image and the debug info can. Treating
         every declared scalar as "no recovered type" made a typed 8-byte
         global written by an 8-byte store an object of unknown extent whose
-        neighbours' loads were cited as reads of it (P1-05)."""
+        neighbours' loads were cited as reads of it (P1-05). A link-time
+        spelling of a rebased object is asked at its view address."""
+        ga = self._view_spelling(ga)
         getdv = getattr(self.bv, "get_data_var_at", None)
         if callable(getdv):
             try:
@@ -11018,7 +11244,7 @@ class TaintEngine:
         """The storage the BINARY declares from *ga* onward: the rest of the
         widest symbol-table object containing it, else the width its debug
         info gives the variable at *ga*, else 0."""
-        ga = int(ga)
+        ga = self._view_spelling(ga)
         cached = self._declared_width_cache.get(ga)
         if cached is not None:
             return cached
@@ -11131,6 +11357,7 @@ class TaintEngine:
             collect=uses)
         self._neighbour_uses_cache[key] = uses
         return uses
+
     def _settle_access(self, fn: Any, ga: int, *, reach: bool) -> Any:
         """Run :meth:`_global_access_steps` for *(fn, ga)* on an explicit stack.
 
@@ -11141,42 +11368,112 @@ class TaintEngine:
         object and hit Python's frame limit on an ordinary `main` (P1-02);
         here each question is a stack entry, so the depth stays constant.
 
-        A ``reach`` entry is :meth:`_reaches_object`'s answer: while it is
-        in progress it reads False (the cycle guard), and a body that cannot
-        be read answers False instead of raising."""
-        def frame(f: Any, g: int, as_reach: bool) -> tuple[Any, tuple | None]:
-            rkey = (int(getattr(f, "start", 0)), int(g)) if as_reach else None
-            if rkey is not None:
-                self._reaches_object_cache[rkey] = False   # cycle guard
-            return self._global_access_steps(f, g), rkey
+        A ``reach`` entry is :meth:`_reaches_object`'s answer, and a body
+        that cannot be read answers False instead of raising.
 
-        stack = [frame(fn, ga, reach)]
+        The questions may form a cycle: an access asking, through others,
+        about one still unsettled. That question is answered with the
+        unsettled access's current assumption -- False until it has an
+        answer -- so whatever is computed from it is provisional, and
+        caching it as final once left an access False that a fresh question
+        answers True (R1-Q3). The accesses of one cycle (a strongly
+        connected component, found the way Tarjan's algorithm finds one)
+        are therefore cached together, when the first of them settles, and
+        only if no assumption lent inside the cycle was below the answer
+        that access came to; otherwise the cycle is asked again under the
+        new assumptions. An assumption only ever rises from False -- a yes
+        only adds a neighbour to scan, it never removes a read -- so every
+        repeated pass turns at least one more answer True and the passes
+        end. For the same reason a yes computed from low assumptions is a
+        yes asked fresh: a cycle whose every access came out True is settled
+        though an assumption it was lent was low, and a cycle whose accesses
+        all reach one another settles in two passes, not three. An access
+        that is in no cycle settles in one pass, as before."""
+        root = (int(getattr(fn, "start", 0)), int(ga))
+        order: dict[tuple[int, int], int] = {}    # unsettled access -> discovery number
+        unsettled: list[tuple[int, int]] = []     # in discovery order (Tarjan's stack)
+        assumed: dict[tuple[int, int], bool] = {}  # answer lent while unsettled
+        lent_false: set[tuple[int, int]] = set()  # unsettled accesses lent as False
+        reach_keys: set[tuple[int, int]] = {root} if reach else set()
+        stack: list[_SettleFrame] = []
+        tickets = itertools.count()
+
+        def push(f: Any, g: int) -> None:
+            key = (int(getattr(f, "start", 0)), int(g))
+            order[key] = next(tickets)
+            unsettled.append(key)
+            stack.append(_SettleFrame(self._global_access_steps(f, g), key, f, g,
+                                      order[key], len(unsettled) - 1))
+
+        push(fn, ga)
         value: Any = None
-        while stack:
-            steps, rkey = stack[-1]
-            try:
-                ask = steps.send(value)
-            except StopIteration as done:
+        try:
+            while True:
+                top = stack[-1]
+                try:
+                    ask = top.steps.send(value)
+                except StopIteration as done:
+                    use = done.value
+                    answer = use.at is not None
+                except TaintError:
+                    if top.key == root and not reach:
+                        raise      # the root access: its caller's to handle
+                    use, answer = None, False
+                else:
+                    qfn, qga = ask
+                    qkey = (int(getattr(qfn, "start", 0)), int(qga))
+                    reach_keys.add(qkey)
+                    if qkey in order:
+                        value = assumed.get(qkey, False)
+                        if not value:
+                            lent_false.add(qkey)
+                        top.low = min(top.low, order[qkey])
+                        continue
+                    known = self._reaches_object_cache.get(qkey)
+                    if known is not None:
+                        value = known
+                        continue
+                    self._check_cancelled()
+                    push(qfn, qga)
+                    value = None
+                    continue
                 stack.pop()
-                value = done.value
-                if rkey is not None:
-                    value = self._reaches_object_cache[rkey] = value.at is not None
-                continue
-            except TaintError:
-                stack.pop()
-                if rkey is None:
-                    raise          # the root access: its caller's to handle
-                value = self._reaches_object_cache[rkey] = False
-                continue
-            qfn, qga = ask
-            known = self._reaches_object_cache.get(
-                (int(getattr(qfn, "start", 0)), int(qga)))
-            if known is not None:
-                value = known
-                continue
-            self._check_cancelled()
-            stack.append(frame(qfn, qga, True))
-            value = None
+                assumed[top.key] = assumed.get(top.key, False) or answer
+                if top.low < order[top.key]:
+                    # Rests on an access below it that is still unsettled.
+                    stack[-1].low = min(stack[-1].low, top.low)
+                    value = assumed[top.key]
+                    continue
+                cycle = unsettled[top.base:]
+                if any(assumed[k] for k in lent_false.intersection(cycle)) \
+                        and not all(assumed[k] for k in cycle):
+                    # A False lent inside the cycle came out True, and an
+                    # answer computed from it may still be a no: ask again.
+                    del unsettled[top.base:]
+                    for k in cycle:
+                        del order[k]
+                        self._global_access_cache.pop(k, None)
+                    lent_false.difference_update(cycle)
+                    push(top.fn, top.ga)
+                    value = None
+                    continue
+                value = assumed[top.key]
+                del unsettled[top.base:]
+                for k in cycle:
+                    del order[k]
+                    lent_false.discard(k)
+                    settled = assumed.pop(k)
+                    if k in reach_keys:
+                        self._reaches_object_cache[k] = settled
+                if not stack:
+                    if not reach:
+                        value = use
+                    break
+        except BaseException:
+            # Nothing computed from an unsettled access stays cached.
+            for k in unsettled:
+                self._global_access_cache.pop(k, None)
+            raise
         self._drain_region_checks()
         return value
 
@@ -12056,10 +12353,12 @@ class TaintEngine:
         argument a callee reads), and cites the first use that may read them
         only when none does -- the CRT's `deregister_tm_clones` handing back
         an address that coincides with the object is not the reader to name
-        when `reader()` loads it. The other referencing functions are listed
-        by the code reference BN records for them -- an established
+        when `reader()` loads it. The other functions BN records a reference
+        to THIS object from are listed at that reference -- an established
         reference, never a claimed read -- rather than each paying a full
-        pointer scan for a fact the verdict does not depend on."""
+        pointer scan for a fact the verdict does not depend on; a body that
+        names only a preceding object is no such reference and is never
+        listed (R1-04)."""
         gtxt = hex(int(ga))
         if any(lf.get("kind") == "global_memory_continuation"
                and isinstance(lf.get("global"), dict)
@@ -12084,7 +12383,9 @@ class TaintEngine:
             if start == own or self._is_crt_helper(start):
                 continue        # its own reads are judged below, by path; CRT markers read nothing
             if cited is not None:
-                others.append((start, site))
+                # Listed by BN's reference to THIS object, unclassified.
+                if start in own_refs:
+                    others.append((start, site))
                 continue
             rfn = function_at(self.bv, start)
             use = (_Use(site, "unreadable", 0, None, None, True) if rfn is None
@@ -12431,7 +12732,8 @@ class TaintEngine:
         leaves: list[dict[str, Any]] = _SalvageList(self._salvage["leaves"])
         findings: list[dict[str, Any]] = _SalvageList(self._salvage["findings"])
         recorded_sinks: set[tuple] = set()
-        processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
+        processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set, field context) descended
+        descended_sinks: set[tuple] = set()  # `_sink_signature`s merged up from descents
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
         # IC03: the writable globals THIS run has tainted, {address: node}, kept
@@ -14199,9 +14501,44 @@ class TaintEngine:
                         if _budget is not None and _budget not in leaves:
                             leaves.append(_budget)
                         continue
-                    # descend each callsite once per tainted-arg set (the fixpoint
-                    # revisits instructions; without this, findings would duplicate)
-                    call_key = (int(getattr(ins, "address", 0)), frozenset(tainted_args.keys()))
+                    # P2-08: an argument pointing into a partially
+                    # tainted object hands the callee those ranges and
+                    # the object's self-pointing members (V1-01),
+                    # rebased to where the pointer points.
+                    arg_fields: dict = {}
+                    if field_only or partial_bases or alias_bases:
+                        for ai in tainted_args:
+                            if ai >= len(params):
+                                continue
+                            root = self._ssa_root_offset(ssaf, params[ai])
+                            if root is not None and root[0] in alias_bases:
+                                ranges, ptrs, _parent = alias_bases[root[0]]
+                                at = int(root[1])
+                            else:
+                                bo = self._addr_base_offset(ssaf, params[ai])
+                                if bo is None:
+                                    continue
+                                ranges = field_only.get(bo[0])
+                                if ranges is None:
+                                    ranges = partial_bases.get(bo[0])
+                                ptrs, at = ptrs_of(bo[0]), int(bo[1])
+                            if ranges:
+                                shifted, sptrs = self._rebase_object(
+                                    tuple(sorted(ranges)), ptrs, at)
+                                arg_fields[ai] = (tuple(sorted(shifted)), tuple(sptrs))
+                    # Descend each call site once per CONTEXT it hands the
+                    # callee: the tainted argument indexes AND the field
+                    # ranges / self-pointers each argument carries -- the
+                    # same context `_summarize` keys its cache on. The
+                    # fixpoint revisits the call on every pass; a field
+                    # stored after it and reached over a back edge grows
+                    # the context while the index set stays the same, and
+                    # skipping that revisit left the callee judged on the
+                    # first pass's fields (R1-02). What the revisit
+                    # re-reports is deduplicated where it is merged below,
+                    # not by refusing to descend.
+                    call_key = (int(getattr(ins, "address", 0)), frozenset(tainted_args.keys()),
+                                tuple(sorted(arg_fields.items())))
                     if call_key in processed_calls:
                         continue
                     processed_calls.add(call_key)
@@ -14333,31 +14670,6 @@ class TaintEngine:
                             if mchanged:
                                 changed = True
                         if descend_internal:
-                            # P2-08: an argument pointing into a partially
-                            # tainted object hands the callee those ranges
-                            # and the object's self-pointing members (V1-01),
-                            # rebased to where the pointer points.
-                            arg_fields: dict = {}
-                            if field_only or partial_bases or alias_bases:
-                                for ai in tainted_args:
-                                    if ai >= len(params):
-                                        continue
-                                    root = self._ssa_root_offset(ssaf, params[ai])
-                                    if root is not None and root[0] in alias_bases:
-                                        ranges, ptrs, _parent = alias_bases[root[0]]
-                                        at = int(root[1])
-                                    else:
-                                        bo = self._addr_base_offset(ssaf, params[ai])
-                                        if bo is None:
-                                            continue
-                                        ranges = field_only.get(bo[0])
-                                        if ranges is None:
-                                            ranges = partial_bases.get(bo[0])
-                                        ptrs, at = ptrs_of(bo[0]), int(bo[1])
-                                    if ranges:
-                                        shifted, sptrs = self._rebase_object(
-                                            tuple(sorted(ranges)), ptrs, at)
-                                        arg_fields[ai] = (tuple(sorted(shifted)), tuple(sptrs))
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
                                               via=via, caller_instrs=instrs,
                                               fields=arg_fields or None)
@@ -14375,6 +14687,12 @@ class TaintEngine:
                             # re-applies this same check with its own hand-off nodes, so
                             # multi-level descent composes).
                             for f in d["findings"]:
+                                # A revisit with a grown context re-reaches
+                                # the first context's sinks: one finding each.
+                                sig = _sink_signature(f)
+                                if sig in descended_sinks:
+                                    continue
+                                descended_sinks.add(sig)
                                 findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
                                 # One callee site reached from several argument
@@ -16024,6 +16342,9 @@ class TaintEngine:
         # full one.
         self._bw_truncated = False
         self._bw_truncation_causes: set[str] = set()
+        # The deepest caller depth the ascent reached: `stats.max_depth`, as
+        # forward reports it -- the number a depth cut's text names (R2-06).
+        self._bw_depth_seen = 0
         slices: list[dict[str, Any]] = []
 
         # Function-level resolution is sink-independent: a missing MLIL/SSA form
@@ -16251,6 +16572,7 @@ class TaintEngine:
             # (#579/#576) -- a backward run whose caller ascent was capped is
             # INCOMPLETE and must not report from stats as a complete one.
             "stats": {"leaves": len(self._bw_leaves), "slices": len(slices),
+                      "max_depth": self._bw_depth_seen,
                       "truncated": self._bw_truncated,
                       "truncation_cause": sorted(self._bw_truncation_causes)},
             # #812: backward had no diagnostics block at all while forward did,
@@ -16340,7 +16662,12 @@ class TaintEngine:
     def _argument_registers(self, func: Any) -> frozenset[str] | None:
         """Full-width names of every register *func*'s calling convention
         passes an integer or floating-point argument in, or None when no
-        convention is recoverable."""
+        convention is recoverable.
+
+        A convention that lists no argument register at all passes every
+        argument on the stack (i386 cdecl): that is an answer -- an empty
+        set, so no register's entry value is an unmapped argument -- not the
+        unreadable convention None stands for (R2-02)."""
         cc = getattr(func, "calling_convention", None)
         if cc is None:
             plat = getattr(self.bv, "platform", None)
@@ -16348,11 +16675,12 @@ class TaintEngine:
         if cc is None:
             return None
         try:
-            regs = list(getattr(cc, "int_arg_regs", []) or []) + \
-                list(getattr(cc, "float_arg_regs", []) or [])
+            int_regs = getattr(cc, "int_arg_regs", None)
+            float_regs = getattr(cc, "float_arg_regs", None)
+            if int_regs is None and float_regs is None:
+                return None
+            regs = list(int_regs or []) + list(float_regs or [])
         except Exception:
-            return None
-        if not regs:
             return None
         return frozenset(_full_width_reg(self.bv.arch, str(r)) for r in regs)
 
@@ -16397,6 +16725,7 @@ class TaintEngine:
         an ``arg:`` sink, and for the caller ascent of a parameter the callee
         read through; None when no consumer reads through the seed."""
         self._visits += 1
+        self._bw_depth_seen = max(self._bw_depth_seen, depth)
         self._check_cancelled()
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
@@ -16473,21 +16802,28 @@ class TaintEngine:
         # How many may-alias stores the walk is currently inside (W02-10). A
         # store through a pointer the walk cannot prove disjoint from a
         # loaded object is only a POSSIBLE writer of it: what produced that
-        # store's value never represents the slice over the load's own
-        # frontier, which names the object the sink actually read.
+        # store's value is walked as evidence -- its steps, its leaves -- but
+        # is no origin of the slice, neither its representative nor a
+        # producer a recursive back edge emits (R2-03, D5b-01): the load's
+        # own frontier, which names the object the sink read, is.
         may_writers = 0
 
         def _set_origin(o, *, weak: int | bool = 0):
+            """Record origin *o* ranked by *weak* (rank 0 best): a formal is
+            kept for the ascent, anything else is a producer; a call's return
+            at rank 1 is a root of its own; the best-ranked origin represents
+            the slice. Inside a may-alias store's value only a formal counts
+            (it still ascends); anything else there is evidence."""
             nonlocal origin, origin_rank
-            o["function"] = fn_ref
             if weak is True:
                 rank = 3
             elif weak:
                 rank = int(weak) + 1
             else:
                 rank = 0 if o.get("kind") == "parameter" else 1
-            if may_writers and rank == 1:
-                rank = 2
+            if may_writers and rank:
+                return
+            o["function"] = fn_ref
             if rank == 0:
                 param_origins.setdefault(int(o["index"]), o)
             elif o not in producers:
@@ -16503,8 +16839,11 @@ class TaintEngine:
             over anything else, a formal found before or after it included.
             Pinned at the top rank, so a later weak origin cannot displace it
             (the outright assignment left a stale rank that could). A formal
-            beside it still ascends on its own (IC01)."""
+            beside it still ascends on its own (IC01). Behind a may-alias
+            store it is evidence only: its call step names it (R2-03)."""
             nonlocal origin, origin_rank
+            if may_writers:
+                return
             o["function"] = fn_ref
             if o not in producers:
                 producers.append(o)
@@ -17238,7 +17577,13 @@ class TaintEngine:
                 target = const_target(getattr(defn, "dest", None))
                 name = self._callee_name(target)
                 mkey, model = lookup_model(self.models, name)
-                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}")
+                # The step names the call structurally: `callee`, and `model`
+                # (the key that matched) when a model judged it -- the only
+                # record of a source behind a may-alias store (D5b-02).
+                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}",
+                                        callee=called_name(mkey, name))
+                if mkey:
+                    call_step["model"] = mkey
                 steps.append(call_step)
                 if model and model.get("sources"):
                     # The representative, ranked (IC01): the outright
@@ -18149,11 +18494,15 @@ class TaintEngine:
         # Address order, never BN's enumeration order: which sites the cap
         # lets through -- and which it drops -- is a property of the binary,
         # not of how the view was loaded (a raw ELF and its saved `.bndb`
-        # enumerate the same callers differently).
-        caller_sites = sorted(
-            getattr(func, "caller_sites", None) or [],
-            key=lambda s: (int(getattr(s, "address", 0)),
-                           int(getattr(getattr(s, "function", None), "start", -1) or -1)))
+        # enumerate the same callers differently). A site is (address,
+        # caller): BN may list one record twice, which used to spend a cap
+        # slot and a drop on the same call, while overlapping functions that
+        # share a call instruction are two callers (R2-04).
+        unique: dict[tuple, Any] = {}
+        for s in getattr(func, "caller_sites", None) or []:
+            unique.setdefault(self._site_identity(
+                getattr(s, "address", 0), getattr(s, "function", None)), s)
+        caller_sites = [unique[k] for k in sorted(unique)]
         start = int(getattr(func, "start", 0))
         # address -> referencing function (None: a data reference)
         indirect: dict[int, Any] = {}
@@ -18164,11 +18513,12 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
-        direct = {int(getattr(s, "address", 0)) for s in caller_sites}
+        direct = set(unique)
+        call_addresses = {k[0] for k in direct}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
                 a, rf = int(getattr(ref, "address", 0)), getattr(ref, "function", None)
-                if a in direct:
+                if a in call_addresses:
                     continue
                 indirect.setdefault(a, rf)
         except Exception:
@@ -18179,20 +18529,20 @@ class TaintEngine:
         # measurement, never the constant (#810).
         considered = caller_sites[:MAX_CALLERS] if ascend else []
         results: list[dict[str, Any]] = []
-        rows: list[dict[str, Any]] = []
-        misses: set[tuple[int, int, str]] = set()
+        rows: dict[tuple, dict[str, Any]] = {}
+        misses: set[tuple[tuple, int, str]] = set()
 
         def _drop(address: int, caller: Any, pidx: int, reason: str) -> None:
             # Every (site, formal, reason) is a row, a site past the cap
             # included: the leaf lists them in address order up to its
             # bound and counts all of them.
-            key = (int(address), pidx, reason)
+            key = (self._site_identity(address, caller), pidx, reason)
             if key in misses:
                 return
             misses.add(key)
-            rows.append({"address": hex(int(address)),
+            rows[key] = {"address": hex(int(address)),
                          "caller": None if caller is None else self._prose_function(caller),
-                         "param": pidx, "reason": reason})
+                         "param": pidx, "reason": reason}
 
         cycled: set[int] = set()
         fkey = self._caller_key(func)
@@ -18311,14 +18661,23 @@ class TaintEngine:
             for pidx in demands:
                 _drop(a, rf, pidx, reason)
         self._bw_note_unfollowed_callers(
-            func, direct=direct, indirect=set(indirect), formals=set(demands),
-            rows=rows, misses=misses)
+            func, direct=direct,
+            indirect={self._site_identity(a, rf) for a, rf in indirect.items()},
+            formals=set(demands), rows=rows, misses=misses)
         return results, cycled
 
     @staticmethod
     def _caller_key(func: Any) -> tuple[int, str]:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+
+    @classmethod
+    def _site_identity(cls, address: Any, caller: Any) -> tuple[int, int, str]:
+        """A caller reference's identity: its address and the function it is
+        in (``(-1, "")`` for a data reference). Ordered by address first, so
+        sorting by it is the address order the cap follows."""
+        key = (-1, "") if caller is None else cls._caller_key(caller)
+        return (int(address), *key)
 
     # C-runtime start routines whose FIRST operand is the program's main
     # callback (`__libc_start_main(main, argc, argv, ..)`).
@@ -18402,12 +18761,15 @@ class TaintEngine:
         return handed > 0
 
     def _bw_note_unfollowed_callers(
-        self, func: Any, *, direct: set[int], indirect: set[int], formals: set[int],
-        rows: list[dict[str, Any]], misses: set[tuple[int, int, str]],
+        self, func: Any, *, direct: set[tuple], indirect: set[tuple], formals: set[int],
+        rows: dict[tuple, dict[str, Any]], misses: set[tuple[tuple, int, str]],
     ) -> None:
         """One caller frontier per function, across every demanded formal.
 
-        Coverage counts distinct reference addresses, each classed by the
+        Coverage counts distinct caller references -- a reference is its
+        address AND the function it is in (:meth:`_site_identity`), so one
+        site BN lists twice counts once and overlapping callers sharing a
+        call instruction count as two (R2-04) -- each classed by the
         formals demanded of it: FULLY followed (every demanded formal
         followed), PARTIALLY followed (some), or UNFOLLOWED (none).
         ``callers_dropped`` is the partial and unfollowed references together
@@ -18421,9 +18783,10 @@ class TaintEngine:
 
         A cut the configuration made -- the ``caller_cap`` and the
         ``max_depth`` bound -- is run truncation: it sets ``stats.truncated``
-        and names its cause in ``truncation_cause`` with an assumption, as
-        forward does for its own bounds. The other reasons are what the
-        binary could not show, disclosed by this leaf alone.
+        and names its cause in ``truncation_cause``, and this leaf names the
+        sites. Like every other truncation it is never an ``assumptions``
+        entry. The other reasons are what the binary could not show,
+        disclosed by this leaf alone.
         """
         start = int(func.start)
         state = self._bw_caller_frontiers.get(start)
@@ -18431,7 +18794,7 @@ class TaintEngine:
             state = {
                 "direct": set(), "known": set(), "dropped": set(), "misses": set(),
                 "demanded": {}, "missed": {},
-                "reasons": {}, "examples": {}, "leaf": None, "bound_assumptions": {},
+                "reasons": {}, "examples": {}, "leaf": None,
             }
             self._bw_caller_frontiers[start] = state
         # Merge after descent into the current accumulator: a recursive ascent
@@ -18439,17 +18802,16 @@ class TaintEngine:
         state["direct"].update(direct)
         state["known"].update(direct)
         state["known"].update(indirect)
-        for address in direct | indirect:
-            state["demanded"].setdefault(address, set()).update(formals)
-        for address, param, reason in misses:
-            state["dropped"].add(address)
-            state["missed"].setdefault(address, set()).add(param)
-            key = (address, param, reason)
+        for site in direct | indirect:
+            state["demanded"].setdefault(site, set()).update(formals)
+        for site, param, reason in misses:
+            state["dropped"].add(site)
+            state["missed"].setdefault(site, set()).add(param)
+            key = (site, param, reason)
             if key not in state["misses"]:
                 state["misses"].add(key)
                 state["reasons"][reason] = state["reasons"].get(reason, 0) + 1
-        for row in rows:
-            key = (int(row["address"], 16), row["param"], row["reason"])
+        for key, row in rows.items():
             state["examples"].setdefault(key, row)
         if not state["dropped"]:
             return
@@ -18457,39 +18819,21 @@ class TaintEngine:
         total = len(state["known"])
         dropped = len(state["dropped"])
         fully = total - dropped
-        partial: list[tuple[int, set[int], set[int]]] = []
-        for address in sorted(state["dropped"]):
-            demanded = state["demanded"].get(address, set())
-            missed = state["missed"][address]
+        partial: list[tuple[tuple, set[int], set[int]]] = []
+        for site in sorted(state["dropped"]):
+            demanded = state["demanded"].get(site, set())
+            missed = state["missed"][site]
             if demanded - missed:
-                partial.append((address, demanded - missed, missed))
+                partial.append((site, demanded - missed, missed))
         unfollowed = dropped - len(partial)
         demands_total = sum(len(state["demanded"].get(a, set())) for a in state["known"])
         demands_unfollowed = sum(len(m) for m in state["missed"].values())
         reasons = dict(sorted(state["reasons"].items()))
-        name = self._prose_function(func)
         capped = "caller_cap" in reasons
-        bounds = {
-            "caller_cap": (
-                f"{name} has {len(state['direct'])} callers; caller ascent fully followed "
-                f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
-                f"(function {start:#x})"),
-            "max_depth": (
-                f"caller ascent of {name} stopped at the --max-depth bound: "
-                f"{len({a for a, _, r in state['misses'] if r == 'max_depth'})} caller "
-                f"reference(s) not followed (function {start:#x})"),
-        }
-        for cause, assumption in bounds.items():
-            if cause not in reasons:
-                continue
-            self._bw_truncated = True
-            self._bw_truncation_causes.add(cause)
-            old = state["bound_assumptions"].get(cause)
-            if old != assumption:
-                if old is not None:
-                    self._bw_assumptions.remove(old)
-                self._bw_assume(assumption)
-                state["bound_assumptions"][cause] = assumption
+        for cause in ("caller_cap", "max_depth"):
+            if cause in reasons:
+                self._bw_truncated = True
+                self._bw_truncation_causes.add(cause)
         note = (
             ("caller-site cap: " if capped else "")
             + f"of {total} distinct caller reference(s), the ascent fully followed {fully} "
@@ -18519,8 +18863,9 @@ class TaintEngine:
             # Which formals each partially followed reference did and did not
             # supply; bounded like `unfollowed`, counted exactly above.
             "partially_followed": [
-                {"address": hex(a), "followed_params": sorted(f), "unfollowed_params": sorted(m)}
-                for a, f, m in partial[:MAX_CALLERS]],
+                {"address": hex(site[0]), "followed_params": sorted(f),
+                 "unfollowed_params": sorted(m)}
+                for site, f, m in partial[:MAX_CALLERS]],
             "detail": (note + " -- an origin reachable only from an unfollowed caller "
                        "is missing from this slice"),
         })

@@ -2418,3 +2418,191 @@ def test_save_through_a_hard_link_records_the_database_despite_inode_replacement
     # And the database is recorded anyway, because the decision was taken
     # while the identity still existed.
     assert noted.get("path") == str(hard)
+
+
+# --------------------------------------------------------------------------
+# Identity across bridge generations (P1-02, P2-07) and the idle policy (P2-09)
+# --------------------------------------------------------------------------
+
+
+def test_a_restarted_bridge_numbers_its_views_above_its_predecessor(monkeypatch):
+    # P1-02: `session restart` seeds the new process with the old one's next
+    # id, so the number a listing showed before the restart is never handed to
+    # a different target after it.
+    from _bridge_fakes import _FakeFileBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    _register_views(module, _FakeFileBV("/srv/alpha", session_id="1"),
+                    _FakeFileBV("/srv/beta", session_id="2"))
+    manager = module.TargetManager(first_view_id=7)
+    assert sorted(row["view_id"] for row in manager.refresh()) == ["7", "8"]
+    assert manager.next_view_id() == 9
+    module._headless_views.clear()
+
+
+def test_an_unknown_numeric_selector_is_refused_as_process_local(monkeypatch):
+    from _bridge_fakes import _FakeFileBV, _register_views
+    from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    _register_views(module, _FakeFileBV("/srv/alpha", session_id="1"),
+                    _FakeFileBV("/srv/beta", session_id="2"))
+    manager = module.TargetManager(first_view_id=7)
+    manager.refresh()
+    with pytest.raises(RuntimeError) as numeric:
+        manager.resolve("1")
+    lines = str(numeric.value).splitlines()
+    assert lines[0] == "Unknown target selector: 1"
+    assert lines[-1] == PROCESS_LOCAL_VIEW_ID_NOTE
+    assert any("/srv/alpha" in line for line in lines)
+    with pytest.raises(RuntimeError) as named:
+        manager.resolve("gamma")
+    assert PROCESS_LOCAL_VIEW_ID_NOTE not in str(named.value).splitlines()
+    module._headless_views.clear()
+
+
+@pytest.mark.parametrize("selector", [" 1 ", "1\t", "\n2"])
+def test_a_padded_unknown_numeric_selector_is_refused_as_process_local(monkeypatch, selector):
+    # D2-04: matching strips the selector, so `-t ' 1 '` named view 1 before a
+    # restart; the refusal must classify it the same way and carry the note.
+    from _bridge_fakes import _FakeFileBV, _register_views
+    from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    _register_views(module, _FakeFileBV("/srv/alpha", session_id="1"))
+    manager = module.TargetManager(first_view_id=7)
+    manager.refresh()
+    assert manager.resolve(" 7 ") is not None          # padded and known: resolves
+    with pytest.raises(RuntimeError) as numeric:
+        manager.resolve(selector)
+    lines = str(numeric.value).splitlines()
+    assert lines[0].startswith("Unknown target selector:")
+    assert any("/srv/alpha" in line for line in lines)
+    assert lines[-1] == PROCESS_LOCAL_VIEW_ID_NOTE
+    module._headless_views.clear()
+
+
+@pytest.mark.parametrize("selector", ["2", " 2 "])
+def test_a_numeric_selector_with_nothing_open_still_gets_the_process_local_note(
+        monkeypatch, selector):
+    # D2-04: the empty-listing early return skipped the note, so a stale id
+    # after a restart that reopened nothing read as a plain "nothing open".
+    from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    manager = module.TargetManager(first_view_id=3)
+    with pytest.raises(RuntimeError) as numeric:
+        manager.resolve(selector)
+    lines = str(numeric.value).splitlines()
+    assert lines[0].startswith("Unknown target selector:")
+    assert lines[-1] == PROCESS_LOCAL_VIEW_ID_NOTE
+    with pytest.raises(RuntimeError) as named:
+        manager.resolve("gamma")
+    assert PROCESS_LOCAL_VIEW_ID_NOTE not in str(named.value)
+
+
+def test_a_successor_of_an_old_registry_accepts_no_numeric_selector(monkeypatch, tmp_path):
+    # D2-02, the reviewer's upgrade path: an older bridge numbered A=1, B=2,
+    # closed B and recorded no next_view_id. Its successor reopens A; whatever
+    # number A now gets, a stale `-t 2` must never select it -- so no bare
+    # number selects anything, while target_id and file names still do.
+    from _bridge_fakes import _FakeFileBV, _register_views
+    from bn.target_hint import NUMERIC_VIEW_IDS_OFF_NOTE, PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    alpha = _FakeFileBV("/srv/alpha", session_id="1")
+    _register_views(module, alpha)
+    manager = module.TargetManager(numeric_view_ids=False)
+    [row] = manager.refresh()
+    assert row["view_id_selects"] is False
+    for stale in (row["view_id"], "2", " 2 "):
+        with pytest.raises(RuntimeError) as refused:
+            manager.resolve(stale)
+        lines = str(refused.value).splitlines()
+        assert lines[0].startswith("Unknown target selector:")
+        assert any("/srv/alpha" in line for line in lines)
+        assert lines[-2:] == [PROCESS_LOCAL_VIEW_ID_NOTE, NUMERIC_VIEW_IDS_OFF_NOTE]
+    assert manager.resolve(row["target_id"]) is alpha
+    assert manager.resolve("alpha") is alpha
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    successor = module.BinaryNinjaBridge(instance_id="upgraded1", numeric_view_ids=False)
+    successor._write_registry()
+    payload = json.loads(successor.registry_path.read_text(encoding="utf-8"))
+    assert payload["numeric_view_ids"] is False
+    module._headless_views.clear()
+
+
+def test_registry_publishes_the_next_view_id_and_the_idle_timeout(instance, monkeypatch):
+    import sys
+
+    from _bridge_fakes import _FakeFileBV, _register_views
+
+    module = sys.modules[type(instance).__module__]
+    _register_views(module, _FakeFileBV("/srv/alpha", session_id="1"))
+    instance._write_registry()
+    payload = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+    assert payload["next_view_id"] == 2
+    assert payload["idle_timeout"] is None
+    assert payload["numeric_view_ids"] is True
+
+    monkeypatch.setenv("BN_IDLE_TIMEOUT", "90")
+    monkeypatch.setattr(instance, "_start_idle_reaper", lambda timeout: None)
+    instance._maybe_start_idle_reaper()
+    payload = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+    assert payload["idle_timeout"] == 90.0
+    module._headless_views.clear()
+
+
+def test_started_at_is_the_process_start_for_every_bridge_it_runs(monkeypatch, tmp_path):
+    # P2-07: a GUI "Restart Bridge" builds a new bridge in the SAME process;
+    # the registry paired that pid with the new object's creation time.
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    first = module.BinaryNinjaBridge(instance_id="gen1")
+    first._write_registry()
+
+    class LaterClock:
+        @staticmethod
+        def now(tz):
+            return types.SimpleNamespace(isoformat=lambda: "2099-01-01T00:00:00+00:00")
+
+    monkeypatch.setattr(module, "datetime", LaterClock)
+    second = module.BinaryNinjaBridge(instance_id="gen2")
+    second._write_registry()
+    stamps = {json.loads(b.registry_path.read_text())["started_at"] for b in (first, second)}
+    [stamp] = stamps                # one process, one start time
+    assert datetime.fromisoformat(stamp) <= datetime.now(timezone.utc)
+
+
+def test_an_export_leaves_the_targets_unsaved_ledger_alone(monkeypatch, tmp_path):
+    # P2-03: `bn save <elsewhere>` wrote a copy and cleared the target's
+    # unsaved marker, while the database a restart reopens never got the work:
+    # stop/restart then discarded it without a refusal.
+    from _bridge_fakes import _RehomingSaveBV, _register_views
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    module = _load_bridge(monkeypatch)
+    bridge = module.BinaryNinjaBridge(instance_id="exp1")
+    raw = tmp_path / "sample"
+    raw.write_bytes(b"\x7fELF")
+    bv = _RehomingSaveBV(str(raw))
+    bv.file.session_id = "1"
+    bv.view_type = types.SimpleNamespace(name="ELF")
+    _register_views(module, bv)
+    assert len(bridge.targets.refresh()) == 1
+    monkeypatch.setattr(bridge.targets, "resolve", lambda target: bv)
+    bridge.targets.mark_dirty(bv)
+
+    export = bridge._save_database(None, str(tmp_path / "copy.bndb"))
+    assert export["export"] is True
+    assert export["unsaved"] is True
+    assert export["backing_database"] is None
+    assert bridge.targets.is_dirty(bv) is True
+
+    own = bridge._save_database(None, None)
+    assert own.get("export") is None
+    assert bridge.targets.is_dirty(bv) is False
+    module._headless_views.clear()

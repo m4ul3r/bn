@@ -63,11 +63,19 @@ def test_a_value_reached_from_ever_shallower_paths_is_rewalked_once():
     func = FFunc("ladder", 0x1000, ssaf, params=[])
     result = te.TaintEngine(FBV({_MALLOC: "malloc"}), te.load_models(), max_depth=6).backward(
         func, [te.parse_locator("arg:malloc:0")])
-    assert result["slices"], result
     # The chain below x is asked about from x's first (deepest) path and once
     # more from its shallowest -- not once per rung of the ladder.
     assert ssaf.var_asks[("y1", 1)] <= 2, ssaf.var_asks
     assert ssaf.var_asks[("x", 1)] <= 2, ssaf.var_asks
+    # ...and that one re-walk is the one that counts: from x's shallowest
+    # path (depth 1) the budget of 6 reaches y5 and cuts at y6, every rung of
+    # both chains is a step, and the ladder's bottom is the other origin.
+    origins = sorted((o["kind"], o.get("var"), tuple(o.get("unwalked") or ()))
+                     for sl in result["slices"] for o in sl["origins"])
+    assert origins == [("entry", "c6#1", ()), ("unresolved", "y6#1 in 0x1000", ("y6#1",))]
+    steps = {st["address"] for sl in result["slices"] for st in sl["slice"]}
+    assert steps == {hex(0x1000 + 4 * i) for i in range(12)}
+    assert result["leaves"] == []
 
 
 def test_loads_sharing_one_memory_chain_walk_it_once():
@@ -109,8 +117,18 @@ def test_loads_sharing_one_memory_chain_walk_it_once():
     func = FFunc("sum_fields", 0x1000, ssaf, params=[])
     result = te.TaintEngine(FBV({_MALLOC: "malloc"}), te.load_models()).backward(
         func, [te.parse_locator("arg:malloc:0")])
-    assert result["slices"], result
     # Every load reads at memory version 8 through a pointer of its own, so
     # each walks the eight stores; what a STORE is -- its slot, the root of
     # its address -- is worked out once per store, not once per load.
     assert ssaf.var_asks[("q", 0)] <= 2 * 8, ssaf.var_asks
+    # The memo changes the cost, never the answer: with every per-function
+    # memo dropped the same walk gives the same slices and leaves -- each
+    # load a frontier through its own pointer, every store a step.
+    unmemoised = te.TaintEngine(FBV({_MALLOC: "malloc"}), te.load_models())
+    unmemoised._per_ssaf = lambda _ssaf, _name: {}
+    reference = unmemoised.backward(
+        FFunc("sum_fields", 0x1000, _CountingSSA(instrs, mem_defs=mem_defs), params=[]),
+        [te.parse_locator("arg:malloc:0")])
+    assert result["slices"] == reference["slices"]
+    assert result["leaves"] == reference["leaves"]
+    assert sorted(lf["base"] for lf in result["leaves"]) == sorted(f"p{i}#0" for i in range(12))

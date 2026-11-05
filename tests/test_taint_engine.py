@@ -995,16 +995,19 @@ def test_a_flagged_body_with_no_mlil_is_an_unread_body_not_a_caveat(models):
 _THUNK_SINK = 0x940
 
 
-def _tail_call_wrapper(body):
-    """``handle(p) { fetch_input(p); }`` where ``fetch_input`` is flagged a
-    thunk and its MLIL is *body* -- each shape ends in a tail call."""
-    p = FVar("p", ident=40)
-    p0 = FSSA(p, 0)
-    stub = FFunc("fetch_input", 0xB00, FSSAFunc(body), is_thunk=True, params=[FVar("s", ident=41)])
-    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(p#0)", reads=[p0], writes=[],
+def _tail_call_wrapper(body, formals=1):
+    """``handle(p, q) { fetch_input(p[, q]); }`` where ``fetch_input`` is
+    flagged a thunk with *formals* parameters and its MLIL is *body* -- each
+    shape ends in a tail call."""
+    p, q = FVar("p", ident=40), FVar("q", ident=42)
+    p0, q0 = FSSA(p, 0), FSSA(q, 0)
+    stub = FFunc("fetch_input", 0xB00, FSSAFunc(body), is_thunk=True,
+                 params=[FVar("s", ident=41), FVar("n", ident=43)][:formals])
+    args = [FExpr("MLIL_VAR_SSA", "p#0", reads=[p0]), FExpr("MLIL_VAR_SSA", "q#0", reads=[q0])]
+    call = FInstr(0, 0x20, "MLIL_CALL_SSA", "0xB00(...)", reads=[p0, q0][:formals], writes=[],
                   dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
-                  params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])])
-    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p])
+                  params=args[:formals])
+    func = FFunc("handle", 0x10, FSSAFunc([call]), params=[p, q])
     sink = FFunc("memcpy", _THUNK_SINK, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
     return func, FBV({_THUNK_SINK: "memcpy"}, funcs={0xB00: stub, _THUNK_SINK: sink})
 
@@ -1054,6 +1057,25 @@ def test_a_pure_veneer_is_still_resolved_to_its_target(models):
     engine = te.TaintEngine(bv, models)
     assert engine._not_internal_reason(bv.get_function_at(0xB00)) == "thunk"
     assert engine._follow_thunk_cached(bv.get_function_at(0xB00)).start == _THUNK_SINK
+
+
+def test_a_tail_call_that_drops_a_formal_is_not_a_veneer(models):
+    # R2-05: `fetch_input(s, n) { return memcpy(s) __tailcall }` forwards its
+    # first formal only. It is no veneer: mapping the caller's arguments onto
+    # memcpy made the tainted `n` memcpy's source, and the copy into the
+    # caller's `p` a frontier. It is walked as the body it is, where `n`
+    # reaches nothing.
+    s0 = FSSA(FVar("s", ident=41), 0)
+    body = [FInstr(0, 0xB00, "MLIL_TAILCALL_SSA", "return memcpy(s#0)", reads=[s0],
+                   dest=FExpr("MLIL_CONST_PTR", "0x940", constant=_THUNK_SINK),
+                   params=[FExpr("MLIL_VAR_SSA", "s#0", reads=[s0], src=s0)])]
+    func, bv = _tail_call_wrapper(body, formals=2)
+    engine = te.TaintEngine(bv, models)
+    assert engine._not_internal_reason(bv.get_function_at(0xB00)) is None
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    assert result["reached_sinks"] == []
+    assert not [lf for lf in result["leaves"]
+                if lf["kind"] in ("arg_under_recovered", "coarse_memory_store")], result["leaves"]
 
 
 def test_a_skipped_thunk_with_stale_mlil_is_an_unread_body(models):
@@ -4166,10 +4188,9 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert "caller_sites_truncated" in BLOCKING_LEAF_KINDS
     # Only the followed callers contributed slices: the dropped 4 did not.
     assert len(result["slices"]) == 16
-    # The caveat names the MEASURED ascent (this fixture resolves every site, so
-    # it equals the cap) -- never the cap constant as if it were coverage.
-    assert any("caller ascent fully followed 16, capped at 16" in a
-               for a in result["assumptions"]), result["assumptions"]
+    # The cap is truncation: stats and the leaf carry it, the assumptions do
+    # not (the leaf's counts are the MEASURED ascent, never the cap constant).
+    assert result["assumptions"] == [], result["assumptions"]
 
 
 def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(models):
@@ -4191,11 +4212,9 @@ def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(model
     assert caps[0]["callers_dropped"] == 14
     # The 6 resolvable sites are exactly the ones that produced slices.
     assert len(result["slices"]) == 6
-    # The human-readable half must agree with the machine-readable one.
-    assert any("caller ascent fully followed 6, capped at 16" in a
-               for a in result["assumptions"]), result["assumptions"]
-    # ... and the real text frontier (what a human reads) prints the measurement
-    # the JSON carries, on an envelope that says INCOMPLETE.
+    # The human-readable half agrees with the machine-readable one: the text
+    # frontier prints the measurement the JSON carries, on an envelope that
+    # says INCOMPLETE.
     from bn.formatters import _render_taint_text
     text = _render_taint_text(result)
     assert "20 caller reference(s): 6 fully followed, 0 partially, 14 not followed; 14 dropped" in text
@@ -7145,13 +7164,14 @@ def test_backward_does_not_recover_arg_for_unmodeled_callee(models, monkeypatch)
 # binaryninja-import-free module; read_taint_slice (which imports binaryninja at
 # module load) wires the same helpers into trace and is verified live.
 
-def test_model_arg_indices_unions_propagate_sink_and_varargs(models):
-    # The gate: a modeled sink's referenced arg indices = propagate `*arg:N`
-    # operands ∪ sink.tainted_args ∪ varargs.first_index. Empty for an unmodeled
-    # callee, so the register fallback never fabricates an arg.
+def test_model_arg_indices_is_every_declared_argument_role(models):
+    # The gate: every argument position the model declares a role for --
+    # propagate operands, sink.tainted_args, the length, the format, varargs'
+    # first index (R3-03). Empty for an unmodeled callee, so the register
+    # fallback never fabricates an arg.
     assert te.model_arg_indices(models, "memcpy") == {0, 1, 2}
     assert te.model_arg_indices(models, "strcpy") == {0, 1}
-    assert te.model_arg_indices(models, "snprintf") == {0, 2, 3}
+    assert te.model_arg_indices(models, "snprintf") == {0, 1, 2, 3}   # len_arg 1
     assert te.model_arg_indices(models, "definitely_not_a_sink") == set()
 
 
@@ -9733,7 +9753,7 @@ def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812()
 
 def test_backward_weak_sink_seed_withholds_completeness_812():
     # The last completeness branch. It is DEFENCE-IN-DEPTH, not live coverage:
-    # none of the six assumptions today's backward walk records contains any
+    # no assumption today's backward walk records (`_bw_assume`) contains any
     # `_WEAK_SEED_ASSUMPTION_MARKERS` substring, so the branch cannot fire from
     # its only caller -- the weak backward seed shapes that exist reach the gate
     # as a BLOCKING leaf (`arg_under_recovered`) instead. That is precisely why
@@ -9750,11 +9770,14 @@ def test_backward_weak_sink_seed_withholds_completeness_812():
     assert weak["safe_to_report_complete_slice"] is False, weak
     assert "seed" in weak["complete_slice_reason"], weak
 
-    # And it keys on the MARKERS, not on "an assumption exists": the caller-cap
-    # note the backward walk really does record must not be read as a weak seed,
-    # or every capped ascent would be blamed on its seed.
+    # And it keys on the MARKERS, not on "an assumption exists": a note the
+    # backward walk really does record -- a stack slot canonicalized to the
+    # parameter it spills -- must not be read as a weak seed, or every such
+    # slice would be blamed on its seed.
     ordinary = tr.backward_diagnostics(
-        [], ["parse_record has 9 callers; caller ascent fully followed 4, capped at 4"],
+        [], ["stack local var_18 appears to be a spill of param 0 (its slot has a single "
+             "store of the incoming parameter); canonicalized to param:0 so caller-ascent "
+             "continues (#434)"],
         sinks_seeded=1, slices=1)
     assert ordinary["safe_to_report_complete_slice"] is True, ordinary
 

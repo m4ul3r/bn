@@ -13,9 +13,11 @@ import contextlib
 import fnmatch
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -51,6 +53,8 @@ from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, u
 # workers. Give that work room on a loaded host before considering pinned signals.
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
+# `bn doctor` runs the PATH `bn`'s interpreter once to identify its code (P2-08).
+_PATH_CLI_PROBE_TIMEOUT = 15.0
 # #1036 item 6: a foreground `session start` of a large binary can block for
 # minutes; one stderr line this often says it is still working.
 _START_PROGRESS_INTERVAL = 30.0
@@ -180,6 +184,82 @@ def _instance_source_dir(instance: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _repository_root(directory: Path) -> str | None:
+    """The git repository or worktree *directory* lives in (nearest ancestor
+    holding a `.git` directory or worktree file), or None for an install that
+    is not a checkout (a wheel in site-packages)."""
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def _cli_identity(module_dir: Path) -> dict[str, Any]:
+    """Where a `bn` CLI's code lives: its package directory, the checkout it
+    belongs to, and a fingerprint of the whole package (P2-08)."""
+    return {
+        "module_dir": str(module_dir),
+        "repository_root": _repository_root(module_dir),
+        "build_id": cli.build_id_for_tree(module_dir),
+    }
+
+
+def _path_cli_identity(this_module_dir: Path) -> dict[str, Any]:
+    """Identity of the `bn` executable a bare `bn` command runs (P2-08).
+
+    `uv run bn` from one checkout and a `bn` installed from another look the
+    same in every report until something behaves differently; doctor names
+    the PATH one and whether it is this CLI. Probed by RUNNING that executable
+    with `IDENTITY_PROBE_ENV` set (D2-03), so what is reported is what a bare
+    `bn` does: a broken shim, an interpreter that cannot import `bn`, or a
+    wrapper that picks another package is seen as such. A nonzero exit, a
+    timeout or an answer that does not echo the nonce identifies nothing, and
+    says why in `error`."""
+    executable = shutil.which("bn")
+    if executable is None:
+        return {"executable": None, "same_as_this_cli": None,
+                "error": "no `bn` executable on PATH"}
+    identity: dict[str, Any] = {"executable": executable}
+    nonce = secrets.token_hex(8)
+
+    def unidentified(reason: str) -> dict[str, Any]:
+        identity.update({"same_as_this_cli": None, "error": reason})
+        return identity
+
+    try:
+        probe = subprocess.run(
+            [executable], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_PATH_CLI_PROBE_TIMEOUT, env={**os.environ, cli.IDENTITY_PROBE_ENV: nonce},
+        )
+    except subprocess.TimeoutExpired:
+        return unidentified(
+            f"it did not answer the identity probe within {_PATH_CLI_PROBE_TIMEOUT:g}s")
+    except OSError as exc:
+        return unidentified(f"it could not be run: {exc}")
+    if probe.returncode != 0:
+        last = (probe.stderr.strip().splitlines() or [""])[-1][:200]
+        return unidentified(
+            f"running it exited {probe.returncode}" + (
+                f": {last}" if last else
+                " without identifying its code (a `bn` older than the identity "
+                "probe prints its usage and exits 1)"))
+    try:
+        found = json.loads((probe.stdout.strip().splitlines() or [""])[-1])
+    except ValueError:
+        found = None
+    if not (isinstance(found, dict) and found.get("identity_probe") == nonce
+            and isinstance(found.get("module_dir"), str) and found["module_dir"]):
+        return unidentified(
+            "it ran but did not identify its code (a `bn` older than the identity "
+            "probe, or a wrapper that runs something else)")
+    module_dir = Path(found["module_dir"])
+    identity.update(_cli_identity(module_dir))
+    plugin_dir = found.get("plugin_source_dir")
+    identity["plugin_source_dir"] = plugin_dir if isinstance(plugin_dir, str) and plugin_dir else None
+    identity["same_as_this_cli"] = _same_dir(str(module_dir), this_module_dir)
+    return identity
+
+
 @command("doctor", help="Validate bridge discovery and installation")
 def _doctor(args: argparse.Namespace) -> int:
     install_dir = cli.plugin_install_dir()
@@ -192,6 +272,9 @@ def _doctor(args: argparse.Namespace) -> int:
     # (e.g. taint_engine.py) is flagged even though bridge.py is unchanged (#161).
     install_engine_id = cli.build_id_for_package(install_dir)
     source_engine_id = cli.build_id_for_package(source_dir)
+    cli_identity = _cli_identity(Path(cli.__file__).resolve().parent)
+    path_cli = _path_cli_identity(Path(cli.__file__).resolve().parent)
+    path_plugin_dir = path_cli.get("plugin_source_dir")
     requested = getattr(args, "instance", None)
     candidates = cli.list_instances()
     if requested:
@@ -285,6 +368,12 @@ def _doctor(args: argparse.Namespace) -> int:
                 # CLI's: restarting it from here would not change its code
                 # unless this CLI's interpreter spawns it (#992).
                 "other_checkout": other_checkout,
+                # P2-08: the bridge's code is not what the `bn` on PATH would
+                # spawn; None when either side is unknown.
+                "path_cli_other_checkout": (
+                    None if bridge_source is None or not path_plugin_dir
+                    else not _same_dir(bridge_source, path_plugin_dir)
+                ),
                 "installed_plugin_build_id": install_build_id,
                 "source_plugin_build_id": source_build_id,
                 "stale_plugin_version": (
@@ -315,6 +404,8 @@ def _doctor(args: argparse.Namespace) -> int:
 
     result = {
         "cli_version": cli.VERSION,
+        "cli": cli_identity,
+        "path_cli": path_cli,
         "plugin_source_dir": str(source_dir),
         "plugin_install_dir": str(install_dir),
         "plugin_source_build_id": source_build_id,
@@ -1010,6 +1101,7 @@ def _default_skill_install_roots() -> list[Path]:
          help="Start a new headless bridge session. BN_CACHE_DIR also scopes the "
               "instance registry and sticky session: a bridge started with it set is "
               "only visible to bn commands run with the same value",
+         routes_instance=False,
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
@@ -1475,6 +1567,8 @@ def _session_restart(args: argparse.Namespace) -> int:
         if isinstance(roots, list):
             inherited_roots = [root for root in roots if isinstance(root, str)]
 
+    first_view_id = _next_view_id(inst, rows)
+
     # Stop the old process: graceful shutdown, then SIGTERM/SIGKILL escalation,
     # blocking until the socket/registry are gone so the respawn can reuse the id.
     # Both signals are gated on durable process identity: a restart must never
@@ -1502,7 +1596,11 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    instance = cli.spawn_instance(resolved_id)
+    # D2-02: with no recorded high-water mark the successor cannot number its
+    # views above every id its predecessor handed out, so it accepts no bare
+    # numeric selector at all rather than infer history from the open rows.
+    instance = cli.spawn_instance(resolved_id, first_view_id=first_view_id,
+                                  numeric_view_ids=first_view_id is not None)
     # Reload targets without associating the restart command's cwd.
     #
     # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
@@ -1571,6 +1669,27 @@ def _session_restart(args: argparse.Namespace) -> int:
         args, result,
         exit_code=1 if failures or association_error or reload_capture_failed else 0,
         text_renderer=_render_session_start_text, stem="session-restart")
+
+
+def _next_view_id(inst: Any, rows: list[dict[str, Any]]) -> int | None:
+    """The first numeric view id the restarted bridge may assign (P1-02), or
+    None when the old process's high-water mark is unknown (D2-02).
+
+    Only the registry's own `next_view_id` can say it: that number also covers
+    the views the old process closed, which nothing it lists now can. When it
+    is recorded, the listed ids still bound it from below (a view the bridge
+    numbered after its last registry write). A registry that predates the
+    field, or one written by a bridge that itself accepted no numeric ids (its
+    own numbering started over), gives None -- the restart then refuses
+    numeric selectors instead of inferring history from the open rows."""
+    meta = inst.meta if isinstance(inst.meta, dict) else {}
+    recorded = meta.get("next_view_id")
+    if (meta.get("numeric_view_ids") is False or not isinstance(recorded, int)
+            or isinstance(recorded, bool) or recorded < 1):
+        return None
+    listed = [int(row["view_id"]) + 1 for row in rows
+              if str(row.get("view_id", "")).isdigit()]
+    return max([recorded, *listed])
 
 
 def _require_headless_lifecycle(inst: Any) -> None:
@@ -1798,6 +1917,20 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             "started_at": inst.started_at,
             "rss_mb": round(rss, 1) if rss is not None else None,
         }
+        # P2-09: seconds of inactivity after which the bridge stops itself, null
+        # when it never does. Omitted for a bridge whose registry predates it.
+        if isinstance(inst.meta, dict) and "idle_timeout" in inst.meta:
+            idle = inst.meta["idle_timeout"]
+            entry["idle_timeout"] = (
+                idle if isinstance(idle, (int, float)) and not isinstance(idle, bool)
+                and idle > 0 else None
+            )
+        # D2-01: the idle window expired but unsaved targets keep the bridge
+        # alive; stated only while the bridge says it is deferring.
+        deferred = inst.meta.get("idle_deferred_unsaved_targets") if isinstance(
+            inst.meta, dict) else None
+        if isinstance(deferred, int) and not isinstance(deferred, bool) and deferred > 0:
+            entry["idle_deferred_unsaved_targets"] = deferred
         # #80: the registry now records each instance's open binaries, so list them
         # here without an N-instance `target list` round-trip. Absent (older bridge
         # or nothing open) -> omit, so the entry stays clean.
@@ -2135,7 +2268,7 @@ def _target_matches(item: dict[str, Any], selector: str) -> bool:
         return True
     if selector == str(item.get("target_id", "")):
         return True
-    if selector == str(item.get("view_id", "")):
+    if item.get("view_id_selects") is not False and selector == str(item.get("view_id", "")):
         return True
     filename = item.get("filename")
     if isinstance(filename, str):
