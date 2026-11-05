@@ -5164,6 +5164,9 @@ class TaintEngine:
         # an all-clear carries the receive-family caveat (#1050 review round 5).
         self._buffer_seeded = False
         self._salvage = {"findings": [], "leaves": []}
+        # IC07: calls of an opt-in sink class this run does not report whose
+        # arming arguments taint reached, keyed by (call, resolved target).
+        self._opt_in_reached: dict[tuple, dict[str, Any]] = {}
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -5276,6 +5279,9 @@ class TaintEngine:
                 "max_iters": int(self.max_iters),
                 "unknown_call": str(self.unknown_call_policy),
             },
+            # IC07: what the run's scope left out, beside what it reported.
+            "opt_in_sinks_reached": sorted(self._opt_in_reached.values(),
+                                           key=lambda r: (int(r["address"], 16), r["callee"])),
             "soundness": SOUNDNESS,
         }
         # #559: a modeled source that reaches no sink returns an otherwise-empty
@@ -5324,6 +5330,7 @@ class TaintEngine:
             truncation_cause=sorted(getattr(self, "_truncation_causes", set())),
             analysis_incomplete=bool(getattr(self, "_analysis_incomplete", ())),
             buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
+            opt_in_reached=list(self._opt_in_reached.values()),
             function=hex(int(func.start)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
@@ -5369,6 +5376,7 @@ class TaintEngine:
         truncation_causes: set[str] = set()
         per_source_diag: dict[str, dict[str, Any]] = {}
         incomplete_funcs: set[str] = set()
+        opt_in: dict[tuple, dict[str, Any]] = {}
 
         for addr in callsite_addrs:
             res = self._forward_run(func, sources, max_depth=max_depth, only_callsite_addr=addr)
@@ -5402,6 +5410,9 @@ class TaintEngine:
             truncation_causes |= set(res["stats"].get("truncation_cause") or [])
             incomplete_funcs |= set(
                 res["stats"].get("analysis_incomplete_functions") or [])
+            for row in res["opt_in_sinks_reached"]:
+                have = opt_in.setdefault((row["address"], row["callee"]), {**row})
+                have["tainted_args"] = sorted(set(have["tainted_args"]) | set(row["tainted_args"]))
 
         # Union the per-callsite results back into the historical top-level shape.
         # Stats follow the pinned rule: max_depth = max across runs; functions_visited
@@ -5458,6 +5469,8 @@ class TaintEngine:
                 "max_iters": int(self.max_iters),
                 "unknown_call": str(self.unknown_call_policy),
             },
+            "opt_in_sinks_reached": sorted(opt_in.values(),
+                                           key=lambda r: (int(r["address"], 16), r["callee"])),
             "soundness": SOUNDNESS,
         }
         # #559/F2: attach a zero-sink frontier diagnostic when the whole
@@ -5495,6 +5508,10 @@ class TaintEngine:
                 "leaves": leaves,
                 "assumptions": assumptions,
                 "stats": {"truncated": truncated},
+                # What any per-callsite run carried out of the function.
+                "reached_return": any((d.get("exits") or {}).get("return") for d in _diags),
+                "out_params": {i for d in _diags
+                               for i in (d.get("exits") or {}).get("out_params") or ()},
             }
             out["diagnostics"] = forward_zero_diagnostics(
                 union_sub,
@@ -5502,6 +5519,7 @@ class TaintEngine:
                 truncated=truncated, truncation_cause=sorted(truncation_causes),
                 analysis_incomplete=bool(incomplete_funcs),
                 buffer_seed=bool(getattr(self, "_buffer_seeded", False)),
+                opt_in_reached=out["opt_in_sinks_reached"],
                 function=hex(int(func.start)))
             out["diagnostics"]["last_use_by_source"] = {
                 a: d.get("last_use") for a, d in per_source_diag.items()
@@ -13634,7 +13652,7 @@ class TaintEngine:
                     # opposite, so the arming is disclosed as a blocking
                     # frontier naming the opt-in that would report it. A sink
                     # whose CLASS is itself the opt-in (`file_write`) is outside
-                    # the default question and stays silent.
+                    # the default question: no leaf, only a record (below).
                     def _foreign(i: int) -> bool:
                         """Taint reaching arg *i* that does NOT derive solely
                         from this same call's own outputs -- `n = read(fd,
@@ -13682,6 +13700,28 @@ class TaintEngine:
                         }
                         if _gl not in leaves:
                             leaves.append(_gl)
+                    if _gate == sink.get("class"):
+                        # IC07 / TT-PILOT-FW04-02: a sink whose CLASS is the
+                        # opt-in (`net_write`, `file_write`) is outside the
+                        # default question -- no finding and no frontier -- but
+                        # taint arming it is a fact of this run. Dropping it
+                        # without a trace made "no modeled sink" read as a
+                        # whole-program dead end; recorded, the all-clear says
+                        # what it is relative to. The same arming test a
+                        # reported sink applies, and nothing is enabled.
+                        _reached = sorted({int(i) for i in [
+                            *(sink.get("tainted_args") or []),
+                            *([sink["len_arg"]] if sink.get("len_arg") is not None else [])]
+                            if isinstance(i, int) and _sink_arg_reach(int(i), sink)[0]})
+                        if _reached:
+                            _row = self._opt_in_reached.setdefault((addr, site_taddr), {
+                                "address": hex(addr),
+                                "callee": str(shown or "?"), **self._model_field(shown),
+                                "class": str(sink.get("class") or "?"),
+                                "gate": str(_gate),
+                                "tainted_args": [],
+                            })
+                            _row["tainted_args"] = sorted(set(_row["tainted_args"]) | set(_reached))
                     sink = None
             if sink is not None and sink.get("format_arg") is not None:
                 if format_gated_sink(sink):

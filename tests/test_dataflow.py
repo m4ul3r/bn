@@ -647,19 +647,6 @@ def test_taint_forward_verdict_frontiers_not_all_clear():
     assert "NO modeled sink reached" in out and "12 tainted frontier" in out and "NOT an all-clear" in out
 
 
-def test_taint_forward_verdict_empty_is_loudly_caveated():
-    # #310: a genuinely empty forward result (no sink, no frontier) is the MOST
-    # caveated case -- it must carry the same "NOT an all-clear" qualifier as the
-    # partial-coverage paths and note the coverage, since it's also how a bug the
-    # engine can't structurally see appears.
-    v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 3}}
-    out = _taint_forward_verdict(v)
-    assert "no taint reached any sink or frontier" in out
-    assert "NOT an all-clear" in out
-    assert "visited 3 fn(s)" in out
-    assert "can't structurally see" in out
-
-
 def test_taint_via_trail_from_path_reasons():
     value = {"function": {"name": "ip_input"}}
     finding = {"sink": {"callee": "memcpy"}, "path": [

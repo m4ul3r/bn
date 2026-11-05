@@ -7838,3 +7838,46 @@ def test_a_member_pointing_into_its_own_struct_reads_the_tainted_field(tmp_path,
     assert "field_load_unresolved" in {lf["kind"] for lf in indexed["leaves"]}, \
         indexed["leaves"]
     assert indexed["diagnostics"]["safe_to_report_all_clear"] is False, indexed["diagnostics"]
+
+
+def test_the_forward_all_clear_names_its_sink_class_scope(tmp_path, shared_bn):
+    """IC07 on a real binary. `push_label` sends its seeded argument: a
+    default run reports no sink -- `net_write` is opt-in -- but records the
+    call, scopes its all-clear to the enabled classes and says so in text and
+    JSON alike; `--sink-class net_write` reports exactly the recorded
+    arguments. `scale_count`'s seed reaches only its return value: an
+    all-clear whose diagnostics name that exit, never a dead end."""
+    binary = tmp_path / "opt_in_scope"
+    _compile(CORPUS / "opt_in_scope.c", binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def forward(fn, source, *extra, fmt="json"):
+        args = ("-t", target, "taint", "forward", "-f", fn, "--source", source, *extra)
+        if fmt == "json":
+            return _bn_json(shared_bn, *args)
+        res = shared_bn.run(*args, timeout=120.0)
+        assert res.returncode == 0, res.stderr
+        return res.stdout
+
+    default = forward("push_label", "param:1")
+    assert default["reached_sinks"] == [] and default["run_params"]["sink_classes"] == []
+    [row] = default["opt_in_sinks_reached"]
+    assert (row["callee"], row["class"]) == ("send", "net_write")
+    assert default["diagnostics"]["safe_to_report_all_clear"] is True
+    assert default["diagnostics"]["opt_in_sink_classes_reached"] == ["net_write"]
+
+    enabled = forward("push_label", "param:1", "--sink-class", "net_write")
+    assert enabled["run_params"]["sink_classes"] == ["net_write"]
+    assert enabled["opt_in_sinks_reached"] == []
+    assert sorted((f["sink"]["address"], f["sink"]["tainted_arg_index"])
+                  for f in enabled["reached_sinks"]) == [
+        (row["address"], i) for i in row["tainted_args"]]
+
+    [verdict] = [line for line in forward("push_label", "param:1", fmt="text").splitlines()
+                 if line.startswith("verdict:")]
+    assert "NOT an all-clear" not in verdict and "net_write" in verdict
+
+    scaled = forward("scale_count", "param:0")
+    assert scaled["reached_sinks"] == [] and scaled["opt_in_sinks_reached"] == []
+    assert scaled["diagnostics"]["safe_to_report_all_clear"] is True
+    assert scaled["diagnostics"]["exits"]["return"] is True
