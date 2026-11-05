@@ -764,7 +764,7 @@ def _disasm(args: argparse.Namespace) -> int:
              arg("--offset", type=_non_negative_int, default=0,
                  help="Skip the first OFFSET blocks (pagination, with --limit)"),
              arg("--address-window", dest="address_window", default=None, metavar="A:B",
-                 help="Only blocks holding an instruction whose address is in [A, B) "
+                 help="Only blocks holding an instruction whose start address is in [A, B) "
                       "(hex 0x.. or decimal), e.g. 0x402000:0x402200"),
          ],
          estimable=True)

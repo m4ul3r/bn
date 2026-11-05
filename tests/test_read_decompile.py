@@ -7681,6 +7681,32 @@ def test_cfg_address_window_keeps_blocks_holding_an_address_in_it(monkeypatch):
     assert result["address_window"] == ["0x401018", "0x401021"]
 
 
+@pytest.mark.parametrize("window, starts", [
+    ((0x401001, 0x401004), []),                 # strictly inside the 5-byte call
+    ((0x401001, 0x401006), ["0x401005"]),       # reaches only the next block's start
+    ((0x401000, 0x401001), ["0x401000"]),       # the call's own start
+])
+def test_cfg_asm_window_matches_instruction_starts_not_block_bytes(monkeypatch, window, starts):
+    # D3-01: the asm window intersected the block's byte range, so a window
+    # inside one multi-byte instruction kept a block holding no instruction
+    # that starts in it; the documented contract is instruction START addresses.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "entry_stub", "void entry_stub(void)")
+    call = _FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "call 0x402000")],
+                         end=0x401005)
+    ret = _FakeCFGBlock(0x401005, lines=[_FakeCFGLine(0x401005, "ret")], end=0x401006)
+    call.outgoing_edges = [_FakeCFGEdge(ret, "UnconditionalBranch")]
+    fn.basic_blocks = [call, ret]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "entry_stub", view="asm", address_window=window)
+
+    assert [b["start"] for b in result["blocks"]] == starts
+    assert (result["total_blocks"], result["matched_blocks"]) == (2, len(starts))
+
+
 def test_cfg_address_window_at_an_il_level_reads_instruction_addresses(monkeypatch):
     # IL block `start` is an index, so the window is matched on the addresses
     # of the block's instructions, never on the index.

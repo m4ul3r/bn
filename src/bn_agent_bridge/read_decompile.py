@@ -2453,12 +2453,18 @@ _CFG_VIEWS = ("asm", "mlil", "hlil")
 
 
 def _block_in_window(bb, level: str, window: tuple[int, int]) -> bool:
-    """Whether basic block *bb* holds an instruction whose ADDRESS is in the
-    half-open *window*. At asm the block is an address range; at IL levels its
-    `start` is an IL index, so the instructions' own addresses decide."""
+    """Whether basic block *bb* holds an instruction whose START address is in
+    the half-open *window*, at every level (D3-01). At IL levels `start` is an
+    IL index, so the instructions' own addresses decide; at asm the block's
+    rendered lines carry each instruction's start -- the block's byte range is
+    not the test, because a window strictly inside one multi-byte instruction
+    overlaps the range yet holds no instruction start. The byte range is only a
+    cheap reject before any line is rendered."""
     lo, hi = window
     if level == "asm":
-        return int(bb.start) < hi and lo < int(bb.end)
+        if not (int(bb.start) < hi and lo < int(bb.end)):
+            return False
+        return any(lo <= int(line.address) < hi for line in bb.disassembly_text)
     return any(lo <= int(ins.address) < hi for ins in bb)
 
 
