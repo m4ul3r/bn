@@ -6488,6 +6488,34 @@ def test_doctor_names_this_cli_and_the_bn_on_path(monkeypatch, tmp_path, capsys)
     assert warnings[1].endswith("here-1")
 
 
+def test_doctor_cli_build_id_changes_when_a_nested_command_module_changes(
+        monkeypatch, tmp_path, capsys):
+    # P2-08 review: the CLI keeps its handlers in `commands/`, which a
+    # top-level fingerprint misses; doctor's `cli.build_id` must move when one
+    # of them is edited, and must not move for bytecode.
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    from bn.version import build_id_for_tree
+
+    here = _Path(bn.cli.__file__).resolve().parent
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr("bn.commands.admin.shutil.which", lambda name: None)
+    bn.cli.main(["doctor", "--format", "json"])
+    assert json.loads(capsys.readouterr().out)["cli"]["build_id"] == build_id_for_tree(here)
+
+    copy = tmp_path / "bn"
+    _shutil.copytree(here, copy, ignore=_shutil.ignore_patterns("__pycache__"))
+    before = build_id_for_tree(copy)
+    (copy / "commands" / "__pycache__").mkdir()
+    (copy / "commands" / "__pycache__" / "admin.cpython-314.pyc").write_bytes(b"\0stale")
+    assert build_id_for_tree(copy) == before
+    nested = copy / "commands" / "admin.py"
+    nested.write_text(nested.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+    assert build_id_for_tree(copy) != before
+
+
+
 def test_session_start_help_does_not_offer_the_instance_selector(capsys):
     # W10: `session start --help` listed `-i/--instance`, which this command
     # refuses -- it names an EXISTING bridge; `--instance-id` names the new one.

@@ -3,13 +3,13 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import shlex
 import types
 
 import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
-from bn.target_hint import active_close_headline
 from bn.transport import MULTI_TARGET_HEADLINE
 
 
@@ -1507,9 +1507,15 @@ def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypat
     assert rc == 2
     assert [c["op"] for c in calls] == ["list_targets"]
     lines = capsys.readouterr().err.splitlines()
-    assert lines[0] == active_close_headline(spelling)
+    # The headline names the selector exactly as given -- not the generic
+    # "requires --target" -- and the copyable `-t` rows for both targets follow.
+    assert lines[0].startswith(f"{spelling} ")
+    assert "--target" not in lines[0]
     assert MULTI_TARGET_HEADLINE not in lines
-    assert any("alpha.so" in line for line in lines) and any("beta.so" in line for line in lines)
+    rows = [shlex.split(line.split("  #")[0]) for line in lines if line.startswith("  bn ")]
+    assert [row[0] for row in rows] == ["bn", "bn"]
+    assert [row.count(sel) for row, sel in zip(rows, ("alpha.so", "beta.so"))] == [1, 1]
+    assert all("close" in row for row in rows)
 
 
 def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):
