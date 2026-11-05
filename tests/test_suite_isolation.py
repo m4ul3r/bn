@@ -681,8 +681,8 @@ _FIXTURE_SHAPE_SKIP_CELLS = (
      True, "atomic batch"),
     ("TestFunctionCreateSkippedAddress", "test_create_on_auto_skipped_address", False,
      "skipped-address"),
-    ("TestTaintEmptyVerdictHonesty", "test_empty_forward_verdict_is_caveated", False,
-     "NOT an all-clear"),
+    ("TestTaintEmptyVerdictHonesty", "test_empty_forward_verdict_agrees_with_the_json_gate", False,
+     "verdict/gate agreement"),
 )
 
 
