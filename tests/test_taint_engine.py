@@ -9753,7 +9753,7 @@ def test_backward_frontier_buckets_and_next_action_name_the_actionable_cut_812()
 
 def test_backward_weak_sink_seed_withholds_completeness_812():
     # The last completeness branch. It is DEFENCE-IN-DEPTH, not live coverage:
-    # none of the six assumptions today's backward walk records contains any
+    # no assumption today's backward walk records (`_bw_assume`) contains any
     # `_WEAK_SEED_ASSUMPTION_MARKERS` substring, so the branch cannot fire from
     # its only caller -- the weak backward seed shapes that exist reach the gate
     # as a BLOCKING leaf (`arg_under_recovered`) instead. That is precisely why
@@ -9770,11 +9770,14 @@ def test_backward_weak_sink_seed_withholds_completeness_812():
     assert weak["safe_to_report_complete_slice"] is False, weak
     assert "seed" in weak["complete_slice_reason"], weak
 
-    # And it keys on the MARKERS, not on "an assumption exists": the caller-cap
-    # note the backward walk really does record must not be read as a weak seed,
-    # or every capped ascent would be blamed on its seed.
+    # And it keys on the MARKERS, not on "an assumption exists": a note the
+    # backward walk really does record -- a stack slot canonicalized to the
+    # parameter it spills -- must not be read as a weak seed, or every such
+    # slice would be blamed on its seed.
     ordinary = tr.backward_diagnostics(
-        [], ["parse_record has 9 callers; caller ascent fully followed 4, capped at 4"],
+        [], ["stack local var_18 appears to be a spill of param 0 (its slot has a single "
+             "store of the incoming parameter); canonicalized to param:0 so caller-ascent "
+             "continues (#434)"],
         sinks_seeded=1, slices=1)
     assert ordinary["safe_to_report_complete_slice"] is True, ordinary
 
