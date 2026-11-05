@@ -2089,8 +2089,9 @@ def test_a_timed_out_taint_request_is_cancelled_and_releases_the_bridge(
         tmp_path, shared_bn, monkeypatch):
     """P1-07: a client that times out sends `cancel_request`; the walk polls it
     at its next function visit, stops with a `cancelled` outcome the client
-    reports as honoured, and the bridge is free for the next request instead
-    of computing for minutes."""
+    reports in its error envelope (`status: "cancelled"`, the bridge's
+    `observed`), and the bridge is free for the next request instead of
+    computing for minutes."""
     count = 2000          # one descended helper each: seconds of walking
     lines = ["#include <string.h>"]
     lines += [f"__attribute__((noinline)) int h{i}(const char *s) "
@@ -2110,8 +2111,13 @@ def test_a_timed_out_taint_request_is_cancelled_and_releases_the_bridge(
                               "--source", "param:1", "--format", "json", timeout=120.0)
     monkeypatch.delenv("BN_REQUEST_TIMEOUT")
     assert timed_out.returncode == 2, (timed_out.stdout, timed_out.stderr)
-    assert "honoured" in timed_out.stdout + timed_out.stderr, (timed_out.stdout,
-                                                               timed_out.stderr)
+    envelope = json.loads(timed_out.stdout)
+    assert envelope["ok"] is False and envelope["status"] == "cancelled", envelope
+    observed = envelope["observed"]
+    assert (observed["timed_out"], observed["cancel_sent"], observed["polls_cancel"],
+            observed["cancel_outcome"], observed["cancelled"]) == (
+        True, True, True, "cancelled", True), observed
+    assert observed["functions_visited"] >= 1, observed
     listed = shared_bn.run("target", "list", "--format", "json", timeout=5.0)
     assert listed.returncode == 0, listed.stderr
 

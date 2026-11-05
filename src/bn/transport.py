@@ -1623,19 +1623,20 @@ def _cancel_polled(raw: bytes) -> bool | None:
     return polls if isinstance(polls, bool) else None
 
 
-def _await_cancel_outcome(sock: socket.socket) -> str:
+def _await_cancel_outcome(sock: socket.socket) -> tuple[str, dict[str, Any]]:
     """How a timed-out request ended once its cancel was sent, read from the
-    request's own connection: ``"honoured"`` -- the bridge answered with status
-    ``cancelled``; ``"finished"`` -- it answered with anything else, so the
-    operation completed before it looked at the cancel; ``"no_answer"`` -- no
-    complete answer within :data:`CANCEL_OUTCOME_WAIT`, so it may still run."""
+    request's own connection, with the bridge's `observed` when it said:
+    ``"cancelled"`` -- the bridge answered with status ``cancelled``;
+    ``"finished"`` -- it answered with anything else, so the operation
+    completed before it looked at the cancel; ``"no_answer"`` -- no complete
+    answer within :data:`CANCEL_OUTCOME_WAIT`, so it may still run."""
     deadline = time.monotonic() + CANCEL_OUTCOME_WAIT
     data: list[bytes] = []
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return "no_answer"
+                return "no_answer", {}
             sock.settimeout(remaining)
             chunk = sock.recv(65536)
             if not chunk:
@@ -1643,10 +1644,13 @@ def _await_cancel_outcome(sock: socket.socket) -> str:
             data.append(chunk)
         response = json.loads(b"".join(data).decode("utf-8"))
     except (OSError, ValueError):
-        return "no_answer"
+        return "no_answer", {}
     if not isinstance(response, dict):
-        return "no_answer"
-    return "honoured" if response.get("status") == "cancelled" else "finished"
+        return "no_answer", {}
+    if response.get("status") != "cancelled":
+        return "finished", {}
+    observed = response.get("observed")
+    return "cancelled", observed if isinstance(observed, dict) else {}
 
 
 def _send_request_to_instance(
@@ -1758,8 +1762,10 @@ def _send_request_to_instance(
     # (None: it did not say).
     cancel_polls: bool | None = None
     # How the request ended once a cancel sent from inside the read loop was
-    # answered (`_await_cancel_outcome`); None when nothing listened for it.
+    # answered (`_await_cancel_outcome`), and the `observed` the bridge sent
+    # with a cancelled answer; None and {} when nothing listened for it.
     cancel_outcome: str | None = None
+    bridge_observed: dict[str, Any] = {}
     send_attempted = False
     for attempt in range(connect_retries):
         if deadline is not None:
@@ -1822,7 +1828,7 @@ def _send_request_to_instance(
                             cancel_sent, cancel_polls = _send_cancel_request(
                                 instance, str(payload["id"]))
                             if cancel_polls:
-                                cancel_outcome = _await_cancel_outcome(sock)
+                                cancel_outcome, bridge_observed = _await_cancel_outcome(sock)
                         raise
                 finally:
                     if notice is not None:
@@ -1849,7 +1855,7 @@ def _send_request_to_instance(
 
     cancellation = (
         "A cancel request was sent and honoured: the bridge stopped the operation. "
-        if cancel_outcome == "honoured" else
+        if cancel_outcome == "cancelled" else
         "A cancel request was sent, but the operation finished before it took "
         "effect; its result was discarded. "
         if cancel_outcome == "finished" else
@@ -1887,11 +1893,20 @@ def _send_request_to_instance(
                 if shown_timeout is not None
                 else ""
             )
+            # The outcome is structured as well as said: `status: "cancelled"`
+            # only when the bridge answered that it stopped (its own `observed`
+            # -- `cancelled`, `functions_visited` -- kept), and `observed`
+            # stating what the client established about the cancel.
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
                 f"{timeout_suffix} (op '{op}'). {cancellation}"
                 "Raise or disable the limit with "
-                "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
+                "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long.",
+                status="cancelled" if cancel_outcome == "cancelled" else None,
+                observed={**bridge_observed, "timed_out": True,
+                          "request_sent": send_attempted, "cancel_sent": cancel_sent,
+                          "polls_cancel": cancel_polls, "cancel_outcome": cancel_outcome,
+                          "cancelled": cancel_outcome == "cancelled"},
             ) from last_error
         # A failure before connect() ever succeeded (socket gone, nothing
         # accepting) never reached the bridge; one after it -- a reset while
