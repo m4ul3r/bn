@@ -1621,3 +1621,29 @@ def test_target_close_is_advertised_by_help_and_capabilities(fake_transport, cap
     assert entry["group"] == "target"
     assert "close" in entry["help"].lower()
     assert "close" in entry["see_also"]
+
+
+@pytest.mark.parametrize("rows,advice", [
+    ([{"target_id": "1:1:1", "selector": "alpha.so", "view_id": 1},
+      {"target_id": "1:2:2", "selector": "beta.so", "view_id": 2}], "listing"),
+    ([{"target_id": "1:1:1", "selector": "alpha.so", "view_id": 1}], "omit"),
+])
+def test_a_typed_empty_target_advises_by_what_is_open(fake_transport, monkeypatch, capsys,
+                                                      rows, advice):
+    """W10: the refusal said "omit --target to use the single open target"
+    with two targets open, and that rerun hits the multi-target refusal.
+    Several open targets get the shared `Open targets:` listing; a sole one
+    keeps the omit advice. The peek names no target: the empty selector is
+    still never forwarded."""
+    monkeypatch.setattr(bn.cli, "list_instances", lambda *a, **k: [object()])
+    calls = fake_transport({"list_targets": {"ok": True, "result": rows}})
+
+    assert bn.cli.main(["function", "list", "-t", ""]) == 2
+    assert [(call["op"], call["target"]) for call in calls] == [("list_targets", None)]
+    err = capsys.readouterr().err
+    omit = "omit --target to use the single open target"
+    if advice == "listing":
+        assert omit not in err and "Open targets:" in err
+        assert "-t alpha.so " in err and "-t beta.so " in err
+    else:
+        assert omit in err and "Open targets:" not in err

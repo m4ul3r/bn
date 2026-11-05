@@ -23,6 +23,7 @@ from .formatters import (
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
     _mutation_summary,
     _render_fanout_text,
+    _render_target_choices,
     _render_mutation_summary_text,
     _render_mutation_text,
     command_routing,
@@ -65,7 +66,7 @@ from .transport import (  # noqa: F401
     validate_instance_id,
     wait_for_teardown,
 )
-from .target_hint import instance_option, respell_for_option
+from .target_hint import SELECT_HINT_LINE, instance_option, respell_for_option
 from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
 
 
@@ -1576,7 +1577,7 @@ def blank_selector(value: Any) -> bool:
 
 def _empty_target_message(
     args: argparse.Namespace,
-    omit_hint: str = "omit --target to use the single open target",
+    omit_hint: str | None = None,
 ) -> str:
     """The refusal for an empty selector, phrased for where it CAME FROM.
 
@@ -1586,6 +1587,11 @@ def _empty_target_message(
     argument they never wrote, and the two sources are cleared in completely
     different ways (`unset BN_TARGET` vs `bn target clear`). Name the source
     and its own remedy instead (#676 item 11).
+
+    *omit_hint* is the caller's own "what omitting the flag does" (a fan-out
+    surveys every target). Without one, the typed refusal says what omitting
+    it would do HERE, which depends on how many targets are open (W10): see
+    `_empty_target_advice`.
     """
     ambient = getattr(args, "_empty_ambient_target", None)
     if ambient:
@@ -1594,10 +1600,39 @@ def _empty_target_message(
             f"{source}: {remedy}. An empty selector is a broken default, not "
             "a request for the default, so nothing was sent."
         )
-    return (
-        f"--target is empty: pass a selector from `bn target list`, or "
-        f"{omit_hint}"
-    )
+    lead = "--target is empty: pass a selector from `bn target list`"
+    if omit_hint is not None:
+        return f"{lead}, or {omit_hint}"
+    return _empty_target_advice(args, lead)
+
+
+def _empty_target_advice(args: argparse.Namespace, lead: str) -> str:
+    """W10: "omit --target to use the single open target" was printed whatever
+    was open, so with several targets the advised rerun hit the multi-target
+    refusal. One peek decides: a sole target keeps that advice, several get
+    the shared `Open targets:` listing (`src/bn/target_hint.py`, the grammar
+    every multi-target refusal prints), none says so. Asked only of a bridge
+    already running -- a refusal must not start one, and with none running
+    there is nothing open to count -- and an unreachable one gets only the
+    lead, with no claim about what is open. The peek names no target, so the
+    empty selector is still never forwarded."""
+    if not list_instances():
+        return f"{lead}."
+    try:
+        targets = unwrap_result(
+            send_request("list_targets", params={}, target=None,
+                         instance_id=getattr(args, "instance", None)),
+            "list_targets")
+    except BridgeError:
+        return f"{lead}."
+    if not isinstance(targets, list):
+        return f"{lead}."
+    if not targets:
+        return f"{lead}; no target is open (`bn load <path>` opens one)."
+    if len(targets) == 1:
+        return f"{lead}, or omit --target to use the single open target"
+    return "\n".join([f"{lead}; {len(targets)} targets are open.", SELECT_HINT_LINE,
+                      _render_target_choices(targets)])
 
 
 def _implicit_target(args: argparse.Namespace) -> str:
