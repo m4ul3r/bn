@@ -1121,6 +1121,12 @@ def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = 
         if b is not None:
             export_bindings.add(b)
     items = []
+    # P2-06: BN's combined symbol list can hold the SAME definition more than
+    # once (one record per symbol table that names it), which listed exact
+    # duplicate rows and inflated `total`. One row per identity -- address,
+    # name and kind -- and the collapse is counted, never silent.
+    seen: set[tuple[int, str, str]] = set()
+    duplicates = 0
     for attr_name, kind in (("FunctionSymbol", "function"), ("DataSymbol", "data")):
         sym_type = getattr(bn.SymbolType, attr_name, None)
         if sym_type is None:
@@ -1132,6 +1138,11 @@ def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = 
             # symbol so callers still get the definition list.
             if export_bindings and binding is not None and binding not in export_bindings:
                 continue
+            identity = (int(sym.address), str(getattr(sym, "name", "")), kind)
+            if identity in seen:
+                duplicates += 1
+                continue
+            seen.add(identity)
             short = getattr(sym, "short_name", None)
             items.append(
                 {
@@ -1145,13 +1156,16 @@ def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = 
                 }
             )
     if count_only:
-        return {"kind": "exports", "count": len(items), "total": len(items)}
+        return {"kind": "exports", "count": len(items), "total": len(items),
+                "duplicates_collapsed": duplicates}
     items.sort(key=lambda item: (
         0 if item["kind"] == "function" else 1,
         item["name"],
         int(item["address"], 16),
     ))
-    return _paged_list_result(items, offset=offset, limit=limit, kind="exports")
+    result = _paged_list_result(items, offset=offset, limit=limit, kind="exports")
+    result["duplicates_collapsed"] = duplicates
+    return result
 
 
 def _imports_build_summary(

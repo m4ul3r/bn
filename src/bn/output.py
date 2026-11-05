@@ -57,6 +57,23 @@ class OutputWriteResult:
     # Mutually exclusive with `near_spill` (the sharper signal whenever a
     # threshold is armed).
     truncation_risk: bool = False
+    # A RAW byte payload the caller must write to ``stdout.buffer`` verbatim
+    # (it neither spilled nor went to ``--out``); ``rendered`` is then empty.
+    raw: bytes | None = None
+
+
+@dataclass(frozen=True)
+class RawBytes:
+    """A raw byte payload on its way to the output layer (``read --encoding
+    bytes`` under ``--format text``).
+
+    It is not a rendered value: stdout receives ``data`` verbatim, so it is
+    measured, spilled and written as bytes rather than through
+    :func:`render_value`. ``summary`` is the envelope summary an ``--out``,
+    spill or estimate envelope carries in its place."""
+
+    data: bytes
+    summary: dict[str, Any]
 
 
 def _json_default(value: Any) -> Any:
@@ -643,6 +660,11 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     for key in ("format", "bytes", "tokens", "tokenizer", "sha256"):
         if key in payload:
             lines.append(f"{key}: {payload[key]}")
+    # #653.8 / P1-03: WHICH target/instance produced the artifact, on the text
+    # face too -- JSON envelopes carried it, text ones dropped it.
+    for key in ("target", "instance"):
+        if payload.get(key) is not None:
+            lines.append(f"{key}: {payload[key]}")
     # #409: surface the token threshold + the rerun/slicing hint so an agent bounds
     # the next read (only present on a spilled envelope).
     if "spill_token_limit" in payload:
@@ -929,6 +951,7 @@ def estimate_bytes_result(
     fmt: str,
     summary: dict[str, Any] | None = None,
     rerun_hint: str | None = None,
+    outcome: dict[str, Any],
 ) -> OutputWriteResult:
     """:func:`estimate_output_result` for a RAW BYTE payload (#796).
 
@@ -944,9 +967,10 @@ def estimate_bytes_result(
     It exists at all because that second emit path had no preflight: the
     command advertised ``--estimate-output``, its ``--encoding hex`` half
     honored it, and its ``--encoding bytes`` half wrote the payload to stdout at
-    rc 0 -- one command, two answers to what the flag means."""
+    rc 0 -- one command, two answers to what the flag means. *outcome* is as
+    for :func:`write_bytes_result`."""
     return _estimate_envelope(bytes(data), fmt=fmt, payload_format="bytes",
-                              summary=summary, rerun_hint=rerun_hint, outcome={"ok": True})
+                              summary=summary, rerun_hint=rerun_hint, outcome=outcome)
 
 
 def _estimate_envelope(
@@ -988,43 +1012,78 @@ def _estimate_envelope(
 
 
 def write_bytes_result(
-    data: bytes,
+    payload: RawBytes,
     *,
     out_path: Path | None,
     fmt: str,
-    summary: dict[str, Any] | None = None,
+    stem: str,
+    spill_token_limit: int | None = None,
+    provenance: dict[str, Any] | None = None,
+    rerun_hint: str | None = None,
+    outcome: dict[str, Any],
 ) -> OutputWriteResult:
-    """Write raw *data* to *out_path* with the same guarantees as
-    :func:`write_output_result`: create parent dirs, wrap OSError in a clean
-    OutputWriteError (not a raw traceback), and return an artifact envelope
-    (path/sha256/size, ``format: bytes``). The previous raw-bytes path did
-    ``out_path.write_bytes(data)`` directly -- no mkdir, no error wrap, no
-    envelope (#96). With no out_path the caller writes the raw bytes to stdout.
-    """
-    if out_path is None:
-        return OutputWriteResult(rendered="")
+    """:func:`write_output_result` for a RAW byte payload, with the same
+    guarantees: ``--out`` creates parent dirs and wraps OSError in a clean
+    OutputWriteError; a payload past an armed ``BN_SPILL_TOKENS`` threshold is
+    written to a private spill artifact (``.bin``) with its provenance sidecar
+    instead of reaching stdout; every envelope carries the producing
+    target/instance (P1-03), the operation *outcome* (:func:`outcome_fields` of
+    the read the bytes came from) and ``written`` for the delivery. Otherwise
+    ``raw`` holds the bytes the caller writes to ``stdout.buffer`` verbatim."""
+    data = payload.data
+    if spill_token_limit is None:
+        spill_token_limit = resolve_spill_limit()
+    token_count = estimate_tokens(data)
+    if out_path is None and (spill_token_limit is None or token_count <= spill_token_limit):
+        near = (spill_token_limit is not None
+                and token_count >= (spill_token_limit * 4) // 5)
+        return OutputWriteResult(
+            rendered="", raw=data, token_count=token_count, near_spill=near,
+            truncation_risk=(not near and token_count >= DEFAULT_SLICE_NOTE_TOKENS))
     try:
-        # User-chosen --out destination (see write_output_result): honor the
-        # caller's permissions, don't force 0o700 as ensure_private_dir would.
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(data)
+        if out_path is not None:
+            # User-chosen --out destination (see write_output_result): honor the
+            # caller's permissions, don't force 0o700 as ensure_private_dir would.
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(data)
+            path = out_path
+        else:
+            path = _spill_path(stem, ".bin")
+            _write_private_bytes(path, data)
+            _write_spill_sidecar(path, data, provenance)
     except OSError as exc:
-        raise OutputWriteError(f"Failed to write --out file {out_path}: {exc}") from exc
-    artifact = {
-        "ok": True,
+        if out_path is not None:
+            raise OutputWriteError(f"Failed to write --out file {out_path}: {exc}") from exc
+        print(f"warning: failed to write spill artifact ({exc}); printing full output",
+              file=sys.stderr)
+        return OutputWriteResult(rendered="", raw=data, token_count=token_count,
+                                 truncation_risk=True)
+    spilled = out_path is None
+    artifact: dict[str, Any] = {
+        **outcome,
         "written": True,
-        "spilled": False,
-        "artifact_path": str(out_path),
+        "spilled": spilled,
+        "artifact_path": str(path),
         "format": "bytes",
         "bytes": len(data),
+        "tokens": token_count,
+        "tokenizer": "estimate",
         "sha256": hashlib.sha256(data).hexdigest(),
+        "summary": dict(payload.summary),
     }
-    if summary is not None:
-        artifact["summary"] = summary
+    for key, val in (provenance or {}).items():
+        if val is not None:
+            artifact.setdefault(key, val)
+    if spilled:
+        if rerun_hint:
+            artifact["rerun"] = rerun_hint
+        artifact["spill_token_limit"] = spill_token_limit
+        artifact["meta_path"] = str(spill_sidecar_path(path))
     return OutputWriteResult(
         rendered=render_envelope(artifact, fmt),
         artifact=artifact,
-        spilled=False,
+        spilled=spilled,
+        token_count=token_count,
     )
 
 
