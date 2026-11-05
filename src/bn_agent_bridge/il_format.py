@@ -209,6 +209,24 @@ def _iter_llil_instructions(func) -> list[Any]:
     return instructions
 
 
+# Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
+# placeholder symbol per compiler builtin its MLIL may synthesise
+# (`__builtin_memcpy`, `__builtin_strcpy`, ...). The placeholder proves nothing
+# about the binary; the builtin is in it only where code references it (a
+# store run or a `rep movs` BN lifted to an inline builtin call).
+SYNTHETIC_BUILTIN_SECTIONS = frozenset({".synthetic_builtins"})
+
+
+def in_synthetic_builtin_section(bv, address: int) -> bool:
+    """Whether *address* is a synthetic-builtin placeholder; False when the
+    view cannot answer."""
+    try:
+        sections = bv.get_sections_at(int(address)) or []
+    except Exception:
+        return False
+    return any(str(getattr(s, "name", "")) in SYNTHETIC_BUILTIN_SECTIONS for s in sections)
+
+
 _LLIL_CALL_OPS = frozenset({"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"})
 
 

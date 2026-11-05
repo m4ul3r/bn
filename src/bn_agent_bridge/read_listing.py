@@ -264,19 +264,29 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
         for target in callee_addresses:
             code_ref_addrs |= {int(getattr(ref, "address", -1)) for ref in _get_code_refs(target)}
     rows = []
+    expansion_addrs: set[int] = set()
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
+        call_addr = int(getattr(insn, "address", 0))
         # Count tail-branch references too (a `b`/branch into the sink rendered
         # as `return <addr>(...) __tailcall`), not just bl/blx -- xrefs and
         # taint backward already treat these as calls, so callsites must agree
         # or it silently misses a reachable sink during triage (#47).
-        if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
+        if op_name in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
+            dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
+            if dest_value not in callee_addresses and call_addr not in code_ref_addrs:
+                continue
+            call_kind = "tailcall" if "TAILCALL" in op_name else "call"
+        elif (op_name == "LLIL_INTRINSIC" and call_addr in code_ref_addrs
+              and call_addr not in expansion_addrs
+              and il_format.inline_expansion_intrinsics(func, call_addr)):
+            # V8-06: an inline string expansion (`rep movs`) MLIL renders as a
+            # call to this builtin -- one row per instruction, however many
+            # intrinsics BN lifted it to.
+            expansion_addrs.add(call_addr)
+            call_kind = "inline_expansion"
+        else:
             continue
-        call_addr = int(getattr(insn, "address", 0))
-        dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
-        if dest_value not in callee_addresses and call_addr not in code_ref_addrs:
-            continue
-        call_kind = "tailcall" if "TAILCALL" in op_name else "call"
 
         instruction_length = il_format._instruction_length(bv, call_addr, arch=func_arch)
         caller_static = call_addr + instruction_length
@@ -946,12 +956,15 @@ def _callsites(
         for symbol in symbols:
             symbol_type = getattr(symbol, "type", None)
             type_name = str(getattr(symbol_type, "name", symbol_type))
+            # V8-06: BN's synthetic builtins (`__builtin_memcpy`) are no
+            # function either; their callers are the inline expansions MLIL
+            # renders as calls to them.
             if symbol_type in allowed_types or type_name in {
                 "ImportedFunctionSymbol",
                 "ImportedDataSymbol",
                 "ImportAddressSymbol",
                 "ExternalSymbol",
-            }:
+            } or il_format.in_synthetic_builtin_section(bv, int(getattr(symbol, "address", 0))):
                 imported.append(symbol)
         if not imported:
             raise

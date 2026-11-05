@@ -8062,3 +8062,25 @@ def test_an_inline_copy_is_one_backward_sink_site(tmp_path, shared_bn):
     assert row["status"] == "seeded", row
     assert row["slices"] == len(result["slices"]) >= 1
     assert {sl["sink"]["address"] for sl in result["slices"]} == {row["address"]}
+
+
+def test_inline_expansions_are_listed_by_the_catalog_and_callsites(tmp_path, shared_bn):
+    """V8-06: the variable-length inline copy (the tainted-total `rep movs`)
+    was missing from `taint models --present --callsites --all-sites`, and
+    `callsites __builtin_memcpy` refused the synthetic builtin, so only
+    `taint forward` ever surfaced it. Both now list it where backward seeds it."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    backward = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                        "--sink", "arg:__builtin_memcpy:2")
+    [site] = {row["address"] for row in backward["sink_status"]}
+
+    catalog = _bn_json(shared_bn, "-t", target, "taint", "models", "--role", "sink",
+                       "--present", "--callsites", "--all-sites")
+    [entry] = [e for e in catalog["items"] if e["symbol"] == "__builtin_memcpy"]
+    rows = {row["address"]: (row["function"], row["kind"]) for row in entry["callsites"]}
+    assert rows[site] == ("copy_label", "app_caller"), rows
+
+    listed = _bn_json(shared_bn, "-t", target, "callsites", "__builtin_memcpy",
+                      "--within", "copy_label")
+    assert [(row["call_addr"], row["call_kind"]) for row in listed["items"]] == [
+        (site, "inline_expansion")]

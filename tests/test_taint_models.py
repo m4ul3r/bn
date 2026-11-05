@@ -590,6 +590,36 @@ def test_constant_inline_builtin_rows_are_non_audit_958():
     assert _sink_entry(res, "__builtin_memset")["audit_callsite_count"] == 1
 
 
+def test_a_rep_movs_lifted_behind_a_direction_flag_branch_is_an_audit_site():
+    """V8-06: BN lifts `rep movsq` to `if (flag:d)` plus one intrinsic per arm;
+    only the intrinsics carry the synthesised `__builtin_memcpy` calls. The
+    catalog judged the first LLIL instruction (the branch), called the site
+    data, and dropped it -- the variable-length copy no list showed."""
+    def synthesised():
+        call = _Llil("MLIL_CALL", _const(0x9100))
+        call.params = [_Llil("MLIL_VAR"), _Llil("MLIL_VAR"), _Llil("MLIL_LSL")]
+        intrinsic = _Llil("LLIL_INTRINSIC")
+        intrinsic.mlils = [call]
+        return intrinsic
+
+    lifted = [_Llil("LLIL_IF", mlil=_Llil("MLIL_IF")), synthesised(), synthesised()]
+    fn = _ILFn("copy_label", 0x5000, {0x5020: lifted[0]})
+    fn.get_llils_at = lambda a: lifted if a == 0x5020 else []
+
+    class _BV(_BVGotPage):
+        def __init__(self):
+            self.functions = [fn]
+            self._syms = {"__builtin_memcpy": [_Sym("__builtin_memcpy", 0x9100)]}
+            self._refs = {0x9100: [_Ref(0x5020)]}
+            self._contain = {0x5020: fn}
+
+    res = rts._taint_models_op(_CtxWithBV(_BV()), "active", {"present": True, "callsites": True})
+    entry = _sink_entry(res, "__builtin_memcpy")
+    assert [(c["address"], c["kind"]) for c in entry["callsites"]] == [("0x5020", "app_caller")]
+    assert entry["callsite_count"] == entry["audit_callsite_count"] == 1
+
+
+
 def test_callsite_rows_name_the_caller_demangled_unless_mangled():
     # #978's rule for text: the containing function by its demangled display
     # name, the raw symbol under --mangled; JSON keeps the raw name.

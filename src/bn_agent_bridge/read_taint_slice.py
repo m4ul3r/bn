@@ -322,37 +322,56 @@ def _callsite_shape(fn, addr: int, targets: set[int], flagged_args: list[int]) -
     """How the instruction at *addr* (a code reference to the modeled symbol)
     uses that symbol (#958):
 
-    * ``"call"``   -- a call or tail branch whose target is one of *targets*;
+    * ``"call"``   -- a call or tail branch whose target is one of *targets*,
+      or an instruction BN's MLIL synthesised a builtin call from with an
+      argument the model flags that is not a constant (an inline `rep movs`
+      whose length is computed, V8-06);
     * ``"inline"`` -- not a call in LLIL, but BN's MLIL synthesised an inline
       builtin call there (`str xzr, ...` runs lifted to `__builtin_memset`) and
       every argument the model flags is a constant, so no taint can arm it;
     * ``"data"``   -- anything else: the `adrp` that loads the GOT page the
       import's slot sits on, the stub's own `ldr`/`add` of its slot;
     * ``None``     -- the view cannot answer (no function, no IL API), so the
-      caller keeps the row rather than dropping a site it could not judge."""
+      caller keeps the row rather than dropping a site it could not judge.
+
+    Every LLIL instruction at *addr* is judged, not only the first: BN lifts
+    one `rep movs` to an `if` on the direction flag and an intrinsic per arm,
+    and only the intrinsics carry the synthesised calls."""
+    get_llils = getattr(fn, "get_llils_at", None) if fn is not None else None
     get_llil = getattr(fn, "get_llil_at", None) if fn is not None else None
-    if not callable(get_llil):
-        return None
     try:
-        llil = get_llil(int(addr))
+        if callable(get_llils):
+            llils = list(get_llils(int(addr)) or [])
+        elif callable(get_llil):
+            llils = [get_llil(int(addr))]
+        else:
+            return None
     except Exception:
         return None
-    if llil is None:
+    llils = [llil for llil in llils if llil is not None]
+    if not llils:
         return None
-    if il_format._il_op_name(llil) in _CALL_OPS:
-        return "call" if _branch_target(getattr(llil, "dest", None)) in targets else "data"
-    try:
-        mlil = getattr(llil, "mlil", None)
-    except Exception:
-        mlil = None
-    if mlil is not None and il_format._il_op_name(mlil) in _CALL_OPS \
-            and _branch_target(getattr(mlil, "dest", None)) in targets:
-        params = list(getattr(mlil, "params", []) or [])
+    real_calls = [llil for llil in llils if il_format._il_op_name(llil) in _CALL_OPS]
+    if real_calls:
+        return ("call" if any(_branch_target(getattr(llil, "dest", None)) in targets
+                              for llil in real_calls) else "data")
+    synthesised = []
+    for llil in llils:
+        try:
+            mlils = list(getattr(llil, "mlils", None) or []) or [getattr(llil, "mlil", None)]
+        except Exception:
+            mlils = []
+        synthesised.extend(m for m in mlils
+                           if m is not None and il_format._il_op_name(m) in _CALL_OPS
+                           and _branch_target(getattr(m, "dest", None)) in targets)
+    if not synthesised:
+        return "data"
+    for call in synthesised:
+        params = list(getattr(call, "params", []) or [])
         flagged = [params[i] for i in flagged_args if 0 <= i < len(params)]
-        if flagged and all("CONST" in il_format._il_op_name(p) for p in flagged):
-            return "inline"
-        return "call"
-    return "data"
+        if not flagged or not all("CONST" in il_format._il_op_name(p) for p in flagged):
+            return "call"
+    return "inline"
 
 
 def _flagged_args(model: dict[str, Any] | None) -> list[int]:
@@ -392,14 +411,6 @@ def _disasm_at(bv, addr: int, container=None) -> str:
     return text or ""
 
 
-# Binary Ninja's loaders add this ExternalSection to EVERY view, holding one
-# placeholder symbol per compiler builtin its MLIL may synthesise
-# (`__builtin_memcpy`, `__builtin_strcpy`, ...). The placeholder proves nothing
-# about the binary; the builtin is in it only where code references it (a
-# store run BN lifted to an inline builtin call).
-_SYNTHETIC_SECTIONS = frozenset({".synthetic_builtins"})
-
-
 def _synthetic_unreferenced(bv, name: str) -> bool:
     """True when every symbol spelled *name* is a synthetic-builtin placeholder
     and no code references any of them, so the name must not mark its model
@@ -410,11 +421,7 @@ def _synthetic_unreferenced(bv, name: str) -> bool:
     if not addrs:
         return False
     for addr in addrs:
-        try:
-            sections = bv.get_sections_at(addr) or []
-        except Exception:
-            return False
-        if not any(str(getattr(s, "name", "")) in _SYNTHETIC_SECTIONS for s in sections):
+        if not il_format.in_synthetic_builtin_section(bv, addr):
             return False
     get_refs = getattr(bv, "get_code_refs", lambda a: [])
     return not any(list(get_refs(addr) or []) for addr in addrs)

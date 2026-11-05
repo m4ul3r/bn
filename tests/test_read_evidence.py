@@ -635,6 +635,42 @@ def test_callsites_enumerates_import_callers_absent_from_the_code_ref_db(monkeyp
     assert result["caller_scan_note"] is None
 
 
+def test_callsites_of_a_synthetic_builtin_list_its_inline_expansions(monkeypatch):
+    """V8-06: `callsites __builtin_memcpy` refused -- the synthetic builtin is
+    a symbol in BN's `.synthetic_builtins` section, not a function -- so no
+    read listed the `rep movs` MLIL renders as a call to it. Its callers are
+    the expansions: one row per instruction, however many intrinsics BN
+    lifted it to."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    symbol = fake_bn.Symbol(fake_bn.SymbolType.SymbolicFunctionSymbol, 0x9100,
+                            "__builtin_memcpy")
+    caller = _FakeFunction(0x412470, "copy_label")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A3)]
+    lifted = [_FakeLLILInstruction(0x4124A0, None, operation=op)
+              for op in ("LLIL_IF", "LLIL_INTRINSIC", "LLIL_INTRINSIC")]
+    caller.low_level_il = [lifted]
+    caller.get_llils_at = lambda address: lifted if address == 0x4124A0 else []
+    bv = _FakeBV(
+        functions=[caller],
+        symbols=[symbol],
+        sections={".synthetic_builtins": _FakeSection(".synthetic_builtins", 0x9000, 0x9200)},
+        code_refs={0x9100: [_FakeCodeRef(0x4124A0, caller)]},
+        instruction_lengths={0x4124A0: 3},
+        disassembly={0x4124A0: "rep movsq qword [rdi], [rsi]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites("active", "__builtin_memcpy", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["call_kind"]) for row in result["items"]] == [
+        ("0x4124a0", "inline_expansion")]
+    assert result["total"] == 1
+    assert result["callee_symbol_only"] is True
+
+
 def test_callsites_discloses_a_capped_caller_scan(monkeypatch):
     """#816/#622: when the caller ENUMERATION is itself partial, every count under
     it is a lower bound. Both consumers must say so -- JSON via
