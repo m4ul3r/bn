@@ -110,6 +110,8 @@ The bridge resolver keeps a count-free convenience for a bare, empty or `"active
 
 The CLI supports several headless bridges concurrently. Each instance gets its own files under `~/.cache/bn/instances/<id>.{json,sock}`; the GUI plugin uses the legacy fixed pair (`~/.cache/bn/bn_agent_bridge.{json,sock}`). Sticky per-project state (selected instance, selected target) lives under `~/.cache/bn/sessions/<sha>.json`, keyed by the project's git root so parallel agents in different repos don't collide.
 
+Idle policy: `BN_IDLE_TIMEOUT` arms a headless bridge's idle reaper. A bridge the CLI auto-starts for a command (no `session start`) gets 1800 seconds unless the variable is set (`0`/`off` disables it); `session start`/`restart` add no default. The reaper never discards unsaved work: `BinaryNinjaBridge._try_idle_shutdown` reads `TargetManager.unsaved_view_ids()` -- the same ledger `session stop`/`restart` refuse on -- and while any target is dirty an expired window is deferred (logged, and published as the registry's `idle_deferred_unsaved_targets` for `session list`); the save or close that clears the last one is a request, so it restarts the window.
+
 ### Mutation Verification
 
 All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Success-ish statuses: `verified` (requested state observed) and `noop` (already in the requested state). Failure statuses are exactly `FAILED_MUTATION_STATUSES` in `src/bn/formatters.py` — `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, `internal_error` — and any of them puts the run at exit 3. A failed batch is fully reverted, and its cleanly rolled-back siblings are stamped `reverted`, which is **not** a failure and does not affect the exit code (#118); a sibling whose restore itself failed is stamped `rollback_failed` and is. A genuine `noop` sibling changed nothing and stays `noop` (counted in `noop_count`) whether the batch failed at apply or at verify: the apply-failure path runs the same verifiers on the applied ops before reverting, solely to keep their `noop` verdicts. A failure card names the phase that failed (`FAILURE_PHASES`), and an `--out`/spill envelope's `ok` is the operation's outcome, with delivery reported separately as `written`.
@@ -128,9 +130,18 @@ All mutations support `--preview` (apply → capture diffs → revert) and live 
 Request: `{"op": "decompile", "params": {...}, "target": "selector", "id": "uuid"}`
 Response: `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`. On an
 `OperationFailure` the `ok: false` envelope also carries `status`, `requested`
-and `observed` describing the structured mutation failure; `requested` and
-`observed` are `{}` when the failure supplied no detail. All three keys are
-omitted entirely for other errors.
+and `observed` describing the structured failure (a mutation's, or a
+cancelled op's `status: "cancelled"`); `requested` and `observed` are `{}`
+when the failure supplied no detail. All three keys are omitted entirely for
+other bridge errors.
+
+The CLI's own `--format json` error object mirrors whatever structure the
+`BridgeError` it caught carries. A client-side request timeout is one that
+carries structure without being a mutation failure: `observed` states what
+the client established (`timed_out`, `request_sent`, `cancel_sent`,
+`polls_cancel`, `cancel_outcome`, `cancelled`, plus the bridge's own
+`observed` when it answered a cancel), and `status` is `"cancelled"` only
+when the bridge confirmed it stopped the op. It is still exit 2.
 
 ## Conventions
 

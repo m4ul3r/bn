@@ -19,6 +19,7 @@ from test_taint_engine import (
     FExpr,
     FFunc,
     FInstr,
+    FSite,
     FSSAFunc,
     FVar,
     _addr_of,
@@ -116,13 +117,16 @@ class _FieldProgram:
                                           FExpr("MLIL_VAR_SSA", "s", reads=[]),
                                           FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]))
 
-    def run(self, *, writable=None, segment_writable=None):
+    def run(self, *, writable=None, segment_writable=None, self_call_at=None):
         """*writable*: ``bv.is_offset_writable``'s answer. *segment_writable*:
         a BN segment over 0x402000..0x403000 with that write flag (None: no
-        segment information)."""
+        segment information). *self_call_at*: the address of `f`'s call to
+        itself, its only caller site."""
         func = FFunc("f", 0x10, FSSAFunc(self.instrs, mem_defs=self.mem_defs),
                      params=[self.m, self.n, self.src])
-        bv = FBV(_NAMES)
+        if self_call_at is not None:
+            func.caller_sites = [FSite(func, self_call_at)]
+        bv = FBV({**_NAMES, 0x10: "f"}, {0x10: func})
         if writable is not None:
             bv.is_offset_writable = lambda addr: writable
         if segment_writable is not None:
@@ -134,6 +138,22 @@ class _FieldProgram:
         reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
         fields = [lf for lf in result["leaves"] if lf["kind"] == "field_load_unresolved"]
         return result, origins, reasons, fields
+
+    def recv_behind_may_store(self):
+        """``r#1 = recv(src#0, d, 8, 0); [n#0].1 = r#1``: a modeled source's
+        return stored through a pointer the walk cannot prove disjoint from
+        any global. Returns the recv call's address."""
+        r1 = FSSA(FVar("r", ident=6), 1)
+        i, a = self._at()
+        self.instrs.append(FInstr(i, a, "MLIL_CALL_SSA", "r#1 = recv(src#0, d, 8, 0)",
+                                  reads=[self.src0], writes=[r1],
+                                  dest=FExpr("MLIL_CONST_PTR", hex(_RECV), constant=_RECV),
+                                  params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[self.src0]),
+                                          FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                                          FExpr("MLIL_CONST", "8", constant=8),
+                                          FExpr("MLIL_CONST", "0", constant=0)]))
+        self.store(self.addr(self.n0, 0), 1, FExpr("MLIL_VAR_SSA", "r#1", reads=[r1]))
+        return a
 
 
 @pytest.mark.parametrize("writable", [False, True])
@@ -519,20 +539,64 @@ def test_backward_next_action_prints_only_a_complete_forward_command(leaf, comma
         assert command in text, text
 
 
-def test_a_global_load_behind_a_may_alias_store_is_the_origin():
+@pytest.mark.parametrize("stored", ["pointer_load", "modeled_source"])
+def test_a_global_load_behind_a_may_alias_store_is_the_origin(stored):
     # W02-10: the length is a byte loaded from a writable global; a later
     # store through a pointer the walk cannot prove disjoint MAY have written
-    # it. That store's value comes from another unresolved load, whose
-    # frontier used to represent the slice -- naming an anonymous pointer
-    # load instead of the global the sink actually read.
+    # it. What that store wrote -- another unresolved load, or a modeled
+    # source's return (R2-03) -- used to represent the slice, naming the
+    # store's value instead of the global the sink actually read.
     g = 0x402010
     p = _FieldProgram()
-    p.store(p.addr(p.n0, 0), 1, p.load(p.addr(p.m0, 0x28), 8))
+    if stored == "modeled_source":
+        recv_at = p.recv_behind_may_store()
+    else:
+        p.store(p.addr(p.n0, 0), 1, p.load(p.addr(p.m0, 0x28), 8))
     p.sink(p.load(FExpr("MLIL_CONST_PTR", hex(g), constant=g), 1))
     result, origins, reasons, fields = p.run(writable=True)
     assert any("may write the loaded bytes" in r for r in reasons), reasons
-    assert origins[0]["kind"] == "field_load_unresolved", origins
-    assert origins[0]["base"] == hex(g), origins
-    # The may-alias store's own provenance stays disclosed as a frontier.
-    assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
+    assert [(o["kind"], o.get("base")) for o in origins] == [("field_load_unresolved", hex(g))]
+    # The may-alias store's own provenance stays disclosed: the pointer
+    # load as its frontier; the source as a structured step of the slice
+    # (D5b-02), never its root.
+    if stored == "modeled_source":
+        steps = [st for sl in result["slices"] for st in sl["slice"]]
+        want = {"address": hex(recv_at), "op": "MLIL_CALL_SSA", "callee": "recv", "model": "recv"}
+        assert any(want.items() <= st.items() for st in steps), steps
+    else:
+        assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
+    assert hex(g) in {lf["base"] for lf in fields}, fields
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_a_source_behind_a_may_alias_store_is_no_origin_on_a_recursive_back_edge():
+    # D5b-01: `f(m, n, src)` passes `[g].1 + m` to itself, and `g` is behind
+    # a may-alias store of recv's return. The self-call is a back edge: its
+    # `m` is answered by the enclosing frame, and the producers it reached
+    # each keep a slice -- which made the may-written source an origin again.
+    g = 0x402010
+    p = _FieldProgram()
+    recv_at = p.recv_behind_may_store()
+    v1 = FSSA(FVar("v", ident=7), 1)
+    loaded = p.load(FExpr("MLIL_CONST_PTR", hex(g), constant=g), 1)
+    total = FExpr("MLIL_ADD", f"{loaded} + m#0", reads=[p.m0])
+    total.left, total.right = loaded, FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
+    i, a = p._at()
+    p.instrs.append(FInstr(i, a, "MLIL_SET_VAR_SSA", f"v#1 = {total}", reads=[p.m0],
+                           writes=[v1], src=total))
+    i, call_at = p._at()
+    p.instrs.append(FInstr(i, call_at, "MLIL_CALL_SSA", "f(v#1, n#0, src#0)",
+                           reads=[v1, p.n0, p.src0],
+                           dest=FExpr("MLIL_CONST_PTR", "0x10", constant=0x10),
+                           params=[FExpr("MLIL_VAR_SSA", "v#1", reads=[v1]),
+                                   FExpr("MLIL_VAR_SSA", "n#0", reads=[p.n0]),
+                                   FExpr("MLIL_VAR_SSA", "src#0", reads=[p.src0])]))
+    p.sink(FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0]))
+    result, origins, _reasons, fields = p.run(writable=True, self_call_at=call_at)
+    assert not any(o["kind"] == "source" for o in origins), origins
+    assert ("field_load_unresolved", hex(g)) in {(o["kind"], o.get("base")) for o in origins}
+    steps = [st for sl in result["slices"] for st in sl["slice"]]
+    want = {"address": hex(recv_at), "op": "MLIL_CALL_SSA", "callee": "recv", "model": "recv"}
+    assert any(want.items() <= st.items() for st in steps), steps
+    assert hex(g) in {lf["base"] for lf in fields}, fields
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False

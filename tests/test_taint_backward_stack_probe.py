@@ -74,3 +74,30 @@ def test_stack_probe_store_is_not_a_may_writer(value_kind, may_write):
     origins = {sl["origin"]["kind"] for sl in result["slices"]}
     # The probe contributes no origin of its own; strcpy's input does.
     assert "parameter" in origins, result["slices"]
+
+
+@pytest.mark.parametrize("source_offset, write_back", [(8, False), (0, True)])
+def test_a_copy_between_two_fields_of_one_struct_is_a_writer(source_offset, write_back):
+    # R2-01: `m->a = t; m->a = m->b; memcpy(.., m->a)`. BN's struct forms keep
+    # the field offset beside a bare base, so the store and its load print the
+    # same address: the copy from another field read as a write-back, and the
+    # older store became the sole origin of a "complete" slice.
+    from test_taint_backward_loads import _FieldProgram
+
+    p = _FieldProgram()
+    m = FExpr("MLIL_VAR_SSA", "m#0", reads=[p.m0])
+    p.store(m, 4, op="MLIL_STORE_STRUCT_SSA", offset=0)
+    p.store(m, 4, p.load(m, 4, op="MLIL_LOAD_STRUCT_SSA", offset=source_offset),
+            op="MLIL_STORE_STRUCT_SSA", offset=0)
+    p.sink(p.load(m, 4, op="MLIL_LOAD_STRUCT_SSA", offset=0))
+    result, origins, _reasons, fields = p.run()
+    from_older = [o for o in origins if o.get("kind") == "call" and o.get("callee") == "read_u32"]
+    if write_back:
+        # A true write-back changes nothing: the older store still decides.
+        assert from_older and not fields, (origins, fields)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is True
+    else:
+        # The copied field's bytes come from the caller's object.
+        assert not from_older, origins
+        assert [lf["offset"] for lf in fields] == ["0x8"], fields
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False
