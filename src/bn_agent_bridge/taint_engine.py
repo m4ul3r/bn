@@ -11238,6 +11238,64 @@ class TaintEngine:
             if sink is not None and sink.get("optional"):
                 _gate = sink.get("gate") or sink.get("class")
                 if _gate not in self._enabled_sink_classes:
+                    # P2-10: taint DID arm this sink -- the gate only decides
+                    # whether it is reported as a finding. A sink gated under a
+                    # name of its own (`recv_overflow`) reports a class every
+                    # run checks by default (`overflow_len`); it is opt-in only
+                    # because its idiom is noisy (#499). Dropping it silently
+                    # left `safe_to_report_all_clear: true` beside a tainted
+                    # `read(fd, buf, n)` length while the text verdict said the
+                    # opposite, so the arming is disclosed as a blocking
+                    # frontier naming the opt-in that would report it. A sink
+                    # whose CLASS is itself the opt-in (`file_write`) is outside
+                    # the default question and stays silent.
+                    def _foreign(i: int) -> bool:
+                        """Taint reaching arg *i* that does NOT derive solely
+                        from this same call's own outputs -- `n = read(fd,
+                        buf + got, cap - got)` re-arming itself round the
+                        loop is the #499 idiom the gate exists for."""
+                        hit = _sink_arg_reach(i, sink)[0]
+                        stack, seen, roots = list(hit), set(), []
+                        while stack:
+                            cur = stack.pop()
+                            if cur in seen:
+                                continue
+                            seen.add(cur)
+                            rec = why.get(cur) or {}
+                            parents = rec.get("parents") or []
+                            if parents:
+                                stack.extend(parents)
+                            else:
+                                roots.append(rec.get("instr"))
+                        return bool(hit) and any(
+                            r is None or int(getattr(r, "address", -1)) != addr
+                            for r in roots)
+                    _armed = sorted({int(i) for i in [
+                        *(sink.get("tainted_args") or []),
+                        *([sink["len_arg"]] if sink.get("len_arg") is not None else [])]
+                        if isinstance(i, int) and _foreign(int(i))}) \
+                        if sink.get("gate") and sink.get("gate") != sink.get("class") else []
+                    if _armed:
+                        _gl_text = str(ins)   # the call, for the text row
+                        _gl = {
+                            "kind": "gated_sink_reached",
+                            "address": hex(addr),
+                            "callee": str(mkey or name or "?"),
+                            "class": str(sink.get("class") or "?"),
+                            "gate": str(_gate),
+                            "tainted_args": _armed,
+                            "il_text": _gl_text,
+                            "detail": (
+                                f"taint reaches arg {', '.join(map(str, _armed))} of "
+                                f"{self._prose_name(mkey or name)}, which arms its "
+                                f"opt-in `{sink.get('class')}` sink; that class is "
+                                f"reported only with `--sink-class {_gate}`, so this "
+                                "run neither reports nor rules it out -- NOT an "
+                                f"all-clear. Re-run with `--sink-class {_gate}` to "
+                                "see the finding and its classification."),
+                        }
+                        if _gl not in leaves:
+                            leaves.append(_gl)
                     sink = None
             if sink is not None and sink.get("format_arg") is not None:
                 if format_gated_sink(sink):
@@ -12725,12 +12783,26 @@ class TaintEngine:
                 if pl is not None and pl not in leaves:
                     leaves.append(pl)
 
-        # P1-04: a global a DIRECT store tainted, still live when the SEEDED
-        # function returns, is read -- if at all -- by code the walk never
-        # reaches (it does not ascend past the seed). Before such a store was
-        # keyed it was a blocking `coarse_memory_store`; keying it must not
-        # turn that into an all-clear. Descended runs hand their globals back
-        # to the caller instead, which asks the question at its own exit.
+        # P2-10: a `param:`/`var:` seed nothing in the body reads, in a run
+        # that found nothing and raised no frontier, followed NOTHING -- its
+        # empty result is about a value the function never sees. A seed the
+        # walk did follow some other way (an under-recovered call's argument
+        # register) has raised its own leaf and is not called unused.
+        if top and not findings and not leaves:
+            for loc in locators:
+                unused = self._unused_seed_leaf(func, instrs, loc)
+                if unused is not None and unused not in leaves:
+                    leaves.append(unused)
+
+        # P1-04 / P2-11: a global the walk tainted -- a direct store, a modeled
+        # copy, a source filling it (`read(0, g, n)`) -- still live when the
+        # SEEDED function returns, is read -- if at all -- by code the walk
+        # never reaches (it does not ascend past the seed), so it is a blocking
+        # frontier at the write. A write is not live at return when every path
+        # from it to every return passes a CLEARING write of all its tainted
+        # bytes (`memset(g, 0, n)`, a constant store, or a call whose body
+        # does one unconditionally). Descended runs hand their globals back to
+        # the caller instead, which asks the question at its own exit.
         if top:
             for ga in sorted(live_globals):
                 store = self._global_direct_stores.get(ga)
@@ -12866,6 +12938,91 @@ class TaintEngine:
                 if taint_node(node, var_label(r), ins, f"output of {callee} (model propagate)", parents):
                     done = True
             return done
+        return False
+
+    def _unused_seed_leaf(self, func: Any, instrs: list, loc: dict[str, Any]
+                          ) -> dict[str, Any] | None:
+        """A blocking ``seed_unused`` leaf when a ``param:``/``var:`` seed names
+        a variable NOTHING in *func* reads, else None (P2-10).
+
+        That run seeds one value and stops: `tainted_values 1`, `last_use
+        null`, and the gate used to read the empty result as an all-clear.
+        The usual cause is a prototype that does not match the body -- BN
+        recovered `remove_connection_headers(struct orderedmap h @ 0x8)` as a
+        stack-slot parameter while the code reads the register -- so the
+        locator names a value the function never sees."""
+        kind = loc.get("kind")
+        try:
+            if kind == "param":
+                var = self._param_var(func, int(loc["index"]))
+                spelled = f"param:{int(loc['index'])}"
+            elif kind == "var":
+                var = self._resolve_var(func, loc["selector"])
+                spelled = f"var:{loc['selector']}"
+            else:
+                return None
+        except (TaintError, KeyError, ValueError, TypeError):
+            return None
+        if var is None or self._var_is_read(func, instrs, var):
+            return None
+        name = str(getattr(var, "name", var))
+        at = hex(int(getattr(func, "start", 0)))
+        return {
+            "kind": "seed_unused",
+            "address": at,
+            "source": spelled,
+            "variable": name,
+            "il_text": f"{spelled} = {name}",
+            "detail": (
+                f"the seed {spelled} ({name}) is never read in "
+                f"{self._prose_function(func)}, so this run followed nothing and its "
+                "empty result says nothing about the value the locator meant -- NOT "
+                "an all-clear. The usual cause is a recovered prototype that does "
+                f"not match the body (a parameter placed in a stack slot the code "
+                f"never reads): compare `bn decompile {at}` with "
+                f"`bn proto get {at}`, and only if the body shows the real argument, "
+                f"apply `bn proto set {at} \"<prototype>\"` and re-run; otherwise "
+                "seed the variable the body actually uses."),
+        }
+
+    @staticmethod
+    def _var_is_read(func: Any, instrs: list, var: Any) -> bool:
+        """Whether any instruction of *func* reads *var* (any SSA version),
+        its address included. BN's own use list first; the SSA operand scan
+        where the view has none."""
+        mlil = getattr(func, "mlil", None)
+        uses = getattr(mlil, "get_var_uses", None)
+        if callable(uses):
+            try:
+                return bool(list(uses(var) or ()))
+            except Exception:
+                pass
+        want = var_key(var)
+        for ins in instrs:
+            if any(var_key(r) == want for r in ssa_reads(ins)):
+                return True
+            stack = [ins]
+            while stack:
+                node = stack.pop()
+                if node is None:
+                    continue
+                if any(var_key(r) == want for r in (getattr(node, "vars_read", None) or ())):
+                    return True
+                if "ADDRESS_OF" in op_name(node):
+                    taken = getattr(node, "src", None)
+                    taken = getattr(taken, "var", taken)
+                    try:
+                        if var_key(taken) == want:
+                            return True
+                    except Exception:
+                        pass
+                    continue
+                for attr in ("src", "dest", "left", "right", "params", "operands"):
+                    sub = getattr(node, attr, None)
+                    if isinstance(sub, (list, tuple)):
+                        stack.extend(s for s in sub if hasattr(s, "operation"))
+                    elif sub is not None and hasattr(sub, "operation"):
+                        stack.append(sub)
         return False
 
     def _param_not_found_error(self, func: Any, idx: int) -> "TaintError":
@@ -13094,6 +13251,39 @@ class TaintEngine:
                                         address=hex(int(getattr(c, "address", 0))),
                                         reason="buffer_not_keyed",
                                     ))
+                                elif ptr_seeded and lookup_model(self.models, callee)[1] is None:
+                                    # P2-10: no model says what the callee does
+                                    # with this argument, and the bytes it points
+                                    # at could not be keyed, so the seed tainted
+                                    # only the POINTER VALUE: what the callee
+                                    # writes there, and its return, are not
+                                    # seeded. `arg:<wrapper>:1` on a read wrapper
+                                    # answered all-clear while the wrapper's
+                                    # count flowed into a global.
+                                    _taddr = self._resolve_direct_target(c)
+                                    _cfn = (function_at(self.bv, _taddr)
+                                            if _taddr is not None else None)
+                                    add_leaf({
+                                        "kind": "unmodeled_callee",
+                                        "address": hex(int(getattr(c, "address", 0))),
+                                        "callee": {
+                                            "name": str(callee),
+                                            "display_name": (_display_name(_cfn) or str(callee))
+                                            if _cfn is not None else str(callee),
+                                            "address": hex(int(_taddr)) if _taddr is not None else None},
+                                        "tainted_args": [idx],
+                                        "reason": "seed_callee_unmodeled",
+                                        "detail": (
+                                            f"--source arg:{callee}:{idx} seeds only the pointer "
+                                            f"value passed to {self._prose_name(callee)}, which "
+                                            "has no taint model: the bytes it may write through "
+                                            "that pointer could not be keyed, and its return "
+                                            "value and other outputs are not seeded -- NOT an "
+                                            "all-clear. Declare what it fills with --models "
+                                            f"(e.g. {{\"{callee}\": {{\"sources\": [{{\"to\": "
+                                            f"\"*arg:{idx}\"}}, {{\"to\": \"ret\"}}]}}}}) and "
+                                            f"seed `call:{callee}`."),
+                                    })
                 if kind == "arg":
                     # #1041 item 1 gate (#1050 review rounds 4-5): this arg is a
                     # buffer the model says the call fills; the gate checks only

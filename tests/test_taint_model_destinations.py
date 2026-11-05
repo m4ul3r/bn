@@ -218,13 +218,18 @@ def test_unreached_rule_source_stays_silent(models):
 
 
 def test_rule_source_recovered_but_untainted_stays_silent(models):
-    # outer(a, b) { model_emit(b); } seeded at param:0: arg 0 of the call is clean.
+    # outer(a, b) { int x = a; model_emit(b); } seeded at param:0: arg 0 of the
+    # call is clean. (`a` is read, so the seed is a real one -- an unread seed
+    # is its own `seed_unused` frontier.)
     models["model_emit"] = _rules(("arg:0", "*arg:1"))
-    a, _ = _var("a")
+    a, a0 = _var("a")
     b, b0 = _var("b")
+    x1 = FSSA(FVar("x"), 1)
     func = FFunc("two", F_ADDR, FSSAFunc([
-        _call(0, SITE, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "b#0", reads=[b0])]),
-        _ret(1, SITE + 5),
+        FInstr(0, SITE - 4, "MLIL_SET_VAR_SSA", "x#1 = a#0", reads=[a0], writes=[x1],
+               src=FExpr("MLIL_VAR_SSA", "a#0", reads=[a0])),
+        _call(1, SITE, EMIT, "model_emit", [FExpr("MLIL_VAR_SSA", "b#0", reads=[b0])]),
+        _ret(2, SITE + 5),
     ]), params=[a, b])
     result = _forward(models, func, "param:0")
     assert _missing(result) == []
@@ -497,8 +502,10 @@ def test_continuation_reset_before_the_null_call_kills_it(models):
 def test_continuation_without_tainted_state_stays_silent(models):
     models["stateful"] = _stateful_model("*arg:1")
     result = _cont_forward(models, _stateful_func(first_tainted=False, reset="after"))
-    assert result["leaves"] == []
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # No missing destination is claimed. The only frontier is the seed itself:
+    # with a constant first argument nothing in the body reads `src` (P2-10).
+    assert _missing(result) == []
+    assert [lf["kind"] for lf in result["leaves"]] == ["seed_unused"], result["leaves"]
 
 
 def test_complete_continuation_still_propagates_to_its_destination(models):

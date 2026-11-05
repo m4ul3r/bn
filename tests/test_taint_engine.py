@@ -1118,8 +1118,12 @@ def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
     # seed a param that does NOT flow into the length: taint `dst`? there is no
     # such param; instead seed nothing-relevant by tainting a var unused at the
     # sink. Use a locator on param 0 but rewire so len#1 is not derived from it.
+    # The seeded `n` is READ (into a local nothing passes on): an unread seed
+    # is its own frontier (`seed_unused`), not this control's question.
     func2 = FFunc("handler", 0x10, FSSAFunc([
         FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = 0x8", writes=[FSSA(FVar("len"), 1)]),
+        FInstr(3, 0x12, "MLIL_SET_VAR_SSA", "seen#1 = n#0", reads=[FSSA(FVar("n"), 0)],
+               writes=[FSSA(FVar("seen"), 1)]),
         FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &dst", writes=[FSSA(FVar("dst"), 1)],
                src=FExpr("MLIL_ADDRESS_OF", "&dst", src=FVar("dst"))),
         FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst#1, &buf, len#1)", writes=[],

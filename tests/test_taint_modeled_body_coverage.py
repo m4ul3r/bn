@@ -894,7 +894,10 @@ def test_the_under_recovery_frontier_does_not_fire_without_evidence(monkeypatch,
     result = engine.forward(entry, [te.parse_locator("param:0")])
     assert [lf for lf in result["leaves"]
             if lf.get("cause") == "arg_under_recovered"] == [], why
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True, why
+    # Without that evidence nothing in the caller's IL reads the seeded `p`
+    # (the call carries no arguments), so the walk followed nothing: the only
+    # frontier is the unread seed itself (P2-10), never an under-recovery.
+    assert [lf["kind"] for lf in result["leaves"]] == ["seed_unused"], why
 
 
 # --------------------------------------------------------------------------

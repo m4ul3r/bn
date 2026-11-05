@@ -65,6 +65,14 @@ from .taint_truncation import describe_truncation_cause
 # gate the same way a real frontier leaf does.
 BLOCKING_LEAF_KINDS = frozenset({
     "coarse_memory_store",
+    # P2-10: a sink gated behind an opt-in name (`recv_overflow`) whose
+    # arming argument taint reached; the run neither reported nor ruled it
+    # out, so it is not an all-clear.
+    "gated_sink_reached",
+    # P2-10: a `param:`/`var:` seed nothing in the function reads -- usually a
+    # prototype that does not match the body -- so the empty result says
+    # nothing about the value the locator meant.
+    "seed_unused",
     "pointer_escape",
     "indirect_call_unresolved",
     "unmodeled_callee",
@@ -334,6 +342,21 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
     UNRESOLVED = ("unmodeled_callee", "arg_under_recovered", "indirect_call_unresolved")
     unresolved = [lf for lf in leaves if str(lf.get("kind", "?")) in UNRESOLVED]
     misanchored = [lf for lf in leaves if lf.get("kind") in _SEED_MISANCHORED_KINDS]
+    unused = next((lf for lf in leaves if lf.get("kind") == "seed_unused"), None)
+    if unused is not None:
+        # P2-10: the seed names a value nothing reads, so every other frontier
+        # of this run follows from a seed that was not the intended value.
+        return (f"the seed {unused.get('source', '?')} is never read in this function, so "
+                "nothing was followed -- check the recovered prototype against the "
+                "body (see the seed_unused leaf) or seed the variable the body uses")
+    gated = [lf for lf in leaves if lf.get("kind") == "gated_sink_reached"]
+    if gated:
+        flags = " ".join(f"--sink-class {g}"
+                         for g in sorted({str(lf.get("gate")) for lf in gated}))
+        return (f"taint armed {len(gated)} opt-in sink(s) "
+                f"({', '.join(sorted({str(lf.get('callee')) for lf in gated}))}) that this "
+                f"run does not report; re-run this same query with `{flags}` added to "
+                "see and classify them")
     if misanchored:
         # A weak/mis-anchored seed is the highest-priority footgun: the pointer
         # was tainted but the received buffer was not keyed, so an empty result
