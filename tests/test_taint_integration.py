@@ -7387,6 +7387,37 @@ def test_an_unbounded_index_into_a_global_keeps_the_out_of_object_frontier(tmp_p
     assert frontiers == [], masked["leaves"]
 
 
+def test_a_strlen_length_demands_the_bytes_it_measures(tmp_path, shared_bn):
+    """IC06 on `taint_corpus/bw_strlen_length.c`: `memcpy(dst, label,
+    strlen(label) + 1)`. The length followed only `label`'s pointer value and
+    named its origin as if the pointer were the length; it now demands the
+    bytes `label` points at, as the copy's own source operand does. A local
+    the length measures keeps its writers' provenance (the `read`)."""
+    binary = tmp_path / "bw_strlen_length"
+    _compile(CORPUS / "bw_strlen_length.c", binary)
+    target = shared_bn.load(binary, copy=False)
+
+    def objects(result, fn):
+        return sorted(lf["pointer"] for lf in result["leaves"]
+                      if lf["kind"] == "pointer_object_unresolved"
+                      and lf["function"]["name"] == fn)
+
+    length = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                      "--sink", "arg:memcpy:2")
+    source = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                      "--sink", "arg:memcpy:1")
+    assert objects(length, "copy_label"), length["leaves"]
+    assert objects(length, "copy_label") == objects(source, "copy_label")
+    assert length["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    local = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_read",
+                     "--sink", "arg:memcpy:2")
+    assert ("source", "read") in {(o["kind"], o.get("callee"))
+                                  for sl in local["slices"] for o in sl["origins"]}
+    assert not [lf for lf in local["leaves"] if lf["kind"] == "pointer_object_unresolved"]
+
+
+
 def _armv7_build(tmp_path, name: str) -> Path:
     cc = shutil.which("arm-linux-gnueabihf-gcc")
     if cc is None:

@@ -536,3 +536,87 @@ def test_a_global_load_behind_a_may_alias_store_is_the_origin():
     # The may-alias store's own provenance stays disclosed as a frontier.
     assert {lf["base"] for lf in fields} >= {hex(g), "m#0"}, fields
     assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+_STRLEN, _NTOHS = 0xa90, 0xaa0
+
+
+def _length_of(callee, *, local=False):
+    """`f(dst, src)`: `n#1 = <callee>(src#0)`, `n#2 = n#1 + 1`,
+    `memcpy(dst#0, src#0, n#2)`. With *local* the length is read over a
+    local buffer `tmp` instead, and the copy's source is unrelated."""
+    dst, src = FVar("dst", ident=11, typ="char*"), FVar("src", ident=12, typ="char*")
+    dst0, src0 = FSSA(dst, 0), FSSA(src, 0)
+    n1, n2 = FSSA(FVar("n", ident=13), 1), FSSA(FVar("n", ident=13), 2)
+    tmp = FVar("tmp", ident=14, typ="char[0x40]")
+    target = {"strlen": _STRLEN, "ntohs": _NTOHS}[callee]
+    arg = _addr_of(tmp) if local else FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", f"n#1 = {callee}({arg})",
+               reads=list(arg.vars_read), writes=[n1],
+               dest=FExpr("MLIL_CONST_PTR", hex(target), constant=target), params=[arg]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "n#2 = n#1 + 1", reads=[n1], writes=[n2],
+               src=FExpr("MLIL_ADD", "n#1 + 1", reads=[n1],
+                         left=FExpr("MLIL_VAR_SSA", "n#1", reads=[n1]),
+                         right=FExpr("MLIL_CONST", "1", constant=1))),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst#0, src#0, n#2)",
+               reads=[dst0, src0, n2],
+               dest=FExpr("MLIL_CONST_PTR", hex(_MEMCPY), constant=_MEMCPY),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "n#2", reads=[n2])]),
+    ]
+    for ins in instrs:
+        ins.src_memory = 0
+    func = FFunc("dup_label", 0x10, FSSAFunc(instrs), params=[dst, src])
+    bv = FBV({**_NAMES, _STRLEN: "strlen", _NTOHS: "ntohs"})
+    return func, bv
+
+
+def _slice(func, bv, sink):
+    result = te.TaintEngine(bv, te.load_models()).backward(func, [te.parse_locator(sink)])
+    kinds = {lf["kind"] for lf in result["leaves"]}
+    origins = {(o["kind"], o.get("index")) for sl in result["slices"] for o in sl["origins"]}
+    return result, kinds, origins
+
+
+def test_a_length_strlen_reads_from_a_pointer_demands_the_bytes_it_points_at():
+    # IC06: `memcpy(dst, src, strlen(src) + 1)`. strlen's return comes from
+    # the bytes `src` points at (`*arg:0 -> ret`), so the length slice demands
+    # those bytes like any reader of them -- it no longer certifies the copy
+    # length by the pointer's own origin as a complete slice.
+    func, bv = _length_of("strlen")
+    result, kinds, origins = _slice(func, bv, "arg:memcpy:2")
+    objects = [lf["pointer"] for lf in result["leaves"]
+               if lf["kind"] == "pointer_object_unresolved"]
+    assert objects == ["src#0"], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    # The copy's own source operand demands the same object from the same
+    # formal; only a SINK's pointer operand also carries the per-sink
+    # `pointer_demand_not_certified` row (control: unchanged).
+    src, src_kinds, src_origins = _slice(func, bv, "arg:memcpy:1")
+    assert [lf["pointer"] for lf in src["leaves"]
+            if lf["kind"] == "pointer_object_unresolved"] == objects
+    assert src_origins == origins == {("parameter", 1)}
+    assert "pointer_demand_not_certified" in src_kinds
+    assert "pointer_demand_not_certified" not in kinds
+
+
+def test_a_length_strlen_reads_from_a_local_follows_the_local_buffers_writers():
+    # The bytes are a local's: no pointer demand to certify, its contents
+    # (unwritten here) are the frontier -- the walk reached the buffer.
+    func, bv = _length_of("strlen", local=True)
+    result, kinds, _origins = _slice(func, bv, "arg:memcpy:2")
+    assert "address_of_local_unresolved" in kinds, result["leaves"]
+    assert "pointer_object_unresolved" not in kinds
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+def test_a_by_value_return_rule_follows_the_argument_value_only():
+    # `n = ntohs(src)` returns a function of the argument VALUE (`arg:0 ->
+    # ret`): the formal is the origin, and no byte of any object is demanded.
+    func, bv = _length_of("ntohs")
+    result, kinds, origins = _slice(func, bv, "arg:memcpy:2")
+    assert origins == {("parameter", 1)}, result["slices"]
+    assert not kinds & {"pointer_object_unresolved", "pointer_demand_not_certified"}, kinds
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is True

@@ -17285,11 +17285,20 @@ class TaintEngine:
                             f"return of {mkey or name} derives from its argument "
                             + ", ".join(str(i) for i in derives))
                         # `arg:N -> ret` returns the argument itself, so the
-                        # demand carries over; `*arg:N -> ret` returns a
-                        # pointer somewhere into it (strchr), at an unknown
-                        # offset. Without a consumer, the whole object.
-                        arg_dem = (None if dem is None
-                                   else (cparams[fi], None if pointee else dem[1]))
+                        # demand carries over (none for a value consumer).
+                        # `*arg:N -> ret` returns something derived from the
+                        # BYTES the argument points at -- strlen's count,
+                        # strchr's pointer somewhere into them -- so those
+                        # bytes are demanded whatever the consumer is, at an
+                        # unknown offset: a length computed by strlen(src)
+                        # followed only src's pointer value and certified the
+                        # copy length by the pointer's origin (IC06), where a
+                        # value read from memory follows the writers of the
+                        # bytes, never the pointer.
+                        if pointee:
+                            arg_dem = (cparams[fi], None)
+                        else:
+                            arg_dem = None if dem is None else (cparams[fi], dem[1])
                         states.append(_follow_input(
                             defn, cparams[fi], d, mv, var_label(v),
                             f"argument {fi} of {mkey or name} returned by", arg_dem))
