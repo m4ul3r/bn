@@ -759,13 +759,28 @@ def _disasm(args: argparse.Namespace) -> int:
                       "targets are IL instruction indexes (hex), not addresses -- "
                       "first-line addresses collide when one instruction expands to "
                       "several IL blocks; per-line addresses stay real at every level"),
+             arg("--limit", type=_positive_int, default=None, metavar="N",
+                 help="Return at most N blocks (in block-start order) -- slice a large graph"),
+             arg("--offset", type=_non_negative_int, default=0,
+                 help="Skip the first OFFSET blocks (pagination, with --limit)"),
+             arg("--address-window", dest="address_window", default=None, metavar="A:B",
+                 help="Only blocks holding an instruction whose start address is in [A, B) "
+                      "(hex 0x.. or decimal), e.g. 0x402000:0x402200"),
          ],
          estimable=True)
 def _function_cfg(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"identifier": args.identifier, "view": args.view}
+    # Forwarded only when given, so an unsliced request is unchanged.
+    if args.offset:
+        params["offset"] = args.offset
+    if args.limit is not None:
+        params["limit"] = args.limit
+    if args.address_window:
+        params["address_window"] = args.address_window
     return _call(
         args,
         "cfg",
-        {"identifier": args.identifier, "view": args.view},
+        params,
         require_target=True,
         text_renderer=lambda value: _resolution_note(value) + _render_cfg_text(value),
         stem="cfg",

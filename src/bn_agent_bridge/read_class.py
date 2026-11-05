@@ -1218,7 +1218,7 @@ def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
         "name": rec["name"],
         "method_count": len(rec["methods"]),
         "has_vtable": rec["vtable"] is not None,
-        "size": rec["size"],
+        **_size_fields(rec["size"]),
         "bases": [b.get("name") for b in rec.get("bases", [])],
         "confidence": rec["confidence"],
         # #922 (d): the other demangled spellings this record absorbed.
@@ -2322,6 +2322,18 @@ def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
 _SIZE_UNAVAILABLE_REASON = "no_defined_type"
 
 
+def _size_fields(size: dict[str, Any] | None) -> dict[str, Any]:
+    """The ONE size schema every class card and list row carries (P2-05):
+    ``size`` (``{value, source}`` or null), and beside it ``size_source`` --
+    where the size came from, ``"unavailable"`` on a miss -- and
+    ``size_reason``, the miss's code (null on a hit, mirroring
+    ``hlil_statement_reason``). Provenance rides beside the size so it is
+    read in one place whether or not a size was recovered (#817)."""
+    return {"size": size,
+            "size_source": size["source"] if size else "unavailable",
+            "size_reason": None if size else _SIZE_UNAVAILABLE_REASON}
+
+
 def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
     """Object size with provenance: a defined BN type's width, else None (never
     fabricated). ``ctx._find_type`` raises on a miss, so the lookup is guarded.
@@ -2464,17 +2476,7 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
                 # not the primary; the card keeps `vtable: null` and says why.
                 rec.setdefault("notes", []).append(_NO_PRIMARY_NOTE)
             _note_rejected_secondaries(rec, recovered["rejected"])
-    size = ctx._object_size_for(bv, rec)
-    rec["size"] = size
-    # #817: where the size came from is a JSON-surface fact of its own, so it
-    # rides BESIDE the size instead of inside it -- one place to read the
-    # provenance whether or not a size was recovered, and the default text card
-    # (which renders only `size`) is unchanged for a class that has none. The
-    # `size_reason` code names the miss: no type is defined for the class, the
-    # one source a size is read from (per-site allocations stay on the
-    # construction sites, #1018.2). Null on a hit, mirroring `hlil_statement_reason`.
-    rec["size_source"] = size["source"] if size else "unavailable"
-    rec["size_reason"] = None if size else _SIZE_UNAVAILABLE_REASON
+    rec.update(_size_fields(ctx._object_size_for(bv, rec)))
     rec["bases"] = ctx._bases_for(bv, rec)
     if len(rec["bases"]) == 1 and isinstance(rec["bases"][0], dict):
         _annotate_shared_base(rec, _sole_base_census(ctx, bv, _build_class_registry(ctx, bv)))
@@ -3033,8 +3035,9 @@ def _class_cards(ctx, selector: str | None, name: str) -> list[dict[str, Any]]:
             # only decorate the card.
             rec = declared[match]
             type_obj = declared_types.get(match)
+            rec.update(_size_fields(
+                _declared_size(type_obj) if type_obj is not None else None))
             if type_obj is not None:
-                rec["size"] = _declared_size(type_obj)
                 # The canonical `types` entry for the declaration (decl, layout,
                 # members) -- a SHOW-only drill-down, exactly as the vtable
                 # layout and object size are, and for the same reason:

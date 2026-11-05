@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-import types
 
 import bn.cli
 import pytest
+from bn.output import OutputWriteResult
 
 
-def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
-    return types.SimpleNamespace(
+def _spill_artifact_namespace(path: str) -> OutputWriteResult:
+    return OutputWriteResult(
         rendered=f"ok: true\nspilled: true\npath: {path}\n",
         spilled=True,
         artifact={
@@ -24,14 +24,11 @@ def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
     )
 
 
-def _oversized_unspilled_namespace(tokens: int = 12345) -> types.SimpleNamespace:
+def _oversized_unspilled_namespace(tokens: int = 12345) -> OutputWriteResult:
     """The default-mode counterpart of `_spill_artifact_namespace`: nothing was
     written to disk, the payload is on stdout, and the caller must warn that a
     consumer will truncate it."""
-    return types.SimpleNamespace(
-        rendered="ok: true\n", spilled=False, artifact=None,
-        near_spill=False, truncation_risk=True, token_count=tokens,
-    )
+    return OutputWriteResult(rendered="ok: true\n", truncation_risk=True, token_count=tokens)
 
 
 def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instance_id=None,

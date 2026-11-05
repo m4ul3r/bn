@@ -1214,12 +1214,46 @@ def test_estimate_and_bytes_envelopes_state_written():
 
     estimate = json.loads(estimate_output_result(_REFUSAL, fmt="json").rendered)
     assert (estimate["ok"], estimate["written"], estimate["estimated"]) == (False, False, True)
-    raw = json.loads(estimate_bytes_result(b"\x00\x01", fmt="json").rendered)
+    raw = json.loads(estimate_bytes_result(b"\x00\x01", fmt="json",
+                                           outcome={"ok": True}).rendered)
     assert (raw["ok"], raw["written"]) == (True, False)
 
 
 def test_write_bytes_envelope_states_written(tmp_path):
-    from bn.output import write_bytes_result
+    from bn.output import RawBytes, write_bytes_result
 
-    envelope = write_bytes_result(b"\x7fELF", out_path=tmp_path / "b.bin", fmt="json").artifact
-    assert (envelope["ok"], envelope["written"]) == (True, True)
+    envelope = write_bytes_result(RawBytes(b"\x7fELF", {"kind": "bytes"}),
+                                  out_path=tmp_path / "b.bin", fmt="json", stem="read",
+                                  outcome={"ok": True}).artifact
+    assert (envelope["ok"], envelope["written"], envelope["spilled"]) == (True, True, False)
+    assert (tmp_path / "b.bin").read_bytes() == b"\x7fELF"
+
+
+@pytest.mark.parametrize("partial_sidecar", [False, True])
+def test_a_failed_sidecar_write_leaves_no_spill_artifact(tmp_path, monkeypatch, capsys,
+                                                         partial_sidecar):
+    """R4-04: the artifact is written before its provenance sidecar. When the
+    sidecar write failed (a disk filling between the two), the payload fell
+    back to stdout and the warning said the spill failed -- while the
+    artifact, and any partial sidecar, stayed in the spill tree. Both are
+    removed; the fallback is the whole payload on stdout."""
+    import bn.output as output
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    monkeypatch.setattr(output, "_spill_pruned", True)
+
+    def full_disk(artifact_path, encoded, provenance):
+        if partial_sidecar:
+            output.spill_sidecar_path(artifact_path).write_bytes(b'{"kind": "spi')
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(output, "_write_spill_sidecar", full_disk)
+    value = {"items": ["x" * 400]}
+    res = output.write_output_result(value, fmt="json", out_path=None, stem="taint-forward",
+                                     provenance={"target": "demo.bndb", "instance": "inst-1"})
+
+    assert res.spilled is False and res.artifact is None
+    assert json.loads(res.rendered) == value
+    assert [p for p in output.spill_root().rglob("*") if p.is_file()] == []
+    assert capsys.readouterr().err.startswith("warning: failed to write spill artifact")

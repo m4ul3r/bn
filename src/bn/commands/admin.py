@@ -94,6 +94,11 @@ def _still_loading_notice(path: str, interval: float):
 def _capabilities(args: argparse.Namespace) -> int:
     # Derived entirely from the @command registry -- no hand-maintained second
     # list -- so the index can't drift from the actual command surface (#276).
+    # `output` is read off each command's BUILT parser (P3): what an agent asks
+    # before a large read -- which formats, whether `--out`/`--estimate-output`
+    # exist here, and which flags slice it -- answered by the parser that will
+    # accept or refuse them, not a description of it.
+    parser = cli.build_parser()
     items = [
         {
             "command": " ".join(spec["path"]),
@@ -101,6 +106,8 @@ def _capabilities(args: argparse.Namespace) -> int:
             "help": spec.get("help", ""),
             "requires_target": bool(spec.get("target", False)),
             "default_format": spec.get("fmt", "text"),
+            "output": _output_capabilities(
+                cli._selected_parser_for_argv(parser, list(spec["path"]))),
             "prefer_when": spec.get("prefer_when", ""),
             "see_also": list(spec.get("see_also", ())),
         }
@@ -112,6 +119,28 @@ def _capabilities(args: argparse.Namespace) -> int:
               "taint": taint_vocabulary()}
     return cli._emit_result(args, result, exit_code=0,
                             text_renderer=_render_capabilities_text, stem="capabilities")
+
+
+def _output_capabilities(sub: argparse.ArgumentParser) -> dict[str, Any]:
+    """The output surface one command's parser accepts. `slice_flags` are the
+    value-taking flags the command's own size hint draws on (`--limit`,
+    `--lines`, `--length`, ...); a switch such as `exports --count` is a mode,
+    not a bound, and `--out` has its own key. `paged` is read off the same
+    parser -- it takes both `--limit` and `--offset` -- not the registry's
+    `paged` flag, which `function cfg` and `evidence function` page without
+    (D3-03)."""
+    options = cli._known_option_strings(sub)
+    fmt = next((action for action in sub._actions if "--format" in action.option_strings), None)
+    takes_value = {option for action in sub._actions if action.nargs != 0
+                   for option in action.option_strings}
+    return {
+        "formats": list(fmt.choices) if fmt is not None and fmt.choices else [],
+        "out": "--out" in options,
+        "estimate_output": "--estimate-output" in options,
+        "paged": "--limit" in options and "--offset" in options,
+        "slice_flags": sorted({option for option, _ in sub._defaults.get("_slice_flags", ())}
+                              & takes_value - {"--out"}),
+    }
 
 
 def _render_help_index_text(value: Any) -> str:
@@ -2253,13 +2282,31 @@ def _target_list(args: argparse.Namespace) -> int:
             if isinstance(item, dict) and _target_matches(item, sticky):
                 item["sticky"] = True
     # Wrap the bare list in the {kind, items} envelope the rest of the CLI's
-    # collection reads use, so an agent doesn't special-case target list (#358).
-    envelope: Any = {"kind": "targets", "items": result if isinstance(result, list) else []}
+    # collection reads use, so an agent doesn't special-case target list (#358)
+    # -- including the paging metadata and row schema those envelopes carry
+    # (P3). The list is never paged: it is every open target, so `has_more` is
+    # false and `total` equals `returned`.
+    rows = [row for row in result if isinstance(row, dict)] if isinstance(result, list) else []
+    envelope: Any = {"kind": "targets", "items": rows, "total": len(rows), "offset": 0,
+                     "returned": len(rows), "has_more": False,
+                     **_target_row_schema(rows)}
     # #996: name the bridge that answered -- a lone instance is used from any cwd.
     if isinstance(response, dict) and isinstance(response.get("instance"), str):
         envelope["instance"] = response["instance"]
     return cli._emit_result(args, envelope, exit_code=0,
                             text_renderer=_render_target_list_text, stem="targets")
+
+
+def _target_row_schema(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """`row_fields` (keys EVERY target row carries, in the first row's order)
+    and `row_fields_optional` (the rest, with the condition that sets them), the
+    contract every bridge collection page states. Derived from the rows, so an
+    empty list claims no field."""
+    fields = [key for key in (rows[0] if rows else {}) if all(key in row for row in rows)]
+    optional = {key: ("the target pinned by `bn target use`" if key == "sticky"
+                      else "present on some rows only")
+                for row in rows for key in row if key not in fields}
+    return {"row_fields": fields, **({"row_fields_optional": optional} if optional else {})}
 
 
 def _target_matches(item: dict[str, Any], selector: str) -> bool:

@@ -49,6 +49,7 @@ from ._shared import (
     _log_internal_error,
     _normalize_prototype,
     _parse_address,
+    _refuse_negative_address,
     _request_cancel_context,
     _request_cancelled,
     _residue_error_disclosure,
@@ -5912,7 +5913,32 @@ def _bind_taint_models(bridge, params, target):
 
 @op("cfg", lock="read")
 def _bind_cfg(bridge, params, target):
-    return bridge._cfg(target, params["identifier"], view=str(params.get("view", "asm")))
+    return bridge._cfg(
+        target, params["identifier"], view=str(params.get("view", "asm")),
+        offset=params.get("offset", 0), limit=params.get("limit"),
+        address_window=_address_window(params.get("address_window")),
+    )
+
+
+def _address_window(aw) -> tuple[int, int] | None:
+    """``"A:B"`` -> the half-open ``(A, B)`` a windowed read keeps (hex or
+    decimal), or None when no window was asked for. Each endpoint is an
+    address, so a negative one -- ``-16`` or ``-0x10`` -- gets the one refusal
+    every address operand gets (D3-02): ``_parse_address`` alone returned
+    ``-16`` as parsed and failed ``-0x10`` with a generic parse error."""
+    if aw is None:
+        return None
+    parts = str(aw).split(":", 1)
+    if len(parts) != 2:
+        raise OperationFailure("invalid_request",
+                               f"--address-window must be A:B, got {aw!r}")
+    for endpoint in parts:
+        _refuse_negative_address(endpoint)
+    window = (_parse_address(parts[0]), _parse_address(parts[1]))
+    if window[1] <= window[0]:
+        raise OperationFailure("invalid_request",
+                               f"--address-window end must exceed start: {aw!r}")
+    return window
 
 
 @op("data_vars", lock="read")
@@ -5952,18 +5978,7 @@ def _bind_disasm(bridge, params, target):
 
 @op("function_evidence", lock="read")
 def _bind_function_evidence(bridge, params, target):
-    aw = params.get("address_window")
-    window = None
-    if aw is not None:
-        # "A:B" -> (int, int); accept hex or decimal, half-open [A, B).
-        parts = str(aw).split(":", 1)
-        if len(parts) != 2:
-            raise OperationFailure("invalid_request",
-                                   f"--address-window must be A:B, got {aw!r}")
-        window = (_parse_address(parts[0]), _parse_address(parts[1]))
-        if window[1] <= window[0]:
-            raise OperationFailure("invalid_request",
-                                   f"--address-window end must exceed start: {aw!r}")
+    window = _address_window(params.get("address_window"))
     callees = _validate_callee_selectors(params.get("callee"), label="callee")
     exclude_callees = _validate_callee_selectors(params.get("exclude_callee"),
                                                  label="exclude_callee")

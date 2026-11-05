@@ -116,6 +116,52 @@ def test_a_backward_origin_names_the_called_symbol_and_its_model():
     assert origins == [("source", "__read_chk", "read_chk")], result["slices"]
 
 
+@pytest.mark.parametrize(("shape", "callee", "locator", "model", "status"), [
+    # The ISO alias queried by its plain model name: seeded at the call.
+    (_sscanf_shape, "__isoc99_sscanf", "arg:sscanf:2", "sscanf", "seeded"),
+    # The fortified symbol queried by its own name; its size is a constant.
+    (_strcpy_shape, "__strcpy_chk", "arg:__strcpy_chk:2", "strcpy_chk", "constant"),
+    # The model key IS the symbol: no `model`.
+    (_strcpy_shape, "strcpy", "arg:strcpy:1", None, "seeded"),
+    # D5c-02: an address-form locator spells no model; the model is the one
+    # the called symbol matches.
+    (_strcpy_shape, "__strcpy_chk", f"arg:{CALL:#x}:1", "strcpy_chk", "seeded"),
+    (_sscanf_shape, "__isoc99_sscanf", f"arg:{CALL:#x}:2", "sscanf", "seeded"),
+])
+def test_a_backward_call_site_row_names_the_called_symbol_and_its_model(
+        shape, callee, locator, model, status):
+    """R3 residual: `slices[].sink` and `sink_status[]` describe one call site
+    but kept the locator's spelling -- `callee: "sscanf"`, no `model` -- for a
+    call to `__isoc99_sscanf`. They follow the forward rule now; only the
+    top-level `sinks[]` echoes the query as written."""
+    func, bv = shape(callee)
+    query = te.parse_locator(locator)
+    result = te.TaintEngine(bv, te.load_models()).backward(func, [query])
+    assert [s["callee"] for s in result["sinks"]] == [query["callee"]]
+    [row] = result["sink_status"]
+    assert (row["status"], row["callee"], row.get("model")) == (status, callee, model)
+    assert [(sl["sink"]["callee"], sl["sink"].get("model")) for sl in result["slices"]] == (
+        [(callee, model)] if status == "seeded" else [])
+
+
+@pytest.mark.parametrize(("symbol", "callee", "model"), [
+    ("__strdup", "__strdup", "strdup"),     # the model key differs: named beside it
+    ("malloc@plt", "malloc", None),         # a decorated import: the bare symbol
+])
+def test_a_backward_call_origin_names_the_called_symbol_and_its_model(symbol, callee, model):
+    """`n = <call>(0x10); malloc(n)`: the returned value's origin is the call,
+    named like every other origin (R3 residual)."""
+    n1 = FSSA(FVar("n"), 1)
+    instrs = [_ext_call(0, 0x10, f"n#1 = {symbol}(0x10)", CALL, [_const(0x10)], writes=[n1]),
+              _ext_call(1, 0x14, "malloc(n#1)", MALLOC, [_ptr(n1, "n#1")], reads=[n1]),
+              FInstr(2, 0x18, "MLIL_RET", "return")]
+    func = FFunc("size", 0x10, FSSAFunc(instrs), params=[])
+    result = te.TaintEngine(_SymBV({CALL: symbol, MALLOC: "malloc"}), te.load_models()).backward(
+        func, [te.parse_locator("arg:malloc:0")])
+    assert [(sl["origin"]["kind"], sl["origin"]["callee"], sl["origin"].get("model"))
+            for sl in result["slices"]] == [("call", callee, model)]
+
+
 # --------------------------------------------------------------------------
 # W07-13: the continuation leaf's label and reseed
 # --------------------------------------------------------------------------
