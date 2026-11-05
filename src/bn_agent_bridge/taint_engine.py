@@ -297,6 +297,11 @@ def _code(text: Any) -> str:
 _CALL_WINDOW = 8
 
 
+# How many of the calls on a load's memory chain a `field_load_unresolved`
+# leaf lists in `candidate_writers`; `candidate_writers_total` counts all.
+_CANDIDATE_WRITERS_SHOWN = 8
+
+
 def _function_ref(func: Any) -> dict[str, str]:
     """A leaf's ``function``: one object shape for every leaf kind (W07-11).
     It was a bare hex string on most backward leaves and an object on the
@@ -541,6 +546,7 @@ class _CfgIndex:
 
 _UNRECOVERED = "model_destination_unrecovered"
 _UNREAD_BODY = "unread_callee_body"
+_INDIRECT = "indirect_call_unresolved"
 
 
 def _unrecovered_key(leaf: dict[str, Any]) -> tuple:
@@ -577,7 +583,8 @@ def _add_leaf(leaves: list, leaf: Any, *, dedupe: bool = True) -> None:
     summary or another callsite's ``by_source`` row, which must not acquire
     evidence it did not observe. An ``unread_callee_body`` boundary merges the
     same way on (call site, body), with the tainted-argument evidence of every
-    context unioned, so one unread body at one call is one leaf and one count.
+    context unioned, so one unread body at one call is one leaf and one count;
+    an ``indirect_call_unresolved`` frontier merges on its call site alone.
     Other leaves are appended unless an equal one is present (``dedupe``) or
     always (``dedupe=False``)."""
     if isinstance(leaf, dict) and leaf.get("kind") == _UNRECOVERED:
@@ -609,6 +616,19 @@ def _add_leaf(leaves: list, leaf: Any, *, dedupe: bool = True) -> None:
                         or recovered != (lf.get("abi_recovered_args") or []):
                     leaves[i] = {**lf, "tainted_args": merged,
                                  "abi_recovered_args": recovered}
+                return
+    if isinstance(leaf, dict) and leaf.get("kind") == _INDIRECT:
+        # One unpinned indirect call is one frontier whatever reached it: the
+        # fixpoint re-visits it per tainted-argument set and each descended
+        # context re-merges its summary, so the argument indexes union into
+        # a copy of the one row (W11-08).
+        for i, lf in enumerate(leaves):
+            if isinstance(lf, dict) and lf.get("kind") == _INDIRECT \
+                    and lf.get("address") == leaf.get("address"):
+                merged = sorted({*(lf.get("tainted_args") or []),
+                                 *(leaf.get("tainted_args") or [])})
+                if merged != (lf.get("tainted_args") or []):
+                    leaves[i] = {**lf, "tainted_args": merged}
                 return
     if not dedupe or leaf not in leaves:
         leaves.append(leaf)
@@ -2657,7 +2677,30 @@ class TaintEngine:
             return ("may_source", mkey or name)
         return ("opaque",)
 
-    def _load_writers(self, ssaf: Any, load: Any, la: tuple) -> list[tuple]:
+    def _writer_call_ref(self, call_ins: Any) -> dict[str, Any]:
+        """A call that may have written loaded bytes, as a frontier names it:
+        the call site and its callee by symbol and display name, never the
+        raw MLIL spelling (``0x4011f0(rdi#3)``, W02-09). ``callee`` is None
+        for an indirect call."""
+        target = self._resolve_direct_target(call_ins)
+        name = self._callee_name(target)
+        callee = None
+        if target is not None:
+            raw, shown = self._symbol_names(name) if name else (hex(target), hex(target))
+            callee = {"name": raw, "display_name": shown, "address": hex(int(target))}
+        return {"address": hex(int(getattr(call_ins, "address", 0) or 0)), "callee": callee}
+
+    def _writer_call_phrase(self, ref: dict[str, Any]) -> str:
+        """*ref* (:meth:`_writer_call_ref`) in prose: ``name at <site>``,
+        marked when the call is handed the loaded object."""
+        cal = ref.get("callee")
+        who = ((cal["name"] if self.mangled else cal["display_name"])
+               if isinstance(cal, dict) else "an indirect call")
+        return (f"{who} at {ref.get('address')}"
+                + (" (handed the object)" if ref.get("handed_object") else ""))
+
+    def _load_writers(self, ssaf: Any, load: Any, la: tuple, *,
+                      through_calls: bool = False) -> list[tuple]:
         """Every memory definition that may supply bytes the LOAD expression
         *load* reads at EXACT slot *la* (:meth:`_exact_addr`), over EVERY
         memory-SSA path back from it -- never just the first phi arm that
@@ -2679,7 +2722,9 @@ class TaintEngine:
           past it -- but no write extent is trusted, so it is a frontier;
         * ``("opaque", defn)`` -- any other memory definition that may write
           them: every other call (no call is proof of "no write",
-          :meth:`_call_load_effect`) or an intrinsic; the path stops;
+          :meth:`_call_load_effect`) or an intrinsic; the path stops, unless
+          *through_calls*, which continues past a CALL so every call on the
+          chain is listed (the frontier's candidate writers, W02-09);
         * ``("entry", None)`` -- the path reaches the function's entry memory:
           the bytes are whatever the caller left;
         * ``("cut", None)`` -- ``MEM_CHAIN_BUDGET`` ran out.
@@ -2749,6 +2794,8 @@ class TaintEngine:
                     pending.append(self._mem_in(defn))
                     continue
             out.append(("opaque", defn))
+            if through_calls and self._is_call(defn):
+                pending.append(self._mem_in(defn))
         return out
 
     def _definite_slot_store(self, ssaf: Any, load: Any) -> Any | None:
@@ -12367,15 +12414,23 @@ class TaintEngine:
                             via = "value-set" if candidates else None
 
                     if not candidates:
+                        site_hex = hex(int(getattr(ins, "address", 0)))
                         leaf = {
                             "kind": "indirect_call_unresolved",
-                            "address": hex(int(getattr(ins, "address", 0))),
+                            "address": site_hex,
                             "dest_expr": str(getattr(ins, "dest", "")),
                             "il_text": str(ins),
-                            "detail": "tainted value flows into an indirect call whose target VSA could not pin",
+                            "tainted_args": sorted(tainted_args),
+                            # W01-11: the remedy that changes the next run's
+                            # answer is pinning the target; this is the
+                            # --resolve-map document for this site with the
+                            # one part bn cannot know left as TARGET.
+                            "resolve_map_template": {site_hex: ["TARGET"]},
+                            "detail": ("tainted value flows into an indirect call whose target "
+                                       "VSA could not pin; pin it with a --resolve-map file "
+                                       "mapping this call to its target(s)"),
                         }
-                        if leaf not in leaves:
-                            leaves.append(leaf)
+                        _add_leaf(leaves, leaf)
                         continue
 
                     ret_tainted = False
@@ -15107,6 +15162,9 @@ class TaintEngine:
             la = self._mem_access_slot(ssaf, load, exact=True)
             fixed = self._gconst_addr(la)
             gaps: list[str] = []
+            # Set only where the memory chain is walked (an exact slot).
+            candidate_writers: list[dict[str, Any]] | None = None
+            candidates_complete = True
             _, consts = self._address_terms(addr)
             kinds = [self._const_ptr_storage(c) for c in consts]
             if fixed is None and addr_reads and consts:
@@ -15140,7 +15198,8 @@ class TaintEngine:
                 gaps.append("its address is not exactly a base plus a constant offset, "
                             "so no store can be matched to it")
             else:
-                for w in self._load_writers(ssaf, load, la):
+                writers = self._load_writers(ssaf, load, la)
+                for w in writers:
                     kind = w[0]
                     if kind in ("store", "partial", "may"):
                         store = w[1]
@@ -15163,10 +15222,11 @@ class TaintEngine:
                         steps.append(_instr_dict(w[1], reason=f"field may be filled by source {w[2]}"))
                         _set_origin({"kind": "source", "callee": w[2],
                                      "address": hex(int(w[1].address))})
-                        gaps.append(f"`{w[1]}` may have written them (no call's write "
-                                    "extent is trusted)")
+                        gaps.append(f"the source {self._writer_call_phrase(self._writer_call_ref(w[1]))} "
+                                    "may have written them (no call's write extent is trusted)")
                     elif kind == "opaque":
-                        gaps.append(f"`{w[1]}` may have written them")
+                        if not self._is_call(w[1]):
+                            gaps.append(f"`{w[1]}` may have written them")
                     elif kind == "entry":
                         # Read-only storage is no exception: `.data.rel.ro`
                         # without RELRO is writable, and the loader may write a
@@ -15177,6 +15237,48 @@ class TaintEngine:
                             f"holds what was stored before this function ran)")
                     else:
                         gaps.append(f"the memory chain exceeded {MEM_CHAIN_BUDGET} versions")
+                # W02-09: the nearest call stops the writer walk, but it is not
+                # the only call that may have written the bytes -- every call
+                # on the chain back to a covering store or the entry is one,
+                # and the call that really wrote them is often further back.
+                stopped = any(w[0] == "opaque" and self._is_call(w[1]) for w in writers)
+                chain = (self._load_writers(ssaf, load, la, through_calls=True)
+                         if stopped else writers)
+                # A call handed the loaded object -- a pointer rooted where the
+                # load's address is, or the global's own address -- is the
+                # likeliest writer, so those lead; walk order within each.
+                root = self._addr_base_var(ssaf, addr)
+                root_id = (None if root is None
+                           else (var_key(root), getattr(root, "version", None)))
+
+                def _handed(call) -> bool:
+                    for p in self._call_params(call):
+                        if fixed is not None and self._int_const(p) == fixed:
+                            return True
+                        pr = self._addr_base_var(ssaf, p) if root_id is not None else None
+                        if pr is not None and (var_key(pr), getattr(pr, "version", None)) == root_id:
+                            return True
+                    return False
+
+                candidates = {}
+                for w in chain:
+                    if w[0] in ("opaque", "may_source") and self._is_call(w[1]):
+                        ref = self._writer_call_ref(w[1])
+                        if ref["address"] not in candidates:
+                            candidates[ref["address"]] = {**ref, "handed_object": _handed(w[1])}
+                candidate_writers = sorted(candidates.values(),
+                                           key=lambda r: not r["handed_object"])
+                candidates_complete = not any(w[0] == "cut" for w in chain)
+                if stopped:
+                    shown = candidate_writers[:_CANDIDATE_WRITERS_SHOWN]
+                    rest = len(candidate_writers) - len(shown)
+                    gaps.append(
+                        f"{len(candidate_writers)} call(s) on its memory chain may have "
+                        f"written them: " + ", ".join(self._writer_call_phrase(r) for r in shown)
+                        + (f" and {rest} more" if rest else "")
+                        + ("" if candidates_complete else
+                           f" (the chain walk stopped at {MEM_CHAIN_BUDGET} versions; "
+                           f"there may be more)"))
                 if not gaps:
                     return
             base_var = self._addr_base_var(ssaf, addr)
@@ -15196,6 +15298,10 @@ class TaintEngine:
                            + "; ".join(dict.fromkeys(gaps))
                            + " -- the slice is NOT complete"),
             }
+            if candidate_writers is not None:
+                leaf["candidate_writers"] = candidate_writers[:_CANDIDATE_WRITERS_SHOWN]
+                leaf["candidate_writers_total"] = len(candidate_writers)
+                leaf["candidate_writers_complete"] = candidates_complete
             if leaf not in self._bw_leaves:
                 self._bw_leaves.append(leaf)
             _set_origin({"kind": "field_load_unresolved", "base": base_label,

@@ -54,6 +54,7 @@ Reconciliation notes:
 """
 from __future__ import annotations
 
+import json
 import shlex
 from typing import Any
 
@@ -340,6 +341,11 @@ def command_template(command: str) -> str:
     return f"template, fill in the UPPER-CASE words: `{command}`"
 
 
+# How many unpinned indirect call sites the --resolve-map advice names and
+# writes into its template document; every leaf carries its own row.
+_RESOLVE_MAP_SITES = 8
+
+
 def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int],
                          unmodeled_reached: bool, ext_no_model: bool,
                          tainted_values: int | None, function: str | None) -> str:
@@ -493,6 +499,25 @@ def _forward_next_action(leaves: list[dict[str, Any]], *, by_kind: dict[str, int
         return ("confirmed extra arguments disagree with a determined nonvariadic "
                 f"declaration; recover the actual callee prototype with proto set{fix} "
                 "and re-run, or seed inside the callee to inspect the incomplete flow")
+    indirect = [lf for lf in unresolved if lf.get("kind") == "indirect_call_unresolved"]
+    if indirect and len(indirect) == len(unresolved) and not ext_no_model:
+        # W01-11: every unresolved call frontier is an indirect call nothing
+        # pinned, and the remedy that changes the next run's answer is to pin
+        # it: the leaves' `resolve_map_template` rows, merged, are the
+        # --resolve-map document with only the targets left to fill in.
+        # Hex addresses order numerically by (length, spelling).
+        sites = sorted({str(lf.get("address")) for lf in indirect}, key=lambda a: (len(a), a))
+        shown = sites[:_RESOLVE_MAP_SITES]
+        more = (f", and {len(sites) - len(shown)} more each leaf's row names"
+                if len(sites) > len(shown) else "")
+        doc = json.dumps({a: ["TARGET"] for a in shown})
+        rerun = (command_template(forward(fn, "SOURCE") + " --resolve-map FILE")
+                 if fn else "--resolve-map FILE")
+        return (f"taint reached {len(sites)} indirect call(s) whose target value-set "
+                f"analysis could not pin ({', '.join(shown)}{more}); the walk does not "
+                f"follow them. Find each call's target(s), write them into FILE as "
+                f"{doc} -- a target is an address or a function name -- and re-run "
+                f"with {rerun}")
     if unmodeled_reached:
         # An in-binary callee the walk did not descend (depth bound, recursion,
         # unanalysable body) and whose tainted argument is a named parameter
