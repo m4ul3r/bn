@@ -883,6 +883,20 @@ def test_a_trace_is_truncated_only_when_work_is_left_at_the_budget(
     assert len(result["assumptions"]) == (1 if truncated else 0)
 
 
+@pytest.mark.parametrize(("chain_steps", "truncated"), [(4, False), (5, True)])
+def test_a_four_step_prefix_with_work_left_differs_from_a_drained_four_step_walk(
+        monkeypatch, chain_steps, truncated):
+    """E3 falsification control: at budget 4 both walks emit exactly four
+    steps, but the five-step chain still has r4#1 queued. Equal length must
+    not read as equal completeness, so only the drained walk is complete."""
+    definitions = _four_step_chain()
+    if chain_steps == 5:
+        definitions[_var("r3#1")] = _set(0x10000, "r4#1")
+    result = _chain_slice(monkeypatch, definitions, max_depth=4)
+    assert (result["step_count"], result["truncated"]) == (4, truncated)
+    assert len(result["assumptions"]) == (1 if truncated else 0)
+
+
 def test_a_variable_already_walked_left_on_the_worklist_is_no_pending_work(monkeypatch):
     """r0#1 reads r1#1 and r2#1, and r1#1 reads r2#1 again: the walk takes
     three steps and leaves a second r2#1 entry it has already walked, which
@@ -912,6 +926,30 @@ def test_a_callee_walk_reports_its_own_pending_work_to_the_trace(
                           interprocedural=True, extra=[callee])
     assert [s["reason"] for s in result["trace"]][:2] == ["cross_function", "definition"]
     assert (result["step_count"], result["truncated"]) == (min(max_depth, 4), truncated)
+
+
+@pytest.mark.parametrize(("callee_steps", "truncated"), [(3, False), (4, True)])
+def test_a_callee_walk_cut_after_a_four_step_prefix_is_pending(
+        monkeypatch, callee_steps, truncated):
+    """The nested twin of the control above: at budget 4 the trace is four
+    steps either way (one crossing plus three callee steps), but when the
+    callee's return value has a fourth definition still queued the trace is
+    truncated; when the callee walk drains in three it is complete."""
+    from _bridge_fakes import _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn
+
+    callee_defs = {_var("result#1"): _set(0x20008, "tmp#1"),
+                   _var("tmp#1"): _set(0x20004, "tmp#2")}
+    if callee_steps == 4:
+        callee_defs[_var("tmp#2")] = _set(0x20002, "tmp#3")
+    ret = _FakeMLILInsn(0x20010, operation="MLIL_RET", vars_read=[_var("result#1")])
+    callee = _FakeFunction(0x20000, "fetch")
+    callee.medium_level_il = _FakeMLILFunction(instructions=[ret], definitions=callee_defs)
+    inner_call = _FakeMLILInsn(0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000))
+    result = _chain_slice(monkeypatch, {_var("r0#1"): inner_call}, max_depth=4,
+                          interprocedural=True, extra=[callee])
+    assert [s["reason"] for s in result["trace"]][:2] == ["cross_function", "definition"]
+    assert (result["step_count"], result["truncated"]) == (4, truncated)
+
 
 
 # --------------------------------------------------------------------------
