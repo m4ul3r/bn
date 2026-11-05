@@ -688,6 +688,13 @@ def merge_unrecovered_leaves(leaves: list) -> list:
     return out
 
 
+def _sink_signature(finding: dict) -> tuple:
+    """What makes two findings the same report: the sink's callee, call site
+    and tainted argument -- not the path that reached it."""
+    s = finding.get("sink", {})
+    return (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+
+
 class TaintEngine:
     def __init__(
         self,
@@ -5103,8 +5110,7 @@ class TaintEngine:
         seen_sink: set[tuple] = set()
         unique_findings = []
         for f in sub["findings"]:
-            s = f.get("sink", {})
-            sig = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+            sig = _sink_signature(f)
             if sig in seen_sink:
                 continue
             seen_sink.add(sig)
@@ -7016,7 +7022,8 @@ class TaintEngine:
     def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int,
                    fields: dict | None = None) -> dict[str, Any]:
         """Analyze *callee* with the given tainted parameter indices, caching the
-        result per (callee, tainted-param-set) so it is computed once."""
+        result per (callee, tainted-param-set, per-parameter field context) so
+        each context is computed once."""
         # P2-08: a parameter pointing at a partially tainted object is its own
         # context -- which bytes are tainted, and which members hold the
         # address of a place in the same object, decide what the body can
@@ -12260,7 +12267,8 @@ class TaintEngine:
         leaves: list[dict[str, Any]] = _SalvageList(self._salvage["leaves"])
         findings: list[dict[str, Any]] = _SalvageList(self._salvage["findings"])
         recorded_sinks: set[tuple] = set()
-        processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
+        processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set, field context) descended
+        descended_sinks: set[tuple] = set()  # `_sink_signature`s merged up from descents
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
         # IC03: the writable globals THIS run has tainted, {address: node}, kept
@@ -14020,9 +14028,44 @@ class TaintEngine:
                         if _budget is not None and _budget not in leaves:
                             leaves.append(_budget)
                         continue
-                    # descend each callsite once per tainted-arg set (the fixpoint
-                    # revisits instructions; without this, findings would duplicate)
-                    call_key = (int(getattr(ins, "address", 0)), frozenset(tainted_args.keys()))
+                    # P2-08: an argument pointing into a partially
+                    # tainted object hands the callee those ranges and
+                    # the object's self-pointing members (V1-01),
+                    # rebased to where the pointer points.
+                    arg_fields: dict = {}
+                    if field_only or partial_bases or alias_bases:
+                        for ai in tainted_args:
+                            if ai >= len(params):
+                                continue
+                            root = self._ssa_root_offset(ssaf, params[ai])
+                            if root is not None and root[0] in alias_bases:
+                                ranges, ptrs, _parent = alias_bases[root[0]]
+                                at = int(root[1])
+                            else:
+                                bo = self._addr_base_offset(ssaf, params[ai])
+                                if bo is None:
+                                    continue
+                                ranges = field_only.get(bo[0])
+                                if ranges is None:
+                                    ranges = partial_bases.get(bo[0])
+                                ptrs, at = ptrs_of(bo[0]), int(bo[1])
+                            if ranges:
+                                shifted, sptrs = self._rebase_object(
+                                    tuple(sorted(ranges)), ptrs, at)
+                                arg_fields[ai] = (tuple(sorted(shifted)), tuple(sptrs))
+                    # Descend each call site once per CONTEXT it hands the
+                    # callee: the tainted argument indexes AND the field
+                    # ranges / self-pointers each argument carries -- the
+                    # same context `_summarize` keys its cache on. The
+                    # fixpoint revisits the call on every pass; a field
+                    # stored after it and reached over a back edge grows
+                    # the context while the index set stays the same, and
+                    # skipping that revisit left the callee judged on the
+                    # first pass's fields (R1-02). What the revisit
+                    # re-reports is deduplicated where it is merged below,
+                    # not by refusing to descend.
+                    call_key = (int(getattr(ins, "address", 0)), frozenset(tainted_args.keys()),
+                                tuple(sorted(arg_fields.items())))
                     if call_key in processed_calls:
                         continue
                     processed_calls.add(call_key)
@@ -14154,31 +14197,6 @@ class TaintEngine:
                             if mchanged:
                                 changed = True
                         if descend_internal:
-                            # P2-08: an argument pointing into a partially
-                            # tainted object hands the callee those ranges
-                            # and the object's self-pointing members (V1-01),
-                            # rebased to where the pointer points.
-                            arg_fields: dict = {}
-                            if field_only or partial_bases or alias_bases:
-                                for ai in tainted_args:
-                                    if ai >= len(params):
-                                        continue
-                                    root = self._ssa_root_offset(ssaf, params[ai])
-                                    if root is not None and root[0] in alias_bases:
-                                        ranges, ptrs, _parent = alias_bases[root[0]]
-                                        at = int(root[1])
-                                    else:
-                                        bo = self._addr_base_offset(ssaf, params[ai])
-                                        if bo is None:
-                                            continue
-                                        ranges = field_only.get(bo[0])
-                                        if ranges is None:
-                                            ranges = partial_bases.get(bo[0])
-                                        ptrs, at = ptrs_of(bo[0]), int(bo[1])
-                                    if ranges:
-                                        shifted, sptrs = self._rebase_object(
-                                            tuple(sorted(ranges)), ptrs, at)
-                                        arg_fields[ai] = (tuple(sorted(shifted)), tuple(sptrs))
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth,
                                               via=via, caller_instrs=instrs,
                                               fields=arg_fields or None)
@@ -14196,6 +14214,12 @@ class TaintEngine:
                             # re-applies this same check with its own hand-off nodes, so
                             # multi-level descent composes).
                             for f in d["findings"]:
+                                # A revisit with a grown context re-reaches
+                                # the first context's sinks: one finding each.
+                                sig = _sink_signature(f)
+                                if sig in descended_sinks:
+                                    continue
+                                descended_sinks.add(sig)
                                 findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
                                 # One callee site reached from several argument
