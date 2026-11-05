@@ -3921,3 +3921,20 @@ def test_exports_text_states_the_collapsed_duplicate_records(fake_transport, cap
     assert bn.cli.main(["exports", "--count", "--target", "active"]) == 0
     assert capsys.readouterr().out.strip() == (
         "Total exports: 1 (3 duplicate symbol record(s) collapsed)")
+
+
+@pytest.mark.parametrize(("argv", "op"), [
+    (["exports", "--count"], "list_exports"),
+    (["function", "list", "--count"], "list_functions"),
+    (["strings", "--count"], "strings"),
+    (["imports", "--summary"], "imports"),
+])
+def test_an_aggregate_estimate_names_no_flag_its_run_refuses(argv, op, fake_transport, capsys):
+    """P3: a count-mode estimate advised `--limit/--offset` (which the count
+    refuses, exit 2), then `--count`/`--min-size`, which do not bound one
+    number. An aggregate's only remedy is the file."""
+    fake_transport({op: {"ok": True, "result": {"kind": "count", "count": 3, "total": 3}}})
+    assert bn.cli.main([*argv, "--estimate-output", "--format", "json",
+                        "--target", "active"]) == 0
+    rerun = json.loads(capsys.readouterr().out)["rerun"]
+    assert set(re.findall(r"--[a-z][a-z-]*", rerun)) == {"--out"}

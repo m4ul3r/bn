@@ -1463,6 +1463,15 @@ def _slice_hint_for_args(args: argparse.Namespace, fmt: str) -> str | None:
     """The derived remedy for the invocation in *args* -- no parser walk."""
     flags = tuple(getattr(args, "_slice_flags", ()))
     accepted = {option for option, _ in flags}
+    mode = getattr(args, "_aggregate_mode", None)
+    if mode is not None:
+        # P3: an aggregate run (`--count`, `imports --summary`) answers once for
+        # the whole target. It refuses the paging flags
+        # (`_refuse_count_only_slices`), `--count` is its mode switch rather
+        # than a size, and a filter (`--min-size`) changes the answer, not the
+        # output's size -- so no slice flag bounds it and the only remedy left
+        # is the file.
+        accepted &= {"--out"}
     used = {
         option for option, dest in flags
         # A store_true default (False) and an unset value (None) both mean "the
@@ -1832,6 +1841,9 @@ def _refuse_count_only_slices(args: argparse.Namespace, *, command: str,
             f"{', '.join(offenders)} would be silently ignored. Drop {mode} for "
             f"the paged list, or drop the flags for the {noun}."
         )
+    # The run's remedy hints read this: a mode that refuses the slice flags must
+    # not be told to rerun with them (`_slice_hint_for_args`).
+    args._aggregate_mode = mode
 
 
 def read_text_input(path: Path, *, what: str, hint: str | None = None) -> str:
