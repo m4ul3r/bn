@@ -6916,3 +6916,106 @@ void _start(void) {
     text = shared_bn.run("-t", target, "taint", "models", "--present")
     assert text.returncode == 0, text.stderr
     assert "no modeled name matched" in text.stdout, text.stdout
+
+
+_FRONTIER_SRC = r"""
+#include <alloca.h>
+#include <stdio.h>
+#include <string.h>
+
+struct packet {
+    unsigned int kind;
+    unsigned int len;
+    char pad[48];
+    const char *data;
+};
+
+unsigned int g_cap;
+
+__attribute__((noinline)) void copy_field(char *dst, const struct packet *p) {
+    memcpy(dst, p->data, p->len);
+}
+
+__attribute__((noinline)) void copy_capped(char *dst, const char *src) {
+    memcpy(dst, src, g_cap);
+}
+
+__attribute__((noinline)) void stage(const char *where, const struct packet *p) {
+    if (strlen(where) < 4)
+        return;
+    unsigned long n = p->len;
+    char *tmp = alloca(n + 1);
+    memcpy(tmp, where, n);
+    tmp[n] = 0;
+    puts(tmp);
+}
+
+int main(int argc, char **argv) {
+    struct packet pk = {1, 8, {0}, argv[0]};
+    char buf[64];
+    g_cap = argc > 1 ? 16 : 8;
+    copy_field(buf, &pk);
+    copy_capped(buf, argv[0]);
+    stage(argv[0], &pk);
+    return 0;
+}
+"""
+
+
+@pytest.fixture
+def frontier_target(tmp_path, shared_bn):
+    src = tmp_path / "frontiers.c"
+    src.write_text(_FRONTIER_SRC)
+    binary = tmp_path / "frontiers"
+    # Stack-clash probes are what `alloca` emits under this flag (and by
+    # default on several distributions' compilers).
+    _compile(src, binary, ["-fstack-clash-protection"])
+    return shared_bn.load(binary, copy=False)
+
+
+def _memcpy_site(shared_bn, target, within):
+    [row] = _bn_json(shared_bn, "-t", target, "callsites", "memcpy", "--within", within)["items"]
+    return row["call_addr"]
+
+
+def test_trace_reports_a_typed_field_loads_member_offset(frontier_target, shared_bn):
+    """W09-01: `memcpy(dst, p->data, p->len)` -- the length is the `len` member
+    at offset 4, read by a typed field load whose offset BN keeps on the load
+    instruction; it was reported as offset 0x0."""
+    site = _memcpy_site(shared_bn, frontier_target, "copy_field")
+    result = _bn_json(shared_bn, "-t", frontier_target, "trace", "copy_field", site,
+                      "--arg", "2")
+    [load] = [s for s in result["trace"] if s.get("reason") == "field_load"]
+    assert (load["offset"], load["width"], load["terminates"]) == ("0x4", 4, True), load
+    assert "field_load" in {g["reason"] for g in result["frontiers"]}, result["frontiers"]
+
+
+def test_trace_stops_at_a_global_load_as_a_named_frontier(frontier_target, shared_bn):
+    """W09-02: a length read from a global used to end the slice with no
+    frontier at all. It is a `global_load` naming the global, rolled up, with
+    an xrefs command for its writers that runs as printed."""
+    site = _memcpy_site(shared_bn, frontier_target, "copy_capped")
+    result = _bn_json(shared_bn, "-t", frontier_target, "trace", "copy_capped", site,
+                      "--arg", "2")
+    [load] = [s for s in result["trace"] if s.get("reason") == "global_load"]
+    assert load["global_name"] == "g_cap", load
+    assert [g["reason"] for g in result["frontiers"]] == ["global_load"], result["frontiers"]
+    xrefs = _bn_json(shared_bn, "-t", frontier_target, "xrefs", load["global_address"])
+    assert any("main" in json.dumps(row) for row in xrefs["items"]), xrefs
+
+
+def test_backward_slice_ignores_alloca_stack_probes(frontier_target, shared_bn):
+    """W09-07: the stack-clash probes `alloca` emits (`or qword [rsp+..], 0`)
+    store back the bytes they load. They were reported as stores that MAY
+    write the parameter's object and the loaded bytes; they write nothing."""
+    result = _bn_json(shared_bn, "-t", frontier_target, "taint", "backward", "-f", "stage",
+                      "--sink", "arg:memcpy:1", timeout=300.0)
+    il = _bn_json(shared_bn, "-t", frontier_target, "function", "structured-il", "stage")
+    probes = {ins["address"] for ins in il["instructions"]
+              if ins["op"] == "MLIL_STORE_SSA"
+              and ins["text"].split(" = ", 1)[0].split(" @ ", 1)[0]
+              == ins["text"].split(" = ", 1)[1].split(" @ ", 1)[0]}
+    assert probes, "the build emitted no stack probe; the case is not exercised"
+    rows = [(st.get("address"), st.get("reason") or "")
+            for sl in result["slices"] for st in sl["slice"]]
+    assert not [r for r in rows if r[0] in probes], rows

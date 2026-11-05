@@ -4740,12 +4740,13 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
 
 
 @_discloses
-def _render_structured_il_text(value: Any) -> str:
+def _render_structured_il_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     form = "ssa" if value.get("ssa") else "non-ssa"
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}  ({value.get('view', 'mlil')} {form})"]
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}  "
+             f"({value.get('view', 'mlil')} {form})"]
     for ins in _field_list(value, "instructions"):
         # A malformed list element (non-dict) must render as fallback text, not
         # crash the whole listing with an AttributeError (#101).
@@ -4764,13 +4765,13 @@ def _render_structured_il_text(value: Any) -> str:
 
 
 @_discloses
-def _render_defuse_text(value: Any) -> str:
+def _render_defuse_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     var = _field_dict(value, "variable")
     lines = [
-        f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}",
+        f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}",
         f"variable: {var.get('ssa', var.get('name', '?'))}  ({var.get('type', '?')})",
     ]
     definition = _field_dict(value, "definition")
@@ -4850,11 +4851,14 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if c.get("kind") == "direct":
                 tgt = _field_dict(c, "target")
                 name = _shown_name(tgt, mangled=mangled) or "<unknown>"
+                # A symbol with no function body (a compiler builtin).
+                bodiless = "  (no function body)" if tgt.get("has_body") is False else ""
                 if per_site:
-                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}")
+                    rows.append(f"  {c.get('call_addr')}  direct -> {name} @ {tgt.get('address')}"
+                                f"{bodiless}")
                     continue
                 # Rendered spellings, so a malformed field still groups (#619).
-                key = (f"{name}", f"{tgt.get('address')}")
+                key = (f"{name}", f"{tgt.get('address')}{bodiless}")
                 if key not in groups:
                     groups[key] = []
                     rows.append(key)  # a group row, rendered once its sites are known
@@ -4892,11 +4896,14 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
                 continue
             caller = _field_dict(c, "caller")
             name = _shown_name(caller, mangled=mangled) or "<unknown>"
+            # A caller found through an indirect call's value-set, not a
+            # direct reference BN recorded.
+            how = "  (indirect call, value-set)" if c.get("kind") == "indirect" else ""
             if per_site:
                 site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
-                rows.append(f"  {site}{name} @ {caller.get('address', '?')}")
+                rows.append(f"  {site}{name} @ {caller.get('address', '?')}{how}")
                 continue
-            key = (f"{name}", f"{caller.get('address', '?')}")
+            key = (f"{name}", f"{caller.get('address', '?')}", how)
             if key not in caller_groups:
                 caller_groups[key] = []
                 rows.append(key)
@@ -4914,19 +4921,36 @@ def _render_callgraph_text(value: Any, *, per_site: bool = False, mangled: bool 
             if isinstance(row, tuple):
                 sites = caller_groups[row]
                 lines.append(f"  {row[0]} @ {row[1]}"
-                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else ""))
+                             + (f"  x{len(sites)}  at {_callgraph_site_list(sites)}" if sites else "")
+                             + row[2])
             else:
                 lines.append(row)
     return "\n".join(lines)
 
 
+def _pv_number(v: Any) -> str:
+    return f"{v:#x}" if isinstance(v, int) and not isinstance(v, bool) else str(v)
+
+
+def _pv_range(r: Any) -> str:
+    """``[0x0..0xff]`` (``step 4`` appended when not 1) for one serialized
+    value range; never the dict's Python repr."""
+    if not isinstance(r, dict):
+        return str(r)
+    step = r.get("step", 1)
+    return (f"[{_pv_number(r.get('start'))}..{_pv_number(r.get('end'))}]"
+            + (f" step {_pv_number(step)}" if step not in (1, None) else ""))
+
+
 @_discloses
-def _render_values_text(value: Any) -> str:
+def _render_values_text(value: Any, *, mangled: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
-    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
-    lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
+    lines = [f"{_shown_name(fn, mangled=mangled) or '<unknown>'} @ {fn.get('address', '<unknown>')}"]
+    index = value.get("il_index")
+    where = f"{value.get('at')}:{index}" if isinstance(index, int) and index >= 0 else value.get("at")
+    lines.append(f"at {where}: {value.get('expression', '<no instruction at address>')}")
     value_sets = [("possible values", value)]
     if _field_present(value, "call_destination"):
         destination = _field_dict(value, "call_destination")
@@ -4942,14 +4966,24 @@ def _render_values_text(value: Any) -> str:
             continue
         # Coerce the type before appending value details (#619).
         summary = str(pvs.get("type", "?"))
+        detailed = False
         if "value" in pvs:
-            summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
-        if pvs.get("values"):
-            summary += f"  values={pvs['values']}"
-        if pvs.get("ranges"):
-            summary += f"  ranges={pvs['ranges']}"
+            summary += f"  value={_pv_number(pvs['value'])}"
+            detailed = True
+        values = _field_list(pvs, "values")
+        if values:
+            summary += "  values={" + ", ".join(_pv_number(v) for v in values) + "}"
+            detailed = True
+        ranges = _field_list(pvs, "ranges")
+        if ranges:
+            summary += "  ranges=" + ", ".join(_pv_range(r) for r in ranges)
+            detailed = True
         lines.append(f"{label}: {summary}")
-        lines.append(f"  raw: {pvs.get('raw', '')}")
+        # BN's own rendering of the set, only for a kind this renderer has no
+        # structured fields for (a lookup table); otherwise it repeats the
+        # line above as a Python repr.
+        if not detailed and pvs.get("type") != "UndeterminedValue" and pvs.get("raw"):
+            lines.append(f"  detail: {pvs['raw']}")
         basis = value_set.get("value_basis")
         if basis == "source_expression" and value_set.get("source_expression"):
             lines.append(f"  of source expression: {value_set['source_expression']}")
@@ -4957,6 +4991,11 @@ def _render_values_text(value: Any) -> str:
             lines.append("  of instruction")
         elif basis == "destination_expression":
             lines.append(f"  of destination expression: {value_set.get('expression')}")
+    others = [o for o in _field_list(value, "other_instructions") if isinstance(o, dict)]
+    if others:
+        lines.append(f"other instructions at {value.get('at')} (select with --at "
+                     f"{value.get('at')}:<il-index>):")
+        lines.extend(f"  [{o.get('il_index')}] {o.get('text', '')}" for o in others)
     return "\n".join(lines)
 
 
@@ -8547,6 +8586,13 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # #1001 item 2: the value is a pointer to a stack object; the stores into
     # that object are what the call consumes, and trace does not follow them.
     "address_of_local": "address of local (stores into it not followed)",
+    # The value is read from a global; the stores other code makes to it are
+    # not followed (the step names the global; the caveat cites `bn xrefs`).
+    "global_load": "global load",
+    "constant": "constant",
+    # A definition with nothing to walk that is not a literal: an intrinsic's
+    # result, an undefined value.
+    "no_traced_inputs": "definition with no traced inputs",
 }
 
 
@@ -8648,8 +8694,14 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
         return f"{header}\n{info}\n\n{body}"
 
     lines = [header, info, ""]
+    sections = _trace_callee_sections(trace)
+    # (callee, signature of a walk already printed) -> the call site it came from
+    walked: dict[tuple[str, tuple], str] = {}
     current_fn: str | None = None
-    for step in trace:
+    resume_at = 0   # past a callee walk printed once already
+    for i, step in enumerate(trace):
+        if i < resume_at:
+            continue
         if not isinstance(step, dict):
             lines.append(f"  {step}")
             continue
@@ -8662,19 +8714,44 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
         reason = step.get("reason") or ""
         terminates = bool(step.get("terminates"))
 
+        # A step whose function differs from the last one printed: name it,
+        # including the RETURN to the traced function after a callee's walk --
+        # without that marker the caller's remaining steps read as the callee's.
+        if fn_ctx != current_fn:
+            if fn_ctx is None:
+                lines.append(f"  ── back in {fn_name} ──")
+            else:
+                shown = _shown_name(step, mangled=mangled, name_key="function_context",
+                                    display_key="function_context_display_name") or fn_ctx
+                lines.append(f"  ── in {shown} ──")
+            current_fn = fn_ctx
+
         if cross_fn:
-            callee = step.get("callee", "")
+            callee = str(step.get("callee") or "")
             shown = _shown_name(step, mangled=mangled, name_key="callee",
                                 display_key="callee_display_name") or callee
+            # The call boundary itself is a step of the CALLER: keep it, so the
+            # reader sees which call the walk crossed at.
+            lines.append(f"  {addr}  {il_text}" if addr else f"  {il_text}")
             lines.append(f"  ── enters {shown} ──")
             current_fn = callee
+            end = sections.get(i, i + 1)
+            signature = tuple(
+                (s.get("address"), s.get("il_text"), s.get("reason"), s.get("ssa_label"))
+                if isinstance(s, dict) else (str(s),)
+                for s in trace[i + 1:end])
+            first_site = walked.get((callee, signature))
+            if signature and first_site is not None:
+                # The same callee entered from another call site walks the
+                # same body: the steps are in the JSON, but printing them twice
+                # buries the caller's own steps.
+                n = len(signature)
+                lines.append(f"  (same {n} {'step' if n == 1 else 'steps'} as the walk "
+                             f"entered at {first_site})")
+                resume_at = end
+            elif signature:
+                walked[(callee, signature)] = str(addr)
             continue
-
-        if fn_ctx and fn_ctx != current_fn:
-            shown = _shown_name(step, mangled=mangled, name_key="function_context",
-                                display_key="function_context_display_name") or fn_ctx
-            lines.append(f"  ── in {shown} ──")
-            current_fn = fn_ctx
 
         if terminates:
             label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
@@ -8687,12 +8764,23 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
                     and step.get("out_param_callee")):
                 _fill = _shown_name(step, mangled=mangled, name_key="out_param_callee",
                                     display_key="out_param_callee_display_name")
-                line += f" (via {_fill})"
+                site = _text_value(step, "out_param_call_site")
+                line += f" (via {_fill}" + (f" @ {site})" if site else ")")
             if reason == "function_parameter":
-                slot = _trace_param_slot(step)
+                slot = _trace_param_slot(step, mangled=mangled)
                 if slot:
                     line += f" ({slot})"
-            if reason == "field_load":
+            if reason == "global_load":
+                gaddr = _text_value(step, "global_address")
+                gname = _text_value(step, "global_name")
+                where = f"{gname} @ {gaddr}" if gname and gaddr else (gaddr or gname)
+                line += f" ({where}; its writers not followed)" if where else ""
+            if reason == "constant":
+                const = _text_value(step, "value")
+                if const:
+                    line += f" = {const}"
+            if reason in ("field_load", "out_param_not_followed",
+                          "interprocedural_out_param_not_followed", "memory_load"):
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
                 if meta:
@@ -8723,16 +8811,44 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
     return "\n".join(lines)
 
 
-def _trace_param_slot(step: Any) -> str:
+def _trace_callee_sections(trace: list[Any]) -> dict[int, int]:
+    """``{index of a cross_function step: end index of its callee walk}``.
+
+    A callee's steps follow its crossing step and carry the callee's
+    ``function_context`` (a nested callee's steps carry their own); the walk
+    ends at the first step whose context is the crossing step's own function or
+    one of ITS callers, which is how the renderer finds the span to compare
+    when one callee is entered from several call sites."""
+    stack: list[tuple[Any, int]] = [(None, -1)]   # (function context, crossing index)
+    ends: dict[int, int] = {}
+    for idx, step in enumerate(trace):
+        if not isinstance(step, dict):
+            continue
+        ctx = step.get("function_context")
+        while len(stack) > 1 and ctx != stack[-1][0] and any(ctx == c for c, _ in stack[:-1]):
+            ends[stack.pop()[1]] = idx
+        if step.get("cross_function"):
+            stack.append((step.get("callee"), idx))
+    for _, idx in stack[1:]:
+        ends[idx] = len(trace)
+    return ends
+
+
+def _trace_param_slot(step: Any, *, mangled: bool = False) -> str:
     """`param 3, x3` for a function-parameter terminal (#959): the 0-based
     parameter position and the register it arrives in, or "" when the bridge
-    sent neither. A malformed index renders nothing rather than a wrong slot."""
+    sent neither. A malformed index renders nothing rather than a wrong slot.
+    A parameter of a CALLEE the walk crossed into names that callee
+    (`param 1 of parse_len, rsi`): the bare slot reads as the traced
+    function's own parameter."""
     if not isinstance(step, dict):
         return ""
     idx = step.get("param_index")
     parts = []
     if isinstance(idx, int) and not isinstance(idx, bool) and idx >= 0:
-        parts.append(f"param {idx}")
+        owner = _shown_name(step, mangled=mangled, name_key="function_context",
+                            display_key="function_context_display_name")
+        parts.append(f"param {idx}" + (f" of {owner}" if owner else ""))
     reg = _text_value(step, "param_register")
     if reg:
         parts.append(reg)
@@ -8764,9 +8880,14 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
                 continue
             nm = ((ex.get("callee_display_name") if not mangled else None) or ex.get("callee")
                   or (ex.get("out_param_callee_display_name") if not mangled else None)
-                  or ex.get("out_param_callee") or ex.get("local"))
+                  or ex.get("out_param_callee") or ex.get("local")
+                  or ex.get("global_name") or ex.get("global_address"))
+            if not nm and reason == "constant":
+                nm = ex.get("value")
+            if not nm and reason == "field_load" and ex.get("base"):
+                nm = f"{ex['base']}+{ex.get('offset') or '0x0'}"
             if not nm and reason == "function_parameter":
-                slot = _trace_param_slot(ex)
+                slot = _trace_param_slot(ex, mangled=mangled)
                 var = str(ex.get("ssa_label") or "").split("#", 1)[0]
                 nm = f"{var} ({slot})" if var and slot else (var or slot)
             if nm and nm not in named:

@@ -2716,6 +2716,10 @@ class TaintEngine:
                     out.append(("entry", None))
                 pending.extend(arms)
                 continue
+            if self._writes_back_what_it_reads(defn):
+                # A stack probe: the bytes before it are the bytes after it.
+                pending.append(self._mem_in(defn))
+                continue
             if "STORE" in op or op in _NAMED_STORE_OPS:
                 if "STORE" in op:
                     rel = self._store_load_relation(ssaf, defn, load, la)
@@ -3353,6 +3357,27 @@ class TaintEngine:
             return inner
         return "no"
 
+    @staticmethod
+    def _writes_back_what_it_reads(defn: Any) -> bool:
+        """A store of the bytes it loads from the very address it writes
+        (``[a].q = [a].q @ mem#k``): it changes no object's contents, so it is
+        never a writer -- or may-writer -- of a buffer or of a pointer's object,
+        and stores no pointer anywhere. Stack-clash probes are the producer:
+        ``or qword [rsp+rax-8], 0`` touching each page an ``alloca`` grows the
+        frame by lifts to exactly this, and its address (off the stack pointer
+        through a renamed register at -O0) is otherwise one the walk cannot
+        pin, so every slice through the frame gained a blocking may-alias row
+        and a spurious origin."""
+        if "STORE" not in op_name(defn):
+            return False
+        dest, src = getattr(defn, "dest", None), getattr(defn, "src", None)
+        if dest is None or src is None or "LOAD" not in op_name(src):
+            return False
+        # SSA text is canonical, so equal text is the same address expression
+        # over the same SSA versions.
+        return (str(getattr(src, "src", None)) == str(dest)
+                and getattr(src, "size", None) == getattr(defn, "size", None))
+
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
                               base_size: int | None = None,
                               region: tuple[int, int] | None = None) -> dict[str, Any]:
@@ -3657,7 +3682,12 @@ class TaintEngine:
                 cov, esc = memo.get(deps[0], ((), False))
                 addrs = escape_addrs.get(deps[0], frozenset())
                 op = op_name(defn)
-                if "STORE" in op or op in _NAMED_STORE_OPS:
+                if self._writes_back_what_it_reads(defn):
+                    # A stack probe (`alloca`'s page touch): no object's
+                    # contents change, so it is neither a writer nor an
+                    # escape.
+                    pass
+                elif "STORE" in op or op in _NAMED_STORE_OPS:
                     slot = self._field_store_slot(ssaf, defn)
                     if slot is not None and slot[0] == base_key:
                         writers.append(("store", defn))
@@ -15190,7 +15220,10 @@ class TaintEngine:
         popen(p - 8)` reads ``b`` at 0 -- never the definition's own offset."""
         seen = seen if seen is not None else set()
         if expr is None or depth > 16:
-            return [{"kind": "unknown", "object": str(expr)}]
+            # The depth cap can land on a bare SSAVariable, whose str() is
+            # BN's `<SSAVariable: x version 0>` repr, not a name.
+            return [{"kind": "unknown",
+                     "object": var_label(expr) if is_ssa_var(expr) else str(expr)}]
         op = op_name(expr)
 
         def rec(e, dd=disp):

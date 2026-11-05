@@ -145,6 +145,7 @@ def _add_resolve_map(args: argparse.Namespace, params: dict[str, Any]) -> None:
                       "stack-passed arguments from the call model; `uses` still lists "
                       "the argument stores, and the result carries the same "
                       "`hints` disclosure `trace` prints (`bn proto set` fixes it)"),
+             mangled_arg(),
          ],
          estimable=True)
 def _dataflow_defuse(args: argparse.Namespace) -> int:
@@ -154,7 +155,8 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
         contextual_hints=True,
-        text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(value),
+        text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(
+            value, mangled=bool(args.mangled)),
         stem="defuse",
     )
 
@@ -194,8 +196,13 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--at", dest="at", required=True,
-                 help="Instruction start address (hex 0x.. or decimal) within the function; "
-                      "call destinations are reported separately, not as return values"),
+                 help="Instruction start address (hex 0x.. or decimal) within the function, "
+                      "optionally ADDR:IL_INDEX to pick one of several MLIL SSA instructions "
+                      "at one address (the [N] `bn function structured-il` prints); an "
+                      "address where two instructions compute a value is refused with the "
+                      "candidates listed. Call destinations are reported separately, not as "
+                      "return values"),
+             mangled_arg(),
          ],
          estimable=True)
 def _dataflow_values(args: argparse.Namespace) -> int:
@@ -206,7 +213,8 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         require_target=True,
         # #1033 item 8: the `--at` refusal prints a `bn il` command.
         contextual_hints=True,
-        text_renderer=lambda value: _resolution_note(value) + _render_values_text(value),
+        text_renderer=lambda value: _resolution_note(value) + _render_values_text(
+            value, mangled=bool(args.mangled)),
         stem="values",
     )
 
