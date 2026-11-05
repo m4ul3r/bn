@@ -7621,3 +7621,40 @@ class TestIdentityAcrossARestart:
         finally:
             if inst:
                 _session_stop(inst)
+
+    def test_after_an_old_registry_restart_the_refusal_names_that_mode(self, tmp_path):
+        """V6-03: a registry without `next_view_id` (an older build) restarts
+        numbering at 1, so the restarted bridge reuses the old ids and accepts
+        none of them. Its refusal said "a restarted bridge never reuses one"
+        next to a listing that did; it names the old-registry mode instead."""
+        from bn import paths
+        from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+        from bn.target_hint import NUMERIC_VIEW_IDS_OFF_NOTE, PROCESS_LOCAL_VIEW_ID_NOTE
+
+        first = tmp_path / "first"
+        shutil.copyfile(HELLO_BINARY, first)
+        first.chmod(0o755)
+        inst = None
+        try:
+            inst = _session_start(str(first))["instance_id"]
+            registry = paths.instances_dir() / f"{inst}.json"
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+            del payload["next_view_id"]
+            registry.write_text(json.dumps(payload), encoding="utf-8")
+            restarted = _bn(
+                "session", "restart", inst, "--format", "json",
+                timeout=_SHUTDOWN_TEARDOWN_TIMEOUT + 2.0 + _SESSION_START_TIMEOUT,
+            )
+            assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
+            listing = _bn("--instance", inst, "target", "list", "--format", "json")
+            [row] = json.loads(listing.stdout)["items"]
+            assert (row["view_id"], row["view_id_selects"]) == ("1", False), row
+
+            refused = _bn("--instance", inst, "-t", "1", "target", "info")
+            assert refused.returncode == 2, f"{refused.stdout}\n{refused.stderr}"
+            lines = refused.stderr.splitlines()
+            assert lines[-1] == NUMERIC_VIEW_IDS_OFF_NOTE, refused.stderr
+            assert PROCESS_LOCAL_VIEW_ID_NOTE not in lines
+        finally:
+            if inst:
+                _session_stop(inst)
