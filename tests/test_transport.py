@@ -4394,10 +4394,9 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
 # sense 1 and 2 are -- `path_has_bound_socket`'s exact-byte fast path (can
 # only weaken a `True` to a `None`, and only `False` authorises an unlink),
 # `_socket_probe`'s `nothing_bound=True` on `ENOENT` (there is nothing left to
-# unlink), `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
+# unlink), and `gc`'s `entry.name.endswith(".json")` skip (the suffix selector
 # already answers `None` for a `.json`, so the condition is redundant rather
-# than load-bearing), and `src/bn/commands/misc.py::_resolved_out_format`'s
-# `if out is None` short circuit.
+# than load-bearing).
 #
 # UNREACHABLE DEFENSIVE CODE — one category, rather than notes scattered
 # across two files. No mutation can redden these because no input on this

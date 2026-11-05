@@ -1214,15 +1214,19 @@ def test_estimate_and_bytes_envelopes_state_written():
 
     estimate = json.loads(estimate_output_result(_REFUSAL, fmt="json").rendered)
     assert (estimate["ok"], estimate["written"], estimate["estimated"]) == (False, False, True)
-    raw = json.loads(estimate_bytes_result(b"\x00\x01", fmt="json").rendered)
+    raw = json.loads(estimate_bytes_result(b"\x00\x01", fmt="json",
+                                           outcome={"ok": True}).rendered)
     assert (raw["ok"], raw["written"]) == (True, False)
 
 
 def test_write_bytes_envelope_states_written(tmp_path):
-    from bn.output import write_bytes_result
+    from bn.output import RawBytes, write_bytes_result
 
-    envelope = write_bytes_result(b"\x7fELF", out_path=tmp_path / "b.bin", fmt="json").artifact
-    assert (envelope["ok"], envelope["written"]) == (True, True)
+    envelope = write_bytes_result(RawBytes(b"\x7fELF", {"kind": "bytes"}),
+                                  out_path=tmp_path / "b.bin", fmt="json", stem="read",
+                                  outcome={"ok": True}).artifact
+    assert (envelope["ok"], envelope["written"], envelope["spilled"]) == (True, True, False)
+    assert (tmp_path / "b.bin").read_bytes() == b"\x7fELF"
 
 
 @pytest.mark.parametrize("partial_sidecar", [False, True])
