@@ -868,8 +868,8 @@ def test_declared_value_role_completes_the_ad_hoc_sink_r7():
 
 @pytest.mark.parametrize("current, expect, placeholders", [
     # A flow model and no sink: its roles are kept and the sink is added.
-    ({"propagates": [{"from": "*arg:1", "to": "ret"}]},
-     {"propagates": [{"from": "*arg:1", "to": "ret"}],
+    ({"propagates": [{"from": "*arg:1", "to": "ret"}], "returns": "scalar"},
+     {"propagates": [{"from": "*arg:1", "to": "ret"}], "returns": "scalar",
       "sink": {"class": "VALUE_CLASS", "tainted_args": [0]}}, True),
     # A value-class sink on another argument: the argument joins it -- a
     # concrete entry, nothing to replace.

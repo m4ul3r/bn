@@ -7422,33 +7422,57 @@ def test_an_unbounded_index_into_a_global_keeps_the_out_of_object_frontier(tmp_p
 
 
 def test_a_strlen_length_demands_the_bytes_it_measures(tmp_path, shared_bn):
-    """IC06 on `taint_corpus/bw_strlen_length.c`: `memcpy(dst, label,
-    strlen(label) + 1)`. The length followed only `label`'s pointer value and
-    named its origin as if the pointer were the length; it now demands the
-    bytes `label` points at, as the copy's own source operand does. A local
-    the length measures keeps its writers' provenance (the `read`)."""
+    """IC06 on `taint_corpus/bw_strlen_length.c`. `memcpy(dst, label,
+    strlen(label) + 1)`: the length is computed from the bytes `label` points
+    at, so its origin is that boundary at the strlen call -- in `relay_label`
+    at the call that handed its formal on -- never the formal; the copy's
+    own source operand (control) has its frontier at the copy. `comma -
+    line` after `strchr` is a pointer return consumed as a value: no object
+    is demanded. `tag[0..2] = "ok\\0"`: the length reads the three bytes up
+    to the proven NUL, not the 64-byte capacity (reported, never certified).
+    A local `read()` filled keeps the read as its origin, with no bound."""
     binary = tmp_path / "bw_strlen_length"
     _compile(CORPUS / "bw_strlen_length.c", binary)
     target = shared_bn.load(binary, copy=False)
 
-    def objects(result, fn):
-        return sorted(lf["pointer"] for lf in result["leaves"]
-                      if lf["kind"] == "pointer_object_unresolved"
-                      and lf["function"]["name"] == fn)
+    def run(fn, sink):
+        return _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", fn, "--sink", sink)
 
-    length = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
-                      "--sink", "arg:memcpy:2")
-    source = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
-                      "--sink", "arg:memcpy:1")
-    assert objects(length, "copy_label"), length["leaves"]
-    assert objects(length, "copy_label") == objects(source, "copy_label")
+    def objects(result):
+        return {lf["function"]["name"]: lf for lf in result["leaves"]
+                if lf["kind"] == "pointer_object_unresolved"}
+
+    length, source = run("copy_label", "arg:memcpy:2"), run("copy_label", "arg:memcpy:1")
+    strlen_at = {st["address"] for sl in length["slices"] for st in sl["slice"]
+                 if st.get("callee") == "strlen"}
+    assert len(strlen_at) == 1, length["slices"]
+    boundary = objects(length)
+    assert set(boundary) == {"copy_label", "relay_label"}, length["leaves"]
+    assert boundary["copy_label"]["address"] in strlen_at
+    assert {(o["pointer"], o["address"]) for sl in length["slices"] for o in sl["origins"]
+            if o["kind"] == "pointer_object_unresolved"} == {
+        (lf["pointer"], lf["address"]) for lf in boundary.values()}
+    assert not [o for sl in length["slices"] for o in sl["origins"] if o["kind"] == "parameter"]
     assert length["diagnostics"]["safe_to_report_complete_slice"] is False
+    copied = objects(source)["copy_label"]
+    assert copied["pointer"] == boundary["copy_label"]["pointer"]
+    assert copied["address"] not in strlen_at
 
-    local = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_read",
-                     "--sink", "arg:memcpy:2")
+    field = run("copy_field", "arg:memcpy:2")
+    assert "copy_field" not in objects(field), field["leaves"]
+
+    tag = run("copy_tag", "arg:memcpy:2")
+    [leaf] = [lf for lf in tag["leaves"] if lf.get("buffer") == "tag"]
+    assert (leaf["kind"], leaf["region"], leaf["unproven"], leaf["terminator"]) == (
+        "region_store_proof_not_certified", {"offset": 0, "size": 3}, [], 2), leaf
+    assert tag["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    local = run("copy_read", "arg:memcpy:2")
     assert ("source", "read") in {(o["kind"], o.get("callee"))
                                   for sl in local["slices"] for o in sl["origins"]}
-    assert not [lf for lf in local["leaves"] if lf["kind"] == "pointer_object_unresolved"]
+    [leaf] = [lf for lf in local["leaves"] if lf.get("buffer") == "tmp"]
+    assert (leaf["region"]["size"], leaf["terminator"]) == (64, None), leaf
+    assert "copy_read" not in objects(local)
 
 
 
