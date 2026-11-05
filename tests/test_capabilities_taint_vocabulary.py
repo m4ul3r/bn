@@ -26,13 +26,14 @@ from bn.taint_vocabulary import (
     VocabularyUnresolved,
     kind_rows,
     origin_constructors,
+    pointer_object_constructors,
     run_params_keys,
     sink_fields,
 )
 
 BRIDGE = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge"
-FIELDS = ["leaf_kinds", "truncation_causes", "origin_kinds", "sink_status", "run_params",
-          "sink_fields"]
+FIELDS = ["leaf_kinds", "truncation_causes", "origin_kinds", "pointer_object_kinds",
+          "sink_status", "run_params", "sink_fields"]
 
 
 def _capabilities(capsys, *extra: str) -> dict:
@@ -50,6 +51,11 @@ def test_capabilities_json_carries_the_taint_vocabulary_from_its_sources(capsys)
     assert taint["truncation_causes"] == sorted(TRUNCATION_CAUSES)
     engine = BRIDGE / "taint_engine.py"
     assert taint["origin_kinds"] == sorted(kind_rows(engine, origin_constructors))
+    # G5-R5: the pointer-demand object kinds, the cross-boundary value kind among
+    # them, read off the one routine that builds them.
+    assert taint["pointer_object_kinds"] == sorted(kind_rows(engine, pointer_object_constructors))
+    assert {"literal_value", "returned", "global", "parameter"} <= set(
+        taint["pointer_object_kinds"])
     assert taint["run_params"] == sorted(
         run_params_keys(engine) | run_params_keys(BRIDGE / "read_taint_slice.py"))
     # An independent read of the sink_status producers: every status literal an
@@ -101,6 +107,9 @@ _ENGINE = textwrap.dedent('''
             origin = {"kind": NEW_ORIGIN if kind else kind}
             return {"sink_status": sink_status, "origin": origin}
 
+        def _demand_objects(self, expr):
+            return [{"kind": "brand_new_object", "object": str(expr)}]
+
         def _make_finding(self, callee, sink):
             return {"sink": {"callee": callee, **self._extra(sink),
                              **({"brand_new_flag": True} if sink else {})}}
@@ -125,6 +134,7 @@ def test_a_new_engine_literal_is_advertised_through_the_cli(tmp_path, monkeypatc
     monkeypatch.setattr(vocab, "plugin_source_dir", lambda: _bridge(tmp_path))
     taint = _capabilities(capsys)["taint"]
     assert taint["origin_kinds"] == ["brand_new_origin", "parameter"]
+    assert taint["pointer_object_kinds"] == ["brand_new_object"]
     assert taint["sink_status"] == ["brand_new_status"]
     assert taint["run_params"] == ["brand_new_echo", "brand_new_knob", "max_depth"]
     assert taint["sink_fields"] == ["brand_new_field", "brand_new_flag", "callee"]

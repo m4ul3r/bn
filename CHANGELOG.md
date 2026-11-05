@@ -52,7 +52,13 @@ taint output vocabulary.
   interprocedural text keeps its call sites; `dataflow` lists value-set
   callers and accepts `--at ADDR:IL_INDEX`.
 - `bn capabilities --format json` advertises the taint leaf kinds, truncation
-  causes, origin kinds, sink statuses and `run_params` keys.
+  causes, origin kinds, pointer-demand object kinds, sink statuses and
+  `run_params` keys.
+- `taint backward`: a pointer-demand object for an allocator's block names
+  the `allocator` and its requested `size` (or `size_expr`), also through a
+  wrapper that tail-calls the allocator; a block `realloc`/`g_realloc` returns
+  may be the block it was handed (builtin models: `arg:0 -> ret`), and a
+  narrower-than-pointer scalar is a `literal_value`, not an address.
 - Spilled output gets a private provenance sidecar (`<artifact>.meta.json`).
 - `function cfg --limit/--offset/--address-window` slice the graph
   bridge-side; `read --encoding bytes` under `--format json` is a base64

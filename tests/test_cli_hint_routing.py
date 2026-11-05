@@ -198,6 +198,124 @@ def test_a_quick_load_note_routes_its_refresh_to_the_target_it_loaded():
         ["bn", "-i", "X1", "-t", "second copy", "refresh"]]
 
 
+# V8-07: every command that resolves a function name prints the bridge's
+# ambiguity refusal with its retry command routed to this call. `proto get`
+# printed a bare `bn function info 0x…` while `decompile` printed it routed.
+def _ambiguous_name_refusal() -> BridgeError:
+    from types import SimpleNamespace
+
+    from bn_agent_bridge._shared import _format_ambiguous_function_error
+    kind = SimpleNamespace(type=SimpleNamespace(name="FunctionSymbol"))
+    rows = [SimpleNamespace(start=a, name="helper", symbol=kind) for a in (0x401130, 0x401150)]
+    return BridgeError(_format_ambiguous_function_error("helper", rows))
+
+
+def _printed_commands(text: str) -> list[list[str]]:
+    from bn.formatters import CODE_SPAN_RE
+    return [shlex.split(m.group(2)) for m in CODE_SPAN_RE.finditer(text)
+            if m.group(2).startswith("bn ")]
+
+
+# The arguments that name a function, by argparse dest, across the registry:
+# the positional `identifier`/`function`, `--function` / `-f`, `--within`.
+_FUNCTION_DESTS = frozenset({"identifier", "function", "within"})
+# A value for every OTHER required argument a function-naming command takes,
+# by dest. A command whose required argument is missing here fails the base
+# case below, so a new one cannot slip past.
+_REQUIRED_VALUES = {
+    "callee": "memcpy", "comment": "note", "var": "x", "at": "0x401140",
+    "arg_index": "0", "variable": "var_8", "new_name": "scale", "new_type": "int",
+    "prototype": "int helper(int x)", "type": "Bookmarks", "sinks": "arg:memcpy:2",
+    "sources": "param:0", "address": "0x401140",
+}
+# Options the handler requires together with a function locator though argparse
+# does not (`tag remove --function` wants a `--type`), filled from the table above.
+_COMPANION_DESTS = frozenset({"type"})
+# Flags that do not select another code path of the command itself.
+_NEUTRAL_FLAGS = frozenset({"-h", "--help", "--help-full", "--all-instances", "--estimate-output"})
+
+
+def _function_naming_commands() -> list[tuple[tuple[str, ...], list[list[str]]]]:
+    """Every registered command that resolves a function name, with its base
+    invocation (`helper` in the function slot, a value in every other
+    required one) and one variant per mode flag (`local list --frame`)."""
+    import argparse
+
+    import bn.commands  # noqa: F401 -- populates the registry
+    parser = bn.cli.build_parser()
+    out = []
+    for spec in sorted(bn.cli._COMMANDS, key=lambda s: s["path"]):
+        sub = bn.cli._selected_parser_for_argv(parser, list(spec["path"]))
+        actions = [a for a in sub._actions if not isinstance(a, argparse._HelpAction)]
+        named = [a for a in actions if a.dest in _FUNCTION_DESTS]
+        if not named:
+            continue
+        fn = named[0]
+        argv = list(spec["path"])
+        for a in actions:
+            if a.option_strings:
+                continue
+            if a is fn:
+                argv.append("helper")
+            elif a.nargs not in ("?", "*"):
+                argv.append(_REQUIRED_VALUES.get(a.dest, f"<{a.dest}>"))
+        if fn.option_strings:
+            argv += [fn.option_strings[-1], "helper"]
+        for a in actions:
+            if a.option_strings and a is not fn and (a.required or a.dest in _COMPANION_DESTS):
+                argv += [a.option_strings[-1], _REQUIRED_VALUES.get(a.dest, f"<{a.dest}>")]
+        flags = [a.option_strings[-1] for a in actions if a.option_strings and a.nargs == 0
+                 and not set(a.option_strings) & _NEUTRAL_FLAGS]
+        out.append((spec["path"], [argv] + [argv + [flag] for flag in flags]))
+    return out
+
+
+_FUNCTION_NAMING = _function_naming_commands()
+
+
+def test_the_function_naming_population_comes_from_the_registry():
+    # The review's omissions are in it because the registry has them, not
+    # because a list names them.
+    paths = {" ".join(path) for path, _ in _FUNCTION_NAMING}
+    assert {"evidence calls", "local retype", "local list", "comment set", "comment delete",
+            "tag get", "tag add", "tag remove", "proto get", "decompile"} <= paths
+
+
+@pytest.mark.parametrize(("path", "invocations"), _FUNCTION_NAMING,
+                         ids=[" ".join(p) for p, _ in _FUNCTION_NAMING])
+def test_an_ambiguous_name_refusal_prints_its_retry_routed(monkeypatch, capsys, path,
+                                                          invocations):
+    # V8-07 (closed by G3's global routing; this is its registry-derived
+    # coverage): every invocation that reaches the bridge and is refused for an
+    # ambiguous name prints its retry routed to this call's -i/-t.
+    sent: list[str] = []
+
+    def fake(op, **kwargs):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "my tgt"}]}
+        sent.append(op)
+        # A fresh refusal per request: the CLI routes the message in place, so
+        # a shared one would arrive pre-routed at every later invocation.
+        raise _ambiguous_name_refusal()
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    for k, argv in enumerate(invocations):
+        sent.clear()
+        try:
+            rc = bn.cli.main(["-i", "X1", "-t", "my tgt", *argv])
+        except SystemExit as stop:
+            rc = stop.code
+        err = capsys.readouterr().err
+        if k == 0:
+            # The base invocation must reach the bridge, or this is no coverage.
+            assert sent, (argv, err)
+        if not sent:
+            continue
+        assert rc == 2, (argv, err)
+        printed = _printed_commands(err)
+        assert printed and all(words[1:5] == ["-i", "X1", "-t", "my tgt"]
+                               for words in printed), (argv, printed)
+
+
 def test_a_fanout_routes_each_rows_bridge_commands_to_that_row(monkeypatch, capsys):
     # G3-05: a fan-out never passed a row's reply through the routing pass, so
     # a command the bridge printed in it -- a result's note, a row's refusal

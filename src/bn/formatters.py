@@ -8843,6 +8843,9 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # not followed (the step names the global; the caveat cites `bn xrefs`).
     "global_load": "global load",
     "constant": "constant",
+    # V8-02: the literal a loop-carried value starts at; the trips that add to
+    # it are the loop's control, which trace does not follow (a caveat says so).
+    "recurrence_initializer": "loop recurrence start",
     # A definition with nothing to walk that is not a literal: an intrinsic's
     # result, an undefined value.
     "no_traced_inputs": "definition with no traced inputs",
@@ -9035,6 +9038,10 @@ def _render_trace_text(value: Any, *, mangled: bool = False) -> str:
                 const = _text_value(step, "value")
                 if const:
                     line += f" = {const}"
+            if reason == "recurrence_initializer":
+                start = _trace_recurrence_start(step)
+                if start:
+                    line += f" = {start}"
             if reason in ("field_load", "out_param_not_followed",
                           "interprocedural_out_param_not_followed", "memory_load"):
                 meta = " ".join(
@@ -9090,6 +9097,24 @@ def _trace_callee_sections(trace: list[Any]) -> dict[int, int]:
     return ends
 
 
+def _trace_recurrence_start(step: Any) -> str:
+    """`0x0 (start of len#2, +0x4 per trip)` for a ``recurrence_initializer``
+    terminal (V8-02), or "" when the bridge sent no integer value. The step
+    is where a loop-carried value STARTS: the per-trip step is printed beside
+    it so the literal never reads as the value."""
+    if not isinstance(step, dict):
+        return ""
+    value = step.get("value")
+    if not isinstance(value, int) or isinstance(value, bool):
+        return ""
+    inc = _field_list(step, "increments")
+    steps = [i for i in inc if isinstance(i, int) and not isinstance(i, bool)]
+    per_trip = (", ".join(f"{i:+#x}" for i in steps) + " per trip" if steps and len(steps) == len(inc)
+                else "a non-constant step per trip")
+    phi = _text_value(step, "phi")
+    return f"{value:#x} (start of {phi}, {per_trip})" if phi else f"{value:#x} ({per_trip})"
+
+
 def _trace_param_slot(step: Any, *, mangled: bool = False) -> str:
     """`param 3, x3` for a function-parameter terminal (#959): the 0-based
     parameter position and the register it arrives in, or "" when the bridge
@@ -9140,6 +9165,8 @@ def _render_trace_frontiers(frontiers: Any, *, mangled: bool = False) -> list[st
                   or ex.get("global_name") or ex.get("global_address"))
             if not nm and reason == "constant":
                 nm = ex.get("value")
+            if not nm and reason == "recurrence_initializer":
+                nm = _trace_recurrence_start(ex)
             if not nm and reason == "field_load" and ex.get("base"):
                 nm = f"{ex['base']}+{ex.get('offset') or '0x0'}"
             if not nm and reason == "function_parameter":

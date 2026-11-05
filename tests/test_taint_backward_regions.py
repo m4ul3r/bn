@@ -634,6 +634,166 @@ def test_literal_sink_is_never_complete_r6(segment_writable):
                                 "offset": 0, "segment_writable": segment_writable}], leaf
 
 
+# V8-01: what each pointer-object kind claims must be what BN says about it.
+_B_ATTACH = 0x984
+_B_NAMES.update({_B_ATTACH: "attach"})
+
+
+class _MappedView:
+    """Mixin: BN maps bytes from 0x400 up; nothing below."""
+
+    def is_valid_offset(self, addr):
+        return addr >= 0x400
+
+
+def _mapped_result(pg, funcs=None):
+    from test_taint_engine import FBVStorage, te
+
+    class View(_MappedView, FBVStorage):
+        pass
+    bv = View(_B_NAMES, ro=[(0x700, 0x800)], rw=[(0x900, 0xa00)])
+    bv._funcs.update(funcs or {})
+    return te.TaintEngine(bv, te.load_models()).backward(pg.func(),
+                                                          [te.parse_locator("arg:popen:0")])
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_an_unmapped_constant_is_a_literal_value_not_an_address(value):
+    # `popen(NULL)`, `popen((char *)1)`: nothing is mapped there, so it is a
+    # value -- it was "literal ... in a read-only segment".
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, p1, f"p#1 = {value}", _cstr(value))
+    _sink_ssa(pg, p1)
+    result = _mapped_result(pg)
+    assert _demand_leaf(result)["objects"] == [
+        {"kind": "literal_value", "object": hex(value), "value": value}]
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
+@pytest.mark.parametrize(("address", "kind", "writable"), [
+    (0x720, "literal", False), (0x940, "global", True)])
+def test_a_mapped_constant_keeps_its_address_and_segment(address, kind, writable):
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, p1, f"p#1 = {address:#x}", _cstr(address))
+    _sink_ssa(pg, p1)
+    assert _demand_leaf(_mapped_result(pg))["objects"] == [
+        {"kind": kind, "object": hex(address), "address": hex(address), "offset": 0,
+         "segment_writable": writable}]
+
+
+def test_an_allocators_return_names_the_allocator_not_its_size():
+    # `p = malloc(sx.q(n)); popen(p)`: the size is no object the pointer
+    # reads -- it was listed as "unknown `sx.q(n)`" the block may point into.
+    n = FVar("n", ident=72, typ="int32_t"); n0 = FSSA(n, 0)
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_MALLOC, [FExpr("MLIL_SX", "sx.q(n#0)", reads=[n0])], reads=[n0], writes=[p1])
+    _sink_ssa(pg, p1)
+    assert _demand_leaf(_mapped_result(pg))["objects"] == [
+        {"kind": "returned", "object": "malloc()", "callee": "malloc", "allocator": "malloc",
+         "size_expr": "sx.q(n#0)", "may_point_into": []}]
+
+
+_B_REALLOC, _B_G_REALLOC, _B_G_REALLOC_N, _B_CALLOC, _B_ACQUIRE = (
+    0x9c0, 0x9c1, 0x9c2, 0x9c3, 0x9c4)
+_B_NAMES.update({_B_REALLOC: "realloc", _B_G_REALLOC: "g_realloc",
+                 _B_G_REALLOC_N: "g_realloc_n", _B_CALLOC: "calloc", _B_ACQUIRE: "acquire"})
+
+
+def _var_ref(v):
+    return FExpr("MLIL_VAR_SSA", f"{v.var.name}#{v.version}", reads=[v])
+
+
+@pytest.mark.parametrize(("target", "sizes", "size_expr"), [
+    (_B_REALLOC, ["n"], "n#0"), (_B_G_REALLOC, ["n"], "n#0"),
+    (_B_G_REALLOC_N, ["n", "m"], "n#0 * m#0")])
+def test_a_reallocated_block_may_be_the_block_it_was_handed(target, sizes, size_expr):
+    # G5-R1: `p = realloc(old, n)` may hand `old` back; the allocator branch
+    # listed nothing the block may point into.
+    old = FVar("old", ident=70, typ="char*"); old0 = FSSA(old, 0)
+    counts = [FVar(s, ident=71 + k, typ="uint64_t") for k, s in enumerate(sizes)]
+    count0 = [FSSA(c, 0) for c in counts]
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[old, *counts])
+    pg.call(target, [_var_ref(old0), *(_var_ref(c) for c in count0)],
+            reads=[old0, *count0], writes=[p1])
+    _sink_ssa(pg, p1)
+    [obj] = _demand_leaf(_mapped_result(pg))["objects"]
+    assert [(o["kind"], o["object"]) for o in obj["may_point_into"]] == [("parameter", "old#0")]
+    assert (obj["kind"], obj["allocator"], obj["size_expr"]) == (
+        "returned", _B_NAMES[target], size_expr), obj
+
+
+@pytest.mark.parametrize(("args", "size"), [
+    ([_const(0x20)], {"size": 0x20}), ([_const(4), _const(0x10)], {"size": 0x40})])
+def test_a_constant_allocation_states_its_size(args, size):
+    # G5-R4: `malloc(32)` / `calloc(4, 16)`: the block's size is known and was
+    # dropped from the description.
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    pg.call(_B_MALLOC if len(args) == 1 else _B_CALLOC, args, writes=[p1])
+    _sink_ssa(pg, p1)
+    [obj] = _demand_leaf(_mapped_result(pg))["objects"]
+    assert {k: obj[k] for k in ("kind", "allocator", *size)} == {
+        "kind": "returned", "allocator": "malloc" if len(args) == 1 else "calloc", **size}
+    assert "size_expr" not in obj
+
+
+@pytest.mark.parametrize(("tail", "allocator"), [(_B_MALLOC, "malloc"), (_B_ATTACH, None)])
+def test_a_wrapper_that_tail_calls_an_allocator_returns_its_block(tail, allocator):
+    # G5-R2: `acquire(n) { return malloc(n); }` optimised into one tail call
+    # has no RET, so the wrapper was not recognised and its block not named.
+    # A wrapper tail-calling anything else is no allocator.
+    from test_taint_engine import FFunc, FSSAFunc
+    w = FVar("w", ident=80, typ="uint64_t"); w0 = FSSA(w, 0)
+    body = FInstr(0, 0x9c4, "MLIL_TAILCALL_SSA", f"tailcall {_B_NAMES[tail]}(w#0)",
+                  reads=[w0], dest=_cstr(tail), params=[_var_ref(w0)])
+    wrapper = FFunc("acquire", _B_ACQUIRE, FSSAFunc([body]), params=[w])
+    n = FVar("n", ident=72, typ="uint64_t"); n0 = FSSA(n, 0)
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[n])
+    pg.call(_B_ACQUIRE, [_var_ref(n0)], reads=[n0], writes=[p1])
+    _sink_ssa(pg, p1)
+    [obj] = _demand_leaf(_mapped_result(pg, {_B_ACQUIRE: wrapper}))["objects"]
+    assert (obj["kind"], obj["callee"], obj.get("allocator")) == ("returned", "acquire", allocator)
+    if allocator:
+        # The wrapper hands its own argument on as the size.
+        assert obj["size_expr"] == "n#0" and obj["may_point_into"] == []
+
+
+@pytest.mark.parametrize(("op", "width", "kind"), [
+    ("MLIL_CONST", 4, "literal_value"), ("MLIL_CONST", 8, "global"),
+    ("MLIL_CONST_PTR", 4, "global")])
+def test_a_mapped_number_is_an_address_only_in_a_pointer_shape(op, width, kind):
+    # G5-R3: a 4-byte scalar whose number happens to be mapped (0x940 sits in
+    # the writable segment) was a `global` address; only BN's pointer
+    # constant or a pointer-width one in this pointer role is.
+    value = FExpr(op, "0x940", constant=0x940)
+    value.size = width
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    _set_ptr(pg, p1, "p#1 = 0x940", value)
+    _sink_ssa(pg, p1)
+    [obj] = _demand_leaf(_mapped_result(pg))["objects"]
+    assert obj["kind"] == kind, obj
+    assert ("value" in obj) is (kind == "literal_value")
+
+
+def test_a_returned_pointer_never_points_into_a_literal_value():
+    # `p = attach(NULL, &buf); popen(p)`: an unmodeled helper's return may
+    # point into the objects it was handed -- `buf`, not the `NULL` beside it.
+    buf = FVar("buf", typ="char[0x40]")
+    p1 = FSSA(FVar("p", typ="char*"), 1)
+    pg = _BufProgram(params=[])
+    pg.call(_B_ATTACH, [_cstr(0), _addr_of(buf)], writes=[p1])
+    _sink_ssa(pg, p1)
+    [obj] = _demand_leaf(_mapped_result(pg))["objects"]
+    assert (obj["kind"], obj["callee"], "allocator" in obj) == ("returned", "attach", False)
+    assert obj["may_point_into"] == [{"kind": "local", "object": "buf", "offset": None}]
+
+
 @pytest.mark.parametrize("index", ["parameter", "constant"])
 def test_got_global_plus_an_index_is_not_complete_r5(index):
     # `popen(global_buf + i)` / `popen(g_req.cmd)` through the GOT: the
