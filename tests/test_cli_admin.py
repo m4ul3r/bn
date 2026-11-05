@@ -1435,7 +1435,7 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
-    def fake_spawn(instance_id=None):
+    def fake_spawn(instance_id=None, **_kw):
         spawned["id"] = instance_id
         return new
     monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
@@ -1507,7 +1507,7 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **_kw: new)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
     rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
@@ -1565,7 +1565,7 @@ def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch,
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", failing_send_to_instance)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
-    def fake_spawn(instance_id=None):
+    def fake_spawn(instance_id=None, **_kw):
         spawned["id"] = instance_id
         return new
     monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
@@ -1615,7 +1615,7 @@ def test_session_restart_with_zero_open_targets_still_restarts(monkeypatch, caps
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
-    def fake_spawn(instance_id=None):
+    def fake_spawn(instance_id=None, **_kw):
         spawned["id"] = instance_id
         return new
     monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
@@ -3812,7 +3812,7 @@ def test_session_restart_escalates_through_one_pin(monkeypatch, capsys):
     )
     converged = iter([False, True])
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: next(converged))
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new_instance)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **_kw: new_instance)
     signallers = _fake_signaller(monkeypatch)
 
     assert bn.cli.main(["session", "restart", "res1", "--format", "json"]) == 0
@@ -3987,7 +3987,7 @@ def _restart_bridge_stubs(
         },
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **_kw: new)
     return calls
 
 
@@ -4296,7 +4296,7 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **_kw: new)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
     rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
@@ -5197,7 +5197,7 @@ def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1", listing=No
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", fake_to_instance)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **_kw: new)
     _fake_signaller(monkeypatch)
     return calls
 
@@ -6244,3 +6244,139 @@ def test_skill_install_and_doctor_report_the_bn_kernel_skill_dir(
     assert bn.cli.main(["doctor"]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert [line for line in lines if line.startswith("bn-kernel skill_dir:")] == expected
+
+
+# --------------------------------------------------------------------------
+# D2: lifecycle and identity across bridge generations
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("meta, view_ids, expected", [
+    ({"next_view_id": 12}, ["3", "5"], 12),   # the registry also covers closed views
+    ({}, ["3", "5"], 6),                      # a registry from before the field
+    ({"next_view_id": 4}, ["9"], 10),         # never below a listed id
+])
+def test_session_restart_numbers_the_new_bridge_above_every_old_view_id(
+    monkeypatch, capsys, meta, view_ids, expected
+):
+    # P1-02: the respawned process numbered its views from 1 again, so a
+    # `-t <view_id>` from before the restart silently selected another target.
+    rows = [{"filename": f"/fw/svc_{vid}", "view_id": vid, "analysis_state": "full",
+             "unsaved": False} for vid in view_ids]
+    old = type("FakeInstance", (), {
+        "instance_id": "gen-1", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"), "meta": meta,
+    })()
+    new = _fake_instance("gen-1")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance",
+                        lambda instance, op, params=None, target=None, **kw:
+                        {"ok": True, "result": rows})
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    spawned = {}
+
+    def fake_spawn(instance_id=None, **kwargs):
+        spawned.update(kwargs, instance_id=instance_id)
+        return new
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **kw: {"ok": True, "result": {"path": "/fw/x"}})
+
+    assert bn.cli.main(["session", "restart", "gen-1", "--format", "json"]) == 0
+    assert spawned["instance_id"] == "gen-1"
+    assert spawned["first_view_id"] == expected
+
+
+def test_session_list_reports_each_bridges_idle_timeout(monkeypatch, capsys):
+    # P2-09: fan-out memory and an unbounded lifetime were invisible.
+    from dataclasses import replace
+
+    instances = [replace(_fake_instance("auto-1"), meta={"idle_timeout": 1800.0}),
+                 replace(_fake_instance("owned-1"), meta={"idle_timeout": None}),
+                 replace(_fake_instance("older-1"), meta={})]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: instances)
+
+    assert bn.cli.main(["session", "list", "--format", "json"]) == 0
+    items = {item["instance_id"]: item for item in json.loads(capsys.readouterr().out)["items"]}
+    assert items["auto-1"]["idle_timeout"] == 1800.0
+    assert items["owned-1"]["idle_timeout"] is None
+    assert "idle_timeout" not in items["older-1"]
+    assert all("rss_mb" in item for item in items.values())
+
+    assert bn.cli.main(["session", "list"]) == 0
+    heads = {line.split()[0]: line.split() for line in capsys.readouterr().out.splitlines()
+             if line and not line.startswith(" ") and "pid=" in line}
+    assert "idle=1800s" in heads["auto-1"]
+    assert "idle=off" in heads["owned-1"]
+    assert not any(part.startswith("idle=") for part in heads["older-1"])
+
+
+def _fake_bn_on_path(tmp_path, module_dir, plugin_dir):
+    """A `bn` script whose interpreter answers the identity probe with
+    *module_dir* / *plugin_dir*, like an install from another checkout."""
+    interpreter = tmp_path / "other-python"
+    interpreter.write_text(
+        "#!/bin/sh\n"
+        f"echo '{{\"module_dir\": \"{module_dir}\", \"plugin_source_dir\": \"{plugin_dir}\"}}'\n",
+        encoding="utf-8")
+    interpreter.chmod(0o755)
+    script = tmp_path / "bin" / "bn"
+    script.parent.mkdir()
+    script.write_text(f"#!{interpreter}\nimport bn\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_doctor_names_this_cli_and_the_bn_on_path(monkeypatch, tmp_path, capsys):
+    # P2-08: `bn` on PATH came from another checkout while doctor looked
+    # healthy -- it named bridge and plugin identities, never the CLI's.
+    other = tmp_path / "other-checkout"
+    (other / ".git").mkdir(parents=True)
+    (other / "src" / "bn").mkdir(parents=True)
+    (other / "src" / "bn" / "__init__.py").write_text("", encoding="utf-8")
+    script = _fake_bn_on_path(tmp_path, other / "src" / "bn",
+                              other / "src" / "bn_agent_bridge")
+    monkeypatch.setattr("bn.commands.admin.shutil.which",
+                        lambda name: str(script) if name == "bn" else None)
+    bridge = type("FakeInstance", (), {
+        "pid": 321, "socket_path": tmp_path / "b.sock", "plugin_version": bn.cli.VERSION,
+        "started_at": None, "instance_id": "here-1",
+        "meta": {"source_dir": str(bn.cli.plugin_source_dir())},
+    })()
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [bridge])
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance",
+                        lambda instance, op, params=None, target=None, **kw:
+                        {"ok": True, "result": {"plugin_version": bn.cli.VERSION}})
+
+    assert bn.cli.main(["doctor", "--format", "json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    this_dir = __import__("pathlib").Path(bn.cli.__file__).resolve().parent
+    assert report["cli"]["module_dir"] == str(this_dir)
+    assert report["cli"]["build_id"]
+    path_cli = report["path_cli"]
+    assert path_cli["executable"] == str(script)
+    assert path_cli["module_dir"] == str(other / "src" / "bn")
+    assert path_cli["repository_root"] == str(other)
+    assert path_cli["same_as_this_cli"] is False
+    assert report["instances"][0]["path_cli_other_checkout"] is True
+
+    assert bn.cli.main(["doctor"]) == 0
+    warnings = [line for line in capsys.readouterr().out.splitlines()
+                if line.startswith("warning:")]
+    assert len(warnings) == 2
+    assert warnings[1].endswith("here-1")
+
+
+def test_session_start_help_does_not_offer_the_instance_selector(capsys):
+    # W10: `session start --help` listed `-i/--instance`, which this command
+    # refuses -- it names an EXISTING bridge; `--instance-id` names the new one.
+    with pytest.raises(SystemExit):
+        bn.cli.main(["session", "start", "--help"])
+    help_text = capsys.readouterr().out
+    assert "--instance-id" in help_text
+    assert "--instance INSTANCE" not in help_text and "-i INSTANCE" not in help_text
+
+    assert bn.cli.main(["session", "start", "-i", "named-1", "/tmp/sample"]) == 2
+    assert "--instance-id named-1" in capsys.readouterr().err

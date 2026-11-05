@@ -7269,3 +7269,71 @@ class TestEvidenceVtableLabels1017:
                              "--compact").stdout
         rows = [ln for ln in text.splitlines() if ln.startswith("- ")]
         assert len(rows) == news and all("operator new @ " in row for row in rows)
+
+
+class TestIdentityAcrossARestart:
+    """D2: a restarted bridge never hands a pre-restart view id to another
+    target (P1-02), and an export leaves the unsaved work it did not persist
+    guarded by `session restart` (P2-03). A private session: the restart IS the
+    subject."""
+
+    def test_a_view_id_listed_before_a_restart_is_refused_after_it(self, tmp_path):
+        from bn.commands.admin import _SHUTDOWN_TEARDOWN_TIMEOUT
+        from bn.target_hint import PROCESS_LOCAL_VIEW_ID_NOTE
+
+        first, second = tmp_path / "first", tmp_path / "second"
+        for source, copy in ((HELLO_BINARY, first), (ADD_BINARY, second)):
+            shutil.copyfile(source, copy)
+            copy.chmod(0o755)
+        inst = None
+        try:
+            inst = _session_start(str(first), str(second))["instance_id"]
+
+            def rows():
+                listing = _bn("--instance", inst, "target", "list", "--format", "json")
+                assert listing.returncode == 0, listing.stderr
+                return {Path(r["filename"]).name: r for r in json.loads(listing.stdout)["items"]}
+
+            # Close and reopen `first` so the old process numbered past its
+            # open views: the restart reloads `second` before `first`.
+            assert _bn("--instance", inst, "-t", str(first), "close").returncode == 0
+            loaded = _bn("--instance", inst, "load", str(first))
+            assert loaded.returncode == 0, loaded.stderr
+            before = rows()
+            stale = before["second"]["view_id"]
+
+            # P2-03: rename, then export -- the work is still not in the
+            # target's own database, so it stays unsaved and guarded.
+            renamed = _bn("--instance", inst, "-t", str(second), "rename", "main",
+                          "D2_EXPORT_MARKER", "--format", "json")
+            assert renamed.returncode == 0, f"{renamed.stdout}\n{renamed.stderr}"
+            export = _bn("--instance", inst, "-t", str(second), "save",
+                         str(tmp_path / "copy.bndb"), "--format", "json")
+            assert export.returncode == 0, export.stderr
+            exported = json.loads(export.stdout)
+            assert (exported["export"], exported["unsaved"]) == (True, True), exported
+            assert rows()["second"]["unsaved"] is True
+            refused = _bn("session", "restart", inst, "--format", "json",
+                          timeout=_SESSION_STOP_TIMEOUT)
+            assert refused.returncode == 2, f"{refused.stdout}\n{refused.stderr}"
+
+            restarted = _bn(
+                "session", "restart", inst, "--discard-unsaved", "--format", "json",
+                timeout=_SHUTDOWN_TEARDOWN_TIMEOUT + 2.0 + _SESSION_START_TIMEOUT,
+            )
+            assert restarted.returncode == 0, f"{restarted.stdout}\n{restarted.stderr}"
+            after = rows()
+            old_ids = {int(r["view_id"]) for r in before.values()}
+            assert min(int(r["view_id"]) for r in after.values()) > max(old_ids), (before, after)
+
+            # P1-02: the old number names nothing now, and says why.
+            reused = _bn("--instance", inst, "-t", stale, "target", "info")
+            assert reused.returncode == 2, f"{reused.stdout}\n{reused.stderr}"
+            assert PROCESS_LOCAL_VIEW_ID_NOTE in reused.stderr.splitlines()
+            current = _bn("--instance", inst, "-t", after["second"]["view_id"],
+                          "target", "info", "--format", "json")
+            assert current.returncode == 0, current.stderr
+            assert Path(json.loads(current.stdout)["filename"]).name == "second"
+        finally:
+            if inst:
+                _session_stop(inst)

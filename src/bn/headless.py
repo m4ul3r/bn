@@ -42,7 +42,9 @@ def main(argv: list[str] | None = None) -> int:
             "                    (each loaded target holds ~1.7 GB). It never fires\n"
             "                    while a request or analysis is in flight. Unset (the\n"
             "                    default) / none / off / 0 disables it: the bridge\n"
-            "                    lives until `bn session stop`.\n"
+            "                    lives until `bn session stop`. A bridge a `bn`\n"
+            "                    command starts on its own (not `bn session\n"
+            "                    start`) gets 1800 when this is unset.\n"
         ),
     )
     parser.add_argument(
@@ -54,6 +56,14 @@ def main(argv: list[str] | None = None) -> int:
         "--instance-id",
         help="Instance ID for this bridge session (default: random)",
         default=None,
+    )
+    parser.add_argument(
+        "--first-view-id",
+        type=int,
+        default=1,
+        help="First numeric view id this bridge assigns (default: 1). `bn session "
+        "restart` passes the previous process's next id, so a view id listed "
+        "before the restart never names a different target after it",
     )
     parser.add_argument(
         "--quick",
@@ -71,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
         "exists (default: load the saved database, like `bn load`)",
     )
     args = parser.parse_args(argv)
+    if args.first_view_id < 1:
+        parser.error("--first-view-id must be a positive integer")
 
     # Make the binaryninja package importable.
     bn_python = _find_bn_python()
@@ -91,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         instance_id=args.instance_id,
         quick=args.quick,
         prefer_bndb=not args.no_bndb,
+        first_view_id=args.first_view_id,
     )
     return 0
 

@@ -1731,6 +1731,12 @@ def _render_session_list_text(value: Any) -> str:
         rss = item.get("rss_mb")
         if rss is not None:
             parts.append(f"rss={rss}MB")
+        if "idle_timeout" in item:
+            idle = item.get("idle_timeout")
+            parts.append(
+                f"idle={idle:g}s"
+                if isinstance(idle, (int, float)) and not isinstance(idle, bool) and idle > 0
+                else "idle=off")
         if item.get("started_at"):
             parts.append(f"started={item['started_at']}")
         lines.append("  ".join(parts))

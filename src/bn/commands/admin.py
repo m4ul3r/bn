@@ -1553,6 +1553,8 @@ def _session_restart(args: argparse.Namespace) -> int:
         if isinstance(roots, list):
             inherited_roots = [root for root in roots if isinstance(root, str)]
 
+    first_view_id = _next_view_id(inst, rows)
+
     # Stop the old process: graceful shutdown, then SIGTERM/SIGKILL escalation,
     # blocking until the socket/registry are gone so the respawn can reuse the id.
     # Both signals are gated on durable process identity: a restart must never
@@ -1580,7 +1582,7 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    instance = cli.spawn_instance(resolved_id)
+    instance = cli.spawn_instance(resolved_id, first_view_id=first_view_id)
     # Reload targets without associating the restart command's cwd.
     #
     # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
@@ -1647,6 +1649,21 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["discarded_unsaved"] = discarded
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures or association_error or reload_capture_failed else 0
+
+
+def _next_view_id(inst: Any, rows: list[dict[str, Any]]) -> int | None:
+    """The first numeric view id the restarted bridge may assign (P1-02).
+
+    Above every id the old process handed out: its registry's `next_view_id`
+    (which also covers views it closed) and, for a registry that predates
+    the field, the ids it lists now. None when neither is known."""
+    seen: list[int] = []
+    recorded = inst.meta.get("next_view_id") if isinstance(inst.meta, dict) else None
+    if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded >= 1:
+        seen.append(recorded)
+    seen.extend(int(row["view_id"]) + 1 for row in rows
+                if str(row.get("view_id", "")).isdigit())
+    return max(seen) if seen else None
 
 
 def _require_headless_lifecycle(inst: Any) -> None:
@@ -1874,6 +1891,14 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             "started_at": inst.started_at,
             "rss_mb": round(rss, 1) if rss is not None else None,
         }
+        # P2-09: seconds of inactivity after which the bridge stops itself, null
+        # when it never does. Omitted for a bridge whose registry predates it.
+        if isinstance(inst.meta, dict) and "idle_timeout" in inst.meta:
+            idle = inst.meta["idle_timeout"]
+            entry["idle_timeout"] = (
+                idle if isinstance(idle, (int, float)) and not isinstance(idle, bool)
+                and idle > 0 else None
+            )
         # #80: the registry now records each instance's open binaries, so list them
         # here without an N-instance `target list` round-trip. Absent (older bridge
         # or nothing open) -> omit, so the entry stays clean.

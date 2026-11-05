@@ -26,6 +26,15 @@ from typing import Any, Callable
 SELECT_HINT_LINE = "Pass -t <selector> (--target) to choose one."
 OPEN_TARGETS_HEADING = "Open targets:"
 STABLE_ID_NOTE = "note: view_id / target_id are stable across `bn save`"
+# P1-02: after an unknown NUMERIC selector. A view_id belongs to the bridge
+# process that listed it; `session restart` numbers the new process's views
+# above the old ones, so an id from before a restart is unknown, never another
+# target.
+PROCESS_LOCAL_VIEW_ID_NOTE = (
+    "note: a numeric view_id is process-local: it names a target only in the "
+    "bridge process that listed it, and a restarted bridge never reuses one -- "
+    "pick the target again from the list above"
+)
 # #996 review: the tail of a destructive close's refusal when its selector named
 # the target only through a `.bndb`-stripped alias. The bridge ends the message
 # with this lead plus the shell-quoted LISTED selector (which resolves to

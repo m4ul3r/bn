@@ -66,12 +66,12 @@ from .paths import (
     PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
     instances_dir, project_root,
 )
-from .proc_identity import identity_payload
+from .proc_identity import identity_payload, process_started_at
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .target_hint import (
-    LISTED_SELECTOR_LEAD, format_multi_target_hint, instance_option, open_target_lines,
-    target_option, target_row,
+    LISTED_SELECTOR_LEAD, PROCESS_LOCAL_VIEW_ID_NOTE, format_multi_target_hint,
+    instance_option, open_target_lines, target_option, target_row,
 )
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -222,6 +222,8 @@ def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -
         lines.append("No BinaryView targets are open.")
         return "\n".join(lines)
     lines.extend(open_target_lines(targets))
+    if str(selector).isdigit():
+        lines.append(PROCESS_LOCAL_VIEW_ID_NOTE)
     return "\n".join(lines)
 
 
@@ -723,7 +725,7 @@ class TargetRecord:
 
 
 class TargetManager:
-    def __init__(self):
+    def __init__(self, first_view_id: int = 1):
         self._lock = threading.RLock()
         self._records: dict[str, TargetRecord] = {}
         # bv -> stable view_id, keyed by the view OBJECT itself rather than
@@ -739,7 +741,11 @@ class TargetManager:
         # transient collecting call's local list going out of scope can no
         # longer make resolve() see a dead reference.
         self._ids_by_object: dict[Any, str] = {}
-        self._next_id = 1
+        # Numeric view ids are process-local, so a restarted headless bridge is
+        # seeded with its predecessor's next id (`session restart`): a number
+        # one generation listed is never handed to a different target by the
+        # next one, where `-t <n>` would silently select it (P1-02).
+        self._next_id = first_view_id
         # Stable view_ids of views with a committed-but-unsaved mutation. BN's
         # bv.file.modified does NOT flip True after our verified rename/comment/
         # retype writes, so `close` could not tell an agent it was about to
@@ -831,6 +837,11 @@ class TargetManager:
 
     def _stable_view_id(self, bv) -> str | None:
         return self._ids_by_object.get(bv)
+
+    def next_view_id(self) -> int:
+        """The number the next newly seen view will be given."""
+        with self._lock:
+            return self._next_id
 
     def mark_dirty(self, bv) -> None:
         """Record that *bv* has a committed mutation not yet written to a .bndb."""
@@ -2001,10 +2012,18 @@ def _function_name_summary(bv) -> dict[str, int]:
 
 
 class BinaryNinjaBridge:
-    def __init__(self, instance_id: str | None = None):
+    def __init__(self, instance_id: str | None = None, first_view_id: int = 1):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
-        self._started_at = datetime.now(timezone.utc).isoformat()
+        # The PROCESS's start, not this object's: a GUI "Restart Bridge" builds
+        # a new bridge inside the same process, and `session list` pairs the
+        # time with the pid (P2-07). Platforms without /proc fall back to now.
+        self._started_at = (
+            process_started_at(os.getpid()) or datetime.now(timezone.utc).isoformat()
+        )
+        # Seconds of inactivity after which the idle reaper stops this bridge,
+        # or None while it is not armed; published in the registry (P2-09).
+        self._idle_timeout: float | None = None
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
@@ -2017,7 +2036,7 @@ class BinaryNinjaBridge:
         # _load_jobs_lock -- stop() latches, then refuses queued jobs.
         self._teardown_lock = threading.Lock()
         self._stopped: bool = False
-        self.targets = TargetManager()
+        self.targets = TargetManager(first_view_id)
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
         self.registry_path = bridge_registry_path(instance_id)
@@ -2508,6 +2527,10 @@ class BinaryNinjaBridge:
         except Exception:
             binaries = []
         payload["binaries"] = binaries
+        # Read after the refresh above, which numbers any view it saw first:
+        # `session restart` seeds the next process with it (P1-02).
+        payload["next_view_id"] = self.targets.next_view_id()
+        payload["idle_timeout"] = self._idle_timeout
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists. Under the
         # teardown latch (#694): a detached load worker that finishes after stop()
@@ -2741,7 +2764,10 @@ class BinaryNinjaBridge:
         if timeout is None:
             return None
         bn.log_info(f"BN Agent Bridge idle reaper armed: self-shutdown after {timeout}s idle")
-        return self._start_idle_reaper(timeout)
+        thread = self._start_idle_reaper(timeout)
+        self._idle_timeout = timeout
+        self._write_registry()
+        return thread
 
     def _is_request_cancelled(self, request_id: Any) -> bool:
         if not isinstance(request_id, str) or not request_id:
@@ -3891,7 +3917,6 @@ class BinaryNinjaBridge:
             _disclose_open_target_collision(self.targets, bv, saved, degraded)
             self._stamp_cache_writer(saved, degraded)
             return degraded
-        self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         # #753: the live filename was just restored to the ORIGINAL path, so from
         # here on nothing in the view says where its analysis actually lives.
         # Record it, or `session restart` reopens the raw bytes and discards this
@@ -7306,6 +7331,7 @@ def start_headless(
     instance_id: str | None = None,
     quick: bool = False,
     prefer_bndb: bool = True,
+    first_view_id: int = 1,
 ):
     """Start the bridge in headless mode (no GUI required).
 
@@ -7315,6 +7341,8 @@ def start_headless(
     With ``prefer_bndb`` (the default), a binary with an adjacent
     ``<binary>.bndb`` loads the sidecar instead of re-analyzing -- matching
     ``bn load``; pass ``--no-bndb`` (prefer_bndb=False) to open the raw binary.
+    ``first_view_id`` is the first numeric view id this process assigns:
+    `session restart` passes its predecessor's next id (P1-02).
     """
     global _bridge
     if _bridge is not None:
@@ -7326,7 +7354,7 @@ def start_headless(
 
     ensure_private_dir(instances_dir())
 
-    bridge = BinaryNinjaBridge(instance_id=instance_id)
+    bridge = BinaryNinjaBridge(instance_id=instance_id, first_view_id=first_view_id)
     bridge.start()
     _bridge = bridge
     bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")
