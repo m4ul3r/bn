@@ -393,3 +393,68 @@ def test_a_plt_stub_with_a_resolver_prototype_is_routed_through_its_model(resolv
         # An ordinary under-recovered prototype keeps the reach-only path.
         assert flow["sink"]["via"] == "abi_register"
         assert flow["sink"]["arity_mismatch"]["class_from"] == "model"
+
+
+# --------------------------------------------------------------------------
+# W06-05: an argument register a phi fills on each incoming path
+# --------------------------------------------------------------------------
+
+def _phi_fed_call(*, undefined_arm=False):
+    """armv7 `itet hi; adds r2, r1, r3; mov r2, r7; ...; blx memcpy`: the
+    register the call reads is an LLIL-SSA phi of one definition per path."""
+    from test_taint_modeled_body_coverage import _FAKE_BN, _LBlock, _lins, _llil_func
+    a, b = FSSA(FVar("len_a", ident=60), 1), FSSA(FVar("len_b", ident=61), 1)
+    then = _lins(0, CALL - 12, "LLIL_SET_REG_SSA_OP", reg="r2", mlil_writes=[a])
+    other = _lins(1, CALL - 8, "LLIL_SET_REG_SSA_OP", reg="r2", mlil_writes=[b])
+    srcs = [types.SimpleNamespace(reg="r2", version=1), types.SimpleNamespace(reg="r2", version=2)]
+    defs = {1: then, 2: None if undefined_arm else other}
+    phi = _lins(2, CALL - 4, "LLIL_REG_PHI_OP", reg="r2")
+    phi.src = srcs
+    phi.function = types.SimpleNamespace(get_ssa_reg_definition=lambda s: defs[s.version])
+    call = _lins(3, CALL, "LLIL_CALL_SSA_OP")
+    _LBlock([then]), _LBlock([other]), _LBlock([phi, call])
+    return te.argument_register_provenance(
+        _llil_func([[then], [other], [phi, call]]), CALL, "r2", _FAKE_BN), (a, b)
+
+
+def test_a_register_filled_on_each_path_bridges_every_definition():
+    (kind, seeds), (a, b) = _phi_fed_call()
+    assert kind == "defined"
+    assert [var for var, _ in seeds] == [a, b]
+
+
+def test_a_phi_arm_with_no_definition_bridges_nothing():
+    # One path leaves the entry value: the argument is not only what the
+    # definitions wrote, so no subset is claimed.
+    (kind, seeds), _ = _phi_fed_call(undefined_arm=True)
+    assert (kind, seeds) == ("defined", [])
+
+
+def test_an_ifunc_routed_argument_with_several_definitions_is_routed():
+    # The second arm of a conditional length carries the taint: the routed
+    # argument is either value, so the sink is reached as the call's own
+    # argument -- it was refused, leaving the copy unreached.
+    p = _reg_var("p", "r0", 40)
+    stub_at = 0x112bc
+    stub = FFunc("memcpy", stub_at, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")
+    stub.type = _resolver_type()
+    call = FInstr(0, CALL, "MLIL_CALL_SSA", "memcpy(0x5000)", reads=[], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(stub_at), constant=stub_at),
+                  params=[FExpr("MLIL_CONST_PTR", "0x5000", constant=0x5000)])
+    call.il_basic_block = [call]
+    caller = FFunc("caller", CALLER, FSSAFunc([call]), params=[p])
+    caller.calling_convention = _cc()
+    bv = FBV({stub_at: "memcpy"}, funcs={stub_at: stub})
+    bv.arch = _arch()
+    bv.platform = types.SimpleNamespace(default_calling_convention=_cc())
+    engine = te.TaintEngine(bv, te.load_models())
+    untainted = FSSA(_reg_var("r2_1", "r2", 91), 1)
+    regs = {1: [(FSSA(_reg_var("r1_1", "r1", 90), 1), "r1")],
+            2: [(untainted, "r2"), (FSSA(p, 0), "r2")]}
+    engine._abi_arg_operands = lambda f, i, idx, **k: [
+        te._RegisterOperand(v, r) for v, r in regs.get(idx, [])]
+    result = engine.forward(caller, [te.parse_locator("param:0")])
+    [flow] = result["reached_sinks"]
+    assert (flow["sink"]["callee"], flow["sink"]["tainted_arg_index"]) == ("memcpy", 2)
+    assert flow["sink"].get("via") != "abi_register"
+    assert any("IFUNC resolver" in a for a in result["assumptions"])

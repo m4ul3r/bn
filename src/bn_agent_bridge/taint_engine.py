@@ -105,12 +105,16 @@ class _RegisterOperand:
 
     operation = _Op
 
-    def __init__(self, var: Any, register: str | None) -> None:
+    def __init__(self, var: Any, register: str | None, *, also: tuple = ()) -> None:
         self.src = var
-        self.vars_read = [var]
+        # A register a phi fills on each incoming path carries one of several
+        # values: the argument is tainted when any of them is.
+        self.vars_read = [var, *also]
         self.register = register
 
     def __str__(self) -> str:
+        if len(self.vars_read) > 1:
+            return f"phi({', '.join(map(str, self.vars_read))}) (via {self.register or '?'})"
         return f"{self.src} (via {self.register or '?'})"
 
 
@@ -1114,9 +1118,11 @@ class TaintEngine:
 
         The stub's own prototype describes a different function, so it says
         nothing about this call's arity; the import's model does, by name
-        (P2-02). Each missing index up to that arity must be ONE definition
-        reaching its register -- anything less proves nothing and the call
-        keeps BN's arguments (and the `abi_register` reach-only path).
+        (P2-02). Each missing index up to that arity must be proven by the
+        definition(s) reaching its register -- several when the register is
+        filled on each incoming path (armv7 conditional execution), which
+        route as one argument carrying any of them; nothing proven leaves the
+        call BN's arguments (and the `abi_register` reach-only path).
         ``routed`` lists the ``(index, register)`` pairs read that way."""
         if target is None or not name:
             return params, []
@@ -1131,10 +1137,12 @@ class TaintEngine:
         routed: list[tuple[int, str]] = []
         for i in range(len(params), max(want) + 1):
             ops = self._abi_arg_operands(func, ins, i)
-            if len(ops) != 1:
+            if not ops:
                 return params, []
-            routed_params.append(ops[0])
-            routed.append((i, str(ops[0].register)))
+            first = ops[0]
+            routed_params.append(first if len(ops) == 1 else _RegisterOperand(
+                first.src, first.register, also=tuple(o.src for o in ops[1:])))
+            routed.append((i, str(first.register)))
         return routed_params, routed
 
     def _arg_register(self, func: Any, idx: int) -> str | None:
