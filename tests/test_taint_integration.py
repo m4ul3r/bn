@@ -7560,3 +7560,48 @@ def test_a_fill_return_copied_back_out_of_its_own_buffer_is_not_an_overread(
     assert sink["class"] == "bounded_len", sink
     assert sink["src_fill"]["callee"] == "recv", sink
     assert int(sink["src_fill"]["at"], 16) < int(sink["address"], 16), sink
+
+
+_ARGV_COPY_SOURCE = """
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    char name[32];
+    if (argc > 1) {
+        memcpy(name, argv[1], (size_t)argc);
+        puts(name);
+    }
+    return 0;
+}
+"""
+
+
+@pytest.mark.parametrize("pie", [False, True], ids=["no-pie", "pie"])
+def test_backward_into_main_classifies_the_runtime_entry_handoff(tmp_path, shared_bn, pie):
+    """W07-05: a backward slice from a sink in `main` whose length is the
+    argument count ascends into main's references. The ELF entry stub's
+    handoff of `main` to the imported C-runtime start routine is a `crt_entry`
+    row -- still withholding completeness -- not an `indirect_reference`, and
+    it adds no "slice backward from the dispatching caller" xrefs advice."""
+    src = tmp_path / "argv_copy.c"
+    src.write_text(_ARGV_COPY_SOURCE)
+    binary = tmp_path / ("argv_copy_pie" if pie else "argv_copy")
+    _compile(src, binary, ["-fno-builtin", *(["-fPIE", "-pie"] if pie else [])])
+    target = shared_bn.load(binary, copy=False)
+
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "main",
+                      "--sink", "arg:memcpy:2")
+    assert [(o["kind"], o.get("index")) for sl in result["slices"]
+            for o in sl["origins"]] == [("parameter", 0)], result["slices"]
+    callers = [lf for lf in result["leaves"] if lf["kind"] == "caller_sites_truncated"]
+    rows = [row for lf in callers for row in lf["unfollowed"]]
+    assert rows, result["leaves"]
+    assert {row["reason"] for row in rows} == {"crt_entry"}, rows
+    assert {row["caller"] for row in rows} == {"_start"}, rows
+    assert [lf["reasons"] for lf in callers] == [{"crt_entry": len(rows)}]
+    # Still not a complete slice: what the runtime passes is not proven.
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+    # No xrefs/callsites command for a caller the binary does not contain.
+    commands = [shlex.split(c) for c in re.findall(r"`(bn [^`]+)`",
+                                                    result["diagnostics"]["next_action"])]
+    assert not [c for c in commands if "xrefs" in c or "callsites" in c], commands

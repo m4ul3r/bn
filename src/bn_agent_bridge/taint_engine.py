@@ -4569,6 +4569,13 @@ class TaintEngine:
                     and const_target(getattr(ins, "dest", None)) is None]
         addrs = ", ".join(hex(int(getattr(i, "address", 0))) for i in indirect[:4])
         more = "" if len(indirect) <= 4 else f", +{len(indirect) - 4} more"
+        # `--resolve-map` takes a JSON FILE (V4-04): the hint prints the
+        # document for the listed sites, the same shape as a leaf's
+        # `resolve_map_template`, with only the targets left to fill in.
+        pin = ("--resolve-map FILE, FILE holding "
+               + json.dumps({hex(int(getattr(i, "address", 0))): ["TARGET"]
+                             for i in indirect[:4]})
+               + " (a TARGET is an address or a function name)")
         own = int(getattr(func, "start", 0))
         callers = [c for c in self._caller_refs(
             [s for fn in self._callee_functions(callee)
@@ -4599,8 +4606,7 @@ class TaintEngine:
                 message += (
                     f". {func.name} also has {len(indirect)} indirect call(s) (e.g. "
                     f"{addrs}{more}) that did not resolve to {callee}; only if one of "
-                    f"them dispatches to it, pin it with --resolve-map "
-                    f"<call_addr>=<target_addr>")
+                    f"them dispatches to it, pin it with {pin}")
             return TaintError(message)
         if indirect:
             return TaintError(
@@ -4608,7 +4614,7 @@ class TaintEngine:
                 f"{len(indirect)} indirect call(s) (e.g. {addrs}{more}) that neither "
                 f"value-set nor a --resolve-map pin resolved to {callee} -- if {callee} "
                 f"is dispatched indirectly (vtable/fn-ptr), pin the call to its target "
-                f"with --resolve-map <call_addr>=<target_addr> and seed "
+                f"with {pin} and seed "
                 f"{flag} arg:<target>:<n>. The {seed_kind} callee must name the pinned "
                 f"target: pin to {callee} itself to keep its model, or to the in-binary "
                 f"wrapper that calls {callee} and seed arg:<wrapper>:<n>")
@@ -14425,7 +14431,7 @@ class TaintEngine:
         That run seeds one value and stops: `tainted_values 1`, `last_use
         null`, and the gate used to read the empty result as an all-clear.
         The usual cause is a prototype that does not match the body -- BN
-        recovered `remove_connection_headers(struct orderedmap h @ 0x8)` as a
+        recovered `strip_headers(struct header_map h @ 0x8)` as a
         stack-slot parameter while the code reads the register -- so the
         locator names a value the function never sees."""
         kind = loc.get("kind")
@@ -17115,11 +17121,15 @@ class TaintEngine:
         were skipped with at most a caveat, so a slice that dropped them
         certified itself complete (IC01). Every such (site, formal) is now a
         row of ONE ``caller_sites_truncated`` frontier, with its reason. A
-        caller's literal is not a skip: it is the origin, reached. Process-entry
-        and startup references are ordinary ``indirect_reference`` boundaries
-        too: names, imports, operand roles and optional entry metadata prove
-        neither caller-supplied origins nor completeness. No entry/runtime
-        classifier is consulted, and every known unresolved reference is kept.
+        caller's literal is not a skip: it is the origin, reached. The process
+        entry stub handing the function to an IMPORTED C-runtime start routine
+        as its main callback (`_start -> __libc_start_main(main, ..)`) is a row
+        too, with its own reason ``crt_entry`` (:meth:`_crt_entry_reference`):
+        no caller in this binary exists to slice from, but what the runtime
+        passes is still not proven, so it blocks like every other row. Every
+        other address-taking reference -- a custom entry's dispatcher, an
+        in-binary or static start routine, any other operand or use -- stays
+        ``indirect_reference``, and every known unresolved reference is kept.
         Returns ``(slices, cycled)``: at least one slice per formal -- a
         formal no caller resolved keeps its own parameter slice -- except the
         ``cycled`` formals, every resolved caller of which was a back edge to
@@ -17285,8 +17295,10 @@ class TaintEngine:
                 _drop(int(getattr(site, "address", 0)), getattr(site, "function", None), pidx,
                       "max_depth" if not ascend else "caller_cap")
         for a, rf in sorted(indirect.items()):
+            reason = ("crt_entry" if self._crt_entry_reference(rf, start)
+                      else "indirect_reference")
             for pidx in demands:
-                _drop(a, rf, pidx, "indirect_reference")
+                _drop(a, rf, pidx, reason)
         self._bw_note_unfollowed_callers(
             func, direct=direct, indirect=set(indirect), formals=set(demands),
             rows=rows, misses=misses)
@@ -17296,6 +17308,87 @@ class TaintEngine:
     def _caller_key(func: Any) -> tuple[int, str]:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+
+    # C-runtime start routines whose FIRST operand is the program's main
+    # callback (`__libc_start_main(main, argc, argv, ..)`).
+    _CRT_START_ROUTINES = frozenset({"__libc_start_main", "__uClibc_main"})
+    # Symbol types naming code outside this binary: a GOT slot, a PLT stub BN
+    # bound to an import, an extern. A LibraryFunctionSymbol is a
+    # signature-matched body IN the binary, so it is not one.
+    _EXTERNAL_SYMBOL_TYPES = frozenset({
+        "ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol"})
+
+    def _crt_entry_reference(self, referrer: Any, target: int) -> bool:
+        """Whether *referrer*'s reference to *target* is the C runtime entry
+        stub's handoff of the program's main (W07-05): *referrer* is the
+        view's entry function (by address), every use of *target*'s address
+        in its IL is operand 0 of a call to an imported C-runtime start
+        routine, and there is at least one. A static or in-binary routine of
+        that name, another operand, a second use (a store, a dispatcher, an
+        offset) or unreadable entry metadata is not proven and returns False:
+        the reference stays an ``indirect_reference``. The answer only names
+        the row's reason; it never removes the row."""
+        if referrer is None or self.bv is None:
+            return False
+        try:
+            entry = getattr(self.bv, "entry_function", None)
+            if entry is None or int(entry.start) != int(referrer.start):
+                return False
+            instrs = self._instrs(self._ssa_func(entry))
+        except Exception:
+            return False
+
+        def is_target(expr: Any) -> bool:
+            if "CONST" not in op_name(expr) and "EXTERN_PTR" not in op_name(expr):
+                return False
+            c = getattr(expr, "constant", None)
+            # An ARM/Thumb code pointer carries the mode in its low bit.
+            return isinstance(c, int) and (c == target or (c & 1 and c & ~1 == target))
+
+        def uses(expr: Any, depth: int = 0) -> int:
+            if expr is None or depth > 32:
+                return 0
+            if isinstance(expr, (list, tuple)):
+                return sum(uses(e, depth + 1) for e in expr)
+            if not hasattr(expr, "operation"):
+                return 0
+            kids = getattr(expr, "operands", None) or [
+                getattr(expr, k, None) for k in ("dest", "src", "params", "left", "right")]
+            return int(is_target(expr)) + sum(uses(e, depth + 1) for e in kids)
+
+        def external(addr: int) -> bool:
+            fn = function_at(self.bv, addr)
+            sym = getattr(fn, "symbol", None) if fn is not None else None
+            if sym is None:
+                sym = self.bv.get_symbol_at(addr)
+            stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
+            return stype in self._EXTERNAL_SYMBOL_TYPES
+
+        def starts_runtime(call: Any) -> bool:
+            dest = getattr(call, "dest", None)
+            if op_name(dest) == "MLIL_IMPORT":
+                slot, imported = getattr(dest, "constant", None), True
+            else:
+                slot = const_target(dest)
+                imported = slot is not None and (
+                    "EXTERN_PTR" in op_name(dest) or external(slot))
+            name = str(self._callee_name(slot) or "").split("@")[0] if imported else ""
+            return name in self._CRT_START_ROUTINES
+
+        handed = 0
+        try:
+            for ins in instrs:
+                n = uses(ins)
+                if not n:
+                    continue
+                params = self._call_params(ins) if self._is_call(ins) else []
+                if n == 1 and params and is_target(params[0]) and starts_runtime(ins):
+                    handed += 1
+                    continue
+                return False
+        except Exception:
+            return False
+        return handed > 0
 
     def _bw_note_unfollowed_callers(
         self, func: Any, *, direct: set[int], indirect: set[int], formals: set[int],
