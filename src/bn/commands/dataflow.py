@@ -29,7 +29,7 @@ from ..formatters import (
     _resolution_note,
 )
 from ..read_taint_models import model_catalog
-from ..taint_models import TaintError
+from ..taint_models import TaintError, model_file_map, user_models_source
 from ..transport import BridgeError
 
 
@@ -91,6 +91,12 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
     params["user_models"] = decode_json_input(
         read_text_input(resolved, what=f"{source} file"),
         refusal=f"could not read {source} {path}")
+    # P2-09: a document that is not an object (`[]` and `null` included) is
+    # refused here, by the bridge's own shape rule, before anything is sent.
+    try:
+        model_file_map(params["user_models"], source=user_models_source(source, str(resolved)))
+    except TaintError as exc:
+        raise BridgeError(str(exc)) from exc
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
