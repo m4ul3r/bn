@@ -297,6 +297,56 @@ def test_an_entry_value_that_is_not_a_register_keeps_its_entry_origin():
     assert not [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
 
 
+_FRAME_REGS = ["r0", "r1", "r2", "r3", "r11", "sp", "lr"]
+
+
+def _entry_value_slice(reg):
+    """`loop: x = phi(<reg>#0, x#1)`; `malloc(x)` in a function whose
+    convention passes arguments in r0-r3 -- the shape of a loop phi BN builds
+    over a register a `push {..., r11, lr}` prologue saved."""
+    idx = {r: i for i, r in enumerate(_FRAME_REGS)}
+    v = FVar(reg, ident=90)
+    v.source_type, v.storage = 1, idx[reg]
+    entry = FSSA(v, 0)
+    merged, again = FSSA(FVar("x", ident=91), 2), FSSA(FVar("x", ident=91), 1)
+    phi = FInstr(0, CALLER, "MLIL_VAR_PHI", f"x#2 = phi({reg}#0, x#1)", reads=[entry, again],
+                 writes=[merged])
+    phi.dest, phi.src = merged, [entry, again]
+    malloc = 0x9000
+    func = FFunc("decode", CALLER, FSSAFunc([
+        phi,
+        FInstr(1, CALL, "MLIL_CALL_SSA", "malloc(x#2)", reads=[merged], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(malloc), constant=malloc),
+               params=[FExpr("MLIL_VAR_SSA", "x#2", reads=[merged], src=merged)]),
+    ]), params=[_reg_var("src", "r0", 92)])
+    func.calling_convention = types.SimpleNamespace(int_arg_regs=["r0", "r1", "r2", "r3"])
+    func.type = "void* decode(char* src)"
+    bv = FBV({malloc: "malloc"})
+    bv.arch = types.SimpleNamespace(
+        get_reg_index=lambda r: idx[r], get_reg_name=lambda i: _FRAME_REGS[i],
+        regs={r: types.SimpleNamespace(full_width_reg=r) for r in _FRAME_REGS})
+    return te.TaintEngine(bv, te.load_models()).backward(
+        func, [te.parse_locator("arg:malloc:0")])
+
+
+@pytest.mark.parametrize("reg", ["lr", "sp", "r11"])
+def test_a_frame_or_return_register_entry_value_is_no_unbound_argument(reg):
+    # The link register, the stack pointer and the frame pointer carry the
+    # return address and the frame, never an argument the prototype failed
+    # to map: an `entry` origin, no `abi_mapping_unbound` frontier.
+    result = _entry_value_slice(reg)
+    assert not [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
+    assert "entry" in {o["kind"] for sl in result["slices"] for o in sl["origins"]}
+
+
+def test_an_unmapped_argument_register_entry_value_stays_a_frontier():
+    # Control on the same shape: r2 is an argument register no formal binds.
+    result = _entry_value_slice("r2")
+    [leaf] = [lf for lf in result["leaves"] if lf["kind"] == "abi_mapping_unbound"]
+    assert leaf["register"] == "r2"
+    assert result["diagnostics"]["safe_to_report_complete_slice"] is False
+
+
 # --------------------------------------------------------------------------
 # P2-02(c): a PLT stub typed with its IFUNC resolver's prototype
 # --------------------------------------------------------------------------

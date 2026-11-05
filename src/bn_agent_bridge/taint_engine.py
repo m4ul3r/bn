@@ -15606,12 +15606,20 @@ class TaintEngine:
         if msg not in self._bw_assumptions:
             self._bw_assumptions.append(msg)
 
-    def _unbound_entry_register(self, v: Any) -> str | None:
-        """The register whose ENTRY value SSA variable *v* is, when *v* is a
-        register variable (the caller has not already proven it a formal or
-        a formal's spill), else None. BN names one `entry_r2`: the value the
-        function was entered with, in a register its prototype binds no
-        parameter to."""
+    def _unbound_entry_register(self, func: Any, v: Any) -> str | None:
+        """The ARGUMENT register whose entry value SSA variable *v* is, when
+        *v* is a register variable (the caller has not already proven it a
+        formal or a formal's spill), else None. BN names one `entry_r2`: the
+        value the function was entered with, in a register its prototype binds
+        no parameter to.
+
+        Only a register the calling convention passes arguments in can carry
+        a caller's value the prototype failed to map. The entry value of any
+        other register -- the link register, the stack and frame pointers, a
+        callee-saved register a `push {..., lr}` prologue saves and a loop
+        phi merges -- is the frame or the return address, an `entry` origin
+        like any other callee-saved state. A convention bn cannot read keeps
+        the register a frontier: never complete is the safe side."""
         var = getattr(v, "var", None)
         if var is None or getattr(v, "version", None) != 0:
             return None
@@ -15619,9 +15627,32 @@ class TaintEngine:
             if int(var.source_type) != _REGISTER_SOURCE:
                 return None
             arch = self.bv.arch
-            return str(arch.get_reg_name(var.storage))
+            reg = str(arch.get_reg_name(var.storage))
         except Exception:
             return None
+        carriers = self._argument_registers(func)
+        if carriers is not None and _full_width_reg(self.bv.arch, reg) not in carriers:
+            return None
+        return reg
+
+    def _argument_registers(self, func: Any) -> frozenset[str] | None:
+        """Full-width names of every register *func*'s calling convention
+        passes an integer or floating-point argument in, or None when no
+        convention is recoverable."""
+        cc = getattr(func, "calling_convention", None)
+        if cc is None:
+            plat = getattr(self.bv, "platform", None)
+            cc = getattr(plat, "default_calling_convention", None)
+        if cc is None:
+            return None
+        try:
+            regs = list(getattr(cc, "int_arg_regs", []) or []) + \
+                list(getattr(cc, "float_arg_regs", []) or [])
+        except Exception:
+            return None
+        if not regs:
+            return None
+        return frozenset(_full_width_reg(self.bv.arch, str(r)) for r in regs)
 
     def _abi_unbound_leaf(self, func: Any, reg: str, label: str, at: str,
                           il_text: str) -> dict[str, Any]:
@@ -16419,7 +16450,7 @@ class TaintEngine:
                                                  d, mv, f"parameter {pidx}",
                                                  before="this function ran")
                 else:
-                    reg = self._unbound_entry_register(v)
+                    reg = self._unbound_entry_register(func, v)
                     if reg is not None:
                         # A register's entry value with no formal bound to it
                         # is the caller's value in a location the prototype
