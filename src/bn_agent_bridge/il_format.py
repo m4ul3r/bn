@@ -209,6 +209,52 @@ def _iter_llil_instructions(func) -> list[Any]:
     return instructions
 
 
+_LLIL_CALL_OPS = frozenset({"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"})
+
+
+def inline_expansion_intrinsics(func, address: int) -> list[Any]:
+    """The ``LLIL_INTRINSIC`` instructions BN lifted at *address* when that
+    instruction is a string operation it expands inline: x86 ``rep movs`` /
+    ``rep stos`` lift to ``__memcpy_u64`` / ``__memfill_u64`` (count in
+    ``rcx``), and MLIL renders each as a synthesised ``__builtin_memcpy`` /
+    ``__builtin_memset`` call -- two of them at one address, one per value of
+    the direction flag. Empty for a real call, an instruction with no
+    intrinsic, or a function with no LLIL to read."""
+    get = getattr(func, "get_llils_at", None)
+    if not callable(get):
+        return []
+    try:
+        llils = list(get(int(address)) or [])
+    except Exception:
+        return []
+    if any(_il_op_name(item) in _LLIL_CALL_OPS for item in llils):
+        return []
+    return [item for item in llils if _il_op_name(item) == "LLIL_INTRINSIC"]
+
+
+def intrinsic_name(intrinsics: list[Any]) -> str | None:
+    """The intrinsic's name (``__memcpy_u64``) shared by *intrinsics*, or None."""
+    for item in intrinsics:
+        name = getattr(getattr(item, "intrinsic", None), "name", None)
+        if name:
+            return str(name)
+    return None
+
+
+def intrinsic_operand_register(intrinsics: list[Any], index: int) -> str | None:
+    """The register operand *index* of an inline expansion reads (``rcx`` for
+    a ``rep movs`` count): the first lifted variant whose operand there is a
+    bare register -- the other variant may offset it (``rdi - (rcx << 3)``)."""
+    for item in intrinsics:
+        params = list(getattr(item, "params", None) or [])
+        if 0 <= index < len(params) and _il_op_name(params[index]) == "LLIL_REG":
+            reg = getattr(params[index], "src", None)
+            name = getattr(reg, "name", None) or (str(reg) if reg is not None else None)
+            if name:
+                return str(name)
+    return None
+
+
 def _hlil_candidates_for_llil(insn) -> list[Any]:
     candidates = []
     seen: set[tuple[str, int]] = set()

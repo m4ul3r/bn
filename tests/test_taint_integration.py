@@ -8016,3 +8016,36 @@ def test_trace_reports_observed_truncation_and_quick_view_state(tmp_path, shared
     assert (partial["analysis_state"], partial["partial"]) == ("quick", True)
     # The raw binary was opened, not the database beside it.
     assert Path(quick).suffix != ".bndb", quick
+
+
+def _inline_expansion_target(tmp_path, shared_bn) -> str:
+    """`taint_corpus/inline_expansion.c` at -O2: two constant-size `rep stos`/
+    `rep movs` expansions and one whose length byte comes from the packet."""
+    binary = tmp_path / "inline_expansion"
+    _compile(CORPUS / "inline_expansion.c", binary, ["-O2"])
+    return shared_bn.load(binary, copy=False)
+
+
+def test_an_alignment_split_inline_expansion_is_bounded_not_overflow(tmp_path, shared_bn):
+    """V8-03: `memset(r, 0, sizeof *r)` and `memcpy(d, s, sizeof *d)` inlined
+    as `rep stos`/`rep movs` were `overflow_len` sinks under a tainted pointer
+    -- their count is the constant total split by the pointer's alignment. A
+    length byte read from the packet, expanded the same way, still overflows."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+
+    def sinks(fn):
+        result = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                          "--source", "param:0")
+        return [s["sink"] for s in result["reached_sinks"]]
+
+    for fn, callee, intrinsic in (("record_reset", "__builtin_memset", "__memfill_u64"),
+                                  ("record_copy", "__builtin_memcpy", "__memcpy_u64")):
+        [sink] = sinks(fn)
+        assert (sink["callee"], sink["class"], sink["catalog_class"]) == (
+            callee, "bounded_len", "overflow_len"), (fn, sink)
+        assert sink["intrinsic_expansion"]["intrinsic"] == intrinsic
+        assert int(sink["intrinsic_expansion"]["length_bound"], 16) <= 0x140, sink
+
+    [label] = sinks("copy_label")
+    assert (label["callee"], label["class"]) == ("__builtin_memcpy", "overflow_len"), label
+    assert "intrinsic_expansion" not in label

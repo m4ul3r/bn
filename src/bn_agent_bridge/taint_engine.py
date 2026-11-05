@@ -83,6 +83,8 @@ from .il_format import (
     _display_name,
     _format_specs,
     _variadic_determination,
+    inline_expansion_intrinsics,
+    intrinsic_name,
     unbounded_scanf_strings,
 )
 from .taint_models import _model_copy_roles
@@ -6792,6 +6794,127 @@ class TaintEngine:
         except Exception:
             return None
         return None
+
+    def _inline_expansion_length(self, ssaf: Any, addr: int, length: Any) -> dict[str, Any] | None:
+        """``{"intrinsic", "length_bound"}`` when the call at *addr* is an inline
+        string expansion (:func:`il_format.inline_expansion_intrinsics`) whose
+        *length* operand is a constant total split by pointer alignment
+        (:meth:`_expansion_length_bound`); else None. A real call is never one,
+        whatever it is named."""
+        intrinsics = inline_expansion_intrinsics(getattr(ssaf, "source_function", None), addr)
+        if not intrinsics:
+            return None
+        bound = self._expansion_length_bound(ssaf, length)
+        if bound is None:
+            return None
+        return {"intrinsic": intrinsic_name(intrinsics), "length_bound": hex(bound)}
+
+    # An alignment clears at most this many low bits: `p & ~0xfff` aligns a
+    # pointer to a page, a wider mask is not an alignment the expansion emits.
+    _ALIGN_MASK_BITS = 12
+
+    def _expansion_length_bound(self, ssaf: Any, expr: Any) -> int | None:
+        """The largest count an inline string expansion's length operand can
+        take when it is built ONLY from constants and pointer-alignment
+        residues; None when any other value contributes.
+
+        gcc expands a constant-size ``memset``/``memcpy`` into a head store, a
+        tail store and a ``rep stos``/``rep movs`` over the aligned middle, whose
+        count is the constant total corrected by how far the destination sits
+        from its alignment: ``(p - ((p + 8) & ~7) + TOTAL) >> 3``. The pointer
+        cancels, so the count is the constant, whatever the pointer holds --
+        taint on the POINTER says nothing about it. The same expansion of a
+        variable size adds the size (``n + (p - align(p + 8)) >> 3``), and
+        that operand stays unbounded here, so a tainted total still reports.
+        Recognised from the arithmetic itself: an aligned value minus the
+        pointer it was aligned from, a low-bit mask (``n & 7``), shifts and
+        constant offsets."""
+        val = self._residue_interval(ssaf, expr, 0)
+        if val is None:
+            return None
+        base, lo, hi = val
+        return hi if base is None and lo >= 0 else None
+
+    def _residue_interval(self, ssaf: Any, expr: Any, depth: int) -> tuple[Any, int, int] | None:
+        """``(base, lo, hi)``: *expr* is ``base + k`` with ``lo <= k <= hi``,
+        *base* an opaque value's identity (None for a pure constant). None when
+        *expr* is not built from one base, constants, alignment masks and
+        shifts (see :meth:`_expansion_length_bound`)."""
+        if expr is None or depth > 24:
+            return None
+        op = op_name(expr)
+        if "CONST" in op:
+            c = getattr(expr, "constant", None)
+            return (None, int(c), int(c)) if isinstance(c, int) else None
+        if op in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
+            return self._residue_interval(ssaf, getattr(expr, "src", None), depth + 1)
+        if op in ("MLIL_VAR_SSA", "MLIL_VAR_SSA_FIELD"):
+            if op == "MLIL_VAR_SSA_FIELD" and int(getattr(expr, "offset", 0) or 0) != 0:
+                return None
+            return self._residue_of_var(ssaf, getattr(expr, "src", None), depth + 1)
+        left, right = getattr(expr, "left", None), getattr(expr, "right", None)
+        if op == "MLIL_AND":
+            width = 8 * int(getattr(expr, "size", 0) or 8)
+            for mask_side, other in ((right, left), (left, right)):
+                m = getattr(mask_side, "constant", None) if "CONST" in op_name(mask_side) else None
+                if not isinstance(m, int):
+                    continue
+                # BN hands an alignment mask over signed (`& -8` for `& ~7`).
+                m &= (1 << width) - 1
+                limit = 1 << self._ALIGN_MASK_BITS
+                if 0 < m < limit and m & (m + 1) == 0:
+                    return (None, 0, m)  # a low-bit residue: `n & 7`, `-p & 7`
+                low = ~m & ((1 << width) - 1)
+                if 0 < low < limit and low & (low + 1) == 0:
+                    val = self._residue_interval(ssaf, other, depth + 1)
+                    # aligning down moves the value back by at most `low`
+                    return None if val is None else (val[0], val[1] - low, val[2])
+            return None
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            a = self._residue_interval(ssaf, left, depth + 1)
+            b = self._residue_interval(ssaf, right, depth + 1)
+            if a is None or b is None:
+                return None
+            if op == "MLIL_ADD":
+                if a[0] is not None and b[0] is not None:
+                    return None
+                return (a[0] if a[0] is not None else b[0], a[1] + b[1], a[2] + b[2])
+            if a[0] == b[0]:
+                base = None
+            elif b[0] is None:
+                base = a[0]
+            else:
+                return None
+            return (base, a[1] - b[2], a[2] - b[1])
+        if op in ("MLIL_LSR", "MLIL_ASR", "MLIL_LSL"):
+            k = getattr(right, "constant", None) if "CONST" in op_name(right) else None
+            val = self._residue_interval(ssaf, left, depth + 1)
+            if not isinstance(k, int) or val is None or val[0] is not None or val[1] < 0:
+                return None
+            if op == "MLIL_LSL":
+                return (None, val[1] << k, val[2] << k)
+            return (None, val[1] >> k, val[2] >> k)
+        return None
+
+    def _residue_of_var(self, ssaf: Any, var: Any, depth: int) -> tuple[Any, int, int] | None:
+        """:meth:`_residue_interval` of an SSA variable: its definition when
+        that is arithmetic the interval follows, every arm of a phi, else the
+        variable itself as an opaque base (a parameter, a load, a call result)."""
+        if not is_ssa_var(var):
+            return None
+        defn = self._ssa_def(ssaf, var)
+        dop = op_name(defn) if defn is not None else ""
+        if dop == "MLIL_VAR_PHI":
+            arms = [self._residue_of_var(ssaf, v, depth + 1)
+                    for v in (getattr(defn, "src", None) or [])]
+            if not arms or any(a is None for a in arms) or len({a[0] for a in arms}) != 1:
+                return None
+            return (arms[0][0], min(a[1] for a in arms), max(a[2] for a in arms))
+        if dop == "MLIL_SET_VAR_SSA":
+            val = self._residue_interval(ssaf, getattr(defn, "src", None), depth + 1)
+            if val is not None:
+                return val
+        return ((var_key(var), getattr(var, "version", None)), 0, 0)
 
     def _residual_chunk_length(self, ssaf: Any, params: list[Any], length_idx: int,
                                dest_idx: int) -> tuple[str, str] | None:
@@ -13943,7 +14066,29 @@ class TaintEngine:
                             # #443: for a recv-style bounded-write sink the
                             # destination is `buf_arg` (not memcpy's arg0), so the
                             # provably-bounded downgrade checks the right buffer.
-                            if argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
+                            # V8-03: an inline string expansion (`rep stos`/
+                            # `rep movs` BN synthesises a `__builtin_*` call
+                            # from) whose count is a constant total split by
+                            # pointer alignment cannot be steered by taint on
+                            # the pointer: bounded, and nothing below may
+                            # re-headline it.
+                            _expansion = (self._inline_expansion_length(ssaf, addr, params[argidx])
+                                          if classify and sink.get("class") == "overflow_len"
+                                          else None)
+                            if _expansion is not None:
+                                _bnd_reason = None
+                                eff_sink = {
+                                    **sink,
+                                    "class": "bounded_len",
+                                    "intrinsic_expansion": _expansion,
+                                    "detail": (sink.get("detail") or "")
+                                    + f" (inline {_expansion['intrinsic']} expansion: the length "
+                                    f"is at most {_expansion['length_bound']}, a constant total "
+                                    "split by pointer alignment -- taint on the pointer does "
+                                    "not reach it)",
+                                    "relabel": "inline expansion of a constant-size copy/fill",
+                                }
+                            elif argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
                                 # Armed by len_arg but NO buf_arg declared: do NOT
                                 # guess arg0 as the destination -- arg0 may be a
                                 # sibling buffer sized to the length while the real
@@ -13994,7 +14139,7 @@ class TaintEngine:
                                 # the length is not provably within.
                                 eff_sink = self._source_side_verdict(
                                     ssaf, params, argidx, mkey, model, eff_sink)
-                            elif classify and sink.get("class") == "overflow_len":
+                            elif classify and eff_sink.get("class") == "overflow_len":
                                 # Length is the return of a modeled receive
                                 # call bounded by a constant count arg
                                 # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
@@ -16393,6 +16538,10 @@ class TaintEngine:
                 # W01-10: the copy length is the return of the modeled fill of
                 # this same source (so no overread_len).
                 **({"src_fill": sink["src_fill"]} if sink.get("src_fill") else {}),
+                # V8-03: the inline string expansion whose alignment-split
+                # constant total bounds the length.
+                **({"intrinsic_expansion": sink["intrinsic_expansion"]}
+                   if sink.get("intrinsic_expansion") else {}),
                 # W10-04: the length's last arithmetic is narrower than the
                 # parameter (widths in bytes).
                 **({"width_narrowing": sink["width_narrowing"]} if sink.get("width_narrowing") else {}),
