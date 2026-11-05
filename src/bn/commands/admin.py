@@ -100,8 +100,8 @@ def _capabilities(args: argparse.Namespace) -> int:
         for spec in sorted(cli._COMMANDS, key=lambda spec: spec["path"])
     ]
     result = {"kind": "capabilities", "items": items, "count": len(items)}
-    cli._emit_result(args, result, text_renderer=_render_capabilities_text, stem="capabilities")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_capabilities_text, stem="capabilities")
 
 
 def _render_help_index_text(value: Any) -> str:
@@ -150,13 +150,13 @@ def _help_index(args: argparse.Namespace) -> int:
         "count": len(items),
         "capabilities_command": "bn capabilities --format json",
     }
-    cli._emit_result(
+    return cli._emit_result(
         args,
         result,
+        exit_code=0,
         text_renderer=_render_help_index_text,
         stem="help",
     )
-    return 0
 
 
 def _same_dir(left: str, right: str | Path) -> bool:
@@ -323,7 +323,6 @@ def _doctor(args: argparse.Namespace) -> int:
             cli.skills_source_dir() / "bn-kernel",
         ),
     }
-    cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
     # #620(c): a doctor report that never fails exit code hides unreachable
     # instances from scripted/CI callers who only check the exit status.
     # Deliberately reachable-only (not staleness): stale_plugin_version /
@@ -335,7 +334,8 @@ def _doctor(args: argparse.Namespace) -> int:
     # instances registered is not a probe failure either: any([]) is False, so
     # doctor still exits 0 when nothing is running (#620 C.3).
     unhealthy = any(not inst["reachable"] for inst in instances)
-    return 1 if unhealthy else 0
+    return cli._emit_result(args, result, exit_code=1 if unhealthy else 0,
+                            text_renderer=_render_doctor_text, stem="doctor")
 
 
 @command("plugin", "install", help="Install the GUI plugin", fmt="text",
@@ -369,10 +369,10 @@ def _plugin_install(args: argparse.Namespace) -> int:
     }
     if up_to_date:
         result["note"] = f"already installed: {state[1]}"
-    cli._emit_result(
-        args, result, text_renderer=_render_plugin_install_text, stem="plugin-install"
+    return cli._emit_result(
+        args, result, exit_code=0, text_renderer=_render_plugin_install_text,
+        stem="plugin-install"
     )
-    return 0
 
 
 # Bytecode an install never writes, but that importing the installed plugin or
@@ -943,8 +943,8 @@ def _skill_install(args: argparse.Namespace) -> int:
             ).rendered)
         print(_render_skill_install_text(result), file=sys.stderr, end="")
         return 2
-    cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
-    return 1 if not_updated_destinations else 0
+    return cli._emit_result(args, result, exit_code=1 if not_updated_destinations else 0,
+                            text_renderer=_render_skill_install_text, stem="skill-install")
 
 
 def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
@@ -1154,8 +1154,8 @@ def _session_start(args: argparse.Namespace) -> int:
                 "timed out waiting for teardown; no clean stop was confirmed"
             )
 
-    cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
-    return 1 if failures or association_error else 0
+    return cli._emit_result(args, result, exit_code=1 if failures or association_error else 0,
+                            text_renderer=_render_session_start_text, stem="session-start")
 
 
 def _positive_seconds(text: str) -> float:
@@ -1222,15 +1222,13 @@ def _session_status(args: argparse.Namespace) -> int:
     if wait and "waited" not in result:
         result["waited"] = {"seconds": round(time.monotonic() - started, 1),
                             "timed_out": False}
-    cli._emit_result(
+    return cli._emit_result(
         args,
         result,
+        exit_code=1 if wait and result.get("succeeded") is not True else 0,
         text_renderer=_render_session_status_text,
         stem="session-status",
     )
-    if wait:
-        return 0 if result.get("succeeded") is True else 1
-    return 0
 
 
 @command(
@@ -1370,8 +1368,9 @@ def _session_stop(args: argparse.Namespace) -> int:
                         f"(pid {inst.pid}) to fully tear down; "
                         f"registry/socket may be stale.{detail}"
                     )
-                    cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
-                    return 1
+                    return cli._emit_result(args, result, exit_code=1,
+                                            text_renderer=_render_session_stop_text,
+                                            stem="session-stop")
                 result["method"] = "sigkill"
 
         # Attached here, not with the `stopped: true` default above: the
@@ -1380,8 +1379,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         # stop did not complete (#925 review).
         if discarded:
             result["discarded_unsaved"] = discarded
-        cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
-        return 0
+        return cli._emit_result(args, result, exit_code=0,
+                                text_renderer=_render_session_stop_text, stem="session-stop")
     finally:
         if signaller is not None:
             signaller.close()
@@ -1562,8 +1561,10 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["reload_capture_error"] = reload_capture_error
     if discarded:
         result["discarded_unsaved"] = discarded
-    cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
-    return 1 if failures or association_error or reload_capture_failed else 0
+    return cli._emit_result(
+        args, result,
+        exit_code=1 if failures or association_error or reload_capture_failed else 0,
+        text_renderer=_render_session_start_text, stem="session-restart")
 
 
 def _require_headless_lifecycle(inst: Any) -> None:
@@ -1972,8 +1973,8 @@ def _session_list(args: argparse.Namespace) -> int:
     # only, so a registry-sourced count would report "0 unsaved" for a bridge
     # holding unsaved renames -- the one wrong answer this field prevents.
     _probe_unsaved_targets(result)
-    cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="session-list")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_session_list_text, stem="session-list")
 
 
 @command("instance", "list", help="List running bridge instances (alias for `session list`)",
@@ -1996,8 +1997,8 @@ def _instance_list(args: argparse.Namespace) -> int:
                            if entry.get("sticky") or root in entry.get("project_roots", ())]
         result["project_root"] = root
         result["total_rss_mb"] = round(sum(entry["rss_mb"] or 0 for entry in result["items"]), 1)
-    cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_session_list_text, stem="instance-list")
 
 
 def _binary_query_matches(binary: str, query: str) -> bool:
@@ -2041,8 +2042,8 @@ def _instance_find(args: argparse.Namespace) -> int:
                     "binary": binary,
                 })
     result: Any = {"kind": "instance_matches", "query": query, "items": items, "count": len(items)}
-    cli._emit_result(args, result, text_renderer=_render_instance_find_text, stem="instance-find")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_instance_find_text, stem="instance-find")
 
 
 @command("instance", "use", help="Pin a bridge instance for subsequent calls", fmt="text",
@@ -2076,16 +2077,16 @@ def _instance_use(args: argparse.Namespace) -> int:
     if prev_target and prev_instance is not None and prev_instance != resolved:
         cli.session_state.update(target=None)
         result["cleared_target_pin"] = prev_target
-    cli._emit_result(args, result, text_renderer=_render_instance_use_text, stem="instance-use")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_instance_use_text, stem="instance-use")
 
 
 @command("instance", "clear", help="Clear the pinned bridge instance", fmt="text")
 def _instance_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(instance_id=None)
     result: Any = {"instance_id": None, "set": False}
-    cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="instance-clear")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_pin_clear_text, stem="instance-clear")
 
 
 @command("instance", "gc",
@@ -2095,8 +2096,8 @@ def _instance_gc(args: argparse.Namespace) -> int:
     # (the lazy liveness sweep keeps .log breadcrumbs forever) without touching
     # any live instance or the shared spawn lock (#80).
     result: Any = cli.gc_instances()
-    cli._emit_result(args, result, text_renderer=_render_instance_gc_text, stem="instance-gc")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_instance_gc_text, stem="instance-gc")
 
 
 @command("target", "list", help="List open BinaryView targets")
@@ -2118,8 +2119,8 @@ def _target_list(args: argparse.Namespace) -> int:
     # #996: name the bridge that answered -- a lone instance is used from any cwd.
     if isinstance(response, dict) and isinstance(response.get("instance"), str):
         envelope["instance"] = response["instance"]
-    cli._emit_result(args, envelope, text_renderer=_render_target_list_text, stem="targets")
-    return 0
+    return cli._emit_result(args, envelope, exit_code=0,
+                            text_renderer=_render_target_list_text, stem="targets")
 
 
 def _target_matches(item: dict[str, Any], selector: str) -> bool:
@@ -2163,13 +2164,13 @@ def _target_use(args: argparse.Namespace) -> int:
         )
     cli.session_state.update(target=args.selector)
     result: Any = {"target": args.selector, "set": True}
-    cli._emit_result(args, result, text_renderer=_render_target_use_text, stem="target-use")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_target_use_text, stem="target-use")
 
 
 @command("target", "clear", help="Clear the pinned target", fmt="text")
 def _target_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(target=None)
     result: Any = {"target": None, "set": False}
-    cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="target-clear")
-    return 0
+    return cli._emit_result(args, result, exit_code=0,
+                            text_renderer=_render_pin_clear_text, stem="target-clear")

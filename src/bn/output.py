@@ -535,21 +535,37 @@ def resolve_spill_limit() -> int | None:
 # simply gets no `rerun` key -- there is no command to name a flag for.
 
 
-def _outcome_fields(value: Any) -> dict[str, Any]:
-    """``ok`` (and a refusal's ``error``) of the payload an envelope stands for.
+def outcome_fields(value: Any) -> dict[str, Any]:
+    """``ok`` (and a refusal's ``error``) of a BRIDGE payload an envelope stands for.
 
     An envelope's ``ok`` is the OPERATION's outcome, never the file write's:
     delivery is ``written``. A failed mutation written through ``--out`` used to
     print ``ok: true`` on stdout over an artifact whose body said ``ok: false``
     (W07), so an agent reading only stdout closed its loop on a rolled-back
-    batch. A payload that states no ``ok`` is a read that succeeded; one that
-    states anything but ``true`` is not ok (a malformed ``ok`` must not read as
-    success). A not-ok payload's string ``error`` -- the refusal shape
-    :func:`render_error` emits -- rides along so stdout says why."""
+    batch. A bridge payload that states no ``ok`` is a read that succeeded; one
+    that states anything but ``true`` is not ok (a malformed ``ok`` must not
+    read as success). A not-ok payload's string ``error`` -- the refusal shape
+    :func:`render_error` emits -- rides along so stdout says why. A result the
+    CLI assembled itself states its outcome by exit code instead
+    (:func:`exit_outcome`)."""
     if not isinstance(value, dict) or "ok" not in value:
         return {"ok": True}
     fields: dict[str, Any] = {"ok": value["ok"] is True}
     if not fields["ok"] and isinstance(value.get("error"), str):
+        fields["error"] = value["error"]
+    return fields
+
+
+def exit_outcome(value: Any, exit_code: int) -> dict[str, Any]:
+    """The outcome of a command the CLI ran itself, as its exit code states it.
+
+    Local commands (`session stop`, `doctor`, `skill install`, ...) report a
+    failure as a result with no ``ok`` key and exit 1; read off the payload,
+    that absence was success, so an ``--out`` envelope said ``ok: true`` over a
+    teardown that failed (D4-01). ``ok`` is exit 0, and a failed result's
+    string ``error`` rides along as in :func:`outcome_fields`."""
+    fields: dict[str, Any] = {"ok": exit_code == 0}
+    if exit_code != 0 and isinstance(value, dict) and isinstance(value.get("error"), str):
         fields["error"] = value["error"]
     return fields
 
@@ -701,18 +717,20 @@ def write_output_result(
     spill_token_limit: int | None = None,
     provenance: dict[str, Any] | None = None,
     rerun_hint: str | None = None,
-    structured: Any = None,
+    outcome: dict[str, Any] | None = None,
 ) -> OutputWriteResult:
-    """*structured* is the payload *value* was rendered from, when it is a text
-    rendering: the envelope's ``ok`` is that payload's outcome
-    (:func:`_outcome_fields`), which rendered text no longer carries."""
+    """*outcome* is the operation outcome the envelope states (:func:`outcome_fields`
+    of the payload a text rendering came from, or :func:`exit_outcome` of a
+    local command); without it, *value* itself is read with
+    :func:`outcome_fields`."""
     # #409: resolve the spill threshold from BN_SPILL_TOKENS when not explicitly set.
     if spill_token_limit is None:
         spill_token_limit = resolve_spill_limit()
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
     token_count = estimate_tokens(encoded)
-    outcome = _outcome_fields(value if structured is None else structured)
+    if outcome is None:
+        outcome = outcome_fields(value)
 
     if out_path is not None:
         try:
@@ -856,7 +874,7 @@ def estimate_output_result(
     *,
     fmt: str,
     rerun_hint: str | None = None,
-    structured: Any = None,
+    outcome: dict[str, Any] | None = None,
 ) -> OutputWriteResult:
     """Preflight an output's size WITHOUT emitting or writing it (#796).
 
@@ -876,13 +894,13 @@ def estimate_output_result(
     parser-derived slicing hint the spill envelope names, and
     ``spill_token_limit`` is stated only when ``BN_SPILL_TOKENS`` is armed, which
     is what makes "this read would have spilled" a comparison the caller can do
-    rather than a claim this module makes. *structured* is as for
+    rather than a claim this module makes. *outcome* is as for
     :func:`write_output_result`."""
     return _estimate_envelope(
         render_value(value, fmt).encode("utf-8"),
         fmt=fmt, payload_format=fmt, summary=_summary(value),
         rerun_hint=rerun_hint,
-        outcome=_outcome_fields(value if structured is None else structured))
+        outcome=outcome_fields(value) if outcome is None else outcome)
 
 
 def estimate_bytes_result(
@@ -922,7 +940,7 @@ def _estimate_envelope(
 ) -> OutputWriteResult:
     """The one estimate envelope, built once for both payload kinds so the two
     preflights cannot state the same measurement in two different shapes.
-    *outcome* is the measured payload's ``ok`` (:func:`_outcome_fields`); an
+    *outcome* is the operation outcome the estimate stands for; an
     estimate writes nothing, so ``written`` is false."""
     token_count = estimate_tokens(encoded)
     payload: dict[str, Any] = {

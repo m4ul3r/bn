@@ -27,8 +27,8 @@ from .formatters import (
     _render_mutation_text,
     command_routing,
 )
-from .output import (estimate_output_result, render_envelope, render_error, render_value,
-                     write_output_result)
+from .output import (estimate_output_result, exit_outcome, outcome_fields, render_envelope,
+                     render_error, render_value, write_output_result)
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -896,7 +896,7 @@ def _render_result(
     provenance: dict[str, Any] | None = None,
     slice_hint: str | None = None,
     estimate_only: bool = False,
-    structured: Any = None,
+    outcome: dict[str, Any] | None = None,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
@@ -911,12 +911,12 @@ def _render_result(
     envelope is a payload like any other -- a caller asking what it costs gets
     its size, not a re-render of a file it may not have.
 
-    *structured* is the payload a text-rendered *value* came from: an envelope's
-    ``ok`` states that payload's outcome, which the rendered text cannot."""
+    *outcome* is the operation outcome an envelope states (see
+    :func:`write_output_result`): the rendered text no longer carries it."""
     if estimate_only:
         result = _apply_result_transform(
             lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint,
-                                                   structured=structured),
+                                                   outcome=outcome),
             value, f"estimate the {stem} output size as {fmt}")
         sys.stdout.write(result.rendered)
         return False
@@ -944,7 +944,7 @@ def _render_result(
     result = _apply_result_transform(
         lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
                                            stem=stem, provenance=provenance,
-                                           rerun_hint=slice_hint, structured=structured),
+                                           rerun_hint=slice_hint, outcome=outcome),
         value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
@@ -1131,10 +1131,12 @@ def _emit_result(
     args: argparse.Namespace,
     result: Any,
     *,
+    exit_code: int,
     text_renderer: Callable[[Any], str] | None = None,
     stem: str,
-) -> None:
-    """Render a locally-built result for handlers that can't go through :func:`_call`.
+) -> int:
+    """Render a locally-built result for handlers that can't go through :func:`_call`;
+    return *exit_code*.
 
     The admin commands (doctor, session/instance/target management) orchestrate
     several bridge requests, so they assemble the result themselves instead of
@@ -1144,6 +1146,10 @@ def _emit_result(
     bridge response becomes a clean :class:`BridgeError` pointing at ``--format
     json``, never a raw traceback), then writes via :func:`_render_result`. With no
     *text_renderer* the value renders as-is in every format.
+
+    *exit_code* is the command's outcome: an ``--out``/spill/estimate envelope
+    states ``ok`` as exit 0 (:func:`exit_outcome`), so the envelope and the exit
+    status can never disagree (D4-01). Handlers ``return`` this call.
     """
     text_renderer = _guarded_transform(
         text_renderer, f"render the {stem} result as text",
@@ -1162,8 +1168,9 @@ def _emit_result(
         # envelope falls back to the stem guesses while their stderr note uses the
         # derived one, and one run offers two different remedies (dogfood pass 4).
         slice_hint=_slice_hint_for_args(args, fmt),
-        structured=result,
+        outcome=exit_outcome(result, exit_code),
     )
+    return exit_code
 
 
 # Regex metacharacters that make a literal substring query likely to be a
@@ -2601,7 +2608,7 @@ def _call(
             shown = text_renderer(result)
     spilled = _render_result(
         shown,
-        structured=result,
+        outcome=outcome_fields(result),
         fmt=fmt,
         out_path=None if bridge_writes_output else args.out,
         stem=stem,

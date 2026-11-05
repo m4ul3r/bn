@@ -236,7 +236,7 @@ def test_an_admin_path_envelope_carries_the_derived_hint(monkeypatch, capsys, tm
     value = {"kind": "instances",
              "items": [{"instance_id": f"i{n}", "pid": n} for n in range(400)]}
 
-    bn.cli._emit_result(args, value, stem="instances")
+    assert bn.cli._emit_result(args, value, exit_code=0, stem="instances") == 0
 
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["spilled"] is True

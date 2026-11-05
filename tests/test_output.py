@@ -1185,11 +1185,11 @@ def test_out_envelope_reads_a_malformed_ok_as_not_ok(tmp_path):
 def test_text_out_envelope_takes_the_outcome_from_the_structured_payload(tmp_path):
     """Text mode writes the RENDERED card, which has no `ok`; the envelope states
     the outcome of the payload the card was rendered from."""
-    from bn.output import write_output_result
+    from bn.output import outcome_fields, write_output_result
 
     out = write_output_result("rolled back: apply failed\n", fmt="text",
                               out_path=tmp_path / "card.txt", stem="card",
-                              structured=_REFUSAL).rendered
+                              outcome=outcome_fields(_REFUSAL)).rendered
     fields = _parse_envelope(out)
     assert (fields["ok"], fields["written"], fields["error"]) == (
         "false", "true", _REFUSAL["error"])
