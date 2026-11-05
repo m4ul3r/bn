@@ -1983,31 +1983,47 @@ def _confidence(obj) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _prototype_provenance(func) -> dict[str, Any]:
+def _prototype_provenance(ctx, bv, func) -> dict[str, Any]:
     """Who owns the prototype and how sure BN is of it.
 
-    ``type_source`` is BN's per-function flag: ``user`` when ``has_user_type``
-    is set -- by ``proto set`` or another analyst write, and equally by BN's
-    DWARF/PDB import, which applies debug-info prototypes as user types --
-    else ``auto`` (inferred by analysis, or applied from a platform type
-    library). BN records no finer origin, so none is claimed. It covers the
-    return type too: BN keeps one such flag per function.
+    ``has_user_type`` is BN's per-function flag as BN reports it. It is not
+    an origin: BN sets it for an analyst's prototype, for a DWARF/PDB import,
+    and -- after a save and reopen -- for nearly every function of the
+    database (measured: 957/959 on one corpus database, see
+    ``read_call_evidence``). So ``type_source`` claims only what can be
+    proven: ``user`` when THIS bridge set and verified the prototype in this
+    session (an in-process record, gone after a restart or reopen), ``auto``
+    when the flag is clear (analysis or a platform type library), else
+    ``unknown``; None when the flag cannot be read. One flag per function,
+    covering the return type too.
 
     Confidences are BN's own 0-255 scale (255 is its maximum). The
-    prototype's is the LOWEST of its return type's, parameter list's and
-    calling convention's, so an inferred part is never hidden behind a
-    confident one; the return type's is reported on its own because an
-    inferred return width is the common disagreement with debug info."""
+    prototype's is the LOWEST of its return type's, parameter list's, each
+    parameter type's and the calling convention's, so an inferred part is
+    never hidden behind a confident one; the return type's is reported on its
+    own because an inferred return width is the common disagreement with
+    debug info."""
     has_user = getattr(func, "has_user_type", None)
     return_type = getattr(func, "return_type", None)
     if return_type is None:
         return_type = getattr(getattr(func, "type", None), "return_value", None)
     return_conf = _confidence(return_type)
+    parameters = getattr(getattr(func, "type", None), "parameters", None) or ()
     parts = [return_conf, _confidence(getattr(func, "parameter_vars", None)),
-             _confidence(getattr(func, "calling_convention", None))]
+             _confidence(getattr(func, "calling_convention", None)),
+             *(_confidence(getattr(param, "type", None)) for param in parameters)]
     known = [part for part in parts if part is not None]
+    if has_user is None:
+        source = None
+    elif not has_user:
+        source = "auto"
+    elif ctx.targets.session_prototype(bv, int(func.start)):
+        source = "user"
+    else:
+        source = "unknown"
     return {
-        "type_source": None if has_user is None else ("user" if has_user else "auto"),
+        "has_user_type": None if has_user is None else bool(has_user),
+        "type_source": source,
         "prototype_confidence": min(known) if known else None,
         "return_type_confidence": return_conf,
     }
@@ -2083,7 +2099,7 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
             "display_name": il_format._display_name(func),
         },
         **metadata,
-        **_prototype_provenance(func),
+        **_prototype_provenance(ctx, bv, func),
         **_address_span(func),
         "parameters": parameters,
         "locals": locals_only,
@@ -2337,7 +2353,7 @@ def _get_prototype(ctx, selector: str | None, identifier):
             "display_name": il_format._display_name(func),
         },
         **il_format._function_metadata(func),
-        **_prototype_provenance(func),
+        **_prototype_provenance(ctx, bv, func),
         **_address_span(func),
     }
     params = list(getattr(getattr(func, "type", None), "parameters", None) or [])

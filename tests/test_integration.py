@@ -2056,8 +2056,31 @@ class TestFunctionReadProvenance:
         res = shared_bn.run("proto", "set", hex(start), "int32_t probe(void)", "--target", selector)
         assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
         info = shared_bn.json("function", "info", hex(start), "--target", selector)
-        assert info["type_source"] == "user"
+        assert (info["has_user_type"], info["type_source"]) == (True, "user")
         assert info["prototype_confidence"] == info["return_type_confidence"] == 255
+
+    def test_a_reopened_database_claims_no_analyst_prototype(self, shared_bn):
+        """D4-04: `type_source` mapped BN's has_user_type to `user`, but after a
+        save and reopen BN reports that flag whatever set the prototype. Only
+        this bridge's own verified `proto set` proves `user`, and a reopened
+        view carries no such record."""
+        target = shared_bn.load(HELLO_BINARY)
+        before = shared_bn.json("function", "info", "main", "--target", target)
+        assert before["type_source"] in ("auto", "unknown"), before
+        res = shared_bn.run("proto", "set", "main", "int32_t main(int32_t argc, char** argv)",
+                            "--target", target)
+        assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+        set_here = shared_bn.json("function", "info", "main", "--target", target)
+        assert set_here["type_source"] == "user", set_here
+
+        database = shared_bn.json("save", "--target", target)["path"]
+        assert shared_bn.run("close", target).returncode == 0
+        reopened_target = shared_bn.load(database, copy=False)
+        reopened = shared_bn.json("function", "info", "main", "--target", reopened_target)
+        assert reopened["type_source"] == "unknown", reopened
+        # The flag BN reports is still there, beside the origin it cannot prove.
+        assert (before["type_source"] == "auto") is (before["has_user_type"] is False)
+        assert (set_here["has_user_type"], reopened["has_user_type"]) == (True, True)
 
     def test_function_info_counts_match_xrefs_for_a_vtable_only_method(self, shared_bn):
         # A virtual method is reached through its vtable slot: a data reference.

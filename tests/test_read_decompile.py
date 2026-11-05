@@ -4134,28 +4134,64 @@ class _ConfidentParams(list):
     pytest.param(lambda inst: inst._function_info("active", "parse_frame"), id="function_info"),
     pytest.param(lambda inst: inst._get_prototype("active", "parse_frame"), id="proto_get"),
 ])
-@pytest.mark.parametrize("user", [False, True], ids=["auto", "user"])
-def test_prototype_reads_report_source_confidence_and_address_span(monkeypatch, call, user):
-    """BN's provenance travels with the prototype: `type_source` is its
-    has_user_type flag, `prototype_confidence` the weakest of the return type,
-    parameter list and calling convention confidences, and the address span
-    is reported apart from the summed block `size`."""
+@pytest.mark.parametrize("flag, written_here, source", [
+    (False, False, "auto"),
+    # The flag alone proves no origin: BN sets it on nearly every function of
+    # a database reopened after save (D4-04).
+    (True, False, "unknown"),
+    # This bridge's own verified `set_prototype` is the proof.
+    (True, True, "user"),
+], ids=["flag-clear", "flag-set-origin-unknown", "set-by-this-bridge"])
+def test_prototype_reads_report_source_confidence_and_address_span(
+        monkeypatch, call, flag, written_here, source):
+    """BN's provenance travels with the prototype: `has_user_type` is BN's
+    flag, `type_source` only the origin that can be proven, and the address
+    span is reported apart from the summed block `size`."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, fn = _thumb_bv()
     fn.return_type = _Confident("char*", 128)
-    fn.calling_convention = _Confident("cdecl", 96 if not user else 255)
+    fn.calling_convention = _Confident("cdecl", 96)
     fn.parameter_vars = _ConfidentParams()
-    fn._has_user_type = user
+    fn._has_user_type = flag
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "_stable_view_id", lambda view: "1")
+    if written_here:
+        instance.targets.note_session_annotations(bv, [
+            {"op": "set_prototype", "status": "verified", "address": hex(fn.start)}])
+
+    result = call(instance)
+
+    assert (result["has_user_type"], result["type_source"]) == (flag, source)
+    assert result["return_type_confidence"] == 128
+    assert result["prototype_confidence"] == 96
+    assert (result["span_start"], result["span_end"], result["contiguous"]) == (
+        "0x8000", "0x8030", False)
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._function_info("active", "parse_frame"), id="function_info"),
+    pytest.param(lambda inst: inst._get_prototype("active", "parse_frame"), id="proto_get"),
+])
+def test_prototype_confidence_includes_each_parameter_types_own(monkeypatch, call):
+    # D4-03: BN keeps a parameter TYPE's confidence apart from the parameter
+    # list's; a 42-confidence parameter type hid behind three 255s.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _thumb_bv()
+    fn.return_type = _Confident("char*", 255)
+    fn.calling_convention = _Confident("cdecl", 255)
+    fn.parameter_vars = _ConfidentParams()
+    fn._type = types.SimpleNamespace(parameters=[
+        types.SimpleNamespace(name="len", type=_Confident("uint32_t", 255)),
+        types.SimpleNamespace(name="buf", type=_Confident("uint8_t*", 42)),
+    ])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = call(instance)
 
-    assert result["type_source"] == ("user" if user else "auto")
-    assert result["return_type_confidence"] == 128
-    assert result["prototype_confidence"] == (128 if user else 96)
-    assert (result["span_start"], result["span_end"], result["contiguous"]) == (
-        "0x8000", "0x8030", False)
+    assert result["return_type_confidence"] == 255
+    assert result["prototype_confidence"] == 42
 
 
 def test_address_span_is_contiguous_when_blocks_abut(monkeypatch):

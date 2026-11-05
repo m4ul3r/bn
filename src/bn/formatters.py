@@ -935,14 +935,17 @@ def _shown_name(entry: Any, *, mangled: bool = False, name_key: str = "name",
 
 
 def _prototype_provenance_line(value: dict[str, Any]) -> str:
-    """`type: auto, confidence 128 (return type 128)` -- who owns the prototype
-    and BN's confidence in it -- or '' when the read carried neither."""
+    """`type: unknown (has_user_type set), confidence 96 (return type 128)` --
+    the prototype's proven origin, BN's flag when it is set, and BN's
+    confidence -- or '' when the read carried none of them."""
     source = value.get("type_source")
     proto = value.get("prototype_confidence")
     ret = value.get("return_type_confidence")
-    if source is None and proto is None and ret is None:
+    flag = _flag_field(value, "has_user_type")
+    if source is None and proto is None and ret is None and flag is None:
         return ""
-    return (f"type: {source if source is not None else '<unknown>'}, confidence "
+    flagged = " (has_user_type set)" if flag else ""
+    return (f"type: {source if source is not None else '<unknown>'}{flagged}, confidence "
             f"{proto if proto is not None else '<unknown>'} "
             f"(return type {ret if ret is not None else '<unknown>'})")
 
