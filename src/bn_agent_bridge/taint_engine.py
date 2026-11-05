@@ -16683,11 +16683,18 @@ class TaintEngine:
         # Resolve argument locators into individual call sites BEFORE seeding:
         # one site's SSA reads must never hide another site's constant or missing
         # operand. Non-argument locators and absent calls retain their refusal path.
+        # One row per call site (V8-04, R2-04's rule for caller sites applied to
+        # sinks): BN lifts an inline `rep movs` to two calls at ONE address, one
+        # per direction-flag value, and seeding both re-emitted every slice. A
+        # site is its address; the first call in IL order stands for it.
         selections: list[tuple[dict[str, Any], Any]] = []
         for sink in sinks:
             sites = (self._find_callsites(instrs, sink["callee"], resolve_indirect=True)
                      if sink.get("kind") == "arg" else [])
-            selections.extend((sink, site) for site in sites or [None])
+            by_address: dict[int, Any] = {}
+            for site in sites:
+                by_address.setdefault(int(getattr(site, "address", 0)), site)
+            selections.extend((sink, site) for site in list(by_address.values()) or [None])
         sink_status: list[dict[str, Any]] = []
         errors: list[tuple[dict[str, Any], str]] = []
         for sink, site in selections:

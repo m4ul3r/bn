@@ -8049,3 +8049,16 @@ def test_an_alignment_split_inline_expansion_is_bounded_not_overflow(tmp_path, s
     [label] = sinks("copy_label")
     assert (label["callee"], label["class"]) == ("__builtin_memcpy", "overflow_len"), label
     assert "intrinsic_expansion" not in label
+
+
+def test_an_inline_copy_is_one_backward_sink_site(tmp_path, shared_bn):
+    """V8-04: BN lifts the `rep movs` of an inlined variable-length copy to two
+    `__builtin_memcpy` calls at one address; backward seeded both, emitting two
+    identical `sink_status` rows and every slice twice."""
+    target = _inline_expansion_target(tmp_path, shared_bn)
+    result = _bn_json(shared_bn, "-t", target, "taint", "backward", "-f", "copy_label",
+                      "--sink", "arg:__builtin_memcpy:2")
+    [row] = result["sink_status"]
+    assert row["status"] == "seeded", row
+    assert row["slices"] == len(result["slices"]) >= 1
+    assert {sl["sink"]["address"] for sl in result["slices"]} == {row["address"]}

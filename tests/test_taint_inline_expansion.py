@@ -122,3 +122,43 @@ def test_a_real_call_with_the_same_length_is_not_an_expansion(models):
     sink = _memset_sink(models, *_fill(_aligned_total, intrinsic=False), "param:0")
     assert sink["class"] == "overflow_len"
     assert "intrinsic_expansion" not in sink
+
+
+# ---------------------------------------------------------------------------
+# V8-04: one inline expansion is one backward sink site
+# ---------------------------------------------------------------------------
+
+MEMCPY = 0x3008
+
+
+def _copy(*, calls_at_site):
+    """``copy(d, s, n)``: ``len#1 = n#0 << 3`` then *calls_at_site*
+    ``__builtin_memcpy(.., .., len#1)`` calls at SITE -- two is how BN lifts
+    one `rep movs` (one call per direction-flag value)."""
+    d, s, n = FVar("d"), FVar("s"), FVar("n")
+    d0, s0, n0 = FSSA(d, 0), FSSA(s, 0), FSSA(n, 0)
+    len1 = FSSA(FVar("len"), 1)
+    shifted = _bin("MLIL_LSL", _v(n0), _const(3), "n#0 << 3")
+    instrs = [FInstr(0, 0x1020, "MLIL_SET_VAR_SSA", "len#1 = n#0 << 3", reads=[n0],
+                     writes=[len1], src=shifted)]
+    for i in range(calls_at_site):
+        instrs.append(FInstr(1 + i, SITE, "MLIL_CALL_SSA", "__builtin_memcpy(d#0, s#0, len#1)",
+                             reads=[d0, s0, len1],
+                             dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                             params=[_v(d0), _v(s0), _v(len1)]))
+    func = FFunc("copy", 0x1000, FSSAFunc(instrs), params=[d, s, n])
+    return func, FBV({MEMCPY: "__builtin_memcpy"})
+
+
+def _backward(models, func, bv):
+    return te.TaintEngine(bv, models).backward(func, [te.parse_locator("arg:__builtin_memcpy:2")])
+
+
+def test_two_calls_at_one_address_are_one_backward_sink_site(models):
+    single = _backward(models, *_copy(calls_at_site=1))
+    double = _backward(models, *_copy(calls_at_site=2))
+    assert [(r["address"], r["status"]) for r in double["sink_status"]] == [(hex(SITE), "seeded")]
+    assert double["sink_status"][0]["slices"] == single["sink_status"][0]["slices"]
+    assert len(double["slices"]) == len(single["slices"]) >= 1
+    assert [o["kind"] for sl in double["slices"] for o in sl["origins"]] == [
+        o["kind"] for sl in single["slices"] for o in sl["origins"]]
