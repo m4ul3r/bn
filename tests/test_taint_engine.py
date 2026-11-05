@@ -4188,10 +4188,9 @@ def test_backward_caller_cap_is_leaf_and_truncation(models):
     assert "caller_sites_truncated" in BLOCKING_LEAF_KINDS
     # Only the followed callers contributed slices: the dropped 4 did not.
     assert len(result["slices"]) == 16
-    # The caveat names the MEASURED ascent (this fixture resolves every site, so
-    # it equals the cap) -- never the cap constant as if it were coverage.
-    assert any("caller ascent fully followed 16, capped at 16" in a
-               for a in result["assumptions"]), result["assumptions"]
+    # The cap is truncation: stats and the leaf carry it, the assumptions do
+    # not (the leaf's counts are the MEASURED ascent, never the cap constant).
+    assert result["assumptions"] == [], result["assumptions"]
 
 
 def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(models):
@@ -4213,11 +4212,9 @@ def test_backward_caller_cap_counts_the_sites_the_ascent_actually_followed(model
     assert caps[0]["callers_dropped"] == 14
     # The 6 resolvable sites are exactly the ones that produced slices.
     assert len(result["slices"]) == 6
-    # The human-readable half must agree with the machine-readable one.
-    assert any("caller ascent fully followed 6, capped at 16" in a
-               for a in result["assumptions"]), result["assumptions"]
-    # ... and the real text frontier (what a human reads) prints the measurement
-    # the JSON carries, on an envelope that says INCOMPLETE.
+    # The human-readable half agrees with the machine-readable one: the text
+    # frontier prints the measurement the JSON carries, on an envelope that
+    # says INCOMPLETE.
     from bn.formatters import _render_taint_text
     text = _render_taint_text(result)
     assert "20 caller reference(s): 6 fully followed, 0 partially, 14 not followed; 14 dropped" in text
