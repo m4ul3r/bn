@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+
 import pytest
 
 import bn.cli
@@ -47,7 +49,7 @@ def test_call_routes_inspection_but_preserves_transport_recovery(
     ])
     with pytest.raises(error_type) as raised:
         bn.cli._call(
-            args, "trace", require_target=True, stem="trace", contextual_hints=True,
+            args, "trace", require_target=True, stem="trace",
         )
 
     assert raised.value is error
@@ -129,3 +131,96 @@ def test_unparseable_or_unclosed_hint_is_not_rewritten():
     original = list(value["hints"])
     bn.cli._contextualize_diagnostic_hints(value, target="my tgt", instance="X1")
     assert value["hints"] == original
+
+
+# ---------------------------------------------------------------------------
+# V7-02: every printed quick-view `bn refresh` carries this call's -i/-t
+# ---------------------------------------------------------------------------
+
+def _printed_refreshes(text: str) -> list[list[str]]:
+    """Every `bn ... refresh` command *text* prints, as shell words."""
+    from bn.formatters import CODE_SPAN_RE
+    commands = [shlex.split(m.group(2)) for m in CODE_SPAN_RE.finditer(text)
+                if m.group(2).startswith("bn ")]
+    return [words for words in commands if words[-1] == "refresh"]
+
+
+_ROUTED_REFRESH = ["bn", "-i", "X1", "-t", "my tgt", "refresh"]
+
+
+def _answering(monkeypatch, result=None, error=None):
+    def fake(op, **kwargs):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "my tgt"}]}
+        if error is not None:
+            raise error
+        return {"ok": True, "result": result}
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+
+
+@pytest.mark.parametrize(("argv", "result"), [
+    (["function", "list"],
+     {"analysis_state": "quick", "partial": True, "has_more": False, "total": 0, "items": []}),
+    (["decompile", "0x401100"],
+     {"analysis_state": "quick", "partial": True, "function": {"address": "0x401100",
+      "name": "copy_in"}, "text": "void copy_in(void)\n{\n}", "warnings": [],
+      "warning_rows": [], "comments": {}}),
+    (["trace", "copy_in", "0x401120", "--arg", "1"],
+     {"analysis_state": "quick", "partial": True, "function": "copy_in",
+      "function_address": "0x401100", "function_display_name": "copy_in",
+      "callee": "memcpy", "arg_index": 1, "target_address": "0x401120", "step_count": 0,
+      "trace": [], "frontiers": [], "hints": [], "assumptions": [],
+      "interprocedural": False, "ip_depth": 0}),
+], ids=["function-list", "decompile", "trace"])
+def test_a_quick_view_warning_prints_a_refresh_routed_to_this_call(monkeypatch, capsys,
+                                                                  argv, result):
+    # The shared warning printed a bare `bn refresh`, which fails with several
+    # instances or targets open; only commands that opted in were routed.
+    _answering(monkeypatch, result=result)
+    assert bn.cli.main(["-i", "X1", "-t", "my tgt", *argv]) == 0
+    assert _printed_refreshes(capsys.readouterr().out) == [_ROUTED_REFRESH]
+
+
+def test_a_quick_view_refusal_prints_a_refresh_routed_to_this_call(monkeypatch, capsys):
+    _answering(monkeypatch, error=BridgeError(
+        "Strings are not available: this target was loaded with --quick (no analysis). "
+        "Run `bn refresh` to build the full string set first."))
+    assert bn.cli.main(["-i", "X1", "-t", "my tgt", "strings"]) == 2
+    assert _printed_refreshes(capsys.readouterr().err) == [_ROUTED_REFRESH]
+
+
+def test_a_quick_load_note_routes_its_refresh_to_the_target_it_loaded():
+    # A load has no target of its own: each loaded row's note names its own.
+    value = {"loaded": [{"target": {"selector": "second copy"}, "notes": [
+        "loaded without analysis (--quick): the full function set needs `bn refresh`"]}]}
+    bn.cli._contextualize_diagnostic_hints(value, target=None, instance="X1")
+    assert _printed_refreshes(value["loaded"][0]["notes"][0]) == [
+        ["bn", "-i", "X1", "-t", "second copy", "refresh"]]
+
+
+def test_a_fanout_routes_each_rows_bridge_commands_to_that_row(monkeypatch, capsys):
+    # G3-05: a fan-out never passed a row's reply through the routing pass, so
+    # a command the bridge printed in it -- a result's note, a row's refusal
+    # -- stayed bare, though it names that one row's target. Text renders the
+    # rows stored here.
+    import json
+
+    rows = {"1:1:1": "first copy", "2:2:2": "second copy"}
+
+    def fake(op, **kwargs):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": t, "selector": s}
+                                           for t, s in rows.items()]}
+        if kwargs["target"] == "2:2:2":
+            raise BridgeError("Strings are not available: this target was loaded with "
+                              "--quick (no analysis). Run `bn refresh` first.")
+        return {"ok": True, "result": {
+            "items": [], "total": 0, "offset": 0, "limit": 100, "returned": 0,
+            "has_more": False, "note": "the string set is partial: run `bn refresh`"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    assert bn.cli.main(["-i", "X1", "strings", "--all-targets", "--format", "json"]) == 0
+    printed = {row["target"]: _printed_refreshes(
+        row["result"]["note"] if row["ok"] else row["error"])
+        for row in json.loads(capsys.readouterr().out)["instances"]}
+    assert printed == {t: [["bn", "-i", "X1", "-t", t, "refresh"]] for t in rows}

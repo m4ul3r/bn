@@ -27,10 +27,12 @@ from bn.taint_vocabulary import (
     kind_rows,
     origin_constructors,
     run_params_keys,
+    sink_fields,
 )
 
 BRIDGE = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge"
-FIELDS = ["leaf_kinds", "truncation_causes", "origin_kinds", "sink_status", "run_params"]
+FIELDS = ["leaf_kinds", "truncation_causes", "origin_kinds", "sink_status", "run_params",
+          "sink_fields"]
 
 
 def _capabilities(capsys, *extra: str) -> dict:
@@ -55,8 +57,35 @@ def test_capabilities_json_carries_the_taint_vocabulary_from_its_sources(capsys)
     text = engine.read_text(encoding="utf-8")
     appended = set(re.findall(r'sink_status\.append\(\{[^}]*?"status": "(\w+)"', text, re.S))
     assert appended and set(taint["sink_status"]) == appended
+    assert taint["sink_fields"] == sorted(sink_fields(engine))
     for field in FIELDS:
         assert taint[field], field
+
+
+def test_every_sink_field_a_forward_run_emits_is_advertised(capsys):
+    # G3-04: `return_unchecked` (V7-01) reached consumers with no entry in the
+    # vocabulary. Independent of the crawler: the sink objects real engine
+    # runs build -- a fill-sized copy, an unchecked receive return, a narrowed
+    # allocation size -- carry only advertised keys.
+    from test_taint_width_and_relabel import (
+        UNCHECKED,
+        _alloc_after,
+        _calloc_sink,
+        _memcpy_sink,
+        _recv_then_copy,
+        _recv_then_dup,
+    )
+    from test_taint_engine import te
+    advertised = set(_capabilities(capsys)["taint"]["sink_fields"])
+    models = te.load_models()
+    sinks = [
+        _memcpy_sink(models, *_recv_then_dup(count="const", length="sx", src="same")),
+        _memcpy_sink(models, *_recv_then_copy(width=8, at_copy=UNCHECKED)),
+        _calloc_sink(models, *_alloc_after("MLIL_ADD", 4)),
+    ]
+    emitted = set().union(*sinks)
+    assert {"src_fill", "return_unchecked", "width_narrowing"} <= emitted, emitted
+    assert emitted <= advertised, emitted - advertised
 
 
 _ENGINE = textwrap.dedent('''
@@ -71,6 +100,13 @@ _ENGINE = textwrap.dedent('''
             sink_status.append({"status": "brand_new_status", "seeded": False})
             origin = {"kind": NEW_ORIGIN if kind else kind}
             return {"sink_status": sink_status, "origin": origin}
+
+        def _make_finding(self, callee, sink):
+            return {"sink": {"callee": callee, **self._extra(sink),
+                             **({"brand_new_flag": True} if sink else {})}}
+
+        def _extra(self, sink):
+            return {"brand_new_field": sink} if sink else {}
 ''')
 _SLICE = textwrap.dedent('''
     def op(result):
@@ -91,13 +127,16 @@ def test_a_new_engine_literal_is_advertised_through_the_cli(tmp_path, monkeypatc
     assert taint["origin_kinds"] == ["brand_new_origin", "parameter"]
     assert taint["sink_status"] == ["brand_new_status"]
     assert taint["run_params"] == ["brand_new_echo", "brand_new_knob", "max_depth"]
+    assert taint["sink_fields"] == ["brand_new_field", "brand_new_flag", "callee"]
 
 
 @pytest.mark.parametrize(("engine", "slice_"), [
     (_ENGINE.replace('"status": "brand_new_status"', '"status": compute()'), _SLICE),
     (_ENGINE, _SLICE.replace('run_params["brand_new_echo"] = 1', "run_params.update(x=1)")),
     (_ENGINE.replace('{"max_depth": 1, "brand_new_knob": 2}', "knobs"), _SLICE),
-], ids=["unreadable_status", "run_params_method_write", "non_literal_run_params"])
+    (_ENGINE.replace("**self._extra(sink)", "**sink"), _SLICE),
+], ids=["unreadable_status", "run_params_method_write", "non_literal_run_params",
+        "unreadable_sink_spread"])
 def test_a_producer_the_crawler_cannot_read_is_refused_not_skipped(tmp_path, engine, slice_):
     with pytest.raises(VocabularyUnresolved):
         vocab.taint_vocabulary(_bridge(tmp_path, engine, slice_))

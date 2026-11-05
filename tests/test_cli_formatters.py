@@ -3018,15 +3018,16 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
     # emptiness claim over an oracle that witnessed nothing is free. The
     # WITNESSES are pinned exactly -- they are what the module actually did, so
     # a driving loop that stops reaching a live surface goes red here instead of
-    # quietly making the two checks above trivially true. Nine of the walk's 17
-    # boundary-free names are witnessed; the other eight sit on branches these
+    # quietly making the two checks above trivially true. Some of the walk's
+    # boundary-free names are witnessed (`_bn_command` and `code_span` by the
+    # quick-view warning's routed refresh, V7-02); the rest sit on branches these
     # payloads do not open, which is the stated limit of a live witness and the
     # reason the conservative static walk is kept beside it rather than
     # replaced by it.
     assert sorted(live_bare) == [
-        "_as_dict", "_field_dict", "_field_list", "_operation_row",
+        "_as_dict", "_bn_command", "_field_dict", "_field_list", "_operation_row",
         "_record_skew", "_render_fallback_text", "_render_target_choice",
-        "_skew_note", "_unknown_ref_label"], (
+        "_skew_note", "_unknown_ref_label", "code_span"], (
         "the runtime oracle no longer witnesses the same set running bare, so "
         "its emptiness claims above are over different evidence than the ones "
         f"that were checked: {sorted(live_bare)}")
