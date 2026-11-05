@@ -35,6 +35,15 @@ PROCESS_LOCAL_VIEW_ID_NOTE = (
     "bridge process that listed it, and a restarted bridge never reuses one -- "
     "pick the target again from the list above"
 )
+# D2-02: a bridge restarted from a registry that recorded no `next_view_id`
+# (an older build) cannot know which ids its predecessor handed out -- the ids
+# it lists now say nothing about ones it closed -- so it accepts no numeric
+# selector at all rather than risk naming a different target.
+NUMERIC_VIEW_IDS_OFF_NOTE = (
+    "note: this bridge accepts no numeric view_id: it was restarted from a bridge "
+    "that did not record which ids it had assigned, so a number could name a "
+    "different target -- use a listed selector or the full target_id"
+)
 # #996 review: the tail of a destructive close's refusal when its selector named
 # the target only through a `.bndb`-stripped alias. The bridge ends the message
 # with this lead plus the shell-quoted LISTED selector (which resolves to

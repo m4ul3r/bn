@@ -1582,7 +1582,11 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    instance = cli.spawn_instance(resolved_id, first_view_id=first_view_id)
+    # D2-02: with no recorded high-water mark the successor cannot number its
+    # views above every id its predecessor handed out, so it accepts no bare
+    # numeric selector at all rather than infer history from the open rows.
+    instance = cli.spawn_instance(resolved_id, first_view_id=first_view_id,
+                                  numeric_view_ids=first_view_id is not None)
     # Reload targets without associating the restart command's cwd.
     #
     # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
@@ -1652,18 +1656,24 @@ def _session_restart(args: argparse.Namespace) -> int:
 
 
 def _next_view_id(inst: Any, rows: list[dict[str, Any]]) -> int | None:
-    """The first numeric view id the restarted bridge may assign (P1-02).
+    """The first numeric view id the restarted bridge may assign (P1-02), or
+    None when the old process's high-water mark is unknown (D2-02).
 
-    Above every id the old process handed out: its registry's `next_view_id`
-    (which also covers views it closed) and, for a registry that predates
-    the field, the ids it lists now. None when neither is known."""
-    seen: list[int] = []
-    recorded = inst.meta.get("next_view_id") if isinstance(inst.meta, dict) else None
-    if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded >= 1:
-        seen.append(recorded)
-    seen.extend(int(row["view_id"]) + 1 for row in rows
-                if str(row.get("view_id", "")).isdigit())
-    return max(seen) if seen else None
+    Only the registry's own `next_view_id` can say it: that number also covers
+    the views the old process closed, which nothing it lists now can. When it
+    is recorded, the listed ids still bound it from below (a view the bridge
+    numbered after its last registry write). A registry that predates the
+    field, or one written by a bridge that itself accepted no numeric ids (its
+    own numbering started over), gives None -- the restart then refuses
+    numeric selectors instead of inferring history from the open rows."""
+    meta = inst.meta if isinstance(inst.meta, dict) else {}
+    recorded = meta.get("next_view_id")
+    if (meta.get("numeric_view_ids") is False or not isinstance(recorded, int)
+            or isinstance(recorded, bool) or recorded < 1):
+        return None
+    listed = [int(row["view_id"]) + 1 for row in rows
+              if str(row.get("view_id", "")).isdigit()]
+    return max([recorded, *listed])
 
 
 def _require_headless_lifecycle(inst: Any) -> None:
@@ -2236,7 +2246,7 @@ def _target_matches(item: dict[str, Any], selector: str) -> bool:
         return True
     if selector == str(item.get("target_id", "")):
         return True
-    if selector == str(item.get("view_id", "")):
+    if item.get("view_id_selects") is not False and selector == str(item.get("view_id", "")):
         return True
     filename = item.get("filename")
     if isinstance(filename, str):

@@ -66,6 +66,14 @@ def main(argv: list[str] | None = None) -> int:
         "before the restart never names a different target after it",
     )
     parser.add_argument(
+        "--no-numeric-view-ids",
+        dest="numeric_view_ids",
+        action="store_false",
+        help="Accept no bare numeric view id as a target selector. `bn session "
+        "restart` passes it when the previous process recorded no next view id, "
+        "so an id it handed out and closed cannot name a different target",
+    )
+    parser.add_argument(
         "--quick",
         "--no-analysis",
         dest="quick",
@@ -104,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         quick=args.quick,
         prefer_bndb=not args.no_bndb,
         first_view_id=args.first_view_id,
+        numeric_view_ids=args.numeric_view_ids,
     )
     return 0
 

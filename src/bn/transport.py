@@ -2075,6 +2075,7 @@ def spawn_instance(
     timeout: float | None = None,
     poll_interval: float = 0.2,
     first_view_id: int | None = None,
+    numeric_view_ids: bool = True,
     auto_started: bool = False,
 ) -> BridgeInstance:
     """Spawn a bridge within one lock-and-registration deadline."""
@@ -2090,6 +2091,7 @@ def spawn_instance(
             timeout=remaining if remaining is not None else timeout,
             poll_interval=poll_interval,
             first_view_id=first_view_id,
+            numeric_view_ids=numeric_view_ids,
             auto_started=auto_started,
         )
 
@@ -2220,12 +2222,15 @@ def _spawn_instance_unlocked(
     timeout: float = DEFAULT_SPAWN_TIMEOUT,
     poll_interval: float = 0.2,
     first_view_id: int | None = None,
+    numeric_view_ids: bool = True,
     auto_started: bool = False,
 ) -> BridgeInstance:
     """Spawn-and-register core. MUST run under _spawn_lock().
 
     *first_view_id* seeds the child's numeric view ids (`session restart`,
-    P1-02); *auto_started* marks a bridge no `session start` asked for, which
+    P1-02); *numeric_view_ids* False makes the child accept no bare numeric
+    view id at all (a restart whose predecessor recorded no next id, D2-02);
+    *auto_started* marks a bridge no `session start` asked for, which
     gets `AUTO_SPAWN_IDLE_TIMEOUT` unless BN_IDLE_TIMEOUT is set (P2-09)."""
     deadline = time.monotonic() + timeout
     # Collision detection MUST see unreachable records too (#694): a socket-less
@@ -2296,6 +2301,8 @@ def _spawn_instance_unlocked(
     cmd = _find_bn_agent() + [f"--instance-id={instance_id}"]
     if first_view_id is not None:
         cmd.append(f"--first-view-id={int(first_view_id)}")
+    if not numeric_view_ids:
+        cmd.append("--no-numeric-view-ids")
     child_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     if auto_started and "BN_IDLE_TIMEOUT" not in os.environ:
         child_env["BN_IDLE_TIMEOUT"] = str(AUTO_SPAWN_IDLE_TIMEOUT)

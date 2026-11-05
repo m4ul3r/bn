@@ -966,6 +966,21 @@ def test_target_use_does_not_overwrite_existing_pin_on_reject(tmp_session, monke
     assert bn.session_state.read()["target"] == "pam_qnx.so.2"   # unchanged
 
 
+@pytest.mark.parametrize("view_id_selects, rc", [(True, 0), (None, 0), (False, 2)])
+def test_target_use_pins_a_view_id_only_where_the_bridge_accepts_one(
+        tmp_session, monkeypatch, capsys, view_id_selects, rc):
+    # D2-02: a bridge restarted without its predecessor's view-id high-water
+    # mark refuses every numeric selector, so `target use 4` must not pin one
+    # there (an older bridge that sends no flag still accepts it).
+    row = {"selector": "svc.so", "filename": "/fw/svc.so", "view_id": "4"}
+    if view_id_selects is not None:
+        row["view_id_selects"] = view_id_selects
+    monkeypatch.setattr(bn.cli, "send_request", lambda *_a, **_kw: {"result": [row]})
+
+    assert bn.cli.main(["target", "use", "4"]) == rc
+    assert bn.session_state.read().get("target") == ("4" if rc == 0 else None)
+
+
 def test_target_clear_removes_state(tmp_session, capsys):
     bn.session_state.update(target="pam_qnx.so.2")
 

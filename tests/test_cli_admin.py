@@ -6251,13 +6251,19 @@ def test_skill_install_and_doctor_report_the_bn_kernel_skill_dir(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("meta, view_ids, expected", [
-    ({"next_view_id": 12}, ["3", "5"], 12),   # the registry also covers closed views
-    ({}, ["3", "5"], 6),                      # a registry from before the field
-    ({"next_view_id": 4}, ["9"], 10),         # never below a listed id
+@pytest.mark.parametrize("meta, view_ids, expected, numeric", [
+    ({"next_view_id": 12}, ["3", "5"], 12, True),   # the registry also covers closed views
+    ({"next_view_id": 4}, ["9"], 10, True),         # never below a listed id
+    # D2-02: a registry from before the field lists A=3 and B=5 but not the
+    # closed view 6; seeding from the open rows would hand 6 out again. The
+    # successor gets no seed and accepts no numeric selector instead.
+    ({}, ["3", "5"], None, False),
+    # ...and a bridge that itself refused numerics restarted its numbering, so
+    # its recorded mark says nothing about ids from before it: still refused.
+    ({"next_view_id": 4, "numeric_view_ids": False}, ["3"], None, False),
 ])
 def test_session_restart_numbers_the_new_bridge_above_every_old_view_id(
-    monkeypatch, capsys, meta, view_ids, expected
+    monkeypatch, capsys, meta, view_ids, expected, numeric
 ):
     # P1-02: the respawned process numbered its views from 1 again, so a
     # `-t <view_id>` from before the restart silently selected another target.
@@ -6286,7 +6292,7 @@ def test_session_restart_numbers_the_new_bridge_above_every_old_view_id(
 
     assert bn.cli.main(["session", "restart", "gen-1", "--format", "json"]) == 0
     assert spawned["instance_id"] == "gen-1"
-    assert spawned["first_view_id"] == expected
+    assert (spawned["first_view_id"], spawned["numeric_view_ids"]) == (expected, numeric)
 
 
 def test_session_list_reports_each_bridges_idle_timeout(monkeypatch, capsys):

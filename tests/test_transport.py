@@ -7361,3 +7361,13 @@ def test_a_restart_spawn_seeds_the_first_view_id(monkeypatch, tmp_path):
     spawn_instance("again1", first_view_id=12)
 
     assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id=again1", "--first-view-id=12"]
+
+
+def test_a_restart_without_a_high_water_mark_spawns_with_numeric_ids_off(monkeypatch, tmp_path):
+    # D2-02: no seed and no numeric selectors when the predecessor recorded
+    # no next view id.
+    popen_calls = _recording_spawn_env(monkeypatch, tmp_path, "again2")
+
+    spawn_instance("again2", numeric_view_ids=False)
+
+    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id=again2", "--no-numeric-view-ids"]

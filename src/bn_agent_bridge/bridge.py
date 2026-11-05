@@ -70,7 +70,8 @@ from .proc_identity import identity_payload, process_started_at
 from .seam import BridgeContext
 from .socket_evidence import bound_socket_listing_available, path_has_bound_socket
 from .target_hint import (
-    LISTED_SELECTOR_LEAD, PROCESS_LOCAL_VIEW_ID_NOTE, format_multi_target_hint,
+    LISTED_SELECTOR_LEAD, NUMERIC_VIEW_IDS_OFF_NOTE, PROCESS_LOCAL_VIEW_ID_NOTE,
+    format_multi_target_hint,
     instance_option, open_target_lines, target_option, target_row,
 )
 from .version import VERSION, build_id_for_file, build_id_for_package
@@ -224,7 +225,8 @@ def _is_numeric_selector(selector: Any) -> bool:
     return candidate.isascii() and candidate.isdigit()
 
 
-def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
+def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]], *,
+                                 numeric_view_ids: bool = True) -> str:
     lines = [f"Unknown target selector: {selector}"]
     if targets:
         lines.extend(open_target_lines(targets))
@@ -232,6 +234,8 @@ def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -
         lines.append("No BinaryView targets are open.")
     if _is_numeric_selector(selector):
         lines.append(PROCESS_LOCAL_VIEW_ID_NOTE)
+        if not numeric_view_ids:
+            lines.append(NUMERIC_VIEW_IDS_OFF_NOTE)
     return "\n".join(lines)
 
 
@@ -733,7 +737,7 @@ class TargetRecord:
 
 
 class TargetManager:
-    def __init__(self, first_view_id: int = 1):
+    def __init__(self, first_view_id: int = 1, *, numeric_view_ids: bool = True):
         self._lock = threading.RLock()
         self._records: dict[str, TargetRecord] = {}
         # bv -> stable view_id, keyed by the view OBJECT itself rather than
@@ -754,6 +758,12 @@ class TargetManager:
         # one generation listed is never handed to a different target by the
         # next one, where `-t <n>` would silently select it (P1-02).
         self._next_id = first_view_id
+        # False when this bridge was restarted from a predecessor that recorded
+        # no `next_view_id`: its high-water mark is unknown, and the ids it
+        # lists now say nothing about the ones it closed, so a bare number is
+        # never accepted as a selector (D2-02). `target_id` and filenames
+        # still resolve.
+        self._numeric_view_ids = numeric_view_ids
         # Stable view_ids of views with a committed-but-unsaved mutation. BN's
         # bv.file.modified does NOT flip True after our verified rename/comment/
         # retype writes, so `close` could not tell an agent it was about to
@@ -828,6 +838,7 @@ class TargetManager:
         with predecessor._lock, self._lock:
             self._ids_by_object = dict(predecessor._ids_by_object)
             self._next_id = max(self._next_id, predecessor._next_id)
+            self._numeric_view_ids = self._numeric_view_ids and predecessor._numeric_view_ids
             self._dirty_view_ids = set(predecessor._dirty_view_ids)
             self._database_paths = dict(predecessor._database_paths)
             self._database_identities = dict(predecessor._database_identities)
@@ -850,6 +861,11 @@ class TargetManager:
         """The number the next newly seen view will be given."""
         with self._lock:
             return self._next_id
+
+    def numeric_view_ids(self) -> bool:
+        """Whether a bare numeric view_id is accepted as a selector (D2-02)."""
+        with self._lock:
+            return self._numeric_view_ids
 
     def mark_dirty(self, bv) -> None:
         """Record that *bv* has a committed mutation not yet written to a .bndb."""
@@ -1169,10 +1185,11 @@ class TargetManager:
     def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
         """Every exact-string alias of *record* with its kind."""
         aliases = [
-            (record.view_id, self._STRONG),
             (record.filename, self._STRONG),
             (record.basename, self._STRONG),
         ]
+        if self._numeric_view_ids:
+            aliases.insert(0, (record.view_id, self._STRONG))
         # A .bndb corpus loads <binary>.bndb, but the obvious selector is
         # <binary>; `-t foo` resolves `foo.bndb` (#312).
         if record.basename.endswith(".bndb"):
@@ -1531,6 +1548,8 @@ class TargetManager:
                         # which does NOT flip for our verified writes and also
                         # covers analysis churn, so the two stay separate.
                         "unsaved": view_id in self._dirty_view_ids,
+                        # D2-02: whether `-t <view_id>` resolves on this bridge.
+                        "view_id_selects": self._numeric_view_ids,
                         "engine_modified": _view_engine_modified(view),
                         # #753: the database that BACKS this view's analysis when
                         # it is not the file `filename` names -- i.e. after a save
@@ -1579,7 +1598,8 @@ class TargetManager:
             # a previous process's -- so it gets the process-local note even
             # when nothing is open now (D2-04).
             if selector is not None and _is_numeric_selector(selector):
-                raise RuntimeError(_format_unknown_target_error(selector, targets))
+                raise RuntimeError(_format_unknown_target_error(
+                    selector, targets, numeric_view_ids=self._numeric_view_ids))
             raise RuntimeError("No BinaryView targets are open")
 
         if selector in (None, "", "active"):
@@ -1592,7 +1612,8 @@ class TargetManager:
             matches = self._matching_records(self._records, selector)
 
         if not matches:
-            raise RuntimeError(_format_unknown_target_error(selector, targets))
+            raise RuntimeError(_format_unknown_target_error(
+                selector, targets, numeric_view_ids=self._numeric_view_ids))
         if len(matches) > 1:
             selectors_by_view = {t["view_id"]: t["selector"] for t in targets}
             candidates = ", ".join(
@@ -2025,7 +2046,8 @@ def _function_name_summary(bv) -> dict[str, int]:
 
 
 class BinaryNinjaBridge:
-    def __init__(self, instance_id: str | None = None, first_view_id: int = 1):
+    def __init__(self, instance_id: str | None = None, first_view_id: int = 1, *,
+                 numeric_view_ids: bool = True):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
         # The PROCESS's start, not this object's: a GUI "Restart Bridge" builds
@@ -2049,7 +2071,7 @@ class BinaryNinjaBridge:
         # _load_jobs_lock -- stop() latches, then refuses queued jobs.
         self._teardown_lock = threading.Lock()
         self._stopped: bool = False
-        self.targets = TargetManager(first_view_id)
+        self.targets = TargetManager(first_view_id, numeric_view_ids=numeric_view_ids)
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
         self.registry_path = bridge_registry_path(instance_id)
@@ -2543,6 +2565,9 @@ class BinaryNinjaBridge:
         # Read after the refresh above, which numbers any view it saw first:
         # `session restart` seeds the next process with it (P1-02).
         payload["next_view_id"] = self.targets.next_view_id()
+        # D2-02: a successor that could not learn its predecessor's high-water
+        # mark refuses numeric selectors; the next restart inherits that.
+        payload["numeric_view_ids"] = self.targets.numeric_view_ids()
         payload["idle_timeout"] = self._idle_timeout
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists. Under the
@@ -7345,6 +7370,7 @@ def start_headless(
     quick: bool = False,
     prefer_bndb: bool = True,
     first_view_id: int = 1,
+    numeric_view_ids: bool = True,
 ):
     """Start the bridge in headless mode (no GUI required).
 
@@ -7355,7 +7381,9 @@ def start_headless(
     ``<binary>.bndb`` loads the sidecar instead of re-analyzing -- matching
     ``bn load``; pass ``--no-bndb`` (prefer_bndb=False) to open the raw binary.
     ``first_view_id`` is the first numeric view id this process assigns:
-    `session restart` passes its predecessor's next id (P1-02).
+    `session restart` passes its predecessor's next id (P1-02). With
+    ``numeric_view_ids`` False (a predecessor that recorded no next id) no bare
+    numeric view_id is accepted as a selector (D2-02).
     """
     global _bridge
     if _bridge is not None:
@@ -7367,7 +7395,8 @@ def start_headless(
 
     ensure_private_dir(instances_dir())
 
-    bridge = BinaryNinjaBridge(instance_id=instance_id, first_view_id=first_view_id)
+    bridge = BinaryNinjaBridge(instance_id=instance_id, first_view_id=first_view_id,
+                               numeric_view_ids=numeric_view_ids)
     bridge.start()
     _bridge = bridge
     bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")

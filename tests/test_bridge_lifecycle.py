@@ -2501,6 +2501,37 @@ def test_a_numeric_selector_with_nothing_open_still_gets_the_process_local_note(
     assert PROCESS_LOCAL_VIEW_ID_NOTE not in str(named.value)
 
 
+def test_a_successor_of_an_old_registry_accepts_no_numeric_selector(monkeypatch, tmp_path):
+    # D2-02, the reviewer's upgrade path: an older bridge numbered A=1, B=2,
+    # closed B and recorded no next_view_id. Its successor reopens A; whatever
+    # number A now gets, a stale `-t 2` must never select it -- so no bare
+    # number selects anything, while target_id and file names still do.
+    from _bridge_fakes import _FakeFileBV, _register_views
+    from bn.target_hint import NUMERIC_VIEW_IDS_OFF_NOTE, PROCESS_LOCAL_VIEW_ID_NOTE
+
+    module = _load_bridge(monkeypatch)
+    alpha = _FakeFileBV("/srv/alpha", session_id="1")
+    _register_views(module, alpha)
+    manager = module.TargetManager(numeric_view_ids=False)
+    [row] = manager.refresh()
+    assert row["view_id_selects"] is False
+    for stale in (row["view_id"], "2", " 2 "):
+        with pytest.raises(RuntimeError) as refused:
+            manager.resolve(stale)
+        lines = str(refused.value).splitlines()
+        assert lines[0].startswith("Unknown target selector:")
+        assert any("/srv/alpha" in line for line in lines)
+        assert lines[-2:] == [PROCESS_LOCAL_VIEW_ID_NOTE, NUMERIC_VIEW_IDS_OFF_NOTE]
+    assert manager.resolve(row["target_id"]) is alpha
+    assert manager.resolve("alpha") is alpha
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    successor = module.BinaryNinjaBridge(instance_id="upgraded1", numeric_view_ids=False)
+    successor._write_registry()
+    payload = json.loads(successor.registry_path.read_text(encoding="utf-8"))
+    assert payload["numeric_view_ids"] is False
+    module._headless_views.clear()
+
 
 def test_registry_publishes_the_next_view_id_and_the_idle_timeout(instance, monkeypatch):
     import sys
@@ -2513,6 +2544,7 @@ def test_registry_publishes_the_next_view_id_and_the_idle_timeout(instance, monk
     payload = json.loads(instance.registry_path.read_text(encoding="utf-8"))
     assert payload["next_view_id"] == 2
     assert payload["idle_timeout"] is None
+    assert payload["numeric_view_ids"] is True
 
     monkeypatch.setenv("BN_IDLE_TIMEOUT", "90")
     monkeypatch.setattr(instance, "_start_idle_reaper", lambda timeout: None)
