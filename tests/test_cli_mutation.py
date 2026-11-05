@@ -444,12 +444,12 @@ def test_go_rename_summary_reads_its_own_counters():
         "kind": "go_rename", "success": False, "committed": False, "preview": False,
         "rolled_back": True,
         "results": [{"op": "rename_symbol", "status": "verification_failed",
-                     "message": "Live rename readback disagreed"}],
+                     "message": "Post-state rename readback disagreed"}],
         "go_renamed_candidates": 9, "go_verified_count": 4,
         "go_failed_count": 1, "go_committed_count": 0, "skipped_user_named": 0,
     })
     assert reverted["dirty_after"] is False
-    assert reverted["first_error"] == "Live rename readback disagreed"
+    assert reverted["first_error"] == "Post-state rename readback disagreed"
 
     # Partial failure whose rollback FAILED: renames are live in the view. This is
     # the shape that must never read clean (cf. #656 on the bridge side).
@@ -457,7 +457,7 @@ def test_go_rename_summary_reads_its_own_counters():
         "kind": "go_rename", "success": False, "committed": False, "preview": False,
         "rolled_back": False, "message": "Rollback failed; the view may be partially renamed",
         "results": [{"op": "rename_symbol", "status": "verification_failed",
-                     "message": "Live rename failed"}],
+                     "message": "Rename failed"}],
         "go_renamed_candidates": 9, "go_verified_count": 4,
         "go_failed_count": 1, "go_committed_count": 0,
     })
@@ -2225,7 +2225,7 @@ def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys)
                         "address": "0x401000",
                         "new_name": "player_update",
                         "status": "verification_failed",
-                        "message": "Live rename verification failed at 0x401000",
+                        "message": "Post-state rename verification failed at 0x401000",
                         "requested": {
                             "identifier": "sub_401000",
                             "kind": "function",
@@ -4716,27 +4716,59 @@ def test_render_mutation_text_does_not_claim_rollback_when_revert_failed():
         "affected_types": [],
     }
     out = formatters._render_mutation_text(value)
-    assert "rolled back: live verification failed" not in out
-    assert "rollback failed" in out
-    assert "may be left modified" in out
+    assert out.splitlines()[0] == "rollback failed: the view may be left modified"
     # the op renders under 'failed:', not as a bare '[verified]'
     assert "failed: " in out
     assert "[verified]" not in out
 
 
-def test_render_mutation_text_still_reports_clean_rollback():
-    """A failed batch that WAS cleanly reverted still says 'rolled back'."""
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize(("status", "phase"), [
+    ("invalid_request", "apply"),
+    ("unsupported", "apply"),
+    ("internal_error", "apply"),
+    ("verification_failed", "verify"),
+])
+def test_render_mutation_text_failure_banner_names_the_failed_phase(status, phase, preview):
+    """W07: the banner of a cleanly rolled-back failure names the batch phase the
+    failed row's status comes from. It used to read 'live verification failed'
+    for every failure -- an op refused before post-state verification and a
+    preview, which verifies nothing live, included."""
+    from bn import formatters
+    value = {
+        "preview": preview,
+        "success": False,
+        "committed": False,
+        "rolled_back": True,
+        "message": "bridge message",
+        "results": [{"op": "rename_symbol", "status": "reverted", "address": "0x1000"},
+                    {"op": "rename_symbol", "status": status, "address": "0x2000"}],
+    }
+    head = "preview rolled back" if preview else "rolled back"
+    assert formatters._render_mutation_text(value).splitlines()[0] == f"{head}: {phase} failed"
+
+
+def test_render_mutation_text_rollback_failure_names_the_phase_before_it():
+    """A failure whose revert also failed says so first and keeps the phase the
+    batch failed in, instead of claiming a rollback (#117)."""
     from bn import formatters
     value = {
         "preview": False,
         "success": False,
         "committed": False,
-        "rolled_back": True,
-        "message": "Rolled back because live-session verification failed.",
-        "results": [{"op": "rename_symbol", "status": "verification_failed", "address": "0x1000"}],
+        "rolled_back": False,
+        "message": "bridge message",
+        "results": [{"op": "rename_symbol", "status": "rollback_failed", "address": "0x1000"},
+                    {"op": "rename_symbol", "status": "unsupported", "address": "0x2000"}],
     }
-    out = formatters._render_mutation_text(value)
-    assert "rolled back: live verification failed" in out
+    assert (formatters._render_mutation_text(value).splitlines()[0]
+            == "rollback failed after apply failed: the view may be left modified")
+
+
+def test_every_failed_mutation_status_has_a_phase():
+    from bn.mutation_statuses import FAILED_MUTATION_STATUSES, FAILURE_PHASES
+    assert set(FAILURE_PHASES) == FAILED_MUTATION_STATUSES
+    assert set(FAILURE_PHASES.values()) == {"apply", "verify", "rollback"}
 
 
 def test_unknown_ref_label_prefers_symbol_then_section():
@@ -5229,9 +5261,13 @@ def test_comment_list_explicit_limit_wins(fake_transport):
 
 
 @pytest.mark.parametrize("fmt", ["json", "ndjson", "text"])
-def test_failed_mutation_out_envelope_reports_file_write_success(
+def test_failed_mutation_out_envelope_states_the_outcome_and_the_write_apart(
     fake_transport, tmp_path, capsys, monkeypatch, fmt
 ):
+    """W07: the stdout envelope of a failed mutation written through `--out` says
+    `ok: false` like the artifact body does; that the file was delivered is the
+    separate `written: true`. It used to print `ok: true` (the write succeeded)
+    over a body that said `ok: false`."""
     fake_transport({"rename_symbol": {"ok": True, "result": {
         "success": False, "committed": False, "rolled_back": True, "preview": False,
         "results": [{
@@ -5249,13 +5285,60 @@ def test_failed_mutation_out_envelope_reports_file_write_success(
     ]) == 3
     captured = capsys.readouterr()
     if fmt == "text":
-        assert "ok: true" in captured.out.splitlines()
+        lines = captured.out.splitlines()
+        assert "ok: false" in lines and "written: true" in lines
         assert "[verification_failed]" in destination.read_text()
     else:
         envelope = json.loads(captured.out)
-        assert envelope["ok"] is True
+        assert envelope["ok"] is False
+        assert envelope["written"] is True
         assert envelope["spilled"] is False
-        assert "error" not in envelope
         detail = json.loads(destination.read_text())
         assert detail["ok"] is False
         assert detail["results"][0]["status"] == "verification_failed"
+
+
+@pytest.mark.parametrize("extra", [[], ["--verbose"], ["--format", "json", "--summary"],
+                                   ["--format", "json"]])
+def test_a_preview_whose_rename_does_not_land_never_claims_a_live_session(
+        monkeypatch, capsys, extra):
+    """D4-02: the banner said `preview rolled back`, but the failed row's own
+    message -- printed twice in the verbose card and copied into the compact
+    `first_error` -- still read "Live rename verification failed", for a
+    preview that never touched the live session. The verifier's message is
+    phase-neutral at its source; driven through the real bridge verifier."""
+    from _bridge_fakes import _FakeFunction, _FakeMutationBV, _load_bridge
+
+    class _StickyName(_FakeFunction):
+        """A function whose rename BN accepts and does not apply."""
+
+        @property
+        def name(self):
+            return self._name
+
+        @name.setter
+        def name(self, value):
+            if not hasattr(self, "_name"):
+                self._name = value
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _StickyName(0x401000, "parse_record")
+    bv = _FakeMutationBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, *, params=None, target=None, **kw:
+                        instance.dispatch({"op": op, "params": params, "target": target}))
+
+    rc = bn.cli.main(["rename", "--target", "fixture", hex(fn.start), "load_record",
+                      "--preview", *extra])
+
+    assert rc == 3
+    out = capsys.readouterr().out
+    assert "live" not in out.lower(), out
+    if extra == ["--format", "json", "--summary"]:
+        summary = json.loads(out)
+        assert summary["failed_count"] == 1 and summary["first_error"], summary
+    elif extra == ["--format", "json"]:
+        [row] = json.loads(out)["results"]
+        assert row["status"] == "verification_failed", row

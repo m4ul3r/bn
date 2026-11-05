@@ -10,6 +10,7 @@ import difflib
 import functools
 import itertools
 import re
+import shlex
 import time
 from typing import Any, NamedTuple
 
@@ -2905,6 +2906,28 @@ def _recover_vtables_from_typeinfo(
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
+    """The one class *name* selects, or the `ambiguous_class` refusal.
+
+    A leaf several classes share is refused like every other read that cannot
+    pick one answer (`ambiguous_instruction`): an `ok: false` envelope with
+    `status`, `error` and the candidates in `observed.matches`, so a JSON
+    consumer reads one error shape for every exit-2 read and never mistakes a
+    list of cards for the card it asked for."""
+    records = _class_cards(ctx, selector, name)
+    if len(records) == 1:
+        return records[0]
+    names = [str(rec.get("name")) for rec in records]
+    raise OperationFailure(
+        "ambiguous_class",
+        f"{name!r} names {len(records)} classes: {', '.join(names)}. Pass the full "
+        f"name of one, e.g. `bn class show -- {shlex.quote(names[0])}`.",
+        requested={"name": name},
+        observed={"matches": records},
+    )
+
+
+def _class_cards(ctx, selector: str | None, name: str) -> list[dict[str, Any]]:
+    """Every class card *name* resolves to (one, or several for a shared leaf)."""
     bv = ctx._resolve_view(selector)
     # #622 (d): the per-view registry IS reused now (see `_build_class_registry`),
     # so a repeat `class show` enumerates nothing. What stays unchanged is the
@@ -3022,6 +3045,4 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
         if disclosure:
             rec.setdefault("notes", []).append(disclosure)
         records.append(rec)
-    if len(records) == 1:
-        return records[0]
-    return {"ambiguous": True, "query": name, "matches": records}
+    return records
