@@ -9,6 +9,8 @@ import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+from bn.target_hint import active_close_headline
+from bn.transport import MULTI_TARGET_HEADLINE
 
 
 def test_target_flag_accepted_before_subcommand():
@@ -842,7 +844,8 @@ def test_close_bare_multiple_targets_requires_target(fake_transport, monkeypatch
         assert rc == 2, argv
         assert [c["op"] for c in calls] == ["list_targets"], argv
         err = capsys.readouterr().err
-        assert "requires --target when multiple targets are open" in err, argv
+        if argv == ["close"]:
+            assert err.splitlines()[0] == MULTI_TARGET_HEADLINE, argv
         assert "alpha.so" in err and "beta.so" in err, argv
 
 
@@ -863,7 +866,8 @@ def test_close_never_forwards_the_active_literal(fake_transport, monkeypatch, ca
     assert rc == 2
     assert [c["op"] for c in calls] == ["list_targets"]
     assert not any(c["target"] == "active" for c in calls)
-    assert "multiple targets are open" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "alpha.so" in err and "beta.so" in err
 
 
 def test_close_explicit_target_multiple_targets_skips_implicit_resolution(fake_transport, monkeypatch, capsys):
@@ -1467,24 +1471,30 @@ def test_close_padded_active_is_forwarded_not_collapsed(fake_transport, monkeypa
     assert "Unknown target selector" in capsys.readouterr().err
 
 
-def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypatch, capsys):
-    # #690 r3: when the user DID pass `-t active` and close refuses under
-    # multiple targets, the generic "requires --target" hint alone is
-    # misleading (they passed --target). The refusal must say the volatile
-    # `active` spelling is not honored for close.
+@pytest.mark.parametrize("argv, spelling", [
+    (["close", "-t", "active"], "`-t active`"),
+    (["target", "close", "active"], "`active`"),
+])
+def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypatch, capsys,
+                                                       argv, spelling):
+    # #690 r3 / W05: the user DID pass a selector -- `active` -- so the refusal
+    # under multiple targets must lead with why that one is not honored, not
+    # with the generic "requires --target", which told them to pass what they
+    # had passed. The listing and the escape hatches still follow.
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
     calls = fake_transport({
         "list_targets": _TWO_TARGETS,
         "close_binary": {"ok": True, "result": {"closed": []}},
     })
 
-    rc = bn.cli.main(["close", "-t", "active", "--format", "text"])
+    rc = bn.cli.main([*argv, "--format", "text"])
 
     assert rc == 2
     assert [c["op"] for c in calls] == ["list_targets"]
-    err = capsys.readouterr().err
-    assert "requires --target when multiple targets are open" in err
-    assert "active" in err and "not honored" in err
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == active_close_headline(spelling)
+    assert MULTI_TARGET_HEADLINE not in lines
+    assert any("alpha.so" in line for line in lines) and any("beta.so" in line for line in lines)
 
 
 def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):

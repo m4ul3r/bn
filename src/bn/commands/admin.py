@@ -1086,6 +1086,7 @@ def _default_skill_install_roots() -> list[Path]:
          help="Start a new headless bridge session. BN_CACHE_DIR also scopes the "
               "instance registry and sticky session: a bridge started with it set is "
               "only visible to bn commands run with the same value",
+         routes_instance=False,
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),

@@ -34,6 +34,15 @@ STABLE_ID_NOTE = "note: view_id / target_id are stable across `bn save`"
 LISTED_SELECTOR_LEAD = "close it by its listed selector instead: "
 
 
+def active_close_headline(spelling: str) -> str:
+    """The refusal headline when a close WAS given a selector -- the volatile
+    *spelling* of `active` -- that it cannot honor with several targets open.
+    The generic "requires --target" headline told a caller who had passed
+    `-t active` to pass `-t` (W05)."""
+    return (f"{spelling} follows the GUI selection, which close does not honor "
+            "while several targets are open.")
+
+
 def _escape_controls(text: str) -> str:
     """*text* on one line: backslash, newline and carriage return escaped, so a
     crafted file name cannot start a line of its own in a listing."""

@@ -1973,8 +1973,15 @@ def unwrap_result(response: Any, op: str) -> Any:
     return response["result"]
 
 
-def implicit_target_selector(response: Any) -> str:
-    """Pin the sole listed view; never substitute the volatile GUI focus."""
+MULTI_TARGET_HEADLINE = "This command requires --target when multiple targets are open."
+
+
+def implicit_target_selector(response: Any, headline: str = MULTI_TARGET_HEADLINE) -> str:
+    """Pin the sole listed view; never substitute the volatile GUI focus.
+
+    *headline* states why several open targets are a refusal: a caller whose
+    command DID carry a selector it cannot honor (`close -t active`) says
+    that, rather than that a selector is missing (W05)."""
     # Imported here because formatters itself uses BridgeError.
     from .formatters import _render_target_choices
     from .target_hint import SELECT_HINT_LINE
@@ -1990,7 +1997,7 @@ def implicit_target_selector(response: Any) -> str:
     if len(targets) > 1:
         raise MultiTargetError(
             "\n".join([
-                "This command requires --target when multiple targets are open.",
+                headline,
                 SELECT_HINT_LINE,
                 _render_target_choices(targets),
             ])
