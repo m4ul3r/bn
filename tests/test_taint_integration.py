@@ -7448,8 +7448,11 @@ def test_a_loop_count_length_is_a_recurrence_not_a_constant(tmp_path, shared_bn)
     """IC08 on `taint_corpus/bw_loop_count.c`: a length `k` that starts at 0
     and grows on loop trips the comma test picks was a `constant 0` origin
     of a complete slice; it is a `recurrence_initializer` (value 0,
-    increments 0 or +1) that withholds completeness. Two literals chosen by a
-    branch stay `constant` origins of a complete slice (control)."""
+    increments 0 or +1) that withholds completeness. So is one counted in a
+    nested loop, one updated through a call, and one a call may reset on
+    another back edge (E2c: `constant 0`, or only the call, and complete).
+    Two literals chosen by a branch stay `constant` origins of a complete
+    slice (control)."""
     binary = tmp_path / "bw_loop_count"
     _compile(CORPUS / "bw_loop_count.c", binary)
     target = shared_bn.load(binary, copy=False)
@@ -7463,6 +7466,17 @@ def test_a_loop_count_length_is_a_recurrence_not_a_constant(tmp_path, shared_bn)
     assert [(o["kind"], o.get("value"), o.get("increments")) for o in origins] == [
         ("recurrence_initializer", 0, [0, 1])], origins
     assert counted["diagnostics"]["safe_to_report_complete_slice"] is False
+
+    # A nested count, a call-defined update (named) and a resettable count
+    # each keep the recurrence beside whatever else the slice reaches.
+    for fn, others, calls in (("count_cells", set(), None),
+                              ("scale_rounds", {"call"}, ["next_round"]),
+                              ("count_or_reset", {"call"}, None)):
+        result, origins = slice_of(fn)
+        [rec] = [o for o in origins if o["kind"] == "recurrence_initializer"]
+        assert rec["value"] == 0 and rec.get("calls") == calls, (fn, rec)
+        assert {o["kind"] for o in origins} - {"recurrence_initializer"} == others, (fn, origins)
+        assert result["diagnostics"]["safe_to_report_complete_slice"] is False, fn
 
     fixed, origins = slice_of("fixed_header")
     assert origins and {o["kind"] for o in origins} == {"constant"}, origins
