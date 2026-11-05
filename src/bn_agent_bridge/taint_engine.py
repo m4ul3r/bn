@@ -5471,6 +5471,21 @@ class TaintEngine:
         srcs = [roles[0]]
         src_expr, len_expr = params[srcs[0]], params[length_idx]
         cap = self._buffer_capacity(ssaf, src_expr)
+        # W01-10: `n = recv(fd, buf, MAX, 0); memcpy(dst, buf, n)` reads back only
+        # the bytes the fill wrote into this same source -- its model bounds the
+        # return by the count it wrote -- so the length cannot over-read it,
+        # whatever the source's recovered size.
+        fill = self._fill_return_of_source(ssaf, len_expr, src_expr)
+        if fill is not None:
+            _fill_callee, _fill_at = fill
+            return {**eff_sink, "src_capacity": cap[0] if cap else None,
+                    **({"src_capacity_source": cap[1]} if cap else {}),
+                    "src_fill": {"callee": _fill_callee, "at": hex(_fill_at)},
+                    "relabel": eff_sink["relabel"] + f"; length is the return of the "
+                    f"{_fill_callee}() that filled the source",
+                    "detail": eff_sink["detail"] + f"; the length is the return value of the "
+                    f"{_fill_callee}() at {hex(_fill_at)} that filled the copy source "
+                    f"(arg{srcs[0]}), so the copy reads back only bytes that call wrote"}
         unchecked = {**eff_sink, "src_capacity": None,
                      "relabel": eff_sink["relabel"] + "; source capacity not checked",
                      "detail": eff_sink["detail"] + f"; the copy source (arg{srcs[0]}) could not "
@@ -5499,6 +5514,97 @@ class TaintEngine:
                 "detail": eff_sink["detail"] + f"; BUT the copy source (arg{srcs[0]}) is {where} "
                 "and the attacker-derived length is not provably within it -- an over-read of "
                 "the source"}
+
+    def _fill_return_of_source(self, ssaf: Any, len_expr: Any,
+                               src_expr: Any) -> tuple[str, int] | None:
+        """``(model key, call address)`` when the copy length IS the return value
+        of a modeled fill of the copy's own source pointer, else None (W01-10).
+
+        A fill model is one declaring ``return_bound`` (its return counts the
+        bytes it wrote); its buffer is the sink's ``buf_arg``, else its single
+        ``*arg:N`` source. The length may reach the return through copies and
+        width extensions only -- any arithmetic on it stops the proof. The
+        source must be the very pointer the fill was given: the same SSA value,
+        or the same object at the same offset (equal buffer key AND equal
+        capacity description, which carries the offset)."""
+        chain = self._def_chain(ssaf, len_expr)
+        var = self._as_single_ssa_var(chain[-1]) if chain else None
+        if var is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(self._canonical_ssa_var(ssaf, var))
+        except Exception:
+            d = None
+        if d is None or "CALL" not in op_name(d):
+            return None
+        callee = self._callee_name(self._resolve_direct_target(d))
+        mkey, model = lookup_model(self.models, callee)
+        if not model or not model.get("return_bound"):
+            return None
+        buf_idx = (model.get("sink") or {}).get("buf_arg")
+        if buf_idx is None:
+            tos = [_try_arg_index(str(s.get("to"))) for s in (model.get("sources") or [])
+                   if str(s.get("to", "")).startswith("*arg:")]
+            buf_idx = tos[0] if len(tos) == 1 else None
+        fparams = self._call_params(d)
+        if buf_idx is None or int(buf_idx) >= len(fparams):
+            return None
+        fill_buf = fparams[int(buf_idx)]
+        same = self._same_ssa_value(ssaf, fill_buf, src_expr)
+        if not same:
+            tf, ts = self._buffer_target(ssaf, fill_buf), self._buffer_target(ssaf, src_expr)
+            cf, cs = self._buffer_capacity(ssaf, fill_buf), self._buffer_capacity(ssaf, src_expr)
+            same = (tf is not None and ts is not None and tf[0] == ts[0]
+                    and cf is not None and cs is not None and cf[:2] == cs[:2])
+        if not same:
+            return None
+        return str(mkey or callee), int(getattr(d, "address", 0))
+
+    # The integer ops whose result wraps in their own width. A length computed
+    # by one of them in fewer bytes than the sink's parameter wraps BEFORE the
+    # widening (`calloc(1, zx.q(n32 + 1))`: n32 = 0xffffffff allocates 0).
+    _WRAPPING_ARITH_OPS = frozenset({"MLIL_ADD", "MLIL_SUB", "MLIL_MUL", "MLIL_LSL",
+                                     "MLIL_NEG", "MLIL_ADC", "MLIL_SBB"})
+
+    def _width_narrowing(self, ssaf: Any, call_ins: Any, param: Any) -> dict[str, Any] | None:
+        """W10-04: ``{computed_width, parameter_width, at}`` (widths in BYTES,
+        ``at`` the hex address of the arithmetic) when the LAST arithmetic that
+        computes the sink argument *param* is a wrapping op narrower than the
+        argument itself; None otherwise. Walks back through SSA copies and
+        ZX/SX/LOW_PART only; the first other operation ends the walk, and only a
+        wrapping op (``_WRAPPING_ARITH_OPS``) can answer. Widths are IL operand
+        sizes, so a missing size answers None rather than guessing."""
+        pwidth = getattr(param, "size", None)
+        if not isinstance(pwidth, int) or pwidth <= 0:
+            return None
+        cur, at = param, getattr(call_ins, "address", None)
+        seen: set = set()
+        for _ in range(16):
+            op = op_name(cur)
+            if op in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
+                cur = getattr(cur, "src", None)
+                continue
+            if op in self._WRAPPING_ARITH_OPS:
+                width = getattr(cur, "size", None)
+                if isinstance(width, int) and 0 < width < pwidth and at is not None:
+                    return {"computed_width": width, "parameter_width": pwidth,
+                            "at": hex(int(at))}
+                return None
+            var = self._as_single_ssa_var(cur)
+            if var is None:
+                return None
+            ident = (var_key(var), getattr(var, "version", None))
+            if ident in seen:
+                return None
+            seen.add(ident)
+            try:
+                d = ssaf.get_ssa_var_definition(var)
+            except Exception:
+                d = None
+            if d is None or op_name(d) != "MLIL_SET_VAR_SSA":
+                return None
+            cur, at = getattr(d, "src", None), getattr(d, "address", None)
+        return None
 
     def _buffer_capacity(self, ssaf: Any, expr: Any,
                          depth: int = 0) -> tuple[int | None, str, Any] | None:
@@ -11595,6 +11701,14 @@ class TaintEngine:
                             # finding are visibly the same sink.
                             if eff_sink.get("class") != sink.get("class"):
                                 eff_sink = {**eff_sink, "catalog_class": sink.get("class")}
+                            # W10-04: a length whose last arithmetic ran in a
+                            # narrower integer than this parameter can wrap
+                            # before the widening -- disclosed on the finding,
+                            # the class is untouched.
+                            if classify and eff_sink.get("class") in ("alloc_size", "overflow_len"):
+                                _narrow = self._width_narrowing(ssaf, ins, params[argidx])
+                                if _narrow is not None:
+                                    eff_sink = {**eff_sink, "width_narrowing": _narrow}
                             if arity is not None:
                                 # #1001 item 1: the model declares args BN's
                                 # prototype dropped. Say so on the finding, and
@@ -13486,6 +13600,12 @@ class TaintEngine:
                 **({"src_capacity": sink["src_capacity"]} if "src_capacity" in sink else {}),
                 **({"src_capacity_source": sink["src_capacity_source"]}
                    if sink.get("src_capacity_source") else {}),
+                # W01-10: the copy length is the return of the modeled fill of
+                # this same source (so no overread_len).
+                **({"src_fill": sink["src_fill"]} if sink.get("src_fill") else {}),
+                # W10-04: the length's last arithmetic is narrower than the
+                # parameter (widths in bytes).
+                **({"width_narrowing": sink["width_narrowing"]} if sink.get("width_narrowing") else {}),
             },
             "path": path,
         }
