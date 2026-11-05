@@ -34,6 +34,7 @@ from ._shared import (
     _format_ambiguous_symbol_error,
     _parse_address,
     _placeholder_address,
+    _refuse_negative_address,
     _symbol_type_name,
 )
 
@@ -505,6 +506,7 @@ class BridgeContext:
         # READ verbs should accept them so a sink address feeds straight into the
         # next command. It stays strict by default so a mutation can't rename or
         # retype the wrong (containing) function from a stray interior address.
+        _refuse_negative_address(identifier)
         looks_like_hex = str(identifier).strip().lower().startswith("0x")
         addr = None
         try:
@@ -1104,6 +1106,7 @@ class BridgeContext:
         an address (`note: resolved … @ 0x…`). A miss raises with the
         `Symbol not found: <name>` prefix the batch's resolver-miss check reads.
         """
+        _refuse_negative_address(value)
         try:
             return _parse_address(value), None
         except ValueError:
