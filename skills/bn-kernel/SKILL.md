@@ -64,7 +64,7 @@ A read's `timeout=` is one end-to-end budget, including pagination. Native reads
 
 ## Own only what you start
 
-A workflow that starts a headless bridge should name a unique instance, arm a positive idle timeout as a crash fallback, and stop that exact instance on every reachable exit:
+A workflow that starts a headless bridge should name a unique instance, arm a positive idle timeout as a crash fallback, and stop that exact instance on every reachable exit. The fallback never discards unsaved mutations: a bridge holding any defers its idle shutdown (`session list` shows `idle_deferred_unsaved_targets`) until they are saved or the instance is stopped with `--discard-unsaved`:
 
 ```bash
 BN_IDLE_TIMEOUT=3600 bn session start /path/to/sample.bin --instance-id analysis-1
