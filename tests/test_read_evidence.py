@@ -791,6 +791,40 @@ def test_callsites_of_an_exported_body_keep_its_recursion_through_its_own_stub(m
     assert (result["total"], result["caller_total"]) == (2, 2)
 
 
+def test_a_stub_only_caller_list_still_falls_back_to_the_call_scan(monkeypatch):
+    """G6 + #816: a symbol-only callee whose one code-ref "caller" is its own
+    import stub has no caller yet. The LLIL call scan must still run and find
+    the caller BN recorded no code ref for, instead of the stub's removal
+    leaving an empty list that reads as "not called"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    stub, symbols = _stub_and_slot(sys.modules["binaryninja"], 0x9000, 0x9300, "fetch_record")
+    caller = _FakeFunction(0x412470, "load_config")
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A5)]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x9300))]]
+    bv = _FakeBV(
+        functions=[stub, caller],
+        symbols=symbols,
+        code_refs={0x9300: [_FakeCodeRef(0x9004, stub)]},
+        instruction_lengths={0x4124A0: 5, 0x9004: 6},
+        disassembly={0x4124A0: "call qword [rel 0x9300]", 0x9004: "jmp qword [rel 0x9300]"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def unresolved(*_args, **_kwargs):
+        raise bridge.OperationFailure("ambiguous_function", "fetch_record names two functions")
+
+    monkeypatch.setattr(instance.ctx, "_find_function", unresolved)
+
+    result = instance._callsites("active", "fetch_record", within_identifiers=[],
+                                 context=0, limit=10)
+
+    assert [(row["call_addr"], row["containing_function"]["name"]) for row in result["items"]] == [
+        ("0x4124a0", "load_config")]
+    assert result["callee_symbol_only"] is True
+
+
+
 def test_callsites_discloses_a_capped_caller_scan(monkeypatch):
     """#816/#622: when the caller ENUMERATION is itself partial, every count under
     it is a lower bound. Both consumers must say so -- JSON via

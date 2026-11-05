@@ -980,11 +980,22 @@ def _callsites(
     stub_addrs = (stub_addrs | {int(getattr(s, "address", 0)) for s in symbol_targets}) \
         - {int(callee.start)}
     targets = {int(callee.start), *stub_addrs}
+
+    def _callers(found: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        # An import stub that IS one of the addresses the name answers to --
+        # the PLT entry whose one instruction jumps through the GOT slot of
+        # that name -- is the call target resolving, never a caller of it
+        # (G6). A body of the name calling itself, directly or through its
+        # stub, is a real call.
+        return [(query, func) for query, func in found
+                if not (int(getattr(func, "start", -1)) in targets
+                        and is_imported_function(func))]
+
     caller_scan_truncated, caller_scan_note = False, None
     if within_identifiers:
-        scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+        scope_functions = _callers(ctx._resolve_scope_functions(bv, within_identifiers))
     else:
-        scope_functions = _all_caller_functions(bv, targets)
+        scope_functions = _callers(_all_caller_functions(bv, targets))
         if not scope_functions and callee_symbol_only:
             # #816: BN recorded no code ref to this imported callee, so the
             # code-ref enumeration above can only answer "no callers" -- which is
@@ -992,16 +1003,9 @@ def _callsites(
             # callee (it falls back to its #622 LLIL call scan). Enumerate the same
             # way here, and carry the scan's truncation up so a partial caller list
             # can never read as "not called".
-            scope_functions, caller_scan_truncated, caller_scan_note = (
-                _scan_caller_functions(ctx, bv, targets)
-            )
-    # An import stub that IS one of the addresses the name answers to -- the
-    # PLT entry whose one instruction jumps through the GOT slot of that name
-    # -- is the call target resolving, never a caller of it (G6). A body of
-    # the name calling itself, directly or through its stub, is a real call.
-    scope_functions = [(query, func) for query, func in scope_functions
-                       if not (int(getattr(func, "start", -1)) in targets
-                               and is_imported_function(func))]
+            scanned, caller_scan_truncated, caller_scan_note = (
+                _scan_caller_functions(ctx, bv, targets))
+            scope_functions = _callers(scanned)
     # Data locations holding the callee's address do not identify indirect callers.
     # Report their count and addresses, and offer class-layout navigation only
     # where bounded ELF object evidence proves a named vtable's ownership.
