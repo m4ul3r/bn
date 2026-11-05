@@ -1755,6 +1755,74 @@ def test_global_store_frontier_and_declared_neighbour(tmp_path, shared_bn):
                     if r.get("display_name") == "log_banner"], (fn, result["leaves"])
 
 
+@pytest.mark.parametrize("opt", ["-O0", "-O2"], ids=["O0", "O2"])
+def test_forward_claims_around_globals_fields_and_gated_lengths(tmp_path, shared_bn, opt):
+    """P2-11 / P2-08 / P2-10 on `taint_corpus/fwd_global_claims.c`.
+
+    Phase-1 integration answered all-clear for `exit_case` (a source fill of
+    a global, read by a function never walked), for `alias_case` (the reader
+    copies through a pointer global initialised to the object) and for both
+    receive lengths (the gated `recv_overflow` sink), and reported a false
+    `memcpy` length flow for `field_case` (a store into one field of a
+    struct tainting the whole of it). Fixed: each claim gap is a blocking
+    frontier naming the reader or the gated call, a full clear before the
+    return is an all-clear, the global a callee fills through its pointer
+    parameter is keyed in the caller, a heap block reloaded through a global
+    is followed to its `malloc` length, and another field is clean."""
+    binary = tmp_path / f"fwd_global_claims{opt[-1]}"
+    _compile(CORPUS / "fwd_global_claims.c", binary,
+             [opt, "-fno-builtin", "-fno-inline", "-Wno-unused-result"])
+    target = shared_bn.load(binary, copy=False)
+
+    def fwd(fn, source, *extra):
+        return _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", fn,
+                        "--source", source, *extra)
+
+    def refs(result, kind):
+        return {r["display_name"] for lf in result["leaves"] if lf["kind"] == kind
+                for r in (lf.get("references") or [])}
+
+    def all_clear(result):
+        return result["diagnostics"]["safe_to_report_all_clear"]
+
+    exit_res = fwd("exit_case", "call:read")
+    assert refs(exit_res, "coarse_memory_store") == {"use_exit"}, exit_res["leaves"]
+    assert all_clear(exit_res) is False
+
+    cleared = fwd("cleared_case", "call:read")
+    assert cleared["leaves"] == [] and all_clear(cleared) is True, cleared
+
+    alias = fwd("alias_case", "call:read")
+    assert "use_alias" in refs(alias, "global_memory_continuation"), alias["leaves"]
+    assert all_clear(alias) is False
+
+    named = fwd("param_case", "param:0")
+    assert "use_name" in refs(named, "global_memory_continuation"), named["leaves"]
+    assert not [lf for lf in named["leaves"] if lf["kind"] == "coarse_memory_store"], \
+        named["leaves"]
+
+    heap = fwd("heap_case", "param:0")
+    assert [(s["sink"]["callee"], s["sink"]["class"]) for s in heap["reached_sinks"]] \
+        == [("malloc", "alloc_size")], heap["reached_sinks"]
+
+    field = fwd("field_case", "param:0")
+    assert field["reached_sinks"] == [], field["reached_sinks"]
+    assert all_clear(field) is True, field["leaves"]
+
+    for fn in ("recv_case", "recv_loop"):
+        gated = fwd(fn, "param:2")
+        assert gated["reached_sinks"] == [], (fn, gated["reached_sinks"])
+        [leaf] = [lf for lf in gated["leaves"] if lf["kind"] == "gated_sink_reached"]
+        assert (leaf["callee"], leaf["class"], leaf["gate"], leaf["tainted_args"]) \
+            == ("read", "overflow_len", "recv_overflow", [2]), leaf
+        assert all_clear(gated) is False, fn
+        armed = fwd(fn, "param:2", "--sink-class", "recv_overflow")
+        assert {s["sink"]["class"] for s in armed["reached_sinks"]} == {"overflow_len"}, \
+            (fn, armed["reached_sinks"])
+        assert not [lf for lf in armed["leaves"] if lf["kind"] == "gated_sink_reached"], fn
+
+
+
 def test_global_continuation_follows_a_thunk_to_its_consumer(tmp_path, shared_bn):
     """Round-3 review F1: a veneer is not a body, but it is not a dead end.
 
@@ -1813,7 +1881,9 @@ def test_global_continuation_write_only_reference_is_not_a_consumer(tmp_path, sh
     Two functions copy into the same global; one then calls a helper whose
     only reference to it is a store, the other a helper that hands it to
     `system`. Only the second is a continuation -- a reference is not a
-    consumer unless it can READ the bytes."""
+    consumer unless it can READ the bytes. The first still returns with the
+    copied bytes live in the global, so it ends in the P2-11.1 exit
+    `coarse_memory_store` citing `reader` -- never `write_only`."""
     src = tmp_path / "writeonlycont.c"
     src.write_text(r"""
 #include <stdlib.h>
@@ -1840,8 +1910,11 @@ int main(int argc, char **argv) {
                         "-f", fn, "--source", "param:0")
 
     quiet = forward("writer_case")
-    assert quiet["leaves"] == [], quiet["leaves"]
-    assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, quiet["diagnostics"]
+    assert _gmc(quiet) == [], quiet["leaves"]
+    [store] = _exit_stores(quiet)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "live_bytes"), store
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert quiet["diagnostics"]["safe_to_report_all_clear"] is False, quiet["diagnostics"]
 
     # the store really is the only reference in that helper
     listing = _bn_json(shared_bn, "-t", target, "disasm", "write_only")["text"]
@@ -2087,8 +2160,11 @@ def test_global_continuation_modeled_write_destinations_are_not_readers(tmp_path
 
     `memset(g, 0, 64)` and `memcpy(g, "safe", 5)` hand the global to a call,
     but their models say that argument is written and never read, so neither
-    helper is a consumer. The unrelated-global and scalar-store controls stay
-    silent too, and a helper that copies the global OUT is still a reader."""
+    helper is a consumer. The unrelated-global and scalar-store controls are
+    not continuations either, and a helper that copies the global OUT is
+    still a reader. Only the full `memset` clears every tainted byte before
+    the return; the others leave them live, so they end in the P2-11.1 exit
+    `coarse_memory_store` citing that real reader -- never their helper."""
     src = tmp_path / "wocalls.c"
     src.write_text(r"""
 #include <stdlib.h>
@@ -2122,9 +2198,17 @@ int main(int argc, char **argv) {
 
     for fn in ("reset_case", "copy_reset_case", "scalar_case", "other_case"):
         quiet = forward(fn)
-        assert [lf for lf in quiet["leaves"]
-                if lf["kind"] == "global_memory_continuation"] == [], (fn, quiet["leaves"])
-        assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, (fn, quiet)
+        assert _gmc(quiet) == [], (fn, quiet["leaves"])
+        if fn == "reset_case":
+            assert quiet["leaves"] == [], (fn, quiet["leaves"])
+            assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, (fn, quiet)
+            continue
+        [store] = _exit_stores(quiet)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "global_bytes"), \
+            (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["leak_helper"], \
+            (fn, store)
+        assert quiet["diagnostics"]["safe_to_report_all_clear"] is False, (fn, quiet)
 
     # the mirror: the same model READS through arg1
     loud = forward("leak_case")
@@ -2302,7 +2386,10 @@ def test_global_continuation_phi_selected_write_destination_is_silent(tmp_path, 
 
     A helper whose entire effect is `p = flag ? g : other; memset(p, 0, 64)`
     reads nothing: the `lea` that materialises the destination is not an
-    access. The reading and read-write twins still block."""
+    access. The reading and read-write twins still block. A reset through a
+    phi-selected pointer does not prove every tainted byte cleared, so the
+    silent helpers' cases end in the P2-11.1 exit `coarse_memory_store`,
+    which cites the real reader `phi_read` -- never the write-only helper."""
     src = tmp_path / "phiwocont.c"
     src.write_text(r"""
 #include <stdlib.h>
@@ -2332,9 +2419,12 @@ int main(int argc, char **argv) {
 
     for fn in ("phi_reset_case", "phi_copy_reset_case"):
         quiet = forward(fn)
-        assert [lf for lf in quiet["leaves"]
-                if lf["kind"] == "global_memory_continuation"] == [], (fn, quiet["leaves"])
-        assert quiet["diagnostics"]["safe_to_report_all_clear"] is True, (fn, quiet)
+        assert _gmc(quiet) == [], (fn, quiet["leaves"])
+        [store] = _exit_stores(quiet)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "global_bytes"), \
+            (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["phi_read"], (fn, store)
+        assert quiet["diagnostics"]["safe_to_report_all_clear"] is False, (fn, quiet)
 
     for fn, reader in (("phi_read_case", "phi_read"), ("phi_rw_case", "phi_rw")):
         loud = forward(fn)
@@ -2396,6 +2486,13 @@ def _gmc(result):
     return [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
 
 
+def _exit_stores(result, address: str | None = None):
+    """P2-11.1 exit frontiers: blocking `coarse_memory_store` leaves for a
+    global still tainted at the seeded return (optionally for one global)."""
+    return [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"
+            and (address is None or (lf.get("global") or {}).get("address") == address)]
+
+
 def test_global_continuation_interior_reference_blocks_with_its_offset(tmp_path, shared_bn):
     """Round-3 review F8: `system(g + 4)` reads the copied bytes.
 
@@ -2403,7 +2500,8 @@ def test_global_continuation_interior_reference_blocks_with_its_offset(tmp_path,
     about the object's base found no consumer and cleared the run. The whole
     object is asked for now, and the leaf reports the base plus the offset
     the consumer actually named. A DISJOINT neighbouring object is not swept
-    in with it."""
+    in with it: its reader is never cited, and the bytes still live at the
+    return end in the P2-11.1 exit store naming a real reader of `g`."""
     target, _tmp = _boundary_target(tmp_path, shared_bn)
 
     def forward(fn):
@@ -2424,7 +2522,12 @@ def test_global_continuation_interior_reference_blocks_with_its_offset(tmp_path,
     # the disjoint control: the consumer reads the NEXT object
     neighbour = forward("neighbour_case")
     assert _gmc(neighbour) == [], neighbour["leaves"]
-    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is True, neighbour
+    [store] = _exit_stores(neighbour)
+    assert store["global"]["address"] == \
+        _data_symbol_addr(_tmp / "boundaries", "global_bytes"), store
+    assert [(r["display_name"], r["offset"]) for r in store["references"]] \
+        == [("offset_consumer", 4)], store
+    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is False, neighbour
 
 
 def test_global_continuation_unread_consumer_behind_a_wrapper(tmp_path, shared_bn):
@@ -2542,7 +2645,10 @@ def test_global_continuation_interior_reader_without_debug_types(tmp_path, share
     the type's word for it made the extent one byte, the reference sweep
     missed the consumer and the interior pointer folded to a different
     "object". The layout answers instead: the object runs to the next data
-    variable that carries a SYMBOL, which is where the neighbour begins."""
+    variable that carries a SYMBOL, which is where the neighbour begins. So
+    the neighbour's reader is never cited for it -- the copied bytes still
+    live at the return end in the P2-11.1 exit store, citing a reader of the
+    object itself."""
     target = _access_target(tmp_path, shared_bn, debug=debug)
 
     def forward(fn):
@@ -2559,7 +2665,12 @@ def test_global_continuation_interior_reader_without_debug_types(tmp_path, share
     neighbour = forward("neighbour_case")
     assert [lf for lf in neighbour["leaves"]
             if lf["kind"] == "global_memory_continuation"] == [], neighbour["leaves"]
-    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is True, neighbour
+    name = "accesses" if debug else "accesses_nodbg"
+    [store] = _exit_stores(neighbour)
+    assert store["global"]["address"] == \
+        _data_symbol_addr(tmp_path / name, "global_bytes"), store
+    assert [r["display_name"] for r in store["references"]] == ["alias_consumer"], store
+    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is False, neighbour
 
 
 def test_global_continuation_callback_behind_a_wrapper(tmp_path, shared_bn):
@@ -2665,7 +2776,9 @@ def test_global_continuation_initialised_global_and_fortified_appends(tmp_path,
     extent stopped five bytes in, so `system(g + 8)` was never discovered.
     The recovered type is a LOWER bound now; the layout (to the next data
     variable that carries a symbol) is the wider answer, and the symbolled
-    neighbour still bounds it.
+    neighbour still bounds it: its reader is never cited, and the bytes
+    still live at the return end in the P2-11.1 exit store, which names the
+    object's own interior reader.
 
     F14: a fortified append stops somewhere else than a bare one, but it
     still walks the destination's existing bytes to find the terminator, so
@@ -2694,7 +2807,11 @@ def test_global_continuation_initialised_global_and_fortified_appends(tmp_path,
     neighbour = forward("neighbour_case")
     assert [lf for lf in neighbour["leaves"]
             if lf["kind"] == "global_memory_continuation"] == [], neighbour["leaves"]
-    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is True, neighbour
+    [store] = _exit_stores(neighbour)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "global_bytes"), store
+    assert [(r["display_name"], r["offset"]) for r in store["references"]] \
+        == [("interior_reader", 8)], store
+    assert neighbour["diagnostics"]["safe_to_report_all_clear"] is False, neighbour
 
     # F14: fortified, bounds-shifted and bare appends all read the dest
     for fn, consumer in (("fort_append_case", "fort_append_consumer"),
@@ -2758,7 +2875,9 @@ def test_global_continuation_large_objects_veneers_and_returned_pointers(tmp_pat
     clip every object to 64 KiB and never enumerate it.
     F16: a veneer onto an in-binary body BN measured and skipped keeps the
     unread-consumer boundary and the analysis-incomplete signal; a genuine
-    PLT thunk onto an import stays external.
+    PLT thunk onto an import stays external: no continuation at the call,
+    and the bytes still live at the return end in the P2-11.1 exit store,
+    citing the `system(global_bytes)` inside `huge_reader`'s own extent.
     F17: returning a pointer is not reading its bytes. A write-only helper
     whose return the caller discards is silent; when the caller CONSUMES the
     returned pointer the boundary is reported at that consumer."""
@@ -2793,7 +2912,19 @@ def test_global_continuation_large_objects_veneers_and_returned_pointers(tmp_pat
             (fn, result["stats"])
     result, leaves = gmc("plt_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "global_bytes"), store
+    [row] = store["references"]
+    assert (row["access"], row["offset"]) == ("call_arg", 0), store
+    # BN carves the analysed tail of the skipped body into its own `sub_`;
+    # the read it cites lies inside `huge_reader`'s symbol, not in `puts`.
+    sized = {p[3]: (int(p[0], 16), int(p[1], 16)) for p in (
+        ln.split() for ln in subprocess.run(
+            ["nm", "-S", str(binary)], capture_output=True, text=True,
+            timeout=60.0).stdout.splitlines()) if len(p) == 4}
+    lo, size = sized["huge_reader"]
+    assert lo <= int(row["at"], 16) < lo + size, (store, hex(lo), hex(size))
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
 
     # F17: ignored returns are silent, a consumed one blocks at the consumer
     for fn in ("reset_ignore_case", "reset_ret_ignore_case"):
@@ -2852,7 +2983,10 @@ def test_global_continuation_returned_aliases_and_source_destinations(tmp_path,
     caller passed has to be mapped onto it and back.
     F20: `read(0, g, 64)` FILLS g; its role lives in the model's `sources`,
     and reading that role is what stops a refill raising a false frontier.
-    An ignored return, and a full `memset` reset, stay silent."""
+    An ignored return and a refill are not continuations, but neither clears
+    the copied bytes, so each ends in the P2-11.1 exit `coarse_memory_store`
+    citing a real reader -- never the refill or the relay. A full `memset`
+    reset stays silent."""
     name = "relay" if debug else "relay_nodbg"
     src = tmp_path / f"{name}.c"
     src.write_text(_RELAY_SRC)
@@ -2876,11 +3010,21 @@ def test_global_continuation_returned_aliases_and_source_destinations(tmp_path,
         assert leaf["references"][0]["access"] == "call_arg", (fn, leaf)
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
 
-    # ...and an ignored return, a refill and a full reset are silent
-    for fn in ("ignore_case", "refill_case", "reset_only_case"):
+    # ...an ignored return and a refill are not continuations; the bytes
+    # they leave live end in the exit store, which cites a real reader
+    for fn in ("ignore_case", "refill_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, (fn, result)
+        [store] = _exit_stores(result)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "global_bytes"), \
+            (fn, store)
+        assert [(r["display_name"], r["offset"]) for r in store["references"]] \
+            == [("use_arg_ret", 8)], (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, (fn, result)
+    # ...and a full reset is silent
+    result, leaves = gmc("reset_only_case")
+    assert result["leaves"] == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result
 
     # F20 control: a refill followed by a genuine read of the bytes blocks
     result, leaves = gmc("refill_read_case")
@@ -2929,7 +3073,8 @@ def test_global_continuation_interior_writes_pins_and_cycles(tmp_path, shared_bn
     R1: `memcpy(g + 8, s, 64)` writes the SAME object `system(g)` reads --
     BN invents a nameless data variable at the interior address, and keying
     the write there cleared a real flow. A disjoint neighbour is still a
-    different object.
+    different object: its reader is never cited, and the bytes still live at
+    the return end in the P2-11.1 exit store naming `reader`.
     R2: pinning the indirect site with `--resolve-map` must not LOSE the
     boundary it discloses while unpinned.
     R3: a self-recursive alias must not unwind the walk, and a sink already
@@ -2961,7 +3106,10 @@ def test_global_continuation_interior_writes_pins_and_cycles(tmp_path, shared_bn
     # ...and a disjoint object is not folded into it
     result, leaves = gmc("disjoint_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True, result
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "global_bytes"), store
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result
 
     # R2: unpinned the indirect site is disclosed; pinned it names the reader
     result, leaves = gmc("indirect_case")
@@ -3054,7 +3202,8 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
     OBJ-02: an analysis-created interior data variable is not a second
     object; a reader spanning the base still sees the interior write.
     ALIAS-01: `fgets` hands its destination back, so a partial refill
-    followed by `system(p + 8)` reads bytes it never touched.
+    followed by `system(p + 8)` reads bytes it never touched; an ignored
+    refill is no continuation, its live bytes end in the P2-11.1 exit store.
     BOUND-03: a returning-wrapper chain past the INTERNAL pointer-return
     depth is unknown, not "no alias"."""
     src = tmp_path / "r3astra.c"
@@ -3099,7 +3248,11 @@ def test_global_continuation_object_extent_aliases_and_internal_bounds(tmp_path,
     assert leaf["references"][0]["access"] == "call_arg", leaf
     result, leaves = gmc("fgets_ignored_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "tracked"), store
+    assert [(r["display_name"], r["offset"]) for r in store["references"]] \
+        == [("use_fgets_alias", 8)], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # BOUND-03: the internal return-pointer depth is a disclosed bound
     result, leaves = gmc("chain_case")
@@ -3747,11 +3900,15 @@ def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_b
     C1: `.set packet_tail, packet + 64` gives one buffer two symbols, so a
     copy of `packet[0..112)` reads bytes a write to `packet_tail` put there
     while naming the other symbol. The access SPAN is what decides: a read
-    that stops short of them, or one of a different object, stays silent.
+    that stops short of them, or one of a different object, is no
+    continuation -- the bytes still live at the return end in the P2-11.1
+    exit store, which cites the ENCLOSING object's reader `consumer`.
     M1: a pointer handed back by `fgets` carries its displacement in the SSA
     chain, not in the instruction -- `system(p + 8)` is a read at +8.
     M2: a call that runs BEFORE the only write carries nothing; a loop's
-    back edge still does.
+    back edge still does. Bytes still live at the return end in the P2-11.1
+    exit `coarse_memory_store` at the write, citing `reader` -- never as a
+    continuation at the earlier call.
     """
     src = tmp_path / "r3overlap.c"
     src.write_text(_OVERLAP_SRC)
@@ -3772,11 +3929,16 @@ def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_b
     assert leaf["references"][0]["access"] == "call_arg", leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
-    # ...and a read that stops short, or reads a different object, is not
+    # ...and a read that stops short, or reads a different object, is not;
+    # the exit store sweeps the enclosing `packet` and cites its reader
     for fn in ("shallow_case", "neighbour_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        [store] = _exit_stores(result)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "packet_tail"), \
+            (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["consumer"], (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # M1: the displacement through the returned destination
     result, leaves = gmc("offset_case")
@@ -3784,10 +3946,13 @@ def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_b
     assert leaf["references"][0]["offset"] == 8, leaf
     assert leaf["references"][0]["offset_known"] is True, leaf
 
-    # M2: before the write is silent; after it, and round a loop, is not
+    # M2: before the write is no continuation; after it, and round a loop, is
     result, leaves = gmc("before_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "tracked"), store
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
     for fn in ("after_case", "loop_case"):
         result, leaves = gmc(fn)
         assert [r["display_name"] for r in leaves[0]["references"]] == ["reader"], fn
@@ -3818,10 +3983,15 @@ def test_global_continuation_symbol_overlap_offsets_and_order(tmp_path, shared_b
         assert row["offset_known"] is True, (fn, leaves)
 
     # F23: mutually exclusive branches never carry those bytes to each other
+    # -- the write still reaches the return, so the exit store cites `reader`
     for fn in ("branch_case", "conditional_before_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        [store] = _exit_stores(result)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "tracked"), \
+            (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["reader"], (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
 
 _VARIANTS_SRC = r"""
@@ -3892,7 +4062,9 @@ def test_global_continuation_alias_chains_write_sites_and_ambiguity(tmp_path,
     the whole chain rather than a fixed couple of predecessors.
     F26: BN sizes `char init_packet[128] = "seed"` as `char[0x5]` -- a LOWER
     bound on the object, never proof of where it ends.
-    F27: a displacement is exact only when every feasible path agrees."""
+    F27: a displacement is exact only when every feasible path agrees.
+    Exclusive branches and another object's reader are no continuation; the
+    copy still live at the return is the P2-11.1 exit store citing `reader`."""
     src = tmp_path / "r3variants.c"
     src.write_text(_VARIANTS_SRC)
     binary = tmp_path / "r3variants"
@@ -3921,11 +4093,16 @@ def test_global_continuation_alias_chains_write_sites_and_ambiguity(tmp_path,
                    for lf in leaves for r in lf["references"]), (fn, leaves)
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
-    # ...and mutually exclusive branches, or another object, still clear
+    # ...and mutually exclusive branches, or another object, are no
+    # continuation -- the live bytes end in the exit store naming `reader`
     for fn in ("disjoint", "different_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        [store] = _exit_stores(result)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "tracked"), \
+            (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["reader"], (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # F27: ambiguous displacements are reported as unknown, never as 0
     for fn in ("literal_phi_case", "separate_phi_case", "producer_choices_case"):
@@ -4107,11 +4284,15 @@ def test_global_continuation_alias_runs_joins_and_pointer_only_callees(
     F33: three interior aliases do not stop the walk short of a reader past
     the last one, for a known, an unknown and a sink-firing copy alike.
     F34/F35: the alias search's own bounds are disclosed where a reader
-    could hide behind them, and NOT where the callee names no global at all.
+    could hide behind them, and NOT where the callee names no global at all
+    -- there the live copy is the P2-11.1 exit store citing the enclosing
+    object's reader.
     F36: a body returning either a formal or the object by name has two
     feasible displacements, so it has none.
     F37: a callee that only hands the pointer back reads nothing; a caller
-    that consumes the result is still the boundary."""
+    that consumes the result is still the boundary. Where no call after the
+    write is a continuation but the bytes stay live at the return and a
+    reader elsewhere can reach them, the P2-11.1 exit store cites it."""
     src = tmp_path / "r3chain.c"
     src.write_text(_CHALLENGE_SRC)
     binary = tmp_path / "r3chain"
@@ -4129,21 +4310,34 @@ def test_global_continuation_alias_runs_joins_and_pointer_only_callees(
         result, leaves = gmc(fn)
         assert any(r["display_name"] == "chain_reader" and r["offset"] == 80
                    for lf in leaves for r in lf["references"]), (fn, leaves)
-    # ...and one that stops short, or has no reader, does not
-    for fn in ("chain_short", "chain_no_reader"):
-        result, leaves = gmc(fn)
-        assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+    # ...one that stops short does not; one whose only call reads nothing is
+    # no continuation, but its unbounded copy reaches +80 and stays live at
+    # the return, so the exit store cites `chain_reader` there
+    result, leaves = gmc("chain_short")
+    assert result["leaves"] == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    result, leaves = gmc("chain_no_reader")
+    assert leaves == [], leaves
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "chain"), store
+    assert [(r["display_name"], r["offset"]) for r in store["references"]] \
+        == [("chain_reader", 80)], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # F34/F35: the search bound is disclosed where it can hide a reader...
     result, leaves = gmc("exact_case")
     assert [lf["reachability"]["cause"] for lf in leaves] == [
         "object_search_budget"], leaves
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
-    # ...and not where the callee names no global at all
+    # ...and not where the callee names no global at all: no bound and no
+    # continuation, but `window_reader` reads the enclosing object, so the
+    # copy still live at the return is the exit store naming it
     result, leaves = gmc("exact_no_reader")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "exact"), store
+    assert [r["display_name"] for r in store["references"]] == ["window_reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # F36: {formal, object-by-name} is two displacements, so neither is exact
     result, leaves = gmc("mixed_case")
@@ -4151,10 +4345,15 @@ def test_global_continuation_alias_runs_joins_and_pointer_only_callees(
                if r["display_name"] == "consume_mixed")
     assert row["offset_known"] is False, leaves
 
-    # F37: a discarded pointer-only callee reads nothing; a used one blocks
+    # F37: a discarded pointer-only callee reads nothing; a used one blocks.
+    # The discarded case's live bytes end in the exit store, which cites the
+    # reader that consumes the result -- never the pointer-only callee.
     result, leaves = gmc("identity_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "form"), store
+    assert [r["display_name"] for r in store["references"]] == ["use_identity"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
     result, leaves = gmc("used_identity_case")
     assert any(r["display_name"] == "use_identity"
                for lf in leaves for r in lf["references"]), leaves
@@ -4220,7 +4419,9 @@ def test_global_continuation_auto_types_branches_and_return_routes(
     not an object boundary, so an unknown-length or sink-firing copy still
     reaches the reader past it.
     F38: "writes only through this parameter" is a verdict over EVERY
-    feasible use, not the first one BN happens to list.
+    feasible use, not the first one BN happens to list. A pointer-only
+    callee is no continuation; the copy it leaves live at the return is the
+    P2-11.1 exit store, citing a wrapper whose callee can `system` it.
     F36: a rooted return route that is present but ambiguous makes the
     displacement unknown, however exact the formal route is."""
     src = tmp_path / f"r3r16{opt[-1]}.c"
@@ -4252,7 +4453,12 @@ def test_global_continuation_auto_types_branches_and_return_routes(
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
     result, leaves = gmc("identity_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "tracked"), store
+    [row] = store["references"]
+    assert row["display_name"] in ("ignore_conditional", "ignore_reverse",
+                                   "ignore_likely"), store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # F36: three arms, and a dynamic arm, are both unknown; agreement is not
     for fn in ("mixed3_case", "dynamic_case"):
@@ -4298,7 +4504,9 @@ def test_global_continuation_survives_any_interior_alias_count(tmp_path,
 
     Running out of ALIASES bounds the enumeration; it does not establish
     where the object ends. Coverage continues to the credible boundary, the
-    bound is named, and the short-write and no-reader controls stay silent.
+    bound is named, and the short-write control stays silent. The no-reader
+    control is no continuation, but its unbounded copy is still live at the
+    return and reaches `far_reader`'s +1048, so it is the P2-11.1 exit store.
     """
     src = tmp_path / f"r3alias{count}.c"
     src.write_text(_alias_count_source(count))
@@ -4325,10 +4533,16 @@ def test_global_continuation_survives_any_interior_alias_count(tmp_path,
         # undeclared shape keeps its `object_search_budget` in the mocked suite.
         _result, leaves = gmc("unknown_case")
         assert "object_search_budget" not in leaves[0]["reachability"]["causes"], leaves
-    for fn in ("short_case", "no_reader_case"):
-        result, leaves = gmc(fn)
-        assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+    result, leaves = gmc("short_case")
+    assert result["leaves"] == [], result["leaves"]
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    result, leaves = gmc("no_reader_case")
+    assert leaves == [], leaves
+    [store] = _exit_stores(result)
+    assert store["global"]["address"] == _data_symbol_addr(binary, "chain"), store
+    assert [(r["display_name"], r["offset"]) for r in store["references"]] \
+        == [("far_reader", 1048)], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 
@@ -4411,9 +4625,11 @@ def test_global_continuation_direct_stores_match_modeled_copies(tmp_path,
     An inlined `memcpy` is a run of stores: at -O1 and -O2 the compiler
     emits one, and the continuation it produces has to be the one the
     modeled call produces at -O0. The span those stores wrote is what
-    decides, so a short run stays silent, and a reader of a DIFFERENT
-    object or no reader at all is silent at every level. The copy note and
-    the sink of a `strcpy` are reported together.
+    decides, so a short run stays silent. A reader of a DIFFERENT object, or
+    no reader at all, is no continuation at any level; the copy -- stores or
+    modeled call alike (P2-11.1) -- is then still live at the return, so
+    the blocking exit `coarse_memory_store` names `reader`. The copy note
+    and the sink of a `strcpy` are reported together.
     """
     src = tmp_path / f"r3store{opt[-1]}.c"
     src.write_text(_STORE_SRC)
@@ -4439,18 +4655,13 @@ def test_global_continuation_direct_stores_match_modeled_copies(tmp_path,
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
         stores = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
-        if opt == "-O0":
-            # a modeled copy: only a call after it is asked about `chain`
-            assert stores == [], (fn, stores)
-            assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
-        else:
-            # P1-04: the inlined copy is a run of DIRECT stores still live when
-            # the case returns, and `reader` -- never walked after it -- reads
-            # them, so the store stays the blocking frontier it was before
-            # direct stores were keyed.
-            assert [r["display_name"] for lf in stores for r in lf["references"]] \
-                == ["reader"], (fn, stores)
-            assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
+        # P1-04 / P2-11.1: the inlined run of DIRECT stores and the modeled
+        # copy are both still live when the case returns, and `reader` --
+        # never walked after it -- reads them, so the write is the blocking
+        # frontier at every level.
+        assert [r["display_name"] for lf in stores for r in lf["references"]] \
+            == ["reader"], (fn, stores)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # the sink and the copy into the destination are reported together
     result, leaves = gmc("sink_copy_case")
@@ -4495,7 +4706,8 @@ def test_global_continuation_veneers_quiet_callees_and_scalar_recursion(
     an internal consumer IS the boundary -- resolving it to the target
     dropped the argument binding and cleared the run.
     F42: a callee whose only global lives elsewhere is not a continuation,
-    whatever the alias search did not reach.
+    whatever the alias search did not reach; the copy it leaves live at the
+    return is the P2-11.1 exit store citing `relay_reader`, never the callee.
     F43: scalar-only mutual recursion is not a pointer question.
     """
     src = tmp_path / f"r3tail{opt[-1]}.c"
@@ -4518,11 +4730,17 @@ def test_global_continuation_veneers_quiet_callees_and_scalar_recursion(
                    for lf in leaves for r in lf["references"]), (fn, result)
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
-    # ...while a thunk-shaped callee that reads nothing of it stays silent
+    # ...while a thunk-shaped callee that reads nothing of it is no
+    # continuation; the live copy ends in the exit store naming the veneer
     for fn in ("plt_case", "no_reader", "recursion_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        [store] = _exit_stores(result)
+        assert store["global"]["address"] == _data_symbol_addr(binary, "shared"), \
+            (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["relay_reader"], \
+            (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # F43: no pointer-depth uncertainty from a scalar cycle
     result, _leaves_ = gmc("recursion_case")
@@ -4555,8 +4773,10 @@ def test_an_exhausted_alias_search_is_reader_specific(tmp_path, shared_bn,
     """Round-18 review F42: the alias bound is not an unconditional leaf.
 
     A callee whose only global is a byte in ANOTHER section reads nothing of
-    the written object, at 63 aliases and at 65 alike; the real reader past
-    them is still disclosed.
+    the written object, at 63 aliases and at 65 alike: no continuation is
+    raised at it. The runtime-length copy is still live at the return, so
+    the P2-11.1 exit store blocks -- naming the real reader, never the
+    quiet callee -- and the real reader past them is still disclosed.
     """
     src = tmp_path / f"r3aliasq{count}.c"
     src.write_text(_alias_quiet_source(count))
@@ -4573,7 +4793,10 @@ def test_an_exhausted_alias_search_is_reader_specific(tmp_path, shared_bn,
 
     result, leaves = gmc("quiet_case")
     assert leaves == [], (count, leaves)
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["reader"], \
+        (count, store)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
     result, leaves = gmc("short_case")
     assert leaves == [], (count, leaves)
     result, leaves = gmc("unknown_case")
@@ -4649,7 +4872,12 @@ def test_a_multi_hop_veneer_chain_keeps_the_body_that_reads(tmp_path,
                                                             shared_bn, opt):
     """Round-19 review F44: `relay2 -> relay1 -> reader -> system` resolves
     to an IMPORT, and answering with that end point discarded `reader` --
-    the one body that reads the tainted object -- so the run cleared."""
+    the one body that reads the tainted object -- so the run cleared.
+
+    A chain that reads ANOTHER object raises no continuation at its call;
+    the copy is still live at the return, so the P2-11.1 exit store blocks
+    naming `reader`, never `unrelated`. A function that never returns
+    (`abort()`) has no exit for the tainted bytes to outlive."""
     target = _build_case(tmp_path, shared_bn, "r3hop", _MULTIHOP_SRC, opt)
 
     def gmc(fn):
@@ -4669,11 +4897,18 @@ def test_a_multi_hop_veneer_chain_keeps_the_body_that_reads(tmp_path,
     assert [s["sink"]["class"] for s in result["reached_sinks"]] == \
         ["overflow_unbounded"], result["reached_sinks"]
 
-    # A chain that reads ANOTHER object, and a plain import, stay silent
-    for fn in ("unrelated_case", "plt_case"):
-        result, leaves = gmc(fn)
-        assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+    # A chain that reads ANOTHER object is not a continuation; the exit
+    # store names the real reader of `tracked`, not the chain's body
+    result, leaves = gmc("unrelated_case")
+    assert leaves == [], leaves
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # ...and a plain import that never returns stays silent
+    result, leaves = gmc("plt_case")
+    assert leaves == [], leaves
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
@@ -4683,7 +4918,9 @@ def test_an_argument_swapping_veneer_binds_by_its_own_signature(tmp_path,
     the call's argument indices mean what SWAP's signature says. Classifying
     them against the resolved body's unchanged index read parameter 1 of
     `write_read` -- the command -- and a write-only global became a
-    blocking consumer."""
+    blocking consumer at the call. The copy is still live at the return,
+    so the P2-11.1 exit store blocks -- naming the real reader `consumer`,
+    never the write-only `bound_clean`."""
     target = _build_case(tmp_path, shared_bn, "r3remap", _REMAP_SRC, opt)
 
     def gmc(fn):
@@ -4694,7 +4931,9 @@ def test_an_argument_swapping_veneer_binds_by_its_own_signature(tmp_path,
     # tracked reaches only the memset DESTINATION; `clean` is what is read
     result, leaves = gmc("write_only_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["consumer"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # the mirror image -- the swap hands TRACKED to the command slot
     result, leaves = gmc("read_case")
@@ -4733,21 +4972,23 @@ def test_a_register_indirect_tail_jump_is_a_call_boundary(tmp_path,
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # ...and a target that reads ANOTHER object removes the boundary at the
-    # jump. For the modeled copy that clears the run. The DIRECT store is
-    # still live when `store_case` returns and `reader` -- reached here by
-    # nothing the walk follows -- reads it, so it stays the blocking store
-    # frontier it was before direct stores were keyed (P1-04).
+    # jump. The tainted bytes -- the DIRECT store's and the modeled copy's
+    # alike -- are still live when the function returns and `reader` --
+    # reached here by nothing the walk follows -- reads them, so each run
+    # ends in the blocking P2-11.1 exit store naming `reader`, never `quiet`.
     pin.write_text(json.dumps({hex(jump_at): ["quiet"]}))
     result, leaves = gmc("store_case", "--resolve-map", str(pin))
     assert leaves == [], leaves
-    [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    [store] = _exit_stores(result)
     assert [r["display_name"] for r in store["references"]] == ["reader"], store
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
     copy_jump = int(gmc("copy_case")[1][0]["address"], 16)
     pin.write_text(json.dumps({hex(copy_jump): ["quiet"]}))
     result, leaves = gmc("copy_case", "--resolve-map", str(pin))
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def _section_source(count: int) -> str:
@@ -4777,7 +5018,9 @@ def test_an_exhausted_alias_search_stops_at_the_section_boundary(tmp_path,
 
     Past the alias limit the forward window ran off the end of `.chain` and
     attributed the FOLLOWING `.clean` global to the written object, so a
-    function reading only `clean` became a blocking continuation."""
+    function reading only `clean` became a blocking continuation. The copy
+    into `chain` is still live at the return, so the P2-11.1 exit store
+    blocks -- naming the reader INSIDE `chain`, never `unrelated`."""
     src = tmp_path / f"r3sec{count}.c"
     src.write_text(_section_source(count))
     binary = tmp_path / f"r3sec{count}"
@@ -4791,7 +5034,11 @@ def test_an_exhausted_alias_search_stops_at_the_section_boundary(tmp_path,
 
     result, leaves = gmc("unrelated_case")
     assert leaves == [], (count, leaves)
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["reader"], \
+        (count, store)
+    assert all(0 <= r["offset"] < 8192 for r in store["references"]), store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # the real reader inside the object is disclosed, at an offset within it
     result, leaves = gmc("bounded_case")
@@ -4904,7 +5151,9 @@ def test_an_indirect_tail_jump_inside_a_callee_is_a_boundary(tmp_path,
             "safe_to_report_all_clear") is not True, fn
 
     # the nested site takes a pin exactly like a call: the real target
-    # refines the leaf, a target that reads another object clears the run
+    # refines the leaf, a target that reads another object removes the
+    # boundary -- the copy is then still live at the return, so the run
+    # ends in the P2-11.1 exit store naming `relay0`, never `quiet`
     il = shared_bn.run("-t", target, "il", "dispatch", "--view", "mlil",
                        "--ssa")
     assert il.returncode == 0, il.stderr
@@ -4918,7 +5167,9 @@ def test_an_indirect_tail_jump_inside_a_callee_is_a_boundary(tmp_path,
     pin.write_text(json.dumps({hex(site): ["quiet"]}))
     result, leaves = gmc("copy_nested", "--resolve-map", str(pin))
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["relay0"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
@@ -4967,7 +5218,9 @@ def test_an_exhausted_alias_search_spares_a_write_only_callee(tmp_path,
 
     Past the alias limit the fallback asked whether the callee TOUCHES this
     object's storage, which a write does, so the bound alone turned a
-    write-only callee into a blocking consumer."""
+    write-only callee into a blocking consumer. Its 64-byte reset does not
+    cover the copy, so the bytes are still live at the return: the P2-11.1
+    exit store blocks naming `reader`, never the write-only `writer`."""
     src = tmp_path / f"r4w{count}.c"
     src.write_text(_writer_source(count))
     binary = tmp_path / f"r4w{count}"
@@ -4982,7 +5235,10 @@ def test_an_exhausted_alias_search_spares_a_write_only_callee(tmp_path,
 
     result, leaves = gmc("writer_case")
     assert leaves == [], (count, leaves)
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == ["reader"], \
+        (count, store)
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
     # the genuine interior reader past the same aliases still blocks
     _result, leaves = gmc("reader_case")
     assert any(r["display_name"] == "reader"
@@ -5190,7 +5446,8 @@ def _scanpool_source(statements: int = 1500) -> str:
 char tracked[256] __attribute__((section(".tracked"))) = "seed";
 void (*volatile hook)(void);
 N void churn(char *t) {{
-{body}}}
+{body}  t[1] ^= tracked[8];
+}}
 N void plain(void) {{ churn(tracked); system(tracked); }}
 N void mixed(void) {{ churn(tracked); system(tracked); hook(); }}
 N void plain_case(char *s) {{ memcpy(tracked, s, 112); plain(); }}
@@ -5203,7 +5460,12 @@ def test_a_second_frontier_cause_does_not_erase_an_exhausted_bound(tmp_path,
                                                                    shared_bn):
     """Round-21 review F59: adding a trailing unresolved `hook()` replaced
     `pointer_scan_budget` as THE cause, and `stats` then reported a
-    complete run with no truncation at all."""
+    complete run with no truncation at all.
+
+    `churn` names `tracked` only in its LAST statement, so classifying it
+    runs the pointer scan out first: the reader sweep no longer scans a
+    body that never names the object (R3 sweep economy), so the bound has
+    to be met in one that does."""
     src = tmp_path / "r5scan.c"
     src.write_text(_scanpool_source())
     binary = tmp_path / "r5scan"
@@ -5275,14 +5537,26 @@ def test_a_callee_write_effect_composes_through_the_call_graph(tmp_path,
         assert any(r["display_name"] == "reader"
                    for lf in leaves for r in lf["references"]), (fn, leaves)
 
-    # the helper fills ANOTHER object...
+    # the helper fills ANOTHER object: `reader` is no continuation of it,
+    # and the exit frontier that write leaves (P2-11.1) -- when something
+    # else references `clean` -- is about `clean`, never `reader`
+    clean = _data_symbol_addr(binary, "clean")
     result, leaves = gmc("other_nested_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
-    # ...and a reader that ran BEFORE the write is not a continuation of it
+    exits = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    assert all(lf["global"]["address"] == clean for lf in exits), exits
+    assert not any(r["display_name"] == "reader"
+                   for lf in exits for r in lf["references"]), exits
+    assert result["diagnostics"]["safe_to_report_all_clear"] is (not exits)
+    # ...and a reader that ran BEFORE the write is not a continuation of it;
+    # it can still run again after `before_case` returns, so the write in
+    # `fill` stays the exit frontier (P2-11.1) naming it
     result, leaves = gmc("before_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    assert store["global"]["address"] == _data_symbol_addr(binary, "tracked"), store
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 _FRAME_ORDER_SRC = r"""
@@ -5398,19 +5672,19 @@ def test_a_callee_write_cannot_precede_a_reader_that_ran_first(tmp_path,
         return result, [lf for lf in result["leaves"]
                         if lf["kind"] == "global_memory_continuation"]
 
+    tracked = _data_symbol_addr(binary, "tracked")
     for fn in ("padded_before", "short_before", "before_store", "sibling"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        if fn != "before_store":
-            assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
-            continue
-        # No continuation at the reader that ran FIRST -- but `store`'s
-        # DIRECT store is still live when `before_store` returns, and
-        # `reader` can run again after it: the store stays the blocking
-        # frontier it was before direct stores were keyed (P1-04), cited at
-        # the store inside the callee and naming the reader.
+        # No continuation at the reader that ran FIRST -- but the write
+        # (`store`'s direct store, or a `memcpy` in `fill`/`long_child`) is
+        # still live when the seeded function returns, and `reader` can run
+        # again after it: the write is the blocking exit frontier (P1-04,
+        # P2-11.1), cited at the write inside the callee and naming the
+        # reader.
         [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
-        assert [r["display_name"] for r in store["references"]] == ["reader"], store
+        assert store["global"]["address"] == tracked, (fn, store)
+        assert [r["display_name"] for r in store["references"]] == ["reader"], (fn, store)
         assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     result, leaves = gmc("after")
@@ -5480,8 +5754,10 @@ def test_two_scan_bounds_both_reach_the_aggregate(tmp_path, shared_bn):
     other."""
     # A body that TOUCHES the object and then does enough work to spend the
     # scan's node pool, beside a relay chain that spends the pointer-return
-    # depth: one search, two different bounds.
-    work = "".join(f"  n += {i};\n" for i in range(1600))
+    # depth: one search, two different bounds. Each statement nests one
+    # expression: a sub-expression is now visited once, so a flat `n += i`
+    # run no longer spends the pool (R3 sweep economy).
+    work = "".join(f"  n = (n ^ {i}) + {i};\n" for i in range(1600))
     src = tmp_path / "r6both.c"
     src.write_text(_chain_source(6).replace(
         "int main(void) { return 0; }",
@@ -5782,7 +6058,10 @@ def test_a_returned_pointer_into_a_written_interior_alias_blocks(tmp_path,
     """Round-24 review F63: the write names `middle = tracked + 64` and the
     consumer receives `advance(tracked + 8)` from a CALL, naming nothing
     itself -- so the overlap test's direct-reference prefilter dropped it
-    and the run cleared."""
+    and the run cleared. A consumer of a DISJOINT object raises no
+    continuation at its call; the copy is still live at the return, so the
+    P2-11.1 exit store blocks naming a real reader of the written bytes
+    (`direct_reader`, `tracked + 88`), never `clean_reader`."""
     target = _returned_alias_target(tmp_path, shared_bn, opt, interior=True)
 
     def gmc(fn):
@@ -5799,7 +6078,10 @@ def test_a_returned_pointer_into_a_written_interior_alias_blocks(tmp_path,
     # a returned pointer into a DISJOINT object is still not a continuation
     result, leaves = gmc("clean_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = _exit_stores(result)
+    assert [r["display_name"] for r in store["references"]] == \
+        ["direct_reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
@@ -5829,7 +6111,11 @@ def test_a_tail_return_composes_the_callee_adjustment(tmp_path, shared_bn,
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
 def test_a_zero_length_read_is_not_an_access(tmp_path, shared_bn, opt):
     """Round-24 review F65: `memcpy(out, g, 0)` reads no byte of `g`, yet
-    the consumer was reported as a proven blocking read."""
+    the consumer was reported as a proven blocking read.
+
+    The write is still live when `zero_case` returns and other functions
+    read `tracked`, so it is the exit frontier (P2-11.1) -- naming one of
+    those genuine readers, never the zero-length one."""
     target = _returned_alias_target(tmp_path, shared_bn, opt, interior=False)
 
     def gmc(fn, *extra):
@@ -5840,7 +6126,11 @@ def test_a_zero_length_read_is_not_an_access(tmp_path, shared_bn, opt):
 
     result, leaves = gmc("zero_case")
     assert leaves == [], leaves
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    [row] = store["references"]
+    assert row["display_name"] in {"tail_reader", "mixed_reader", "direct_reader",
+                                   "one_reader", "n_reader"}, store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
     # one byte, and a length nothing states, still block
     for fn in ("one_case", "n_case"):
         _result, leaves = gmc(fn)
@@ -5941,7 +6231,10 @@ def test_a_bounded_read_of_an_abutting_neighbour_is_disjoint(tmp_path,
     P1-05: `first` DECLARES 64 bytes, so `system(first)` -- a read of no
     stated length -- is a read of first's own storage, not of `second`;
     `memcpy(out, first, 128)` states that it reads 64 bytes past that end,
-    and is cited as a proven reader of `second`."""
+    and is cited as a proven reader of `second`. The bytes the roots copy
+    into `second` are still live when they return, so each ends in the
+    P2-11.1 exit store -- naming that proven reader, never the bounded,
+    direct or unbounded reader the root called."""
     src = tmp_path / f"r9abut{opt[-1]}.c"
     src.write_text(_ABUT_SRC)
     binary = tmp_path / f"r9abut{opt[-1]}"
@@ -5958,7 +6251,10 @@ def test_a_bounded_read_of_an_abutting_neighbour_is_disjoint(tmp_path,
     for fn in ("bounded_root", "direct_root", "unbounded_root"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        [store] = _exit_stores(result)
+        assert [(r["display_name"], r["access"]) for r in store["references"]] == \
+            [("over_read", "call_arg")], (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # a read whose stated length runs into the tainted bytes still blocks
     result, leaves = gmc("over_root")
@@ -6081,7 +6377,11 @@ def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
     """Round-26 review F72: `wchar_t` is 2 bytes on Windows, so
     `wmemcpy(g, s, 32)` writes 64 bytes there -- scaling from the pointer
     width invented a 128-byte footprint and blocked a read of bytes the
-    program never wrote."""
+    program never wrote.
+
+    The write is live when `pe_case` returns, so it is the exit frontier
+    (P2-11.1); the reader it names is the one inside [0, 64), never the
+    one at +88 a 128-byte footprint would have cited."""
     cc = shutil.which("x86_64-w64-mingw32-gcc")
     if cc is None:
         refuse_silent_skip("x86_64-w64-mingw32-gcc is required for the PE64 ABI")
@@ -6109,6 +6409,7 @@ def test_a_wide_count_follows_the_target_wchar_abi(tmp_path, shared_bn):
     # only the global continuation's footprint.
     _result, leaves = gmc("pe_case")
     assert leaves == [], leaves
+
     _result, leaves = gmc("pe_inside_case")
     assert any(r["display_name"] == "byte62_reader"
                for lf in leaves for r in lf["references"]), leaves
@@ -6150,7 +6451,12 @@ def test_a_read_that_misses_every_tainted_byte_is_not_a_reference(tmp_path,
     A distinct global further below than this object is wide is not an arm
     a route can land inside, and a FORWARD string read that starts past
     every tainted byte touches none of them -- the end being unknown does
-    not make the start unknown."""
+    not make the start unknown.
+
+    A write into `middle` that is live when the case returns is the exit
+    frontier (P2-11.1) whenever another function reads those bytes: it
+    names that reader (`far_string_reader`, from +80), never the reader
+    whose every arm misses."""
     src = tmp_path / f"r11miss{opt[-1]}.c"
     src.write_text(_MISS_SRC)
     binary = tmp_path / f"r11miss{opt[-1]}"
@@ -6165,10 +6471,15 @@ def test_a_read_that_misses_every_tainted_byte_is_not_a_reference(tmp_path,
                         if lf["kind"] == "global_memory_continuation"]
 
     # neither arm can reach the written bytes, directly or through the PHI
+    middle = _data_symbol_addr(binary, "middle")
     for fn in ("inline_miss_case", "direct_miss_case"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+        assert store["global"]["address"] == middle, (fn, store)
+        assert [r["display_name"] for r in store["references"]] == \
+            ["far_string_reader"], (fn, store)
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     # ...while an arm that lands INSIDE the written bytes still blocks
     _result, leaves = gmc("inline_hit_case")
@@ -6315,7 +6626,9 @@ def test_one_objects_interior_aliases_are_one_storage(tmp_path, shared_bn, opt):
     so a pointer taken from any of them and adjusted composes back into
     the bytes a write to `middle` tainted. The objects next door -- the
     one before it, the one after it, and one in another section -- are
-    separate storage however close their bases."""
+    separate storage however close their bases: a reader of one of them
+    is no continuation, and the live write's exit frontier (P2-11.1)
+    names a reader of `tracked`, not it."""
     target = _taint_target(tmp_path, shared_bn, _STORAGE_SRC, "r11store", opt)
 
     # the upper alias, adjusted back INTO the written bytes
@@ -6346,7 +6659,13 @@ def test_one_objects_interior_aliases_are_one_storage(tmp_path, shared_bn, opt):
 
     # another section is another object, adjusted or not
     leaves, _rows, clear = _gmc_rows(shared_bn, target, "elsewhere_case")
-    assert leaves == [] and clear is True, leaves
+    assert leaves == [] and clear is False, leaves
+    exits = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f",
+                     "elsewhere_case", "--source", "param:0")["leaves"]
+    middle = _data_symbol_addr(tmp_path / f"r11store{opt[-1]}", "middle")
+    assert [(lf["global"]["address"], [r["display_name"] for r in lf["references"]])
+            for lf in exits if lf["kind"] == "coarse_memory_store"] == \
+        [(middle, ["upper_reader"])], exits
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
@@ -6357,7 +6676,11 @@ def test_an_append_is_not_a_base_relative_bounded_copy(tmp_path, shared_bn,
     `strncat(dst, src, n)` copies at most n bytes OF SRC to wherever dst's
     terminator is. The count bounds neither the destination scan -- which
     runs over the existing string whatever n says, including 0 -- nor the
-    position the appended bytes land at."""
+    position the appended bytes land at.
+
+    A write live when its case returns is the exit frontier (P2-11.1)
+    naming a function that reads the tainted bytes -- never `read64` for
+    a byte at the base, never the zero-length copy."""
     target = _taint_target(tmp_path, shared_bn, _APPEND_END_SRC, "r11span", opt)
 
     # the appended byte lands at the terminator at +64, not at the base
@@ -6368,9 +6691,20 @@ def test_an_append_is_not_a_base_relative_bounded_copy(tmp_path, shared_bn,
     # ...which the direct one-byte copy at +64 has always reported
     _leaves, rows, _clear = _gmc_rows(shared_bn, target, "copy_one")
     assert ("read64", 64, True) in rows, rows
-    # ...and a one-byte copy at the BASE still reaches nothing at +64
+    # ...and a one-byte copy at the BASE still reaches nothing at +64: the
+    # exit frontier names the append that scans byte 0, not `read64`
+    binary = tmp_path / f"r11span{opt[-1]}"
+    tracked = _data_symbol_addr(binary, "tracked")
+
+    def exit_rows(case):
+        found = _bn_json(shared_bn, "-t", target, "taint", "forward", "-f", case,
+                         "--source", "param:0")["leaves"]
+        return [(lf["global"]["address"], [r["display_name"] for r in lf["references"]])
+                for lf in found if lf["kind"] == "coarse_memory_store"]
+
     leaves, _rows, clear = _gmc_rows(shared_bn, target, "copy_base")
-    assert leaves == [] and clear is True, leaves
+    assert leaves == [] and clear is False, leaves
+    assert exit_rows("copy_base") == [(tracked, ["append_one"])]
 
     # the destination scan reads the tainted bytes whatever the count says
     for case in ("scan_one_case", "scan_zero_case"):
@@ -6378,7 +6712,10 @@ def test_an_append_is_not_a_base_relative_bounded_copy(tmp_path, shared_bn,
         assert leaves and clear is False, (case, leaves)
     # ...while a genuine zero-length COPY still touches nothing
     leaves, _rows, clear = _gmc_rows(shared_bn, target, "empty_copy_case")
-    assert leaves == [] and clear is True, leaves
+    assert leaves == [] and clear is False, leaves
+    [(where, names)] = exit_rows("empty_copy_case")
+    assert where in (tracked, _data_symbol_addr(binary, "middle")), where
+    assert names == ["read64"], names
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
@@ -6864,7 +7201,8 @@ def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shar
     """P1-08, P2-04 and the W07/W05 papercuts on one real build.
 
     Two globals written once stay live across four later calls, so the walk
-    records a continuation leaf per (call, global), and the write at an
+    records ONE continuation leaf per global whose `sites` name every call
+    it stayed live across, and the write at an
     interior symbol deep inside a large object runs the enclosing-object
     search out of its internal budget; a void call with a tainted argument
     gets the return frontier. The text names the cause with its own remedy
@@ -6890,10 +7228,13 @@ def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shar
     assert result["run_params"]["models"] == []
     assert all("note" not in leaf for leaf in result["leaves"]), result["leaves"]
     gmc = [lf for lf in result["leaves"] if lf["kind"] == "global_memory_continuation"]
-    per_global: dict[str, int] = {}
+    sites: dict[str, list] = {}
     for lf in gmc:
-        per_global[lf["global"]["address"]] = per_global.get(lf["global"]["address"], 0) + 1
-    assert len(per_global) == 2 and max(per_global.values()) >= 2, gmc
+        assert lf["global"]["address"] not in sites, gmc     # one leaf per global
+        sites[lf["global"]["address"]] = lf["sites"]
+        first = lf["sites"][0]
+        assert (lf["address"], lf["callee"]) == (first["address"], first["callee"]), lf
+    assert len(sites) == 2 and min(len(s) for s in sites.values()) >= 2, gmc
 
     # The return frontier points at a bounded window AT the call, and it runs.
     [lost] = [lf for lf in result["leaves"] if lf.get("cause") == "return_value_unrecovered"]
@@ -6919,12 +7260,16 @@ def test_forward_frontier_verdict_advice_and_text_on_a_real_build(tmp_path, shar
                for line in frontier), frontier
     blocks = [b for b in _frontier_blocks(frontier)
               if "global_memory_continuation @" in b[0]]
-    # One block per global, its count the leaves that global carries, and
-    # exactly one follow-up command in it.
-    assert len(blocks) == len(per_global), frontier
-    for address, count in per_global.items():
+    # One block per global -- one leaf, so no `[N leaves]` count -- listing
+    # every call that global crossed, with exactly one follow-up command.
+    assert len(blocks) == len(sites), frontier
+    for address, crossed in sites.items():
         [block] = [b for b in blocks if f"global={address}" in b[0]]
-        assert (f"[{count} leaves]" in block[0]) is (count > 1), block
+        assert " leaves]" not in block[0], block
+        text = " ".join(" ".join(block).split())
+        for site in crossed:
+            assert f"{site['address']} -> {site['callee']['display_name']}" in text, \
+                (site, block)
         assert len(re.findall(r"`bn [^`]+`", "\n".join(block))) == 1, block
     # Every command the text prints carries this invocation's routing, and
     # the frontier block's own command runs as printed.

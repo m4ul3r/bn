@@ -509,10 +509,10 @@ def test_two_tainted_globals_are_disclosed_separately(models):
         (hex(0x40110c), hex(G_DIR)), (hex(0x401110), hex(G_OTHER))]
 
 
-def test_one_leaf_per_call_and_global_across_fixpoint_passes(models):
-    # The fixpoint revisits every instruction; the disclosure is per (call,
-    # global), not per pass, and a second call to the SAME consumer is its own
-    # boundary.
+def test_one_leaf_per_global_lists_every_call_it_crossed(models):
+    # P2-04: the fixpoint revisits every instruction, and the global is live
+    # across two calls to the same consumer -- one fact, so ONE leaf whose
+    # `sites` names both calls, each once.
     hook = _reader("run_hook", 0x401200, G_DIR, 0x401210)
     func, _argv = _copy_then_call(
         0x401104, STRCPY, G_DIR,
@@ -520,7 +520,12 @@ def test_one_leaf_per_call_and_global_across_fixpoint_passes(models):
     bv = FGlobalBV({STRCPY: "strcpy", SYSTEM: "system", 0x401200: "run_hook"},
                    funcs={0x401200: hook}, refs={G_DIR: [FRef(hook, 0x401210)]})
     result = _forward(bv, func, models)
-    assert sorted(lf["address"] for lf in _leaves(result)) == [hex(0x401108), hex(0x40110c)]
+    [leaf] = _leaves(result)
+    assert leaf["address"] == hex(0x401108)
+    assert [(s["address"], s["callee"]["name"], s["descended"]) for s in leaf["sites"]] == [
+        (hex(0x401108), "run_hook", False), (hex(0x40110c), "run_hook", False)]
+    assert [r["display_name"] for r in leaf["references"]] == ["run_hook"]
+    assert result["stats"]["leaves"] == len(result["leaves"])
 
 
 # --------------------------------------------------------------------------
@@ -2842,7 +2847,13 @@ def test_a_call_before_the_only_write_carries_nothing(models):
     func, bv = _before_after_program("before", blocks=[FBlock(0, 2)])
     result = _forward(bv, func, models, source="param:0")
     assert _leaves(result) == [], result["leaves"]
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # P2-11: no continuation at the EARLIER call -- but the copied bytes are
+    # still live when `main` returns, and `reader`, which the walk ran only
+    # before the write, reads them: the copy is the exit frontier.
+    [store] = _leaves(result, "coarse_memory_store")
+    assert store["address"] == hex(0x401104), store
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_a_call_after_the_write_still_blocks(models):
@@ -3103,7 +3114,11 @@ def test_a_reader_on_the_other_branch_sees_nothing(models):
     func, bv = _branch_program()
     result = _forward(bv, func, models, source="param:0")
     assert _leaves(result) == [], result["leaves"]
-    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+    # P2-11: no continuation on the sibling branch, but `main` returns with
+    # the copied bytes live and `reader` can run after it.
+    [store] = _leaves(result, "coarse_memory_store")
+    assert store["address"] == hex(0x401110), store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def test_il_order_decides_only_inside_one_block(models):
@@ -4160,7 +4175,11 @@ def test_a_pinned_tail_jump_is_resolved_like_a_call(models, pinned, reads):
         assert result["diagnostics"]["safe_to_report_all_clear"] is False
     else:
         assert leaves == [], leaves
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True
+        # P2-11: `quiet` reads nothing of it, but `main` leaves the copied
+        # bytes live for `reader`, which the walk never runs after the write.
+        [store] = _leaves(result, "coarse_memory_store")
+        assert [r["display_name"] for r in store["references"]] == ["reader"]
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 def _swap_program(swap_args=True):
