@@ -273,7 +273,6 @@ def test_render_taint_forward_frontier_message():
     }
     text = _render_taint_text(value)
     assert "no sinks reached by tainted data" not in text
-    assert "NO modeled sink reached" in text
     assert "1 tainted frontier" in text and "NOT an all-clear" in text
     # the call -> callee hand-off line for the frontier leaf
     assert "parse_event @ 0x3000" in text
@@ -644,7 +643,7 @@ def test_taint_forward_verdict_frontiers_not_all_clear():
     v = {"reached_sinks": [], "leaves": [{"kind": "coarse_memory_store"}] * 12,
          "stats": {"functions_visited": 1}}
     out = _taint_forward_verdict(v)
-    assert "NO modeled sink reached" in out and "12 tainted frontier" in out and "NOT an all-clear" in out
+    assert "12 tainted frontier" in out and "NOT an all-clear" in out
 
 
 def test_taint_via_trail_from_path_reasons():

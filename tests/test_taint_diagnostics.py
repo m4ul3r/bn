@@ -266,26 +266,70 @@ def test_a_return_only_flow_is_an_all_clear_that_names_the_return_not_a_dead_end
     assert f"--source ret:{hex(SCALE)}" in diag["next_action"]
 
 
-@pytest.mark.parametrize("gate", [True, False, None])
-def test_the_empty_verdict_states_the_gate_the_diagnostics_state(gate):
+def test_the_empty_verdict_states_the_gate_the_diagnostics_state():
     """TT-PILOT-HOST04-01: the zero-sink, zero-frontier verdict said "NOT an
     all-clear" whatever the gate said. It now carries the same claim as
-    `diagnostics.safe_to_report_all_clear` (no diagnostics: no all-clear),
-    and an all-clear names the sink classes it covers."""
+    `diagnostics.safe_to_report_all_clear` -- an all-clear only when the gate
+    is true, never when it is false or absent -- and every one of those
+    verdicts names the sink classes it covers and the opt-in call it did not
+    report. One node: the gate values are the same contract read three ways."""
     from bn.formatters import _render_taint_text
 
-    result = _forward(_relay_program(), "param:1")
-    result["run_params"] = {"sink_classes": ["file_write"]}
-    if gate is None:
-        result.pop("diagnostics")
-    else:
-        result["diagnostics"]["safe_to_report_all_clear"] = gate
-    text = _render_taint_text(result)
-    verdict = next(line for line in text.splitlines() if line.startswith("verdict:"))
-    assert ("NOT an all-clear" in verdict) is (gate is not True)
-    assert ("file_write" in verdict) is (gate is True)
-    if gate is not None:
-        assert f"safe_to_report_all_clear: {str(gate).lower()}" in text
+    seen = {}
+    for gate in (True, False, None):
+        result = _forward(_relay_program(), "param:1")
+        result["run_params"] = {"sink_classes": ["file_write"]}
+        if gate is None:
+            result.pop("diagnostics")
+        else:
+            result["diagnostics"]["safe_to_report_all_clear"] = gate
+        text = _render_taint_text(result)
+        seen[gate] = next(line for line in text.splitlines() if line.startswith("verdict:"))
+        if gate is not None:
+            assert f"safe_to_report_all_clear: {str(gate).lower()}" in text
+    assert {gate: "NOT an all-clear" in verdict for gate, verdict in seen.items()} == {
+        True: False, False: True, None: True}
+    assert all("file_write" in verdict and "net_write" in verdict for verdict in seen.values())
+
+
+def _relay_with_frontier():
+    """relay(fd, buf, fp): send(fd, buf, 0x40, 0); fp(buf) -- the opt-in
+    `net_write` call and an unresolved indirect call both receive `buf`."""
+    from test_taint_engine import _ext_call
+
+    fd, buf, fp = FVar("fd"), FVar("buf"), FVar("fp")
+    fd0, buf0, fp0 = FSSA(fd, 0), FSSA(buf, 0), FSSA(fp, 0)
+    instrs = [_ext_call(0, 0x10, "send(fd#0, buf#0, 0x40, 0)", SEND,
+                        [FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                         FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0]),
+                         FExpr("MLIL_CONST", "0x40", constant=0x40),
+                         FExpr("MLIL_CONST", "0", constant=0)], reads=[fd0, buf0]),
+              FInstr(1, 0x14, "MLIL_CALL_SSA", "fp#0(buf#0)", reads=[fp0, buf0],
+                     dest=FExpr("MLIL_VAR_SSA", "fp#0", reads=[fp0]),
+                     params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+              FInstr(2, 0x18, "MLIL_RET", "return")]
+    return FFunc("relay", 0x10, FSSAFunc(instrs), params=[fd, buf, fp]), FBV({SEND: "send"})
+
+
+def test_a_withheld_all_clear_is_scoped_and_names_the_opt_in_call_too():
+    """E4-1: with a frontier beside the opt-in call, the gate is false and
+    the text verdict said "NO modeled sink reached" -- and the JSON reason
+    "no modeled sink reached" -- above the listed `net_write` call it had
+    reached. Both are scoped to the enabled classes and name the opt-in
+    class, as the true gate's are."""
+    from bn.formatters import _render_taint_text
+
+    result = _forward(_relay_with_frontier(), "param:1")
+    assert [lf["kind"] for lf in result["leaves"]] == ["indirect_call_unresolved"]
+    assert [r["class"] for r in result["opt_in_sinks_reached"]] == ["net_write"]
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False
+    assert diag["opt_in_sink_classes_reached"] == ["net_write"]
+    assert "enabled class" in diag["all_clear_reason"] and "net_write" in diag["all_clear_reason"]
+    verdict = next(line for line in _render_taint_text(result).splitlines()
+                   if line.startswith("verdict:"))
+    assert "NOT an all-clear" in verdict
+    assert "default sink classes" in verdict and "net_write" in verdict
 
 
 def test_a_per_callsite_union_merges_the_opt_in_record_and_its_exits():

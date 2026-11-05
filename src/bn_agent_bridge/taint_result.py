@@ -187,48 +187,58 @@ def _derive_all_clear(
     analysis genuinely ESCAPED and an empty ``reached_sinks`` is not an
     all-clear even though no blocking leaf was emitted (#562).
 
-    The claim is relative to the sink classes the run ENABLED (IC07): taint
+    The claim is relative to the sink classes the run ENABLED (IC07), whether
+    the gate holds or not: every reason opens with that scope, and taint
     reaching a sink of an opt-in class the run did not enable
-    (*opt_in_classes*, from ``opt_in_sinks_reached``) neither withholds it nor
-    is left out of it -- the reason names those classes, so the all-clear
-    never reads as "nothing reached any sink".
+    (*opt_in_classes*, from ``opt_in_sinks_reached``) is named in it -- it
+    neither withholds the all-clear nor is left out of a withheld one, so no
+    reason reads as "nothing reached any sink".
     """
+    head = "no modeled sink of an enabled class reached"
+    opt_in = (f"; taint did reach opt-in sink class(es) {', '.join(opt_in_classes)}, "
+              "which this run does not report (see opt_in_sinks_reached)"
+              if opt_in_classes else "")
+    withheld = _withheld_all_clear(
+        leaves, assumptions, truncated=truncated, unmodeled_reached=unmodeled_reached,
+        truncation_cause=truncation_cause, analysis_incomplete=analysis_incomplete)
+    if withheld is not None:
+        return False, f"{head}, but {withheld} -- NOT an all-clear{opt_in}"
+    return True, (f"{head} and no tainted frontier in the analyzed region{opt_in}; "
+                  "still a may-analysis -- not a proof of safety")
+
+
+def _withheld_all_clear(
+    leaves: list[dict[str, Any]],
+    assumptions: list[str],
+    *,
+    truncated: bool,
+    unmodeled_reached: bool,
+    truncation_cause: list[str] | None,
+    analysis_incomplete: bool,
+) -> str | None:
+    """Why a zero-sink forward run is NOT an all-clear, or None when it is."""
     blocking = [str(lf.get("kind")) for lf in leaves
                 if lf.get("kind") in BLOCKING_LEAF_KINDS]
-    weak_seed = _assumption_has_weak_seed(assumptions)
-
     if blocking:
         # De-dup preserving order for a readable reason.
-        seen: list[str] = []
-        for k in blocking:
-            if k not in seen:
-                seen.append(k)
-        return False, (
-            f"no modeled sink reached, but {len(blocking)} blocking frontier "
-            f"leaf(s) ({', '.join(seen)}) remain -- NOT an all-clear")
+        seen = list(dict.fromkeys(blocking))
+        return (f"{len(blocking)} blocking frontier leaf(s) ({', '.join(seen)}) remain")
     if leaves:
-        return False, (
-            f"no modeled sink reached, but {len(leaves)} frontier leaf(s) "
-            f"remain -- NOT an all-clear")
+        return f"{len(leaves)} frontier leaf(s) remain"
     if any("tokenizer_state_escapes" in str(a) for a in assumptions):
         # A `continuation` model (strtok) left its static state tainted when
         # the function returned; a `strtok(NULL, ..)` in another function
         # continues it and is not followed, so the empty result speaks only
         # for this function's own tokens (PR-928 review P2).
-        return False, (
-            "no modeled sink reached, but a tokenizer's static state is left "
-            "tainted at return (see the tokenizer_state_escapes caveat) -- a "
-            "continuation in another function is not followed, NOT an all-clear")
-    if weak_seed:
-        return False, (
-            "no sinks/leaves, but the source seed was incomplete or mis-anchored "
-            "(see caveats) -- NOT an all-clear")
+        return ("a tokenizer's static state is left tainted at return (see the "
+                "tokenizer_state_escapes caveat); a continuation in another "
+                "function is not followed")
+    if _assumption_has_weak_seed(assumptions):
+        return "the source seed was incomplete or mis-anchored (see caveats)"
     if unmodeled_reached:
-        return False, (
-            "no modeled sink reached, but taint reached an unmodeled call "
-            "frontier (an unresolved in-binary callee or an external callee with "
-            "no taint model, returned conservatively tainted) -- analysis "
-            "escaped there, NOT an all-clear")
+        return ("taint reached an unmodeled call frontier (an unresolved in-binary "
+                "callee or an external callee with no taint model, returned "
+                "conservatively tainted); analysis escaped there")
     if analysis_incomplete:
         # #811: a callee whose MLIL was missing mid-run (a partially analysed
         # view, or a function BN had not finished lifting) is caught by
@@ -237,19 +247,12 @@ def _derive_all_clear(
         # under-disclosure started, so the condition is threaded structurally and
         # withholds the all-clear here: the body was never read, so "no sink in
         # it" is an absence of evidence, not evidence of absence.
-        return False, (
-            "no modeled sink reached, but one or more callee bodies could not be "
-            "analysed (MLIL unavailable -- the view may be partially analysed); "
-            "their contents were never examined, NOT an all-clear")
+        return ("one or more callee bodies could not be analysed (MLIL unavailable "
+                "-- the view may be partially analysed); their contents were never "
+                "examined")
     if truncated:
-        return False, (
-            f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
-            "incomplete coverage, NOT an all-clear")
-    scope = "no modeled sink of an enabled class and no tainted frontier in the analyzed region"
-    if opt_in_classes:
-        scope += (f"; taint did reach opt-in sink class(es) {', '.join(opt_in_classes)}, "
-                  "which this run does not report (see opt_in_sinks_reached)")
-    return True, f"{scope}; still a may-analysis -- not a proof of safety"
+        return f"analysis truncated ({_truncation_hint(truncation_cause)}): incomplete coverage"
+    return None
 
 
 def command_template(command: str) -> str:

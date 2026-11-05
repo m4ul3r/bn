@@ -5511,25 +5511,29 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
         classes = ", ".join(cls + _marks(cls)
                             for cls in sorted({str(s.get("class") or "?") for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
-    if leaves:
-        return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
-                f"(NOT an all-clear){fns_part}{trunc}")
-    # No sink AND no frontier. The verdict states the SAME claim the JSON gate
-    # (`diagnostics.safe_to_report_all_clear`) makes, scoped to the sink classes
-    # the run enabled (IC07): it said "NOT an all-clear" beside a gate that said
-    # all-clear, and "no taint reached any sink" while taint had armed an opt-in
-    # sink the run does not report. An absent or false gate is no all-clear.
-    visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
-    diag = _field_dict(value, "diagnostics")
-    if diag.get("safe_to_report_all_clear") is not True:
-        return (f"verdict: no modeled sink reached and no tainted frontier — NOT an "
-                f"all-clear ({visited}; see diagnostics){trunc}")
+    # IC07: every zero-finding verdict is scoped to the sink classes the run
+    # enabled (the default catalog plus `run_params.sink_classes`) and names
+    # the opt-in calls taint reached that the run does not report -- a run
+    # with a frontier said "NO modeled sink reached" above a listed `net_write`
+    # call it had reached.
     enabled = [str(c) for c in _field_list(_field_dict(value, "run_params"), "sink_classes")]
     scope = "the default sink classes" + (f" + {', '.join(enabled)}" if enabled else "")
     opt_in = [r for r in _field_list(value, "opt_in_sinks_reached") if isinstance(r, dict)]
     skipped = (f"; {len(opt_in)} call(s) of opt-in sink class(es) "
                f"{', '.join(sorted({str(r.get('class')) for r in opt_in}))} reached, "
                "not reported" if opt_in else "")
+    if leaves:
+        return (f"verdict: no sink of {scope} reached — {len(leaves)} tainted frontier(s) "
+                f"(NOT an all-clear{skipped}){fns_part}{trunc}")
+    # No sink AND no frontier. The verdict states the SAME claim the JSON gate
+    # (`diagnostics.safe_to_report_all_clear`) makes: it said "NOT an
+    # all-clear" beside a gate that said all-clear. An absent or false gate is
+    # no all-clear.
+    visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
+    diag = _field_dict(value, "diagnostics")
+    if diag.get("safe_to_report_all_clear") is not True:
+        return (f"verdict: no sink of {scope} reached and no tainted frontier — NOT an "
+                f"all-clear ({visited}; see diagnostics{skipped}){trunc}")
     return (f"verdict: no sink of {scope} reached and no tainted frontier — all-clear "
             f"for those classes only, a may-analysis and not a proof ({visited}{skipped})"
             f"{trunc}")
