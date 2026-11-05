@@ -786,6 +786,7 @@ def write_output_result(
         )
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
+    spill_path: Path | None = None
     try:
         spill_path = _spill_path(stem, suffix)
         _write_private_bytes(spill_path, encoded)
@@ -793,11 +794,18 @@ def write_output_result(
     except OSError as exc:
         # The rendered output is already in memory; losing it over a failed
         # spill write (disk full, permissions) would punish the user twice.
+        # R4-04: what this attempt DID write -- the artifact, a partial
+        # sidecar -- is removed, so the fallback is what it says: the payload
+        # on stdout and no artifact left in the spill tree (one with no
+        # provenance sidecar is the unattributable file #653 ended). A file
+        # that cannot be removed is named, never silently left.
+        stranded = [] if spill_path is None else _remove_spill_files(spill_path)
         print(
-            f"warning: failed to write spill artifact ({exc}); printing full output",
+            f"warning: failed to write spill artifact ({exc}); printing full output"
+            + (f"; could not remove {', '.join(stranded)}" if stranded else ""),
             file=sys.stderr,
         )
-        # Nothing was written, so the FULL payload is on stdout -- exactly the case
+        # The FULL payload is on stdout -- exactly the case
         # the slicing note exists for. Two fixes from dogfood passes 3/4: leaving
         # `token_count` at its 0 default silenced the note entirely, and gating on
         # the 10 000 default ignored an ARMED threshold below it (armed 50, payload
@@ -840,6 +848,18 @@ def write_output_result(
 def spill_sidecar_path(artifact_path: Path) -> Path:
     """Provenance sidecar written next to a spill artifact (``<artifact>.meta.json``)."""
     return artifact_path.with_name(artifact_path.name + ".meta.json")
+
+
+def _remove_spill_files(artifact_path: Path) -> list[str]:
+    """Unlink *artifact_path* and its sidecar if present; the paths that
+    exist but could not be removed."""
+    stranded = []
+    for path in (artifact_path, spill_sidecar_path(artifact_path)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            stranded.append(str(path))
+    return stranded
 
 
 def _write_spill_sidecar(
