@@ -1121,10 +1121,23 @@ def backward_diagnostics(
             "the sink seeded but no slice was produced; confirm the --sink "
             "locator names the operand you meant")
     else:
+        # A `crt_entry` row is the one frontier left: the slice did reach its
+        # origins, but the formals of the function the C runtime's start
+        # routine calls are what the process was started with -- nothing in
+        # the binary supplies them, which is why the slice is not complete.
+        entered = sorted({
+            str((lf.get("function") or {}).get("name") or lf.get("address"))
+            for lf in caller_leaves
+            if isinstance(lf.get("reasons"), dict) and "crt_entry" in lf["reasons"]})
+        boundary = (
+            f"; {', '.join(entered)} is entered from the C runtime's start routine, "
+            "which passes what the process was started with (argc, argv, envp) -- "
+            "no caller in this binary supplies those formals, so treat them as "
+            "program inputs" if entered else "")
         next_action = (
-            "the slice reached its origins; classify each origin (parameter / "
-            "modeled source / constant) to decide whether the sink is "
-            "attacker-reachable")
+            f"the slice reached its origins{boundary}; classify each origin "
+            "(parameter / modeled source / constant) to decide whether the sink "
+            "is attacker-reachable")
 
     return {
         "sinks_seeded": int(sinks_seeded),

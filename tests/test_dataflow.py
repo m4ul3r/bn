@@ -344,12 +344,13 @@ _BACKWARD_CAPPED = {
                            "formal) demand(s) unfollowed: 4 caller_cap -- an origin "
                            "reachable only from an unfollowed caller is missing from "
                            "this slice")}],
-    # The wording is the engine's own (`_bw_note_caller_cap`), copied rather than
-    # paraphrased: a fixture that drifts from the envelope it stands for renders
-    # prose no run can produce, and the renderer assertions stop describing the
-    # real thing (#810 review).
-    "assumptions": ["use_len has 20 callers; caller ascent fully followed 16, capped at 16"],
-    "stats": {"leaves": 1, "slices": 1, "truncated": True,
+    # The wording is the engine's own (`_bw_note_unfollowed_callers`), copied
+    # rather than paraphrased: a fixture that drifts from the envelope it
+    # stands for renders prose no run can produce, and the renderer assertions
+    # stop describing the real thing (#810 review). A cap is truncation, so it
+    # is in `stats` and the leaf, never in `assumptions` (R2).
+    "assumptions": [],
+    "stats": {"leaves": 1, "slices": 1, "max_depth": 1, "truncated": True,
               "truncation_cause": ["caller_cap"]},
     "soundness": "x",
 }

@@ -3412,7 +3412,7 @@ class TaintEngine:
                     out.append(("entry", None))
                 pending.extend(arms)
                 continue
-            if self._writes_back_what_it_reads(defn):
+            if self._writes_back_what_it_reads(ssaf, defn):
                 # A stack probe: the bytes before it are the bytes after it.
                 pending.append(self._mem_in(defn))
                 continue
@@ -4057,9 +4057,8 @@ class TaintEngine:
             return inner
         return "no"
 
-    @staticmethod
-    def _writes_back_what_it_reads(defn: Any) -> bool:
-        """A store of the bytes it loads from the very address it writes
+    def _writes_back_what_it_reads(self, ssaf: Any, defn: Any) -> bool:
+        """A store of the bytes it loads from the very slot it writes
         (``[a].q = [a].q @ mem#k``): it changes no object's contents, so it is
         never a writer -- or may-writer -- of a buffer or of a pointer's object,
         and stores no pointer anywhere. Stack-clash probes are the producer:
@@ -4067,16 +4066,37 @@ class TaintEngine:
         frame by lifts to exactly this, and its address (off the stack pointer
         through a renamed register at -O0) is otherwise one the walk cannot
         pin, so every slice through the frame gained a blocking may-alias row
-        and a spurious origin."""
+        and a spurious origin.
+
+        The slot is the whole of it -- base, field offset and width. BN's
+        ``*_STRUCT`` forms keep the field offset beside a bare base, so
+        ``m->a = m->b`` prints one address on both sides; comparing the text
+        alone read that copy as a write-back and the older store became the
+        sole origin of a "complete" slice (R2-01)."""
         if "STORE" not in op_name(defn):
             return False
         dest, src = getattr(defn, "dest", None), getattr(defn, "src", None)
         if dest is None or src is None or "LOAD" not in op_name(src):
             return False
-        # SSA text is canonical, so equal text is the same address expression
-        # over the same SSA versions.
+        if getattr(src, "size", None) != getattr(defn, "size", None):
+            return False
+        written = self._mem_access_slot(ssaf, defn, exact=True)
+        read = self._mem_access_slot(ssaf, src, exact=True)
+        if written is not None or read is not None:
+            return written == read
+        # No exact identity for the address (a probe off the stack pointer
+        # plus a run-time size): SSA text is canonical, so equal text is the
+        # same address over the same SSA versions -- and the field offsets
+        # beside it must agree too.
+        def field(access: Any) -> int | None:
+            if "_STRUCT" not in op_name(access):
+                return 0
+            try:
+                return int(getattr(access, "offset", 0) or 0)
+            except (TypeError, ValueError):
+                return None
         return (str(getattr(src, "src", None)) == str(dest)
-                and getattr(src, "size", None) == getattr(defn, "size", None))
+                and field(defn) is not None and field(defn) == field(src))
 
     def _local_buffer_writers(self, ssaf: Any, base_key: Any, mv: Any,
                               base_size: int | None = None,
@@ -4382,7 +4402,7 @@ class TaintEngine:
                 cov, esc = memo.get(deps[0], ((), False))
                 addrs = escape_addrs.get(deps[0], frozenset())
                 op = op_name(defn)
-                if self._writes_back_what_it_reads(defn):
+                if self._writes_back_what_it_reads(ssaf, defn):
                     # A stack probe (`alloca`'s page touch): no object's
                     # contents change, so it is neither a writer nor an
                     # escape.
@@ -6989,11 +7009,13 @@ class TaintEngine:
     def _is_pure_veneer(self, fn: Any) -> bool:
         """Whether *fn* is a stub the caller may resolve to its target: every
         hop of the chain ``follow_thunk`` walks is one MLIL tail call that
-        hands its own parameters on unchanged, in order. Anything else -- a
-        store, a call, an argument swap or a constant passed in a parameter's
-        place -- is a body of its own: mapping the caller's arguments straight
-        onto the target would hand them to the wrong formals, and what the
-        body does before its `jmp` would go unread."""
+        hands EVERY one of its own parameters on unchanged, in order. Anything
+        else -- a store, a call, an argument swap, a constant passed in a
+        parameter's place, or a formal it does not forward at all -- is a body
+        of its own: mapping the caller's arguments straight onto the target
+        would hand them to the wrong formals (an omitted formal's value lands
+        in a target slot it never reaches, R2-05), and what the body does
+        before its `jmp` would go unread."""
         if self._follow_thunk_cached(fn) is None:
             return False
         cur = fn
@@ -7010,7 +7032,10 @@ class TaintEngine:
                 # The end of the chain: a body follow_thunk stopped at.
                 return cur is not fn
             formals = list(getattr(cur, "parameter_vars", None) or [])
-            for i, param in enumerate(self._call_params(instructions[0])):
+            params = self._call_params(instructions[0])
+            if len(params) != len(formals):
+                return False
+            for i, param in enumerate(params):
                 src = getattr(param, "src", None)
                 if (op_name(param) != "MLIL_VAR_SSA" or i >= len(formals)
                         or getattr(src, "version", None) != 0
@@ -16317,6 +16342,9 @@ class TaintEngine:
         # full one.
         self._bw_truncated = False
         self._bw_truncation_causes: set[str] = set()
+        # The deepest caller depth the ascent reached: `stats.max_depth`, as
+        # forward reports it -- the number a depth cut's text names (R2-06).
+        self._bw_depth_seen = 0
         slices: list[dict[str, Any]] = []
 
         # Function-level resolution is sink-independent: a missing MLIL/SSA form
@@ -16544,6 +16572,7 @@ class TaintEngine:
             # (#579/#576) -- a backward run whose caller ascent was capped is
             # INCOMPLETE and must not report from stats as a complete one.
             "stats": {"leaves": len(self._bw_leaves), "slices": len(slices),
+                      "max_depth": self._bw_depth_seen,
                       "truncated": self._bw_truncated,
                       "truncation_cause": sorted(self._bw_truncation_causes)},
             # #812: backward had no diagnostics block at all while forward did,
@@ -16633,7 +16662,12 @@ class TaintEngine:
     def _argument_registers(self, func: Any) -> frozenset[str] | None:
         """Full-width names of every register *func*'s calling convention
         passes an integer or floating-point argument in, or None when no
-        convention is recoverable."""
+        convention is recoverable.
+
+        A convention that lists no argument register at all passes every
+        argument on the stack (i386 cdecl): that is an answer -- an empty
+        set, so no register's entry value is an unmapped argument -- not the
+        unreadable convention None stands for (R2-02)."""
         cc = getattr(func, "calling_convention", None)
         if cc is None:
             plat = getattr(self.bv, "platform", None)
@@ -16641,11 +16675,12 @@ class TaintEngine:
         if cc is None:
             return None
         try:
-            regs = list(getattr(cc, "int_arg_regs", []) or []) + \
-                list(getattr(cc, "float_arg_regs", []) or [])
+            int_regs = getattr(cc, "int_arg_regs", None)
+            float_regs = getattr(cc, "float_arg_regs", None)
+            if int_regs is None and float_regs is None:
+                return None
+            regs = list(int_regs or []) + list(float_regs or [])
         except Exception:
-            return None
-        if not regs:
             return None
         return frozenset(_full_width_reg(self.bv.arch, str(r)) for r in regs)
 
@@ -16690,6 +16725,7 @@ class TaintEngine:
         an ``arg:`` sink, and for the caller ascent of a parameter the callee
         read through; None when no consumer reads through the seed."""
         self._visits += 1
+        self._bw_depth_seen = max(self._bw_depth_seen, depth)
         self._check_cancelled()
         ssaf = self._ssa_func(func)
         steps: list[dict[str, Any]] = []
@@ -16766,21 +16802,28 @@ class TaintEngine:
         # How many may-alias stores the walk is currently inside (W02-10). A
         # store through a pointer the walk cannot prove disjoint from a
         # loaded object is only a POSSIBLE writer of it: what produced that
-        # store's value never represents the slice over the load's own
-        # frontier, which names the object the sink actually read.
+        # store's value is walked as evidence -- its steps, its leaves -- but
+        # is no origin of the slice, neither its representative nor a
+        # producer a recursive back edge emits (R2-03, D5b-01): the load's
+        # own frontier, which names the object the sink read, is.
         may_writers = 0
 
         def _set_origin(o, *, weak: int | bool = 0):
+            """Record origin *o* ranked by *weak* (rank 0 best): a formal is
+            kept for the ascent, anything else is a producer; a call's return
+            at rank 1 is a root of its own; the best-ranked origin represents
+            the slice. Inside a may-alias store's value only a formal counts
+            (it still ascends); anything else there is evidence."""
             nonlocal origin, origin_rank
-            o["function"] = fn_ref
             if weak is True:
                 rank = 3
             elif weak:
                 rank = int(weak) + 1
             else:
                 rank = 0 if o.get("kind") == "parameter" else 1
-            if may_writers and rank == 1:
-                rank = 2
+            if may_writers and rank:
+                return
+            o["function"] = fn_ref
             if rank == 0:
                 param_origins.setdefault(int(o["index"]), o)
             elif o not in producers:
@@ -16796,8 +16839,11 @@ class TaintEngine:
             over anything else, a formal found before or after it included.
             Pinned at the top rank, so a later weak origin cannot displace it
             (the outright assignment left a stale rank that could). A formal
-            beside it still ascends on its own (IC01)."""
+            beside it still ascends on its own (IC01). Behind a may-alias
+            store it is evidence only: its call step names it (R2-03)."""
             nonlocal origin, origin_rank
+            if may_writers:
+                return
             o["function"] = fn_ref
             if o not in producers:
                 producers.append(o)
@@ -17531,7 +17577,13 @@ class TaintEngine:
                 target = const_target(getattr(defn, "dest", None))
                 name = self._callee_name(target)
                 mkey, model = lookup_model(self.models, name)
-                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}")
+                # The step names the call structurally: `callee`, and `model`
+                # (the key that matched) when a model judged it -- the only
+                # record of a source behind a may-alias store (D5b-02).
+                call_step = _instr_dict(defn, reason=f"defined by call to {name or 'indirect'}",
+                                        callee=called_name(mkey, name))
+                if mkey:
+                    call_step["model"] = mkey
                 steps.append(call_step)
                 if model and model.get("sources"):
                     # The representative, ranked (IC01): the outright
@@ -18442,11 +18494,15 @@ class TaintEngine:
         # Address order, never BN's enumeration order: which sites the cap
         # lets through -- and which it drops -- is a property of the binary,
         # not of how the view was loaded (a raw ELF and its saved `.bndb`
-        # enumerate the same callers differently).
-        caller_sites = sorted(
-            getattr(func, "caller_sites", None) or [],
-            key=lambda s: (int(getattr(s, "address", 0)),
-                           int(getattr(getattr(s, "function", None), "start", -1) or -1)))
+        # enumerate the same callers differently). A site is (address,
+        # caller): BN may list one record twice, which used to spend a cap
+        # slot and a drop on the same call, while overlapping functions that
+        # share a call instruction are two callers (R2-04).
+        unique: dict[tuple, Any] = {}
+        for s in getattr(func, "caller_sites", None) or []:
+            unique.setdefault(self._site_identity(
+                getattr(s, "address", 0), getattr(s, "function", None)), s)
+        caller_sites = [unique[k] for k in sorted(unique)]
         start = int(getattr(func, "start", 0))
         # address -> referencing function (None: a data reference)
         indirect: dict[int, Any] = {}
@@ -18457,11 +18513,12 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
-        direct = {int(getattr(s, "address", 0)) for s in caller_sites}
+        direct = set(unique)
+        call_addresses = {k[0] for k in direct}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
                 a, rf = int(getattr(ref, "address", 0)), getattr(ref, "function", None)
-                if a in direct:
+                if a in call_addresses:
                     continue
                 indirect.setdefault(a, rf)
         except Exception:
@@ -18472,20 +18529,20 @@ class TaintEngine:
         # measurement, never the constant (#810).
         considered = caller_sites[:MAX_CALLERS] if ascend else []
         results: list[dict[str, Any]] = []
-        rows: list[dict[str, Any]] = []
-        misses: set[tuple[int, int, str]] = set()
+        rows: dict[tuple, dict[str, Any]] = {}
+        misses: set[tuple[tuple, int, str]] = set()
 
         def _drop(address: int, caller: Any, pidx: int, reason: str) -> None:
             # Every (site, formal, reason) is a row, a site past the cap
             # included: the leaf lists them in address order up to its
             # bound and counts all of them.
-            key = (int(address), pidx, reason)
+            key = (self._site_identity(address, caller), pidx, reason)
             if key in misses:
                 return
             misses.add(key)
-            rows.append({"address": hex(int(address)),
+            rows[key] = {"address": hex(int(address)),
                          "caller": None if caller is None else self._prose_function(caller),
-                         "param": pidx, "reason": reason})
+                         "param": pidx, "reason": reason}
 
         cycled: set[int] = set()
         fkey = self._caller_key(func)
@@ -18604,14 +18661,23 @@ class TaintEngine:
             for pidx in demands:
                 _drop(a, rf, pidx, reason)
         self._bw_note_unfollowed_callers(
-            func, direct=direct, indirect=set(indirect), formals=set(demands),
-            rows=rows, misses=misses)
+            func, direct=direct,
+            indirect={self._site_identity(a, rf) for a, rf in indirect.items()},
+            formals=set(demands), rows=rows, misses=misses)
         return results, cycled
 
     @staticmethod
     def _caller_key(func: Any) -> tuple[int, str]:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+
+    @classmethod
+    def _site_identity(cls, address: Any, caller: Any) -> tuple[int, int, str]:
+        """A caller reference's identity: its address and the function it is
+        in (``(-1, "")`` for a data reference). Ordered by address first, so
+        sorting by it is the address order the cap follows."""
+        key = (-1, "") if caller is None else cls._caller_key(caller)
+        return (int(address), *key)
 
     # C-runtime start routines whose FIRST operand is the program's main
     # callback (`__libc_start_main(main, argc, argv, ..)`).
@@ -18695,12 +18761,15 @@ class TaintEngine:
         return handed > 0
 
     def _bw_note_unfollowed_callers(
-        self, func: Any, *, direct: set[int], indirect: set[int], formals: set[int],
-        rows: list[dict[str, Any]], misses: set[tuple[int, int, str]],
+        self, func: Any, *, direct: set[tuple], indirect: set[tuple], formals: set[int],
+        rows: dict[tuple, dict[str, Any]], misses: set[tuple[tuple, int, str]],
     ) -> None:
         """One caller frontier per function, across every demanded formal.
 
-        Coverage counts distinct reference addresses, each classed by the
+        Coverage counts distinct caller references -- a reference is its
+        address AND the function it is in (:meth:`_site_identity`), so one
+        site BN lists twice counts once and overlapping callers sharing a
+        call instruction count as two (R2-04) -- each classed by the
         formals demanded of it: FULLY followed (every demanded formal
         followed), PARTIALLY followed (some), or UNFOLLOWED (none).
         ``callers_dropped`` is the partial and unfollowed references together
@@ -18714,9 +18783,10 @@ class TaintEngine:
 
         A cut the configuration made -- the ``caller_cap`` and the
         ``max_depth`` bound -- is run truncation: it sets ``stats.truncated``
-        and names its cause in ``truncation_cause`` with an assumption, as
-        forward does for its own bounds. The other reasons are what the
-        binary could not show, disclosed by this leaf alone.
+        and names its cause in ``truncation_cause``, and this leaf names the
+        sites. Like every other truncation it is never an ``assumptions``
+        entry. The other reasons are what the binary could not show,
+        disclosed by this leaf alone.
         """
         start = int(func.start)
         state = self._bw_caller_frontiers.get(start)
@@ -18724,7 +18794,7 @@ class TaintEngine:
             state = {
                 "direct": set(), "known": set(), "dropped": set(), "misses": set(),
                 "demanded": {}, "missed": {},
-                "reasons": {}, "examples": {}, "leaf": None, "bound_assumptions": {},
+                "reasons": {}, "examples": {}, "leaf": None,
             }
             self._bw_caller_frontiers[start] = state
         # Merge after descent into the current accumulator: a recursive ascent
@@ -18732,17 +18802,16 @@ class TaintEngine:
         state["direct"].update(direct)
         state["known"].update(direct)
         state["known"].update(indirect)
-        for address in direct | indirect:
-            state["demanded"].setdefault(address, set()).update(formals)
-        for address, param, reason in misses:
-            state["dropped"].add(address)
-            state["missed"].setdefault(address, set()).add(param)
-            key = (address, param, reason)
+        for site in direct | indirect:
+            state["demanded"].setdefault(site, set()).update(formals)
+        for site, param, reason in misses:
+            state["dropped"].add(site)
+            state["missed"].setdefault(site, set()).add(param)
+            key = (site, param, reason)
             if key not in state["misses"]:
                 state["misses"].add(key)
                 state["reasons"][reason] = state["reasons"].get(reason, 0) + 1
-        for row in rows:
-            key = (int(row["address"], 16), row["param"], row["reason"])
+        for key, row in rows.items():
             state["examples"].setdefault(key, row)
         if not state["dropped"]:
             return
@@ -18750,39 +18819,21 @@ class TaintEngine:
         total = len(state["known"])
         dropped = len(state["dropped"])
         fully = total - dropped
-        partial: list[tuple[int, set[int], set[int]]] = []
-        for address in sorted(state["dropped"]):
-            demanded = state["demanded"].get(address, set())
-            missed = state["missed"][address]
+        partial: list[tuple[tuple, set[int], set[int]]] = []
+        for site in sorted(state["dropped"]):
+            demanded = state["demanded"].get(site, set())
+            missed = state["missed"][site]
             if demanded - missed:
-                partial.append((address, demanded - missed, missed))
+                partial.append((site, demanded - missed, missed))
         unfollowed = dropped - len(partial)
         demands_total = sum(len(state["demanded"].get(a, set())) for a in state["known"])
         demands_unfollowed = sum(len(m) for m in state["missed"].values())
         reasons = dict(sorted(state["reasons"].items()))
-        name = self._prose_function(func)
         capped = "caller_cap" in reasons
-        bounds = {
-            "caller_cap": (
-                f"{name} has {len(state['direct'])} callers; caller ascent fully followed "
-                f"{len(state['direct'] - state['dropped'])}, capped at {MAX_CALLERS} "
-                f"(function {start:#x})"),
-            "max_depth": (
-                f"caller ascent of {name} stopped at the --max-depth bound: "
-                f"{len({a for a, _, r in state['misses'] if r == 'max_depth'})} caller "
-                f"reference(s) not followed (function {start:#x})"),
-        }
-        for cause, assumption in bounds.items():
-            if cause not in reasons:
-                continue
-            self._bw_truncated = True
-            self._bw_truncation_causes.add(cause)
-            old = state["bound_assumptions"].get(cause)
-            if old != assumption:
-                if old is not None:
-                    self._bw_assumptions.remove(old)
-                self._bw_assume(assumption)
-                state["bound_assumptions"][cause] = assumption
+        for cause in ("caller_cap", "max_depth"):
+            if cause in reasons:
+                self._bw_truncated = True
+                self._bw_truncation_causes.add(cause)
         note = (
             ("caller-site cap: " if capped else "")
             + f"of {total} distinct caller reference(s), the ascent fully followed {fully} "
@@ -18812,8 +18863,9 @@ class TaintEngine:
             # Which formals each partially followed reference did and did not
             # supply; bounded like `unfollowed`, counted exactly above.
             "partially_followed": [
-                {"address": hex(a), "followed_params": sorted(f), "unfollowed_params": sorted(m)}
-                for a, f, m in partial[:MAX_CALLERS]],
+                {"address": hex(site[0]), "followed_params": sorted(f),
+                 "unfollowed_params": sorted(m)}
+                for site, f, m in partial[:MAX_CALLERS]],
             "detail": (note + " -- an origin reachable only from an unfollowed caller "
                        "is missing from this slice"),
         })

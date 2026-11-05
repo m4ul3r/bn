@@ -316,7 +316,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="Max interprocedural depth to follow slices up into callers (default: 8; "
                       "0 = intraprocedural only); callers it stops short of are named in a "
                       "caller_sites_truncated leaf (reason max_depth) and the cut sets "
-                      "stats.truncated (truncation_cause max_depth) with an assumption. The "
+                      "stats.truncated (truncation_cause max_depth, stats.max_depth the depth "
+                      "reached), never an assumption. The "
                       "in-function def-chain walk caps at 64 steps, and a cut there ends the "
                       "value at an `unresolved` slice origin with cause def_chain_budget."),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",

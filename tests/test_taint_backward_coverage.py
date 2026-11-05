@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from bn.formatters import _render_taint_text
 from conftest import FixtureBuildError
 from test_taint_backward_loads import _FieldProgram
 from test_taint_engine import FBV, FSSA, FExpr, FFunc, FInstr, FSite, FSSAFunc, FVar, te
@@ -589,10 +590,16 @@ def test_caller_depth_cut_is_structured_incompleteness_beside_a_resolved_sibling
     assert leaf["reasons"] == {"max_depth": len(leaf["unfollowed"])}
     assert leaf["callers_fully_followed"] == 0
     assert "--max-depth" in result["diagnostics"]["next_action"]
-    # A depth-bound cut is run truncation, like the caller cap (W02-08).
+    # A depth-bound cut is run truncation, like the caller cap (W02-08):
+    # recorded in stats and the leaf, never as an assumption, and the text
+    # names the depth it happened at (R2-06).
     assert result["stats"]["truncated"] is True
     assert result["stats"]["truncation_cause"] == ["max_depth"]
-    assert any("--max-depth" in a and cut_in in a for a in result["assumptions"]), result["assumptions"]
+    assert result["stats"]["max_depth"] == depth
+    assert not any("--max-depth" in a for a in result["assumptions"]), result["assumptions"]
+    verdict = next(line for line in _render_taint_text(result).splitlines()
+                   if line.startswith("verdict:"))
+    assert f"truncated @depth {depth} (" in verdict, verdict
     if depth == 1:
         # the literal sibling was resolved; the cut is still disclosed
         assert any(o.get("kind") == "constant" and o.get("value") == 7 for o in _origins(result))
@@ -692,6 +699,38 @@ def test_caller_cap_follows_address_order_and_names_every_dropped_site(n_callers
         assert result["stats"]["truncation_cause"] == ["caller_cap"]
     assert results["ascending"]["slices"] == results["shuffled"]["slices"]
     assert _caller_leaves(results["ascending"]) == _caller_leaves(results["shuffled"])
+
+
+def test_a_duplicate_caller_record_does_not_consume_the_cap():
+    # R2-04: BN may list one call site twice. 17 distinct sites plus a second
+    # record of the lowest one: the cap is 16 DISTINCT sites, and only the
+    # 17th is dropped.
+    sink, sites = _capped_wrapper(17, "ascending")
+    sink.caller_sites = [sites[0], *sites]
+    result = _backward(sink, {**_NAMES, sink.start: sink.name})
+    by_address = [hex(s.address) for s in sites]
+    assert _followed_sites(result, "put_len") == set(by_address[:16])
+    (leaf,) = _caller_leaves(result)
+    assert leaf["reasons"] == {"caller_cap": 1}
+    assert (leaf["callers_total"], leaf["callers_fully_followed"]) == (17, 16)
+    assert [r["address"] for r in leaf["unfollowed"]] == [by_address[16]]
+
+
+def test_two_callers_at_one_address_are_two_sites():
+    # R2-04: overlapping functions share a call instruction. Each caller is
+    # its own site: the cap orders sites by address, then by caller, so the
+    # second caller of the 16th address is the 17th site and the one dropped.
+    sink, sites = _capped_wrapper(16, "ascending")
+    last = sites[-1]
+    twin = FSite(_caller("caller_twin", last.function.start + 0x8, last.address,
+                         sink.start, _const(99)), last.address)
+    sink.caller_sites = [*sites, twin]
+    result = _backward(sink, {**_NAMES, sink.start: sink.name})
+    (leaf,) = _caller_leaves(result)
+    assert (leaf["callers_total"], leaf["callers_fully_followed"]) == (17, 16)
+    assert leaf["reasons"] == {"caller_cap": 1}
+    assert [(r["address"], r["caller"]) for r in leaf["unfollowed"]] == [
+        (hex(last.address), "caller_twin")]
 
 
 # --------------------------------------------------------------------------
