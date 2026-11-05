@@ -1086,7 +1086,13 @@ int main(int argc, char **argv) {
     unkeyed = forward("pump", "--source", "call:recv")
     assert unkeyed["diagnostics"]["safe_to_report_all_clear"] is False
     assert any(lf.get("seed") == "call" for lf in unkeyed["leaves"]), unkeyed["leaves"]
-    assert _run_or_check_template(shared_bn, _forward_prose(unkeyed))[1] >= 1
+    # `c->buf + have` is a loaded buffer plus the integer parameter `have`: no
+    # parameter is the buffer, so no caller is offered as its owner.
+    assert not [lf for lf in unkeyed["leaves"] if lf.get("buffer_param")], unkeyed["leaves"]
+    # The advice either runs as printed (the helper runs each such command and
+    # asserts it succeeds -- a wrapper's caller reseed) or is a marked template
+    # (seed a value read from the buffer); never neither.
+    assert sum(_run_or_check_template(shared_bn, _forward_prose(unkeyed))) >= 1
 
     # Depth 0 stops at sink_len: the advice seeds inside it, filled in.
     stopped = forward("deep", "--source", "call:read", "--max-depth", "0")
@@ -1392,7 +1398,9 @@ int main(void) { return parse_synth("1 2 3 4 x"); }
                       "--source", "param:0")
     [leaf] = _format_holes(result)
     assert leaf["destinations"] == 5 and _lost(leaf) == 1, leaf
-    assert leaf["callee"] == "sscanf"       # the canonical model key, via the alias
+    # `callee` is the symbol the binary calls; `model` the plain model the
+    # alias resolved to.
+    assert (leaf["callee"], leaf.get("model")) == ("__isoc23_sscanf", "sscanf"), leaf
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
