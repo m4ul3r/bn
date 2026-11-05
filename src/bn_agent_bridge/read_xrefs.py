@@ -387,6 +387,16 @@ def _code_ref_count(bv, address: int) -> int:
         return 0
 
 
+def _ref_counts(ctx, bv, address: int) -> tuple[int, int]:
+    """``(code_ref_count, data_ref_count)`` for *address* by the definitions
+    `xrefs` reports for a function: genuine code refs (#284) plus the callers
+    of a same-name PLT stub (#286), and BN's data refs -- counted from the same
+    readers `_xrefs_to_address` uses, without building its per-ref rows."""
+    _all, genuine = _code_refs_once(bv, int(address))
+    code_refs, _stubs = _union_stub_code_refs(ctx, bv, int(address), genuine)
+    return len(code_refs), len(_data_refs_once(bv, int(address)))
+
+
 def _xrefs_ambiguous(ctx, bv, identifier: str, bodies, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     """Report xrefs for a same-name collision (#220): pick the member carrying the
     most code refs (the thunk usually holds the traffic; the real body shows

@@ -789,6 +789,12 @@ class TargetManager:
         # shares a location or a spelling with one is never credited to this
         # session.
         self._session_annotations: dict[str, dict[tuple[str, int], str]] = {}
+        # Stable view_id -> the function starts whose prototype a committed
+        # `set_prototype` of THIS bridge verified. BN's has_user_type cannot
+        # say who set a prototype -- after a save and reopen it reads True for
+        # nearly every function -- so this is the one proof `type_source:
+        # user` rests on (D4-04). In-process only: a reopened view has none.
+        self._session_prototypes: dict[str, set[int]] = {}
         # The manager that took this one's ledger over in a GUI bridge restart
         # (`succeed`). A request the old bridge admitted can still commit -- or
         # save, or close -- after the handover; its ledger change is forwarded
@@ -827,6 +833,9 @@ class TargetManager:
                 vid: dict(ledger)
                 for vid, ledger in predecessor._session_annotations.items()
             }
+            self._session_prototypes = {
+                vid: set(starts) for vid, starts in predecessor._session_prototypes.items()
+            }
             predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
@@ -852,32 +861,38 @@ class TargetManager:
             successor.clear_dirty(bv)
 
     def note_session_annotations(self, bv, results) -> None:
-        """Record the comments a committed mutation verified on *bv* (#977).
+        """Record the comments and prototypes a committed mutation verified on
+        *bv* (#977, D4-04).
 
         Only ``verified`` rows count: a ``noop`` set means the body was already
         stored, which is exactly the inherited case the redaction exists for.
         A verified delete forgets the location."""
         entries: list[tuple[tuple[str, int], str | None]] = []
+        prototypes: set[int] = set()
         for row in results or []:
             if not isinstance(row, dict) or row.get("status") != "verified":
                 continue
             op_name = row.get("op")
-            if op_name not in ("set_comment", "delete_comment"):
+            if op_name not in ("set_comment", "delete_comment", "set_prototype"):
                 continue
             try:
                 address = int(str(row.get("address")), 16)
             except (TypeError, ValueError):
+                continue
+            if op_name == "set_prototype":
+                prototypes.add(address)
                 continue
             scope = "function_doc" if row.get("scope") == "function_doc" else "address"
             body = None
             if op_name == "set_comment":
                 body = str((row.get("requested") or {}).get("comment") or "")
             entries.append(((scope, address), body or None))
-        if not entries:
+        if not entries and not prototypes:
             return
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
+                self._session_prototypes.setdefault(vid, set()).update(prototypes)
                 ledger = self._session_annotations.setdefault(vid, {})
                 for key, body in entries:
                     if body is None:
@@ -893,6 +908,13 @@ class TargetManager:
         with self._lock:
             vid = self._stable_view_id(bv)
             return dict(self._session_annotations.get(vid, {})) if vid is not None else {}
+
+    def session_prototype(self, bv, start: int) -> bool:
+        """Whether this bridge set and verified the prototype of the function
+        at *start* on *bv*."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return vid is not None and start in self._session_prototypes.get(vid, set())
 
     def note_database(self, bv, path: str) -> None:
         """Record that *path* is the database backing *bv*'s analysis.
@@ -1065,6 +1087,7 @@ class TargetManager:
                 self._database_identities.pop(vid, None)
                 self._exports.pop(vid, None)
                 self._session_annotations.pop(vid, None)
+                self._session_prototypes.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
             successor = self._successor
@@ -1455,6 +1478,10 @@ class TargetManager:
                 }
                 self._exports = {
                     vid: paths for vid, paths in self._exports.items() if vid in alive
+                }
+                self._session_prototypes = {
+                    vid: starts for vid, starts in self._session_prototypes.items()
+                    if vid in alive
                 }
                 self._session_annotations = {
                     vid: ledger for vid, ledger in self._session_annotations.items()
@@ -4798,13 +4825,13 @@ class BinaryNinjaBridge:
                     except Exception as exc:  # noqa: BLE001 - preserve all-or-nothing rename
                         failed_rows.append(self._go_rename_failure_row(
                             candidate, "verification_failed",
-                            f"Live rename failed: {_serialize_error(exc)}",
+                            f"Rename failed: {_serialize_error(exc)}",
                         ))
                         break
                     observed = str(getattr(fn, "name", "") or "")
                     if observed != candidate["new_name"]:
                         failed_rows.append(self._go_rename_failure_row(
-                            candidate, "verification_failed", "Live rename readback disagreed",
+                            candidate, "verification_failed", "Post-state rename readback disagreed",
                         ))
                         break
                     verified_count += 1
