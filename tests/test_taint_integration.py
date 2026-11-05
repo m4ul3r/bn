@@ -4433,9 +4433,20 @@ def test_a_register_indirect_tail_jump_is_a_call_boundary(tmp_path,
                for lf in leaves for r in lf["references"]), result
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
-    # ...and a target that reads ANOTHER object clears the run
+    # ...and a target that reads ANOTHER object removes the boundary at the
+    # jump. For the modeled copy that clears the run. The DIRECT store is
+    # still live when `store_case` returns and `reader` -- reached here by
+    # nothing the walk follows -- reads it, so it stays the blocking store
+    # frontier it was before direct stores were keyed (P1-04).
     pin.write_text(json.dumps({hex(jump_at): ["quiet"]}))
     result, leaves = gmc("store_case", "--resolve-map", str(pin))
+    assert leaves == [], leaves
+    [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+    assert [r["display_name"] for r in store["references"]] == ["reader"], store
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
+    copy_jump = int(gmc("copy_case")[1][0]["address"], 16)
+    pin.write_text(json.dumps({hex(copy_jump): ["quiet"]}))
+    result, leaves = gmc("copy_case", "--resolve-map", str(pin))
     assert leaves == [], leaves
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
 
@@ -4746,18 +4757,32 @@ N int other_case(char *s) { int st = other_child(s); reader(); return st; }
 int main(int c, char **v) { if (c > 1) return child_case(v[1]); return 0; }
 """
 
-_REMEDY_SRC = r"""
-#include <stdlib.h>
-#include <string.h>
-#define N __attribute__((noinline,noclone))
-char tracked[256] __attribute__((section(".tracked"))) = "seed";
-extern unsigned char mid;
-__asm__(".globl mid\n.set mid,tracked+16\n.type mid,@object\n.size mid,1\n");
-N void reader(void) { system(tracked + 80); }
-N void runtime_case(char *s, size_t n) { memcpy(tracked, s, n); reader(); }
-N void fixed_case(char *s) { memcpy(tracked, s, 112); reader(); }
-int main(void) { return 0; }
-"""
+def _remedy_source(declared: bool) -> str:
+    """`tracked` (256 bytes) with an alias symbol at +16. Declared, the C
+    definition gives it an ELF `st_size`; undeclared, it and the alias are
+    assembly symbols with no `.size` -- the only shape whose end still
+    comes from the layout once declared sizes end objects (P1-05)."""
+    if declared:
+        objects = (
+            'char tracked[256] __attribute__((section(".tracked"))) = "seed";\n'
+            'extern unsigned char mid;\n'
+            '__asm__(".globl mid\\n.set mid,tracked+16\\n.type mid,@object\\n'
+            '.size mid,1\\n");\n')
+    else:
+        objects = (
+            'extern char tracked[256];\n'
+            '__asm__(".section .tracked,\\"aw\\"\\n.globl tracked\\n'
+            '.type tracked,@object\\ntracked:\\n.ascii \\"seed\\"\\n.zero 252\\n'
+            '.previous\\n");\n'
+            'extern unsigned char mid;\n'
+            '__asm__(".globl mid\\n.set mid,tracked+16\\n.type mid,@object\\n");\n')
+    return (
+        "#include <stdlib.h>\n#include <string.h>\n"
+        "#define N __attribute__((noinline,noclone))\n" + objects
+        + "N void reader(void) { system(tracked + 80); }\n"
+        "N void runtime_case(char *s, size_t n) { memcpy(tracked, s, n); reader(); }\n"
+        "N void fixed_case(char *s) { memcpy(tracked, s, 112); reader(); }\n"
+        "int main(void) { return 0; }\n")
 
 
 @pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"], ids=["O0", "O1", "O2"])
@@ -4800,38 +4825,60 @@ def test_the_extent_remediation_never_fabricates_a_width(tmp_path, shared_bn,
     """Round-21 review F57: for a runtime-length copy the advice printed
     `char[1]`, and applying that authoritative width erased a real
     continuation. A size is printed only where the evidence proves one, and
-    applying THAT one keeps the reader disclosed."""
-    src = tmp_path / f"r5rem{opt[-1]}.c"
-    src.write_text(_REMEDY_SRC)
-    binary = tmp_path / f"r5rem{opt[-1]}"
-    _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
-    target = shared_bn.load(binary, copy=False)
+    applying THAT one keeps the reader disclosed.
 
-    def gmc(fn):
+    P1-05: an object the image DECLARES needs no remedy -- its `st_size`
+    already ends it -- so the advice path is exercised on an object
+    defined in assembly with no `.size`, and the declared twin must keep
+    its reader with no extent doubt and no retype advice at all."""
+    def build(declared):
+        stem = f"r5rem{'d' if declared else 'u'}{opt[-1]}"
+        src = tmp_path / f"{stem}.c"
+        src.write_text(_remedy_source(declared))
+        binary = tmp_path / stem
+        _compile(src, binary, [opt, "-U_FORTIFY_SOURCE", "-fno-builtin", "-g0"])
+        return shared_bn.load(binary, copy=False)
+
+    def gmc(target, fn):
         result = _bn_json(shared_bn, "-t", target, "taint", "forward",
                           "-f", fn, "--source", "param:0")
         return result, [lf for lf in result["leaves"]
                         if lf["kind"] == "global_memory_continuation"]
 
-    result, leaves = gmc("runtime_case")
+    def retypes(leaf):
+        return [c for c in re.findall(r"`(bn [^`]+)`", leaf["detail"])
+                if "retype" in c]
+
+    target = build(declared=False)
+    result, leaves = gmc(target, "runtime_case")
     assert leaves, result
     detail = leaves[0]["detail"]
+    assert "object_extent_unproven" in leaves[0]["reachability"]["causes"], leaves
     assert "char[1]`" not in detail, detail
-    assert not [c for c in re.findall(r"`(bn [^`]+)`", detail)
-                if "retype" in c], detail
+    assert not retypes(leaves[0]), detail
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
     # the proven-extent case prints a command; running it keeps the reader
-    result, leaves = gmc("fixed_case")
-    cmds = [c for c in re.findall(r"`(bn [^`]+)`", leaves[0]["detail"])
-            if "retype" in c]
+    result, leaves = gmc(target, "fixed_case")
+    cmds = retypes(leaves[0])
     assert cmds, leaves[0]["detail"]
     res = shared_bn.run(*shlex.split(cmds[0])[1:])
     assert res.returncode == 0, res.stderr
-    result, leaves = gmc("fixed_case")
+    result, leaves = gmc(target, "fixed_case")
     assert any(r["display_name"] == "reader"
                for lf in leaves for r in lf["references"]), result
     assert result["diagnostics"]["safe_to_report_all_clear"] is False
+
+    # the declared twin: the reader at +80 is named, nothing to remedy
+    target = build(declared=True)
+    for fn in ("runtime_case", "fixed_case"):
+        result, leaves = gmc(target, fn)
+        [leaf] = leaves
+        assert [(r["display_name"], r["offset"]) for r in leaf["references"]] == \
+            [("reader", 80)], (fn, leaf)
+        assert "object_extent_unproven" not in leaf["reachability"]["causes"], (fn, leaf)
+        assert not retypes(leaf), (fn, leaf["detail"])
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
 
 def _scanpool_source(statements: int = 1500) -> str:
@@ -5055,7 +5102,17 @@ def test_a_callee_write_cannot_precede_a_reader_that_ran_first(tmp_path,
     for fn in ("padded_before", "short_before", "before_store", "sibling"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
-        assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+        if fn != "before_store":
+            assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
+            continue
+        # No continuation at the reader that ran FIRST -- but `store`'s
+        # DIRECT store is still live when `before_store` returns, and
+        # `reader` can run again after it: the store stays the blocking
+        # frontier it was before direct stores were keyed (P1-04), cited at
+        # the store inside the callee and naming the reader.
+        [store] = [lf for lf in result["leaves"] if lf["kind"] == "coarse_memory_store"]
+        assert [r["display_name"] for r in store["references"]] == ["reader"], store
+        assert result["diagnostics"]["safe_to_report_all_clear"] is False, fn
 
     result, leaves = gmc("after")
     assert any(r["display_name"] == "reader"
@@ -5303,13 +5360,18 @@ def test_a_mixed_ordinary_and_tail_return_joins_both_offsets(tmp_path,
 
 
 def _layout_bound_source(count: int) -> str:
+    # `big` is an assembly object with no `.size`: a declared size would end
+    # it before any layout walk (P1-05), and the walk -- with its budget --
+    # is what this fixture is about.
     touches = "".join(f"  x += (unsigned char)big[{8 * (i + 1)}];\n"
                       for i in range(count))
     return f"""
 #include <stdlib.h>
 #include <string.h>
 #define N __attribute__((noinline,noclone))
-char big[65536] __attribute__((section(".pair"))) = "seed";
+extern char big[65536];
+__asm__(".section .pair,\\"aw\\"\\n.globl big\\n.type big,@object\\n"
+        "big:\\n.ascii \\"seed\\"\\n.zero 65532\\n.previous\\n");
 char neighbour[64] __attribute__((section(".pair"))) = "safe";
 volatile unsigned char seen;
 N unsigned probe(void) {{
@@ -5330,7 +5392,11 @@ def test_the_layout_bound_speaks_only_where_a_reader_could_hide(tmp_path,
                                                                 count):
     """Round-23 review F62: the new layout bound was attached to every
     frontier question about the object, so a callee whose whole body is
-    `return 7;` became a blocking continuation once the walk ran out."""
+    `return 7;` became a blocking continuation once the walk ran out.
+
+    The bound only exists for an object whose end comes from the layout:
+    one the image declares a size for ends there (P1-05). `big` is defined
+    in assembly without `.size` so the walk still runs."""
     src = tmp_path / f"r7lay{count}.c"
     src.write_text(_layout_bound_source(count))
     binary = tmp_path / f"r7lay{count}"
@@ -5571,7 +5637,12 @@ def test_a_bounded_read_of_an_abutting_neighbour_is_disjoint(tmp_path,
                                                              shared_bn, opt):
     """Round-25 review F69: `memcpy(out, pointer(), 64)` reads exactly the
     clean neighbour, ending where the tainted object begins -- but RETURNING
-    that neighbour's address was counted as an unbounded use of it."""
+    that neighbour's address was counted as an unbounded use of it.
+
+    P1-05: `first` DECLARES 64 bytes, so `system(first)` -- a read of no
+    stated length -- is a read of first's own storage, not of `second`;
+    `memcpy(out, first, 128)` states that it reads 64 bytes past that end,
+    and is cited as a proven reader of `second`."""
     src = tmp_path / f"r9abut{opt[-1]}.c"
     src.write_text(_ABUT_SRC)
     binary = tmp_path / f"r9abut{opt[-1]}"
@@ -5585,15 +5656,18 @@ def test_a_bounded_read_of_an_abutting_neighbour_is_disjoint(tmp_path,
         return result, [lf for lf in result["leaves"]
                         if lf["kind"] == "global_memory_continuation"]
 
-    for fn in ("bounded_root", "direct_root"):
+    for fn in ("bounded_root", "direct_root", "unbounded_root"):
         result, leaves = gmc(fn)
         assert leaves == [], (fn, leaves)
         assert result["diagnostics"]["safe_to_report_all_clear"] is True, fn
 
-    # a read that does NOT stop short of the tainted bytes still blocks
-    for fn in ("unbounded_root", "over_root"):
-        _result, leaves = gmc(fn)
-        assert leaves, fn
+    # a read whose stated length runs into the tainted bytes still blocks
+    result, leaves = gmc("over_root")
+    [leaf] = leaves
+    assert [(r["display_name"], r["access"]) for r in leaf["references"]] == \
+        [("over_read", "call_arg")], leaf
+    assert leaf["reads_proven"] is True, leaf
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False
 
 
 _SCOPE_SRC = r"""
