@@ -27,8 +27,8 @@ from .formatters import (
     _render_mutation_text,
     command_routing,
 )
-from .output import (estimate_output_result, render_envelope, render_error, render_value,
-                     write_output_result)
+from .output import (RawBytes, estimate_bytes_result, estimate_output_result, render_envelope,
+                     render_error, render_value, write_bytes_result, write_output_result)
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -152,27 +152,30 @@ def _resolve_output_format(args: argparse.Namespace) -> str:
     none was given; when an explicit ``--format`` disagrees with the extension,
     honor the explicit choice but warn so it is not a silent footgun.
     """
+    resolved = getattr(args, "_resolved_format", None)
+    if resolved is not None:
+        return resolved     # resolved once per invocation: the note prints once
     fmt = getattr(args, "format", "text")
     out = getattr(args, "out", None)
-    if out is None:
-        return fmt
-    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
-    if inferred is None or inferred == fmt:
-        return fmt
-    suffix = Path(str(out)).suffix
-    if getattr(args, "_format_explicit", False):
-        print(
-            f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
-            f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
-            file=sys.stderr,
-        )
-        return fmt
-    print(
-        f"note: inferring --format {inferred} from the {suffix} --out path; "
-        f"pass an explicit --format to override.",
-        file=sys.stderr,
-    )
-    return inferred
+    inferred = (None if out is None
+                else _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower()))
+    if inferred is not None and inferred != fmt:
+        suffix = Path(str(out)).suffix
+        if getattr(args, "_format_explicit", False):
+            print(
+                f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
+                f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"note: inferring --format {inferred} from the {suffix} --out path; "
+                f"pass an explicit --format to override.",
+                file=sys.stderr,
+            )
+            fmt = inferred
+    args._resolved_format = fmt
+    return fmt
 
 
 class BnArgumentParser(argparse.ArgumentParser):
@@ -475,9 +478,10 @@ def _common_io_options(
         action=_RecordExplicitFormat,
         help="Output format",
     )
-    out_help = ("Write output to a file instead of stdout (a .json/.ndjson path "
-                "infers --format unless one is given). Relative paths are resolved "
-                "against the invoking shell's cwd, not the bridge's.")
+    out_help = ("Write output to a file instead of stdout; missing parent directories "
+                "are created (a .json/.ndjson path infers --format unless one is "
+                "given). Relative paths are resolved against the invoking shell's "
+                "cwd, not the bridge's.")
     # #796: the preflight half of #409's "bound the next read" -- the size of the
     # payload the caller would otherwise pay for, and the flag that slices it.
     # Advertised ONLY on the commands whose emit path implements it
@@ -910,9 +914,13 @@ def _render_result(
     envelope is a payload like any other -- a caller asking what it costs gets
     its size, not a re-render of a file it may not have."""
     if estimate_only:
-        result = _apply_result_transform(
-            lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
-            value, f"estimate the {stem} output size as {fmt}")
+        if isinstance(value, RawBytes):
+            result = estimate_bytes_result(value.data, fmt=fmt, summary=value.summary,
+                                           rerun_hint=slice_hint)
+        else:
+            result = _apply_result_transform(
+                lambda payload: estimate_output_result(payload, fmt=fmt, rerun_hint=slice_hint),
+                value, f"estimate the {stem} output size as {fmt}")
         sys.stdout.write(result.rendered)
         return False
     # Serializing the bridge result parses and walks it too: `json.dumps` on a
@@ -933,11 +941,17 @@ def _render_result(
             f"serialize the {stem} artifact envelope as {fmt}"))
         return bool(artifact.get("spilled"))
 
-    result = _apply_result_transform(
-        lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
-                                           stem=stem, provenance=provenance,
-                                           rerun_hint=slice_hint),
-        value, f"serialize the {stem} result as {fmt}")
+    if isinstance(value, RawBytes):
+        # P1-03: a raw byte payload takes the same --out / spill / provenance
+        # decisions as a rendered one; only the final stdout write differs.
+        result = write_bytes_result(value, out_path=out_path, fmt=fmt, stem=stem,
+                                    provenance=provenance, rerun_hint=slice_hint)
+    else:
+        result = _apply_result_transform(
+            lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
+                                               stem=stem, provenance=provenance,
+                                               rerun_hint=slice_hint),
+            value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
         # spills is recoverable (re-read the artifact); an atomic write whose result
@@ -1002,7 +1016,11 @@ def _render_result(
                 file=sys.stderr,
             )
         return True
-    sys.stdout.write(result.rendered)
+    if result.raw is not None:
+        sys.stdout.buffer.write(result.raw)
+        sys.stdout.buffer.flush()
+    else:
+        sys.stdout.write(result.rendered)
     if result.near_spill:
         # #409: fit this time, but close to the threshold -- warn so the agent slices
         # the next (larger) read pre-emptively instead of discovering the spill after

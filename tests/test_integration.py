@@ -5,6 +5,7 @@ the binaryninja module is not available.
 """
 from __future__ import annotations
 
+import base64
 import collections
 import hashlib
 import json
@@ -7269,3 +7270,29 @@ class TestEvidenceVtableLabels1017:
                              "--compact").stdout
         rows = [ln for ln in text.splitlines() if ln.startswith("- ")]
         assert len(rows) == news and all("operator new @ " in row for row in rows)
+
+
+# --- read surface: raw bytes and sliced CFGs (dogfood P1-03, P2-04) ----------
+
+
+def test_raw_byte_read_is_structured_json_and_spills_like_any_read(shared_bn, tmp_path):
+    """P1-03 on a real view: `read --encoding bytes` under `--format json` is a
+    base64 envelope, and under text an armed `BN_SPILL_TOKENS` spills the raw
+    bytes to a `.bin` artifact instead of dumping them."""
+    shared_bn.load(PARSER_BINARY)
+    start = shared_bn.json("function", "info", "parse_record")["function"]["address"]
+    hex_read = shared_bn.json("read", start, "64")
+    envelope = shared_bn.json("read", start, "64", "--encoding", "bytes")
+    assert envelope["encoding"] == "base64" and envelope["length"] == 64
+    assert base64.b64decode(envelope["data"]).hex() == hex_read["hex"]
+    assert envelope["short_read"] is False
+
+    env = {**shared_bn.env(), "BN_SPILL_TOKENS": "1"}
+    res = subprocess.run(
+        [*_BN_CLI, "--instance", shared_bn.instance_id, "read", start, "64",
+         "--encoding", "bytes"], capture_output=True, text=True, timeout=60, env=env)
+    assert res.returncode == 0, res.stderr
+    lines = res.stdout.splitlines()
+    assert "spilled: true" in lines and "format: bytes" in lines
+    [path] = [line.split(": ", 1)[1] for line in lines if line.startswith("path: ")]
+    assert Path(path).read_bytes().hex() == hex_read["hex"]

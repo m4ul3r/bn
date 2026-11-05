@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -10,10 +11,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import bn.cli
+import bn.output
 import pytest
 
 from bn_agent_bridge._shared import OperationFailure, _serialize_error, _write_json_artifact
-from bn.commands.misc import _resolved_out_format
 from bn.output import OutputWriteError, render_value, write_output_result
 from _cli_helpers import *  # noqa: F401,F403
 # The #864 FIFO readers are split across two test modules; the stall guard is
@@ -578,25 +579,6 @@ def test_write_json_artifact_ndjson_keeps_a_payloads_own_meta_key(tmp_path):
     lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line]
     assert len(lines) == 1
     assert json.loads(lines[0]) == payload      # nothing dropped, nothing rewritten
-
-
-@pytest.mark.parametrize("explicit_format", [None, "json", "ndjson", "text"])
-@pytest.mark.parametrize("out", ["x.json", "x.ndjson", "x.txt", "x", None])
-def test_bundle_delegation_format_tracks_the_cli_resolver(
-        capsys, explicit_format, out):
-    # #670 (major): the delegation predicate re-derives cli._resolve_output_format's
-    # precedence because the real resolver PRINTS the note/warning and `_call`
-    # invokes it again. Two copies of one precedence rule drift silently, so the
-    # equivalence is pinned over every --format x --out-suffix combination.
-    args = types.SimpleNamespace(out=out, format=explicit_format or "text")
-    if explicit_format is not None:
-        args._format_explicit = True
-
-    quiet = _resolved_out_format(args)
-    loud = bn.cli._resolve_output_format(args)
-    capsys.readouterr()      # the real resolver's note/warning is a side effect
-
-    assert quiet == loud
 
 
 def test_bundle_does_not_delegate_a_suffix_the_bridge_writes_as_json(
@@ -1864,18 +1846,19 @@ def test_strings_section_hint_suppressed_when_request_fails(monkeypatch, capsys)
 
 
 def test_read_bytes_out_writes_envelope_and_creates_parents(fake_transport, capsys, tmp_path):
-    # #96: the bytes --out path must mkdir parents and emit an artifact envelope.
-    fake_transport({"read": {"ok": True, "result": {"hex": "deadbeef"}}})
+    # #96: the bytes --out path must mkdir parents and emit an artifact envelope;
+    # P1-03: the envelope names the target that produced the artifact.
+    fake_transport({"read": {"ok": True, "result": {"address": "0x1000", "hex": "deadbeef"}}})
     out = tmp_path / "nested" / "dir" / "out.bin"  # parent does not exist yet
     rc = bn.cli.main(["read", "0x1000", "--length", "4", "--encoding", "bytes",
-                      "--target", "active", "--out", str(out), "--format", "json"])
+                      "--target", "active", "--out", str(out)])
     assert rc == 0
-    assert out.read_bytes() == bytes.fromhex("deadbeef")  # parents created, data written
-    envelope = json.loads(capsys.readouterr().out)
-    assert envelope["format"] == "bytes"
-    assert envelope["bytes"] == 4
-    assert envelope["artifact_path"] == str(out)
-    assert "sha256" in envelope
+    assert out.read_bytes() == bytes.fromhex("deadbeef")  # parents created, raw data written
+    receipt = capsys.readouterr().out.splitlines()
+    assert "format: bytes" in receipt
+    assert "bytes: 4" in receipt
+    assert f"path: {out}" in receipt
+    assert "target: active" in receipt
 
 
 def test_read_bytes_out_bad_dir_is_clean_error(fake_transport, capsys, tmp_path):
@@ -2370,16 +2353,16 @@ def test_read_bytes_encoding_discloses_a_capped_read_827(fake_transport, capsys,
     assert captured.out == "ABCD"
     assert "capped at 100000 bytes (requested 200000)" in captured.err
 
-    # The --out envelope carries the same two fields, so a saved blob is not
-    # indistinguishable from a complete dump either.
+    # The structured bytes envelope carries the same two fields, so a saved
+    # blob is not indistinguishable from a complete dump either.
+    dump = tmp_path / "dump.json"
     rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
-                      "--length", "200000", "--encoding", "bytes",
-                      "--out", str(tmp_path / "dump.bin"), "--format", "json"])
+                      "--length", "200000", "--encoding", "bytes", "--out", str(dump)])
 
     assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["summary"]["capped"] is True
-    assert payload["summary"]["requested_length"] == 200000
+    payload = json.loads(dump.read_text(encoding="utf-8"))
+    assert payload["capped"] is True
+    assert payload["requested_length"] == 200000
 
 
 
@@ -2423,14 +2406,14 @@ def test_read_bytes_encoding_discloses_a_short_read_too_827(fake_transport, caps
     assert captured.out == "ABCD"                      # stdout is still only the payload
     assert "short read: requested 16 bytes, only 4 mapped" in captured.err
 
-    # ...and the --out summary says it too, so a saved blob is not
+    # ...and the structured envelope says it too, so a saved blob is not
     # indistinguishable from a complete dump either.
+    dump = tmp_path / "dump.json"
     rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
-                      "--length", "16", "--encoding", "bytes",
-                      "--out", str(tmp_path / "dump.bin"), "--format", "json"])
+                      "--length", "16", "--encoding", "bytes", "--out", str(dump)])
 
     assert rc == 0
-    summary = json.loads(capsys.readouterr().out)["summary"]
+    summary = json.loads(dump.read_text(encoding="utf-8"))
     assert summary["short_read"] is True
     assert summary["requested_length"] == 16
     assert "capped" not in summary                     # the other marker is not invented
@@ -2446,11 +2429,11 @@ def test_read_bytes_encoding_discloses_a_short_read_too_827(fake_transport, caps
             "note": "short read: only 4 mapped from 0x1000",
         }},
     })
+    partial = tmp_path / "partial.json"
     rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000",
-                      "--length", "16", "--encoding", "bytes",
-                      "--out", str(tmp_path / "partial.bin"), "--format", "json"])
+                      "--length", "16", "--encoding", "bytes", "--out", str(partial)])
     assert rc == 0
-    thin = json.loads(capsys.readouterr().out)["summary"]
+    thin = json.loads(partial.read_text(encoding="utf-8"))
     assert thin["short_read"] is True
     assert "requested_length" not in thin, thin
 
@@ -3087,16 +3070,15 @@ def test_estimate_output_preflights_the_raw_bytes_read_796(fake_transport, capsy
     assert "--length" in text                    # this command's own slicing knob
     assert "AAAA" not in text                    # ...and NOT the payload itself
 
-    # Machine-readable under --format json, and it measures the RAW byte payload
-    # (64 bytes), not a hex rendering of it.
+    # Under --format json the payload is the structured bytes envelope, so that
+    # envelope is what the preflight measures -- and still prints none of it.
     assert bn.cli.main(["read", "0x401000", "--length", "64", "--encoding", "bytes",
                         "--estimate-output", "--format", "json",
                         "--target", "active"]) == 0
     envelope = json.loads(capsys.readouterr().out)
-    assert envelope["estimated"] is True and envelope["format"] == "bytes"
-    assert envelope["bytes"] == 64 and envelope["tokens"] > 0
-    assert envelope["summary"] == {"kind": "bytes", "address": "0x401000", "length": 64}
-    assert "hex" not in envelope
+    assert envelope["estimated"] is True and envelope["format"] == "json"
+    assert envelope["bytes"] > 64 and envelope["tokens"] > 0
+    assert "data" not in envelope and "hex" not in envelope
 
     # Without the flag the raw bytes still reach stdout unchanged: the preflight
     # is opt-in and replaces nothing when it is not asked for.
@@ -3116,13 +3098,13 @@ def test_estimate_output_keeps_partial_raw_read_disclosure_796_827(fake_transpor
 
     assert bn.cli.main([
         "read", "0x401000", "--length", "200000", "--encoding", "bytes",
-        "--estimate-output", "--format", "json", "--target", "active",
+        "--estimate-output", "--target", "active",
     ]) == 0
     captured = capsys.readouterr()
-    envelope = json.loads(captured.out)
-    assert envelope["estimated"] is True and envelope["bytes"] == 4
-    assert envelope["summary"]["capped"] is True
-    assert envelope["summary"]["requested_length"] == 200000
+    lines = captured.out.splitlines()
+    assert "estimated: true" in lines and "bytes: 4" in lines
+    [summary] = [line for line in lines if line.startswith("summary: ")]
+    assert "capped=True" in summary.split() and "requested_length=200000" in summary.split()
     assert "ABCD" not in captured.out
     assert "capped at 100000 bytes (requested 200000)" in captured.err
 
@@ -3854,10 +3836,64 @@ def test_raw_byte_out_summary_states_the_resolved_address_not_the_name_1048(
             "address": "0x420018", "length": 2, "hex": "c80c", "ascii": "..",
             "resolved_symbol": {"name": "sock_path", "kind": "data", "address": "0x420018"}}},
     })
-    out = tmp_path / "ptr.bin"
+    out = tmp_path / "ptr.json"
     assert bn.cli.main(["read", "sock_path", "2", "--encoding", "bytes",
-                        "--out", str(out), "--format", "json"]) == 0
-    summary = json.loads(capsys.readouterr().out)["summary"]
-    assert summary["address"] == "0x420018"
-    assert summary["resolved_symbol"]["name"] == "sock_path"
-    assert out.read_bytes() == b"\xc8\x0c"
+                        "--out", str(out)]) == 0
+    envelope = json.loads(out.read_text(encoding="utf-8"))
+    assert envelope["address"] == "0x420018"
+    assert envelope["resolved_symbol"]["name"] == "sock_path"
+    assert envelope["data"] == "yAw="           # base64 of c8 0c
+
+
+@pytest.mark.parametrize("fmt", ["json", "ndjson"])
+def test_raw_byte_read_under_a_machine_format_is_a_structured_envelope(
+        fake_transport, capsys, fmt):
+    # P1-03: `--encoding bytes --format json` exited 0 with the raw bytes on
+    # stdout, so `| jq` failed on a successful read. A machine format gets the
+    # bytes as base64 inside an envelope that states the window.
+    fake_transport({"read": {"ok": True, "result": {
+        "address": "0x401000", "length": 4, "hex": "00ff4142",
+        "short_read": True, "requested_length": 16,
+        "note": "short read: requested 16 bytes, only 4 mapped from 0x401000"}}})
+    assert bn.cli.main(["read", "0x401000", "--length", "16", "--encoding", "bytes",
+                        "--format", fmt, "--target", "active"]) == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["kind"] == "bytes" and envelope["encoding"] == "base64"
+    assert base64.b64decode(envelope["data"]) == b"\x00\xffAB"
+    assert (envelope["address"], envelope["length"]) == ("0x401000", 4)
+    assert envelope["short_read"] is True and envelope["requested_length"] == 16
+
+
+def test_raw_byte_read_honors_an_armed_spill_threshold(
+        fake_transport, capsys, monkeypatch, tmp_path):
+    # P1-03: with BN_SPILL_TOKENS armed every read spills past it -- except the
+    # raw-byte one, which dumped the whole payload with no envelope.
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    monkeypatch.setattr(bn.output, "spill_root", lambda: tmp_path)
+    data = bytes(range(256)) * 4
+    fake_transport({"read": {"ok": True, "result": {
+        "address": "0x401000", "length": len(data), "hex": data.hex()}}})
+    assert bn.cli.main(["read", "0x401000", "--length", str(len(data)), "--encoding",
+                        "bytes", "--format", "text", "--target", "active"]) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert "spilled: true" in lines and "format: bytes" in lines
+    assert "target: active" in lines
+    [path] = [line.split(": ", 1)[1] for line in lines if line.startswith("path: ")]
+    assert Path(path).suffix == ".bin" and Path(path).read_bytes() == data
+    meta = json.loads(Path(path + ".meta.json").read_text(encoding="utf-8"))
+    assert meta["target"] == "active"
+    [rerun] = [line for line in lines if line.startswith("rerun: ")]
+    assert "--length" in rerun
+    assert "spilled to" in captured.err
+
+
+def test_raw_byte_out_path_infers_its_format_once(fake_transport, capsys, tmp_path):
+    # P1-03: `--out x.json` infers json for this read like for any other, and
+    # the inference is resolved -- and announced -- once per invocation.
+    fake_transport({"read": {"ok": True, "result": {"address": "0x401000", "hex": "4142"}}})
+    out = tmp_path / "blob.json"
+    assert bn.cli.main(["read", "0x401000", "--length", "2", "--encoding", "bytes",
+                        "--out", str(out), "--target", "active"]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["data"] == "QUI="
+    assert capsys.readouterr().err.count("inferring --format json") == 1
