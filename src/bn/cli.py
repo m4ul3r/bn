@@ -2404,8 +2404,9 @@ def _contextualize_diagnostic_hints(
     commands. Registry target requirements distinguish inspection/mutation hints
     from lifecycle recovery, which must retain its own instance/spawn arguments.
     """
-    if not instance and not target:
-        return value
+    # The selector a command is routed to: the call's target, or -- inside a
+    # result row that names its own target (a loaded binary) -- that row's.
+    selector = [target]
     # As in build_parser(), defer registration until cli.py is fully imported.
     from . import commands  # noqa: F401
 
@@ -2456,9 +2457,9 @@ def _contextualize_diagnostic_hints(
 
         if instance and not routed("instance"):
             flags.append(instance_option(instance))
-        if target and not routed("target"):
-            flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
-                         else shlex.quote(f"--target={target}"))
+        if selector[0] and not routed("target"):
+            flags.append(f"-t {shlex.quote(selector[0])}" if not selector[0].startswith("-")
+                         else shlex.quote(f"--target={selector[0]}"))
         if not flags:
             return match.group(0)
         # Through `code_span`: the selector spliced in here may itself carry a
@@ -2475,24 +2476,34 @@ def _contextualize_diagnostic_hints(
     # prose: unrouted, it was the one hint that exited 2 ("multiple bridges")
     # while the same command quoted in `detail` ran (BN23-ADVICE-01). route()
     # already refuses a second selector, so the pair stays single-routed.
-    prose_keys = {"error", "hints", "assumptions", "note", "detail", "next_action",
+    # `notes` is a load's per-target prose: a `--quick` load's `bn refresh` is
+    # routed to the target that row loaded (V7-02).
+    prose_keys = {"error", "hints", "assumptions", "note", "notes", "detail", "next_action",
                   "recovery_advice", "summary", "warnings", "reseed"}
 
-    def visit(item: Any, *, prose: bool = False) -> None:
+    # Iterative: every result now passes through here, and a hostile reply
+    # nested past the interpreter's recursion limit must reach the result
+    # checks that refuse it, not raise out of the routing pass.
+    stack: list[tuple[Any, bool, str | None]] = [(value, False, target)]
+    while stack:
+        item, prose, routed_to = stack.pop()
+        selector[0] = routed_to
         if isinstance(item, dict):
+            own = item.get("target")
+            own = own.get("selector") if isinstance(own, dict) else None
+            if isinstance(own, str) and own:
+                selector[0] = routed_to = own
             for key, child in item.items():
                 if key in prose_keys and isinstance(child, str):
                     item[key] = route_prose(child)
                 elif isinstance(child, (dict, list)):
-                    visit(child, prose=key in prose_keys)
+                    stack.append((child, key in prose_keys, routed_to))
         elif isinstance(item, list):
             for index, child in enumerate(item):
                 if prose and isinstance(child, str):
                     item[index] = route_prose(child)
                 elif isinstance(child, (dict, list)):
-                    visit(child, prose=prose)
-
-    visit(value)
+                    stack.append((child, prose, routed_to))
     return value
 
 
@@ -2526,10 +2537,6 @@ def _call(
     # #996: copy the answering instance (stamped by `send_request`) into a dict
     # result, so the output names which bridge answered.
     stamp_instance: bool = False,
-    contextual_hints: bool = False,
-    # Bind the `bn ...` commands the TEXT renderer itself prints to this
-    # invocation's -i/-t (per row under a fan-out), so they run as printed.
-    route_rendered_commands: bool = False,
 ) -> int:
     _require_nonempty_instance(args)
     # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
@@ -2576,7 +2583,6 @@ def _call(
             text_renderer=text_renderer,
             timeout_kwargs=timeout_kwargs,
             stem=stem,
-            route_rendered_commands=route_rendered_commands,
         )
 
     target = _resolve_target(
@@ -2610,15 +2616,14 @@ def _call(
             **timeout_kwargs,
         )
     except BridgeError as exc:
-        if contextual_hints:
-            routed = _contextualize_diagnostic_hints(
-                {"error": str(exc)}, target=target,
-                instance=getattr(args, "instance", None))
-            exc.args = (routed["error"],)
+        # Every command a refusal prints runs as printed: this invocation's
+        # -i/-t (V7-02: a quick-view `strings` refusal named a bare `bn refresh`).
+        routed = _contextualize_diagnostic_hints(
+            {"error": str(exc)}, target=target, instance=getattr(args, "instance", None))
+        exc.args = (routed["error"],)
         raise
-    if contextual_hints:
-        response = _contextualize_diagnostic_hints(
-            response, target=target, instance=getattr(args, "instance", None))
+    response = _contextualize_diagnostic_hints(
+        response, target=target, instance=getattr(args, "instance", None))
     result = unwrap_result(response, op)
     if stamp_instance and isinstance(result, dict) and isinstance(response, dict):
         answering = response.get("instance")
@@ -2702,10 +2707,10 @@ def _call(
     slice_hint = _slice_hint_for_args(args, fmt)
     shown = result
     if text_renderer is not None and fmt == "text":
-        if route_rendered_commands:
-            with command_routing(target=target, instance=getattr(args, "instance", None)):
-                shown = text_renderer(result)
-        else:
+        # Every `bn ...` command the TEXT renderer itself prints -- a follow-up,
+        # the quick-view `bn refresh` -- carries this invocation's -i/-t, so it
+        # runs as printed (V7-02: only opted-in commands were routed).
+        with command_routing(target=target, instance=getattr(args, "instance", None)):
             shown = text_renderer(result)
     spilled = _render_result(
         shown,
@@ -2763,7 +2768,6 @@ def _fanout_call(
     text_renderer: Callable[[Any], str] | None,
     timeout_kwargs: dict[str, Any],
     stem: str,
-    route_rendered_commands: bool = False,
 ) -> int:
     """Run *op* across every running bridge instance (``--all-instances``) and/or
     every open target in each instance (``--all-targets``), and aggregate (#169 L1).
@@ -2967,8 +2971,7 @@ def _fanout_call(
     fmt = _resolve_output_format(args)
     rendered: Any = result
     if fmt == "text":
-        rendered = _render_fanout_text(result, inner_renderer=text_renderer,
-                                       route_rows=route_rendered_commands)
+        rendered = _render_fanout_text(result, inner_renderer=text_renderer)
     _render_result(
         rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
         spill_label="fanout", spill_context=result, paged=True,

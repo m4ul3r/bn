@@ -2821,12 +2821,6 @@ def _render_paged_list_text(
     return footer if body == _EMPTY_RESULT else f"{body}\n\n{footer}"
 
 
-_QUICK_PARTIAL_WARNING = (
-    "WARNING: target is quick-loaded; {what} is partial. "
-    "Run `bn refresh` for full analysis."
-)
-
-
 def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     """A leading warning line when a read envelope is quick-loaded/partial
     (#437), so a text reader doesn't trust a partial answer as a complete one.
@@ -2837,7 +2831,9 @@ def _quick_partial_prefix(value: Any, what: str = "function list/count") -> str:
     one message would otherwise tell a `decompile`/`class list`/`types`/
     `evidence function` reader that a "function list/count" was partial."""
     if isinstance(value, dict) and value.get("partial"):
-        return _QUICK_PARTIAL_WARNING.format(what=what) + "\n"
+        # The remedy runs as printed: this invocation's -i/-t (V7-02).
+        return (f"WARNING: target is quick-loaded; {what} is partial. "
+                f"Run {code_span(_bn_command('refresh'))} for full analysis.\n")
     return ""
 
 
@@ -4323,8 +4319,7 @@ def _render_message_lens_text(value: Any) -> str:
 
 
 @_discloses
-def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None,
-                        *, route_rows: bool = False) -> str:
+def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
     """Render an --all-instances fan-out (#169 L1): a header per instance, then
     that instance's result rendered by the command's own text renderer (or a
     fallback), and an ``error:`` line for instances that couldn't be reached/
@@ -4367,13 +4362,10 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
             inner = r.get("result")
             if inner_renderer is not None:
                 try:
-                    if route_rows:
-                        # Commands a row's renderer prints carry THIS row's
-                        # instance and target (#1037 review).
-                        with command_routing(target=r.get("target"),
-                                             instance=r.get("instance")):
-                            lines.append(inner_renderer(inner))
-                    else:
+                    # Commands a row's renderer prints carry THIS row's
+                    # instance and target (#1037 review).
+                    with command_routing(target=r.get("target"),
+                                         instance=r.get("instance")):
                         lines.append(inner_renderer(inner))
                 except BridgeError:
                     # A `BridgeError` is not a render failure: it is this CLI
@@ -4412,7 +4404,8 @@ def _render_orient_text(value: Any) -> str:
     state = value.get("analysis_state") or ("full" if value.get("analyzed") else "?")
     lines = [f"orientation: {name}  [analysis: {state}]"]
     if not value.get("analyzed", True):
-        lines.append("  ! loaded with --quick — run `bn refresh` before trusting strings/functions")
+        lines.append(f"  ! loaded with --quick — run {code_span(_bn_command('refresh'))} "
+                     "before trusting strings/functions")
     fc = value.get("function_count")
     if fc is not None:
         lines.append(f"  functions: {fc}")

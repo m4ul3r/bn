@@ -154,7 +154,6 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         "defuse",
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
-        contextual_hints=True,
         text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(
             value, mangled=bool(args.mangled)),
         stem="defuse",
@@ -211,8 +210,6 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         "possible_values",
         {"identifier": args.identifier, "at": args.at},
         require_target=True,
-        # #1033 item 8: the `--at` refusal prints a `bn il` command.
-        contextual_hints=True,
         text_renderer=lambda value: _resolution_note(value) + _render_values_text(
             value, mangled=bool(args.mangled)),
         stem="values",
@@ -295,9 +292,6 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        contextual_hints=True,
-        # The frontier block prints its own `bn xrefs` follow-up (P2-04).
-        route_rendered_commands=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-forward",
@@ -350,8 +344,6 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        contextual_hints=True,
-        route_rendered_commands=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)),
                                                     mangled=args.mangled)),
         stem="taint-backward",
