@@ -26,12 +26,39 @@ from typing import Any, Callable
 SELECT_HINT_LINE = "Pass -t <selector> (--target) to choose one."
 OPEN_TARGETS_HEADING = "Open targets:"
 STABLE_ID_NOTE = "note: view_id / target_id are stable across `bn save`"
+# P1-02: after an unknown NUMERIC selector. A view_id belongs to the bridge
+# process that listed it; `session restart` numbers the new process's views
+# above the old ones, so an id from before a restart is unknown, never another
+# target.
+PROCESS_LOCAL_VIEW_ID_NOTE = (
+    "note: a numeric view_id is process-local: it names a target only in the "
+    "bridge process that listed it, and a restarted bridge never reuses one -- "
+    "pick the target again from the list above"
+)
+# D2-02: a bridge restarted from a registry that recorded no `next_view_id`
+# (an older build) cannot know which ids its predecessor handed out -- the ids
+# it lists now say nothing about ones it closed -- so it accepts no numeric
+# selector at all rather than risk naming a different target.
+NUMERIC_VIEW_IDS_OFF_NOTE = (
+    "note: this bridge accepts no numeric view_id: it was restarted from a bridge "
+    "that did not record which ids it had assigned, so a number could name a "
+    "different target -- use a listed selector or the full target_id"
+)
 # #996 review: the tail of a destructive close's refusal when its selector named
 # the target only through a `.bndb`-stripped alias. The bridge ends the message
 # with this lead plus the shell-quoted LISTED selector (which resolves to
 # exactly that target); the CLI replaces the tail with the spelling of the
 # command that was run (`bn close -t X` / `bn target close X`).
 LISTED_SELECTOR_LEAD = "close it by its listed selector instead: "
+
+
+def active_close_headline(spelling: str) -> str:
+    """The refusal headline when a close WAS given a selector -- the volatile
+    *spelling* of `active` -- that it cannot honor with several targets open.
+    The generic "requires --target" headline told a caller who had passed
+    `-t active` to pass `-t` (W05)."""
+    return (f"{spelling} follows the GUI selection, which close does not honor "
+            "while several targets are open.")
 
 
 def _escape_controls(text: str) -> str:
