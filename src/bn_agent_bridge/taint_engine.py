@@ -11344,8 +11344,48 @@ class TaintEngine:
         fn = function_at(self.bv, start)
         return str(getattr(fn, "name", "") or "") in self._CRT_HELPERS
 
+    def _self_reread(self, func: Any, instrs: list, ga: int,
+                     writes: list) -> tuple | None:
+        """``(start, at, "load", offset, "", offset_known)`` for the first load
+        of the global at *ga* in *func* that control reaches from the entry
+        without passing any of *writes* -- the instructions in *func* that
+        tainted it -- or None.
+
+        Such a load runs, on the next activation or a loop's next iteration,
+        after the store this run tainted: `c = table[last]; ...; last = n;`
+        indexes with the previous call's input (V3-01). A load every tainting
+        write dominates reads the value this activation stored, which the walk
+        followed. With no write in *func* (a descended callee stored it) there
+        is no path to judge, and None is returned. A view without block
+        information cannot rule a path out, so such a load counts."""
+        if not writes or not instrs:
+            return None
+        entry = instrs[0]
+        for ins in instrs:
+            exprs = [getattr(ins, a, None) for a in ("src", "condition", "dest")]
+            exprs += list(getattr(ins, "params", None) or ())
+            loads = [ld for e in exprs for ld in self._outer_loads(e)
+                     if self._names_global(getattr(ld, "src", None), ga)]
+            if not loads:
+                continue
+            if ins is not entry and self._reaches_avoiding(entry, ins, list(writes)) is False:
+                continue
+            for ld in loads:
+                const = self._int_const(getattr(ld, "src", None))
+                known = const is not None
+                offset = int(const) - int(ga) if known else 0
+                width = getattr(ld, "size", None)
+                use = _Use(int(getattr(ins, "address", 0)), "load", offset, None,
+                           int(width) if isinstance(width, int) and width > 0 else None,
+                           known)
+                if self._use_misses_tainted(ga, use):
+                    continue    # another field of the object: `s.name` after `s.port = n`
+                return (int(getattr(func, "start", 0)), use.at, "load", offset, "", known)
+        return None
+
     def _unfollowed_global_leaf(self, func: Any, ga: int, write_ins: Any,
-                                leaves: list) -> dict[str, Any] | None:
+                                leaves: list, instrs: list,
+                                writes: list) -> dict[str, Any] | None:
         """The blocking frontier for a tainted global still live when the
         seeded function returns (P1-04).
 
@@ -11395,7 +11435,7 @@ class TaintEngine:
         own_refs = self._global_ref_functions(ga)
         for start, site in sorted(refs.items()):
             if start == own or self._is_crt_helper(start):
-                continue        # its own re-reads were walked; CRT markers read nothing
+                continue        # its own reads are judged below, by path; CRT markers read nothing
             if cited is not None:
                 others.append((start, site))
                 continue
@@ -11419,6 +11459,16 @@ class TaintEngine:
                 fallback = row
             else:
                 others.append((start, site))
+        self_read = False
+        if cited is None:
+            # V3-01: the seeded function itself loads the object on a path
+            # from its entry that no tainting write of it precedes -- a
+            # static its NEXT activation reads (or a loop's next iteration,
+            # before the store). The walk saw that load holding the OLD
+            # value only, so the stored bytes reach it unfollowed: that load
+            # is the reader the frontier names.
+            cited = self._self_reread(func, instrs, ga, writes)
+            self_read = cited is not None
         if cited is None:
             cited = fallback
         elif fallback is not None:
@@ -11438,7 +11488,12 @@ class TaintEngine:
                 + (f" (+{hex(r['offset'])})" if r["offset"] and r["offset_known"]
                    else (" (+?)" if not r["offset_known"] else ""))
                 + f" ({r['access']})" for r in rows)
-            readers = (f"code the walk never examined "
+            readers = (f"{self._prose_function(func)} itself loads it on a path from "
+                       f"its entry that no tainting store precedes, so its next "
+                       f"activation (or a loop's next iteration) reads the stored "
+                       f"bytes unfollowed ({where})"
+                       if self_read else
+                       f"code the walk never examined "
                        f"{'reads' if proven else 'may read'} it ({where})")
         else:
             readers = "its reference sweep did not finish, so who reads it is unknown"
@@ -11469,6 +11524,9 @@ class TaintEngine:
                            sorted(self._global_keyed_offsets.get(ga) or ())[:8]]},
             "references": rows,
             "reads_proven": any(r["access"] in _PROVEN_GLOBAL_READS for r in rows),
+            # V3-01: the reader cited is the seeded function's own earlier
+            # load of the object, not code elsewhere.
+            "self_reread": self_read,
             # The other functions BN records a reference from, at that
             # reference, unclassified -- the same shape the continuation's
             # reachability uses for references it did not examine.
@@ -14285,7 +14343,7 @@ class TaintEngine:
                         if k in by_key]
                 if self._cleared_before_return(func, ssaf, instrs, ga, here, rets):
                     continue
-                leaf = self._unfollowed_global_leaf(func, ga, write, leaves)
+                leaf = self._unfollowed_global_leaf(func, ga, write, leaves, instrs, here)
                 if leaf is not None and leaf not in leaves:
                     leaves.append(leaf)
 
