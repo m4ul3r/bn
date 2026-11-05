@@ -17972,11 +17972,15 @@ class TaintEngine:
         # Address order, never BN's enumeration order: which sites the cap
         # lets through -- and which it drops -- is a property of the binary,
         # not of how the view was loaded (a raw ELF and its saved `.bndb`
-        # enumerate the same callers differently).
-        caller_sites = sorted(
-            getattr(func, "caller_sites", None) or [],
-            key=lambda s: (int(getattr(s, "address", 0)),
-                           int(getattr(getattr(s, "function", None), "start", -1) or -1)))
+        # enumerate the same callers differently). A site is (address,
+        # caller): BN may list one record twice, which used to spend a cap
+        # slot and a drop on the same call, while overlapping functions that
+        # share a call instruction are two callers (R2-04).
+        unique: dict[tuple, Any] = {}
+        for s in getattr(func, "caller_sites", None) or []:
+            unique.setdefault(self._site_identity(
+                getattr(s, "address", 0), getattr(s, "function", None)), s)
+        caller_sites = [unique[k] for k in sorted(unique)]
         start = int(getattr(func, "start", 0))
         # address -> referencing function (None: a data reference)
         indirect: dict[int, Any] = {}
@@ -17987,11 +17991,12 @@ class TaintEngine:
         except Exception:
             pass
         get_code_refs = getattr(self.bv, "get_code_refs", None)
-        direct = {int(getattr(s, "address", 0)) for s in caller_sites}
+        direct = set(unique)
+        call_addresses = {k[0] for k in direct}
         try:
             for ref in (get_code_refs(start) if callable(get_code_refs) else []):
                 a, rf = int(getattr(ref, "address", 0)), getattr(ref, "function", None)
-                if a in direct:
+                if a in call_addresses:
                     continue
                 indirect.setdefault(a, rf)
         except Exception:
@@ -18002,20 +18007,20 @@ class TaintEngine:
         # measurement, never the constant (#810).
         considered = caller_sites[:MAX_CALLERS] if ascend else []
         results: list[dict[str, Any]] = []
-        rows: list[dict[str, Any]] = []
-        misses: set[tuple[int, int, str]] = set()
+        rows: dict[tuple, dict[str, Any]] = {}
+        misses: set[tuple[tuple, int, str]] = set()
 
         def _drop(address: int, caller: Any, pidx: int, reason: str) -> None:
             # Every (site, formal, reason) is a row, a site past the cap
             # included: the leaf lists them in address order up to its
             # bound and counts all of them.
-            key = (int(address), pidx, reason)
+            key = (self._site_identity(address, caller), pidx, reason)
             if key in misses:
                 return
             misses.add(key)
-            rows.append({"address": hex(int(address)),
+            rows[key] = {"address": hex(int(address)),
                          "caller": None if caller is None else self._prose_function(caller),
-                         "param": pidx, "reason": reason})
+                         "param": pidx, "reason": reason}
 
         cycled: set[int] = set()
         fkey = self._caller_key(func)
@@ -18134,14 +18139,23 @@ class TaintEngine:
             for pidx in demands:
                 _drop(a, rf, pidx, reason)
         self._bw_note_unfollowed_callers(
-            func, direct=direct, indirect=set(indirect), formals=set(demands),
-            rows=rows, misses=misses)
+            func, direct=direct,
+            indirect={self._site_identity(a, rf) for a, rf in indirect.items()},
+            formals=set(demands), rows=rows, misses=misses)
         return results, cycled
 
     @staticmethod
     def _caller_key(func: Any) -> tuple[int, str]:
         """A function's identity in the ascent's demand keys."""
         return (int(getattr(func, "start", 0)), str(getattr(func, "name", "")))
+
+    @classmethod
+    def _site_identity(cls, address: Any, caller: Any) -> tuple[int, int, str]:
+        """A caller reference's identity: its address and the function it is
+        in (``(-1, "")`` for a data reference). Ordered by address first, so
+        sorting by it is the address order the cap follows."""
+        key = (-1, "") if caller is None else cls._caller_key(caller)
+        return (int(address), *key)
 
     # C-runtime start routines whose FIRST operand is the program's main
     # callback (`__libc_start_main(main, argc, argv, ..)`).
@@ -18225,12 +18239,15 @@ class TaintEngine:
         return handed > 0
 
     def _bw_note_unfollowed_callers(
-        self, func: Any, *, direct: set[int], indirect: set[int], formals: set[int],
-        rows: list[dict[str, Any]], misses: set[tuple[int, int, str]],
+        self, func: Any, *, direct: set[tuple], indirect: set[tuple], formals: set[int],
+        rows: dict[tuple, dict[str, Any]], misses: set[tuple[tuple, int, str]],
     ) -> None:
         """One caller frontier per function, across every demanded formal.
 
-        Coverage counts distinct reference addresses, each classed by the
+        Coverage counts distinct caller references -- a reference is its
+        address AND the function it is in (:meth:`_site_identity`), so one
+        site BN lists twice counts once and overlapping callers sharing a
+        call instruction count as two (R2-04) -- each classed by the
         formals demanded of it: FULLY followed (every demanded formal
         followed), PARTIALLY followed (some), or UNFOLLOWED (none).
         ``callers_dropped`` is the partial and unfollowed references together
@@ -18262,17 +18279,16 @@ class TaintEngine:
         state["direct"].update(direct)
         state["known"].update(direct)
         state["known"].update(indirect)
-        for address in direct | indirect:
-            state["demanded"].setdefault(address, set()).update(formals)
-        for address, param, reason in misses:
-            state["dropped"].add(address)
-            state["missed"].setdefault(address, set()).add(param)
-            key = (address, param, reason)
+        for site in direct | indirect:
+            state["demanded"].setdefault(site, set()).update(formals)
+        for site, param, reason in misses:
+            state["dropped"].add(site)
+            state["missed"].setdefault(site, set()).add(param)
+            key = (site, param, reason)
             if key not in state["misses"]:
                 state["misses"].add(key)
                 state["reasons"][reason] = state["reasons"].get(reason, 0) + 1
-        for row in rows:
-            key = (int(row["address"], 16), row["param"], row["reason"])
+        for key, row in rows.items():
             state["examples"].setdefault(key, row)
         if not state["dropped"]:
             return
@@ -18280,12 +18296,12 @@ class TaintEngine:
         total = len(state["known"])
         dropped = len(state["dropped"])
         fully = total - dropped
-        partial: list[tuple[int, set[int], set[int]]] = []
-        for address in sorted(state["dropped"]):
-            demanded = state["demanded"].get(address, set())
-            missed = state["missed"][address]
+        partial: list[tuple[tuple, set[int], set[int]]] = []
+        for site in sorted(state["dropped"]):
+            demanded = state["demanded"].get(site, set())
+            missed = state["missed"][site]
             if demanded - missed:
-                partial.append((address, demanded - missed, missed))
+                partial.append((site, demanded - missed, missed))
         unfollowed = dropped - len(partial)
         demands_total = sum(len(state["demanded"].get(a, set())) for a in state["known"])
         demands_unfollowed = sum(len(m) for m in state["missed"].values())
@@ -18299,7 +18315,7 @@ class TaintEngine:
                 f"(function {start:#x})"),
             "max_depth": (
                 f"caller ascent of {name} stopped at the --max-depth bound: "
-                f"{len({a for a, _, r in state['misses'] if r == 'max_depth'})} caller "
+                f"{len({s for s, _, r in state['misses'] if r == 'max_depth'})} caller "
                 f"reference(s) not followed (function {start:#x})"),
         }
         for cause, assumption in bounds.items():
@@ -18342,8 +18358,9 @@ class TaintEngine:
             # Which formals each partially followed reference did and did not
             # supply; bounded like `unfollowed`, counted exactly above.
             "partially_followed": [
-                {"address": hex(a), "followed_params": sorted(f), "unfollowed_params": sorted(m)}
-                for a, f, m in partial[:MAX_CALLERS]],
+                {"address": hex(site[0]), "followed_params": sorted(f),
+                 "unfollowed_params": sorted(m)}
+                for site, f, m in partial[:MAX_CALLERS]],
             "detail": (note + " -- an origin reachable only from an unfollowed caller "
                        "is missing from this slice"),
         })
