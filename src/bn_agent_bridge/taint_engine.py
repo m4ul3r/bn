@@ -975,6 +975,9 @@ class TaintEngine:
         self._unverified_neighbours: dict[int, set[int]] = {}
         # (function start, neighbour) -> every read-capable use of it there.
         self._neighbour_uses_cache: dict[tuple[int, int], list] = {}
+        # (SSA function, buffer, memory version, size, region) -> its solved
+        # writer rows (`_local_buffer_writers`), for one backward run.
+        self._buffer_writer_solves: dict[tuple, dict[str, Any]] = {}
         # global -> the first write of a tainted value into it this run made
         # -- a direct store, a modeled copy, a source filling it -- in any
         # function the walk entered: the write a seeded function's exit must
@@ -4469,7 +4472,16 @@ class TaintEngine:
         at a full-cover writer: ``strcat`` after ``strcpy`` both feed the
         sink, and a may-analysis that drops the earlier one loses an origin.
         A partial store never masks anything either (mirrors
-        ``_load_writers``)."""
+        ``_load_writers``).
+
+        The solve is a function of its arguments alone, and every caller only
+        reads the result, so one backward run solves each question once: the
+        caller ascent re-enters a function from every seed and site, and a
+        content demand asks again at each reader's memory version (IC06)."""
+        solve_key = (ssaf, base_key, mv, base_size, region)
+        solved = self._buffer_writer_solves.get(solve_key)
+        if solved is not None:
+            return solved
         if base_size is not None and base_size <= 0:
             base_size = None
         end = base_size if base_size is not None else _REGION_OPEN
@@ -4810,9 +4822,11 @@ class TaintEngine:
         final = memo.get(int(mv), ((), False))[0]
         unproven = None if truncated else _iv_gaps(final, r_lo, r_hi)
         writers.reverse()
-        return {"writers": writers, "covered": unproven == [], "truncated": truncated,
-                "region": (r_lo, r_hi), "unproven": unproven,
-                "proven_fills": proven_fills}
+        solved = {"writers": writers, "covered": unproven == [], "truncated": truncated,
+                  "region": (r_lo, r_hi), "unproven": unproven,
+                  "proven_fills": proven_fills}
+        self._buffer_writer_solves[solve_key] = solved
+        return solved
 
     def _store_bytes(self, ssaf: Any, defn: Any, base_key: Any) -> tuple[int, int] | None:
         """``[k, k + width)`` of local *base_key* a store writer *defn* writes
@@ -17276,6 +17290,7 @@ class TaintEngine:
     def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
         self._bw_leaves: list[dict[str, Any]] = []
         self._bw_assumptions: list[str] = []
+        self._buffer_writer_solves = {}
         # Shared by every seed and recursive ascent in this run. Reference
         # coverage is per function/site, not per demanded formal.
         self._bw_caller_frontiers: dict[int, dict[str, Any]] = {}
