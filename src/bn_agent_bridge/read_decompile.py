@@ -857,10 +857,14 @@ def _runs_into_next(bv, func, block) -> int | None:
 
 def _split_pair(bv, head, tail) -> bool:
     """Whether *head* running into *tail* reads as a shared-tail split. Not
-    when either is an EH/cold fragment (`_is_eh_fragment`), and not when the
+    when either is an EH/cold fragment (`_is_eh_fragment`), not when the
     tail never returns: BN outlines a bare `call __stack_chk_fail` or abort
-    path that way, and no return path of the head is hidden behind it."""
+    path that way, and no return path of the head is hidden behind it -- and
+    not when either is a linker stub: a PLT entry ends in `ldr pc, [..]` /
+    `jmp [..]` into the GOT, and its neighbour is the next stub, never a tail
+    it shares (W06-06: the note advised `function delete` on PLT entries)."""
     return bool(getattr(tail, "can_return", True)) \
+        and not _is_linker_stub(bv, tail) and not _is_linker_stub(bv, head) \
         and not _is_eh_fragment(bv, tail) and not _is_eh_fragment(bv, head)
 
 
@@ -1401,20 +1405,24 @@ def _c_quote(value: str) -> str:
 _RESOLVED_JUMP_OPS = ("HLIL_CONST", "HLIL_CONST_PTR", "HLIL_IMPORT", "HLIL_EXTERN_PTR")
 
 
-def _is_plt_stub(bv, func) -> bool:
-    """An import stub or the PLT header (`push [..]; jmp [GOT+16]`): its jump
-    is the dynamic linker's business, not code a reader needs explained."""
+def _is_linker_stub(bv, func) -> bool:
+    """An import's stub or a PLT slot: an import symbol, or code in a `.plt`
+    section. Its jump is the dynamic linker's business."""
     try:
         start = int(func.start)
         symbol = bv.get_symbol_at(start)
         if str(getattr(getattr(symbol, "type", None), "name", "")) in _IMPORT_SYMBOL_KINDS:
             return True
-        if bool(getattr(func, "is_thunk", False)):
-            return True
         return any(".plt" in str(getattr(section, "name", ""))
                    for section in list(bv.get_sections_at(start) or []))
     except Exception:  # noqa: BLE001 - unknown: treat as ordinary code
         return False
+
+
+def _is_plt_stub(bv, func) -> bool:
+    """An import stub or the PLT header (`push [..]; jmp [GOT+16]`): its jump
+    is the dynamic linker's business, not code a reader needs explained."""
+    return bool(getattr(func, "is_thunk", False)) or _is_linker_stub(bv, func)
 
 
 def _unresolved_jump_findings(bv, func) -> list[dict[str, Any]]:
