@@ -556,7 +556,7 @@ def targets_from_pvs(pvs: Any) -> list[int]:
     return sorted({a for a in out if a})
 
 
-def follow_thunk(bv: Any, fn: Any) -> Any | None:
+def follow_thunk(bv: Any, fn: Any, *, ssa_of: Any = _mlil_ssa) -> Any | None:
     """If *fn* is a single-instruction tailcall thunk, return its real target.
 
     Follows thunk chains (PLT stubs, GCC veneers) iteratively, guarding against
@@ -564,13 +564,15 @@ def follow_thunk(bv: Any, fn: Any) -> Any | None:
     recursive form only rejected a direct A->A self-loop, so a multi-step
     tailcall cycle in the binary (A->B->A, or longer) recursed without bound and
     raised ``RecursionError``. Returns the deepest resolved target, or None when
-    *fn* is not a thunk.
+    *fn* is not a thunk. *ssa_of* reads a body's MLIL SSA form; the taint
+    engine passes its per-request cache, so a hop it already lifted is not
+    lifted again.
     """
     seen: set[int] = {int(getattr(fn, "start", -1))}
     cur = fn
     result: Any | None = None
     while True:
-        ssa = _mlil_ssa(cur)
+        ssa = ssa_of(cur)
         if ssa is None:
             break
         instructions = _ssa_instructions(ssa)
