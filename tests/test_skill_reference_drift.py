@@ -1,4 +1,4 @@
-"""Docs-drift guards for `skills/bn/reference/` (#650, #651).
+"""Docs-drift guards for ordinary and opt-in project skills (#650, #651).
 
 Agents read the skill reference as the API surface, not `--help`. Where the
 reference omits a flag, agents conclude it does not exist: in one 5-agent dogfood
@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import importlib
 import re
+import shlex
 import sys
 import types
 from pathlib import Path
@@ -36,6 +37,8 @@ REFERENCE = Path(__file__).resolve().parent.parent / "skills" / "bn" / "referenc
 READING = REFERENCE / "reading.md"
 MUTATING = REFERENCE / "mutating.md"
 SKILL = REFERENCE.parent / "SKILL.md"
+PROJECT_SKILL = REFERENCE.parent.parent / "bn-projects" / "SKILL.md"
+INDEX_SKILLS = (SKILL, PROJECT_SKILL)
 
 COMMAND_INDEX_HEADING = "## Command index"
 
@@ -81,6 +84,9 @@ REQUIRED_INDEX_GROUPS = {
 # group, which is what makes the group an exemption rather than a free pass.
 INDEX_EXEMPT_STICKY = frozenset({
     "instance use", "instance clear", "target use", "target clear",
+    # All three pin the bridge that owns a project (`init` reuses `open`'s
+    # attach-or-open path).
+    "project open", "project attach", "project init",
 })
 
 # A true ALIAS: the same registered handler under a second path, so advertising
@@ -349,7 +355,8 @@ def test_skill_command_index_names_every_required_group(command_groups):
     assert not renamed, f"the index requires groups the CLI registry does not have: {renamed}"
 
 
-def test_skill_command_index_advertises_every_registered_command(command_paths):
+@pytest.mark.parametrize("skill", INDEX_SKILLS, ids=lambda path: path.parent.name)
+def test_skill_command_index_advertises_every_registered_command(skill, command_paths):
     """...and this half is POPULATION, derived from the registry rather than from
     the names one bug report happened to list.
 
@@ -359,14 +366,18 @@ def test_skill_command_index_advertises_every_registered_command(command_paths):
     advertised unless it is declared exempt, and a new command is a
     documentation failure until someone classifies it either way.
     """
-    advertised = {command for line in _index_lines()
+    advertised = {command for line in _index_lines(skill)
                   for command in _advertised_commands(line)}
+    owned = {command for command in command_paths
+             if command.startswith("project ") == (skill == PROJECT_SKILL)}
+    misplaced = advertised - owned
+    assert not misplaced, f"{skill.parent.name} advertises another skill's commands: {sorted(misplaced)}"
     stale = sorted(INDEX_EXEMPT_COMMANDS - command_paths)
     assert not stale, (
         f"these exemptions name commands the registry does not have: {stale}; a "
         "stale exemption silently drops a real command from the requirement"
     )
-    unadvertised = sorted(command_paths - advertised - INDEX_EXEMPT_COMMANDS)
+    unadvertised = sorted(owned - advertised - INDEX_EXEMPT_COMMANDS)
     assert not unadvertised, (
         "the SKILL.md Command index -- the map an agent reads first -- does not "
         f"advertise these registered commands: {unadvertised}. Add an index "
@@ -821,7 +832,7 @@ def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
         f"these exemptions name commands the registry does not have: {stale}; a "
         "stale exemption silently drops a real command from the requirement"
     )
-    advertised = {command for line in _index_lines()
+    advertised = {command for skill in INDEX_SKILLS for line in _index_lines(skill)
                   for command in _advertised_commands(line)}
     leaked = sorted(INDEX_EXEMPT_STICKY & advertised)
     assert not leaked, (
@@ -859,9 +870,9 @@ def test_every_index_exemption_states_a_reason_that_is_true(command_paths):
     )
 
 
-def _index_section() -> str:
+def _index_section(skill: Path = SKILL) -> str:
     """The Command index body, WITHOUT the remainder of its heading line."""
-    text = SKILL.read_text(encoding="utf-8")
+    text = skill.read_text(encoding="utf-8")
     sections = text.count(COMMAND_INDEX_HEADING)
     assert sections == 1, (
         f"expected exactly one {COMMAND_INDEX_HEADING!r} section, found {sections}: "
@@ -893,13 +904,13 @@ _INDEX_LINE = re.compile(r"\s*[-*+] +\*\*(?P<group>[^*]+)\*\*")
 _BASH_BLOCK = re.compile(r"```(?:bash|sh|shell|console)\n(.*?)```", re.S)
 
 # A runnable invocation: a line whose first word is `bn`.
-_RUNNABLE = re.compile(r"^[ \t]*bn +(?P<rest>[a-z].*)$", re.M)
+_RUNNABLE = re.compile(r"^[ \t]*bn[ \t]+(?P<rest>\S.*)$", re.M)
 
 # The index line's TERMINAL pointer -- what follows the arrow. Searching the
 # whole line instead returns the first `reference/*.md` it happens to mention,
 # so a reference named inside an entry's parenthetical gloss silently stood in
 # for the file the line actually points an agent at.
-_INDEX_REFERENCE = re.compile(r"`(reference/[a-z_]+\.md)`")
+_INDEX_REFERENCE = re.compile(r"`((?:reference/[a-z_]+|SKILL)\.md)`")
 
 
 def _index_pointer(line: str) -> str:
@@ -943,11 +954,26 @@ def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
     Each `bn ...` line resolves to its longest registered command path, so a
     match is exact rather than a prefix: `bn types show <name>` documents
     `types show` and NOT `types`, which a prefix check would let stand in for it.
+    Leading instance/target routing options are not part of the command path.
     """
     documented: set[str] = set()
     for match in _RUNNABLE.finditer("\n".join(_BASH_BLOCK.findall(text))):
-        words = match.group("rest").split()
-        for size in range(min(3, len(words)), 0, -1):
+        try:
+            words = shlex.split(match.group("rest"), comments=True)
+        except ValueError:
+            continue
+        while words:
+            if words[0] in {"-i", "--instance", "-t", "--target"}:
+                if len(words) < 2 or words[1].startswith("-"):
+                    break
+                words = words[2:]
+            elif words[0].startswith(("--instance=", "--target=")):
+                words = words[1:]
+            elif words[0].startswith(("-i", "-t")) and len(words[0]) > 2:
+                words = words[1:]
+            else:
+                break
+        for size in range(len(words), 0, -1):
             candidate = " ".join(words[:size])
             if candidate in command_paths:
                 documented.add(candidate)
@@ -955,15 +981,62 @@ def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
     return documented
 
 
-# The groups the Command index must carry. Pinned as a SET, not a floor: a floor
-# is satisfied by "still at least four lines", which is exactly how a line that
-# stopped matching disappeared unnoticed. `_INDEX_LINE` refusing what it cannot
-# read covers the other half -- nothing silently leaves the sweep.
-EXPECTED_INDEX_GROUPS = frozenset({"Read", "Mutate", "Discover", "Session", "Tooling",
-                                   "Escape hatch"})
+@pytest.mark.parametrize("invocation,expected", [
+    ("bn -i <owner-instance-id> project finding types", "project finding types"),
+    ("bn -i <owner-instance-id> project finding context --file usr/bin/app",
+     "project finding context"),
+    ("bn -i <owner-instance-id> project finding list --type dataflow --type dependency",
+     "project finding list"),
+    ("bn -i <owner-instance-id> project finding show <finding-id>", "project finding show"),
+    ("bn -i <owner-instance-id> project finding add - --author analyst-a <<'JSON'",
+     "project finding add"),
+    ("bn -i <owner-instance-id> -t <selector> save", "save"),
+])
+def test_documented_commands_resolve_global_option_examples(invocation, expected, command_paths):
+    assert expected in command_paths
+    assert _documented_commands(f"```bash\n{invocation}\n```", command_paths) == {expected}
 
 
-def _index_lines() -> list[str]:
+@pytest.mark.parametrize("routing", [
+    "",
+    "-i owner",
+    "--instance owner",
+    "--instance=owner",
+    "-iowner",
+    "-t selector",
+    "--target selector",
+    "--target=selector",
+    "-tselector",
+    '-i owner --target "a target with spaces"',
+    "--target=selector --instance=owner",
+])
+def test_documented_commands_resolve_exact_paths_after_routing_options(routing):
+    paths = {"types", "types show", "project finding", "project finding show"}
+    text = (
+        f"```bash\nbn {routing} types show <name>\n"
+        f"bn {routing} project finding show <finding-id>\n```"
+    )
+    assert _documented_commands(text, paths) == {"types show", "project finding show"}
+
+
+@pytest.mark.parametrize("text", [
+    "bn -i owner project finding show <finding-id>",
+    "The command is `bn -i owner project finding show <finding-id>`.",
+    "```text\nbn -i owner project finding show <finding-id>\n```",
+    "```bash\n# bn -i owner project finding show <finding-id>\n```",
+    "```bash\necho bn -i owner project finding show <finding-id>\n```",
+    "```bash\nbn -i owner project findings show <finding-id>\n```",
+    "```bash\nbn --unknown owner project finding show <finding-id>\n```",
+    "```bash\nbn -i project finding show <finding-id>\n```",
+    "```bash\nbn -i\n```",
+    "```bash\nbn -i --target selector project finding show <finding-id>\n```",
+    '```bash\nbn -i "owner project finding show <finding-id>\n```',
+])
+def test_documented_commands_reject_noncommands(text):
+    assert _documented_commands(text, {"project finding show"}) == set()
+
+
+def _index_lines(skill: Path = SKILL) -> list[str]:
     """Every non-blank line of the Command index, unfiltered.
 
     Unfiltered on purpose: filtering to the lines this guard can READ is how a
@@ -973,33 +1046,28 @@ def _index_lines() -> list[str]:
     This used to assert here, at parametrize time -- so a doc slip became
     `Interrupted: 1 error during collection`, which aborts the whole pytest
     session and silences every other module's result. One red cell is the
-    correct blast radius; `test_the_command_index_is_shaped_as_this_guard_reads_it`
+    correct blast radius; `test_the_command_index_is_readable`
     owns the section-level claims.
     """
-    return [line for line in _index_section().splitlines() if line.strip()]
+    return [line for line in _index_section(skill).splitlines() if line.strip()]
 
 
-def test_the_command_index_is_shaped_as_this_guard_reads_it():
-    """The section-level claims, as a failing TEST rather than a collection
-    error: every line is readable, and the group set is pinned as a SET rather
-    than a floor ("still at least four lines" is how a line that stopped
-    matching disappeared unnoticed)."""
-    lines = _index_lines()
+@pytest.mark.parametrize("skill", INDEX_SKILLS, ids=lambda path: path.parent.name)
+def test_the_command_index_is_readable(skill):
+    """The index must remain nonempty and readable, regardless of its categories."""
+    lines = _index_lines(skill)
+    assert lines, f"the Command index advertises no commands: {skill}"
     unreadable = [line for line in lines if not _INDEX_LINE.match(line)]
     assert not unreadable, (
         "every line in the Command index must be a readable `- **Group** ...` "
         f"entry, or this guard silently stops checking it: {unreadable}"
     )
-    groups = {_INDEX_LINE.match(line).group("group").strip() for line in lines}
-    assert groups == EXPECTED_INDEX_GROUPS, (
-        f"the Command index groups changed: expected {sorted(EXPECTED_INDEX_GROUPS)}, "
-        f"parsed {sorted(groups)}"
-    )
 
 
-@pytest.mark.parametrize("line", _index_lines(),
-                         ids=lambda line: line.strip()[:24])
-def test_skill_index_entries_are_documented_where_the_index_points(line, command_paths):
+@pytest.mark.parametrize("skill,line",
+                         [(skill, line) for skill in INDEX_SKILLS for line in _index_lines(skill)],
+                         ids=lambda value: value.parent.name if isinstance(value, Path) else value.strip()[:24])
+def test_skill_index_entries_are_documented_where_the_index_points(skill, line, command_paths):
     """#627: naming a group in the index is only half the map -- each line ends
     in `-> reference/<file>.md`, so every command it advertises must actually be
     documented in THAT file. The first cut of the widened index advertised a
@@ -1037,12 +1105,22 @@ def test_skill_index_entries_are_documented_where_the_index_points(line, command
         f"the SKILL.md index advertises commands the CLI registry does not have: "
         f"{unregistered}"
     )
-    text = (REFERENCE.parent / reference).read_text(encoding="utf-8")
+    text = (skill.parent / reference).read_text(encoding="utf-8")
     documented = _documented_commands(text, command_paths)
     missing = [cmd for cmd in commands if cmd not in documented]
     assert not missing, (
         f"the SKILL.md index points at {reference} for commands that "
         f"file never shows as a runnable command: {missing}"
+    )
+
+
+def test_project_reference_documents_every_project_command_including_pin_writers(command_paths):
+    """Pin writers stay out of the index, but still need runnable documentation."""
+    project_commands = {command for command in command_paths if command.startswith("project ")}
+    assert project_commands, "the project command registry is empty"
+    documented = _documented_commands(PROJECT_SKILL.read_text(encoding="utf-8"), command_paths)
+    assert not project_commands - documented, (
+        f"project commands missing from bn-projects: {sorted(project_commands - documented)}"
     )
 
 

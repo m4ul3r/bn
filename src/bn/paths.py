@@ -182,6 +182,12 @@ def instances_dir() -> Path:
     return cache_home() / "instances"
 
 
+def projects_dir() -> Path:
+    """Where `bn project init` creates a project when the rootfs's parent is
+    not writable: `<cache>/projects/<sha256(root)[:16]>.bnpr`."""
+    return cache_home() / "projects"
+
+
 def sessions_dir() -> Path:
     return cache_home() / "sessions"
 

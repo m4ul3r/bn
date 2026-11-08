@@ -83,7 +83,6 @@ addresses are not possible return values. Unknown destinations remain unknown;
 the destination set does not replace a determined instruction value or change
 assignment-source selection.
 
-
 Notes:
 
 - `function search` is a case-insensitive substring search over the demangled display name. Use `--exact` for a known API, `--word` for an identifier token, or an anchored `--regex` for a family. A regex-shaped zero-hit literal query may be retried as a regex; `regex_fallback` discloses that choice. Confirm a source or sink against the import and actual call target, not its name alone.

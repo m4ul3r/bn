@@ -64,6 +64,7 @@ A headless start owns an instance that should be stopped when work ends. Set a p
 
 `bn session stop` and `bn session restart` refuse (exit 2) while any target of that instance has unsaved mutations, listing each target's `-t` selector and the `bn -i <id> -t <selector> save` to run; `--discard-unsaved` proceeds and reports `discarded_unsaved` (`selector` + `path` per target; text: `[unsaved changes discarded]`), the same disclosure `bn close` prints. The check asks the bridge with its own short budget, independent of `BN_REQUEST_TIMEOUT`. A bridge that cannot be reached (stopped, gone, socket missing) is stopped as before; a live bridge that does not answer — busy under a write lock, or a GUI that cannot enumerate its tabs — also refuses (exit 2, "cannot verify"), and `--discard-unsaved` is the only way past it.
 
+
 Process lifecycle commands (`session stop` and `session restart`) are headless-only. They refuse a GUI-owned bridge without sending a shutdown RPC or escalating to SIGTERM/SIGKILL, including with `--discard-unsaved`. The GUI `shutdown` RPC itself also refuses and leaves admission open: it has no headless event waiter to complete teardown. Use Binary Ninja's **Restart Bridge** menu command to restart its bridge, or close Binary Ninja normally to exit the GUI process.
 GUI ownership is checked before target enumeration, so unsaved or unresponsive GUI views do not produce a misleading `--discard-unsaved` retry hint.
 
@@ -126,9 +127,12 @@ bn capabilities --format json
 bn doctor
 bn plugin install
 bn skill install
+bn skill install projects
 ```
 
 `bn capabilities` is the registry-derived command catalog. Use `bn doctor` when discovery, installation, or bridge connectivity is wrong; stale plugin code requires restarting the bridge or GUI. `bn plugin install` and `bn skill install` install local bridge and skill links, defaulting to text (`--format json` remains available). After moving to a new checkout, an old link is reported as not updated (`skill install` exits 1, `plugin install` refuses).
+
+The default `bn skill install` installs the ordinary skills (`bn`, `bn-kernel`, `bn-re`, `bn-vr`), not `bn-projects`. Explicitly run `bn skill install projects` to install only `bn-projects`; project APIs require Binary Ninja Commercial or Ultimate and this guidance remains opt-in regardless of license. Installation only adds guidance: it does not validate a license or enable project support. Installation options such as `--dest` and `--mode copy` apply to either selection.
 
 Copy installs write `.bn-copy-install.json` with `{"format":"bn-copy-install-v1","artifact":"<source directory name>"}`. `--force` replaces removable links, empty directories, or copies with a valid regular, non-symlink marker for that artifact, losing local edits and added files in the copies. Matching source bytes alone are not ownership proof. Move an unmarked older copy to a backup by hand, then re-run the same install command without `--force`; do not manufacture a marker. A linked skills root into an unmarked checkout is refused rather than rewriting the checkout.
 

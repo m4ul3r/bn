@@ -6,6 +6,7 @@ import functools
 import json
 import re
 import shlex
+import unicodedata
 from typing import Any, Callable, Iterator, Sequence
 
 from .target_hint import instance_option, open_target_lines, target_option, target_row
@@ -20,20 +21,23 @@ from .transport import BridgeError
 # `bn.formatters.FAILED_MUTATION_STATUSES`.
 from .mutation_statuses import FAILED_MUTATION_STATUSES  # noqa: E402,F401
 
-# Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
-# break a --format text row across lines or corrupt the terminal. Escape them so
-# the row stays on one line and the name is still readable (#370.1). JSON output
-# is untouched -- it round-trips the raw name faithfully. #771 routes the other
-# operator-settable free-text cells -- comment text, tag data, local names, and
-# the import library / raw symbol name columns -- through the same helper, for
-# the same reason: each is one cell of a row.
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Text cells must not inject terminal controls, rows, or invisible direction
+# changes. Keep printable Unicode intact; JSON output never uses this helper.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\xad]|[^\x00-\xff]")
 
 
 def _escape_control_chars(text: Any) -> str:
-    s = str(text)
-    s = s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
-    return _CONTROL_CHAR_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", s)
+    def escape(match: re.Match[str]) -> str:
+        char = match.group()
+        if char in ("\n", "\r", "\t"):
+            return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}[char]
+        if unicodedata.category(char) not in ("Cc", "Cf", "Zl", "Zp"):
+            return char
+        code = ord(char)
+        return (f"\\x{code:02x}" if code <= 0xff else
+                f"\\u{code:04x}" if code <= 0xffff else f"\\U{code:08x}")
+
+    return _CONTROL_CHAR_RE.sub(escape, str(text))
 
 
 def _render_fallback_text(value: Any) -> str:
@@ -78,7 +82,7 @@ def _skew_note(*fields: str) -> str:
     the payload was unusable. Base raised loudly, so degrading must stay loud --
     an undetectable wrong answer is worse than the crash it replaced (#619)."""
     plural = "s" if len(fields) > 1 else ""
-    return (f"! malformed {', '.join(fields)} field{plural}: not the expected "
+    return (f"! malformed {', '.join(_escape_control_chars(f) for f in fields)} field{plural}: not the expected "
             "shape -- the rows or counts it carries may be missing or partial "
             "(use --format json)")
 
@@ -1386,18 +1390,18 @@ def _render_load_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     suffix = "  [not analyzed]" if value.get("analyzed") is False else ""
-    lines = [f"loaded: {value.get('path', '<unknown>')}{suffix}"]
+    lines = [f"loaded: {_escape_control_chars(value.get('path', '<unknown>'))}{suffix}"]
     for note in _field_list(value, "notes"):
-        lines.append(f"note: {note}")
+        lines.append(f"note: {_escape_control_chars(note)}")
     targets = _field_list(value, "targets")
     if targets:
         lines.append("")
         lines.append("targets:")
         for t in targets:
             if isinstance(t, dict):
-                lines.append("- " + str(t.get("selector") or t.get("basename") or "<unknown>"))
+                lines.append("- " + _escape_control_chars(t.get("selector") or t.get("basename") or "<unknown>"))
             else:
-                lines.append("- " + _render_fallback_text(t))
+                lines.append("- " + _escape_control_chars(_render_fallback_text(t)))
     return "\n".join(lines)
 
 
@@ -1444,18 +1448,20 @@ def _render_save_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     export = value.get("export") is True
-    line = f"saved: {value.get('path', '<unknown>')}"
+    line = f"saved: {_escape_control_chars(value.get('path', '<unknown>'))}"
     if export:
         # #1036 item 5: an explicit-path save is a copy. Say where the target
         # itself still saves and restarts from, so neither this agent nor a
         # second one reading `target list` mistakes the copy for its home.
-        restart = value.get("restart_path") or "<unknown>"
+        restart = _escape_control_chars(value.get("restart_path") or "<unknown>")
         restart_what = (
             "its database" if value.get("restart_path_is_database")
             else "the raw file, without this analysis"
         )
-        default = _text_value(value, "default_save_path") or "<unknown>"
+        default = _escape_control_chars(_text_value(value, "default_save_path") or "<unknown>")
         fallback = _text_value(value, "default_cache_fallback")
+        if fallback:
+            fallback = _escape_control_chars(fallback)
         refused = _flag_field(value, "default_cache_fallback_refused") is True
         if fallback and refused:
             # Review round 1, finding 6: say what a plain save does TODAY, not
@@ -1479,13 +1485,13 @@ def _render_save_text(value: Any) -> str:
         # both. Not silent.
         line += (
             "\nnote: also open as target "
-            f"{collision.get('selector', '<unknown>')}; the two targets are now "
+            f"{_escape_control_chars(collision.get('selector', '<unknown>'))}; the two targets are now "
             "one database and a session restart will return one for both"
         )
     if value.get("fallback"):
         # The default path was unwritable (e.g. a read-only firmware mount); the
         # database landed in the writable cache instead (#214).
-        line += (f"\nnote: {value.get('requested_path')} was not writable; "
+        line += (f"\nnote: {_escape_control_chars(value.get('requested_path'))} was not writable; "
                  f"saved to the cache instead")
     writer = _field_dict(value, "cache_writer")
     if writer:
@@ -1493,10 +1499,10 @@ def _render_save_text(value: Any) -> str:
         # this entry for -- and that everyone else gets the raw bytes.
         error = _text_value(writer, "error")
         if error:
-            line += (f"\nnote: {error}; every later load will report this "
+            line += (f"\nnote: {_escape_control_chars(error)}; every later load will report this "
                      "cache entry instead of restoring it")
         else:
-            roots = [str(root) for root in _field_list(writer, "project_roots")]
+            roots = [_escape_control_chars(root) for root in _field_list(writer, "project_roots")]
             owners = []
             instance = _text_value(writer, "instance_id")
             pid = writer.get("pid")
@@ -1506,13 +1512,529 @@ def _render_save_text(value: Any) -> str:
             # projects can claim the entry.
             if isinstance(pid, int) and not isinstance(pid, bool):
                 owners.append(f"this bridge process (pid {pid}"
-                              + (f", instance {instance})" if instance else ")"))
+                              + (f", instance {_escape_control_chars(instance)})" if instance else ")"))
             if roots:
                 owners.append(f"project {', '.join(roots)}")
             line += ("\nnote: this cache entry is restored by default only for "
                      f"{' or '.join(owners) or 'nobody'}; any other load of these "
                      "bytes opens the raw file and prints the `bn load` that restores it")
+    if value.get("project_file_id"):
+        # A project-backed target saves into the project,
+        # never to a path of the caller's choosing; say which file and whether
+        # this save created the database or snapshotted an existing one.
+        line += (f"\nproject file: {_escape_control_chars(value.get('project_path', '<unknown>'))} "
+                 f"({_escape_control_chars(value.get('mode', '<unknown>'))})")
     return line
+
+
+def _project_file_kind(row: dict[str, Any]) -> str:
+    return "bndb" if _flag_field(row, "is_database") else "raw"
+
+
+def _render_project_open_targets(value: Any) -> list[str]:
+    rows = _field_list(value, "open_targets")
+    if not rows:
+        return []
+    lines = ["", "open targets:"]
+    for row in rows:
+        if not isinstance(row, dict):
+            lines.append(f"- {_escape_control_chars(_render_fallback_text(row))}")
+            continue
+        lines.append(
+            f"- {_escape_control_chars(row.get('project_path', '<unknown>'))}"
+            f"  target={_escape_control_chars(row.get('target_id', '<unknown>'))}"
+            f"  view={_escape_control_chars(row.get('view_id', '<unknown>'))}"
+            f"  file={_escape_control_chars(str(row.get('project_file_id', ''))[:8])}"
+        )
+    return lines
+
+
+@_discloses
+def _render_project_attach_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    return (f"attached to instance {_escape_control_chars(value.get('instance_id', '<unknown>'))}"
+            f"\n\tproject: {_escape_control_chars(value.get('path', '<unknown>'))}")
+
+
+@_discloses
+def _render_project_info_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    head = f"project: {_escape_control_chars(value.get('name', '<unknown>'))}"
+    if value.get("opened") is False:
+        head += "  [already open]"
+    lines = [head]
+    details = [
+        ("instance", value.get("instance")),
+        ("path", value.get("path")),
+        ("id", value.get("id")),
+        ("description", value.get("description")),
+        ("files", value.get("file_count")),
+        ("folders", value.get("folder_count")),
+    ]
+    for key, item in details:
+        if item not in (None, ""):
+            lines.append(f"\t{key}: {_escape_control_chars(item)}")
+    lines.extend(_render_project_open_targets(value))
+    return "\n".join(lines)
+
+
+def _project_file_line(row: dict[str, Any]) -> str:
+    size = row.get("size")
+    size_text = str(size) if isinstance(size, int) and not isinstance(size, bool) else "-"
+    line = (f"{_escape_control_chars(str(row.get('id', ''))[:8]):<8}  "
+            f"{_project_file_kind(row):<4}  {size_text:>10}  "
+            f"{_escape_control_chars(row.get('path', '<unknown>'))}")
+    open_target = row.get("open_target_id")
+    if open_target:
+        # The selector `-t` accepts is the path-in-project without its leading
+        # slash.
+        selector = str(row.get("path", "")).lstrip("/") or str(open_target)
+        line += f"  [open as -t {_escape_control_chars(selector)}]"
+    sibling = row.get("sibling_database_id")
+    if sibling and not _flag_field(row, "is_database"):
+        line += f"  sibling db: {_escape_control_chars(str(sibling)[:8])}"
+    if _flag_field(row, "exists_on_disk") is False:
+        line += "  [missing on disk]"
+    return line
+
+
+@_discloses
+def _render_project_file_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    return "imported: " + _project_file_line(value)
+
+
+@_discloses
+def _render_project_files_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    files = _field_list(value, "files")
+    folders = _field_list(value, "folders")
+    if not files and not folders:
+        return _empty_result("project files")
+    lines = []
+    for row in files:
+        lines.append(_project_file_line(row) if isinstance(row, dict)
+                     else _escape_control_chars(_render_fallback_text(row)))
+    if folders:
+        if lines:
+            lines.append("")
+        lines.append("folders:")
+        for folder in folders:
+            if isinstance(folder, dict):
+                lines.append(f"- {_escape_control_chars(folder.get('path', '<unknown>'))}"
+                             f"  ({_escape_control_chars(str(folder.get('id', ''))[:8])})")
+            else:
+                lines.append(f"- {_escape_control_chars(_render_fallback_text(folder))}")
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_load_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    text = _render_load_text(value)
+    project_path = value.get("project_path")
+    if project_path or value.get("project_file_id"):
+        text += (f"\nProject file: {_escape_control_chars(project_path or '<unknown>')} "
+                 f"({_escape_control_chars(value.get('project_file_id', '<unknown>'))})")
+    # `substituted_from` is already explained by the bridge's own note in
+    # `notes` (which `_render_load_text` prints); no second line for it.
+    if _field_present(value, "link"):
+        link = _field_dict(value, "link")
+        text += (f"\nlinked: {_project_count_text(link, 'linked')} "
+                 f"({_project_rows_count(link, 'unresolved')} unresolved)")
+        status = _text_value(link, "status")
+        success = _flag_field(link, "success")
+        if status in FAILED_MUTATION_STATUSES or success is False:
+            text += f"\nauto-link FAILED: {_escape_control_chars(status or '<unknown>')}"
+        message = _project_link_message(link)
+        if message:
+            text += f"\nauto-link note: {_escape_control_chars(message)}"
+    return text
+
+
+def _lookup_path_lines(rows: list[Any]) -> list[str]:
+    if not rows:
+        return ["lookup paths: " + _empty_result()]
+    lines = ["lookup paths:"]
+    for row in rows:
+        if isinstance(row, dict):
+            lines.append(f"  {_escape_control_chars(row.get('path', '<unknown>'))}"
+                         f"  ({_escape_control_chars(row.get('source', '<unknown>'))})")
+        else:
+            lines.append(f"  {_escape_control_chars(_render_fallback_text(row))}")
+    return lines
+
+
+def _sync_counts_line(sync: dict[str, Any]) -> str:
+    return (f"imported {_project_rows_count(sync, 'imported')} / "
+            f"skipped {_project_count_text(sync, 'skipped_existing')} / "
+            f"changed {_project_rows_count(sync, 'changed')}")
+
+
+def _sync_detail_lines(sync: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for row in _field_list(sync, "imported"):
+        lines.append("  " + (_project_file_line(row) if isinstance(row, dict)
+                             else _escape_control_chars(_render_fallback_text(row))))
+    changed = _field_list(sync, "changed")
+    if changed:
+        lines.append("changed on disk (not replaced; delete and re-sync to update):")
+        for row in changed:
+            if isinstance(row, dict):
+                lines.append(f"  {_escape_control_chars(row.get('rel_realpath', '<unknown>'))}  "
+                             f"({_escape_control_chars(str(row.get('project_file_id', ''))[:8])})")
+            else:
+                lines.append(f"  {_escape_control_chars(_render_fallback_text(row))}")
+    not_elf = sync.get("skipped_not_elf")
+    if isinstance(not_elf, int) and not isinstance(not_elf, bool) and not_elf:
+        lines.append(f"skipped (not ELF): {not_elf}")
+    for note in _field_list(sync, "notes"):
+        lines.append(f"note: {_escape_control_chars(note)}")
+    return lines
+
+
+@_discloses
+def _render_project_sync_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    lines = [f"rootfs: {_escape_control_chars(value.get('root', '<unknown>'))}  "
+             f"({_escape_control_chars(value.get('platform', '<unknown>'))})"]
+    lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+    lines.append(_sync_counts_line(value))
+    lines.extend(_sync_detail_lines(value))
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_init_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    markers = ", ".join(_escape_control_chars(m) for m in _field_list(value, "markers")) or _empty_result()
+    lines = [
+        f"rootfs: {_escape_control_chars(value.get('root', '<unknown>'))}",
+        f"\tplatform: {_escape_control_chars(value.get('platform', '<unknown>'))}  (markers: {markers})",
+    ]
+    path = _escape_control_chars(value.get("project_path", "<unknown>"))
+    dry_run = _flag_field(value, "dry_run")
+    if dry_run is True:
+        state = "exists" if _flag_field(value, "project_exists") else "new"
+        lines.append(f"project: {path}  [{state}]")
+        lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+        lines.append(f"candidate libraries: {_stated_count(value, 'candidate_libraries')}")
+        for note in _field_list(value, "notes"):
+            lines.append(f"note: {_escape_control_chars(note)}")
+        lines.append("dry-run: nothing was created, opened or imported")
+        return "\n".join(lines)
+    if _field_skewed("dry_run"):
+        state = "unknown (unreadable dry_run)"
+    elif _flag_field(value, "attached"):
+        state = "attached"
+    elif _flag_field(value, "created"):
+        state = "created"
+    else:
+        state = "opened"
+    instance = value.get("instance")
+    lines.insert(0, f"project: {path}  [{state}]"
+                 + (f"  instance: {_escape_control_chars(instance)}" if instance else ""))
+    sync = _field_dict(value, "sync")
+    if sync:
+        lines.extend(_lookup_path_lines(_field_list(sync, "lookup_paths")))
+        lines.append("libraries: " + _sync_counts_line(sync))
+        lines.extend(_sync_detail_lines(sync))
+    else:
+        lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+        error = _text_value(value, "sync_error")
+        if error:
+            lines.append(f"libraries: sync FAILED -- {_escape_control_chars(error)}")
+        elif value.get("platform") == "unknown":
+            lines.append("libraries: not synced (platform unknown: no loader lookup paths)")
+        else:
+            lines.append("libraries: not synced (--no-libs); `bn project libs --sync` imports them")
+    lines.append("next: `bn project files` lists the project; "
+                 "`bn project load <path-in-project>` opens a file and links its imports")
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_libs_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    head = (f"rootfs: {_escape_control_chars(value.get('root', '<unknown>'))}  "
+            f"({_escape_control_chars(value.get('platform', '<unknown>'))})")
+    if value.get("synced_at"):
+        head += f"  synced: {_escape_control_chars(value['synced_at'])}"
+    libs = _field_list(value, "libs")
+    if not libs:
+        return head + "\n" + _empty_result("rootfs libraries") + "; `bn project libs --sync` imports them"
+    lines = [head]
+    for row in libs:
+        if not isinstance(row, dict):
+            lines.append(_escape_control_chars(_render_fallback_text(row)))
+            continue
+        elf_class = row.get("elf_class")
+        machine = row.get("e_machine")
+        kind = _escape_control_chars(f"{elf_class if elf_class is not None else '?'}/{machine if machine is not None else '?'}")
+        names = ", ".join(_escape_control_chars(n) for n in _field_list(row, "names"))
+        soname = _text_value(row, "soname")
+        if soname is None and _field_present(row, "soname"):
+            soname = _render_fallback_text(row["soname"])
+        line = (f"{_escape_control_chars(str(row.get('project_file_id', ''))[:8]):<8}  {kind:<7}  "
+                f"{_escape_control_chars(soname or '-'):<24}  "
+                f"{_escape_control_chars(row.get('project_path', '<unknown>'))}  {names}")
+        if row.get("sibling_database_id"):
+            line += f"  [db {_escape_control_chars(str(row['sibling_database_id'])[:8])}]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _project_count_text(value: Any, key: str) -> str:
+    count = _nonnegative_count(value, key)
+    return str(count) if _field_present(value, key) and not _field_skewed(key) else "?"
+
+
+def _project_rows_count(value: Any, key: str) -> str:
+    rows = _row_list(value, key)
+    return str(len(rows)) if _field_present(value, key) and not _field_skewed(key) else "?"
+
+
+def _project_link_message(value: Any) -> str | None:
+    message = _text_value(value, "message")
+    notes = []
+    for note in _field_list(value, "notes"):
+        if isinstance(note, str):
+            notes.append(note)
+        else:
+            _record_skew("notes")
+    return message or "; ".join(notes) or None
+
+
+def _project_link_lines(link: dict[str, Any]) -> list[str]:
+    """The lines both `project link` views share: the libraries table, the
+    counts line, the unresolved imports and the ambiguities."""
+    lines: list[str] = []
+    for row in _row_list(link, "libraries"):
+        name = _escape_control_chars(_text_value(row, "name") or "<unknown>")
+        resolved = _flag_field(row, "resolved")
+        if resolved is True:
+            lines.append(f"  {name:<24} -> {_escape_control_chars(_text_value(row, 'project_path') or '<unknown>')}"
+                         f"  ({_escape_control_chars(_text_value(row, 'backing') or 'raw')})")
+        elif resolved is None:
+            lines.append(f"  {name:<24} -> (resolution unknown)")
+        else:
+            lines.append(f"  {name:<24} -> (not in project)")
+    lines.append(f"linked {_project_count_text(link, 'linked')}  "
+                 f"relinked {_project_count_text(link, 'relinked')}  "
+                 f"rebound {_project_count_text(link, 'rebound')}  "
+                 f"unresolved {_project_rows_count(link, 'unresolved')}")
+    for row in _row_list(link, "unresolved"):
+        lines.append(f"  {_escape_control_chars(_text_value(row, 'symbol') or '<unknown>')}  "
+                     f"{_escape_control_chars(_text_value(row, 'reason') or '')}".rstrip())
+    ambiguous = _field_list(link, "ambiguous_libraries")
+    if ambiguous:
+        lines.append("ambiguous (first lookup-path match used): "
+                     + ", ".join(_escape_control_chars(_render_fallback_text(a))
+                                 for a in ambiguous))
+    return lines
+
+
+@_discloses
+def _render_project_link_text(value: Any) -> str:
+    """The `--verbose` view of `project link`: status, then the shared lines."""
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    status = _escape_control_chars(_text_value(value, "status") or "<unknown>")
+    preview = _flag_field(value, "preview")
+    dry_run = _flag_field(value, "dry_run")
+    head = f"project link: {status}" + ("  [preview]" if preview is True or dry_run is True else "")
+    lines = [head, "libraries:"]
+    lines.extend(_project_link_lines(value))
+    message = _project_link_message(value)
+    if message:
+        lines.append(f"note: {_escape_control_chars(message)}")
+    scope = [_escape_control_chars(s) for s in _field_list(value, "scope")]
+    if scope:
+        lines.append("scope: " + ", ".join(scope))
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_export_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    return (f"exported: {_escape_control_chars(value.get('dest', '<unknown>'))}"
+            f"\n\tproject file: {_escape_control_chars(value.get('project_file_id', '<unknown>'))}")
+
+
+@_discloses
+def _render_project_delete_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    return f"deleted: {_escape_control_chars(value.get('project_file_id', '<unknown>'))}"
+
+
+@_discloses
+def _render_project_close_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    lines = [f"closed project: {_escape_control_chars(value.get('path', '<unknown>'))}"]
+    closed = _field_list(value, "targets_closed")
+    if not closed:
+        lines.append(_empty_result("targets closed"))
+        return "\n".join(lines)
+    lines.append("targets closed:")
+    unsaved_any = False
+    for row in closed:
+        if not isinstance(row, dict):
+            lines.append(f"- {_escape_control_chars(_render_fallback_text(row))}")
+            continue
+        unsaved = row.get("unsaved") is True
+        unsaved_any = unsaved_any or unsaved
+        marker = "  [unsaved changes discarded]" if unsaved else ""
+        lines.append(f"- {_escape_control_chars(row.get('path', '<unknown>'))}{marker}")
+    if unsaved_any:
+        lines.append("")
+        lines.append("warning: unsaved mutations were discarded (--force).")
+    return "\n".join(lines)
+
+
+_FINDING_CAVEAT = (
+    "Freshness checks evidence currency, not claim truth; acceptance requires explicit review."
+)
+
+
+def _finding_heading(row: dict[str, Any]) -> str:
+    for key in ("id", "type", "review_state", "freshness"):
+        _text_value(row, key)
+    _count_field(row, "revision")
+    return (f"{_escape_control_chars(row.get('id', '<unknown>'))} "
+            f"r{_escape_control_chars(row.get('revision', '?'))} "
+            f"type={_escape_control_chars(row.get('type', '<unknown>'))} "
+            f"review={_escape_control_chars(row.get('review_state', '<unknown>'))} "
+            f"freshness={_escape_control_chars(row.get('freshness', 'unknown'))}")
+
+
+def _finding_detail_lines(row: dict[str, Any]) -> list[str]:
+    lines = [_finding_heading(row)]
+    # Validate known shapes for disclosure, but render the original values:
+    # malformed qualifications must not disappear into fake empty containers.
+    for key in ("claim", "kind", "author", "claim_revision", "scope", "scope_evidence",
+                "assumptions", "limitations", "next_steps", "dependencies", "tags", "evidence",
+                "reviews", "freshness_reasons", "reasons", "checks", "replacement",
+                "latest_revision", "created_at", "updated_at", "action"):
+        if key not in row:
+            continue
+        value = row[key]
+        if key in ("scope", "scope_evidence", "assumptions", "limitations",
+                   "next_steps", "dependencies", "tags", "evidence", "reviews",
+                   "freshness_reasons", "reasons", "checks"):
+            _field_list(row, key)
+            if isinstance(value, list):
+                if not value:
+                    continue
+                lines.append(f"{key}:")
+                lines.extend(f"  - {_escape_control_chars(json.dumps(item, ensure_ascii=False))}" for item in value)
+            else:
+                lines.append(f"{key}: {_escape_control_chars(json.dumps(value, ensure_ascii=False))}")
+        else:
+            if key == "action":
+                _field_dict(row, key)
+            elif key in ("claim_revision", "latest_revision"):
+                _count_field(row, key)
+            else:
+                _text_value(row, key)
+            lines.append(f"{key}: {_escape_control_chars(json.dumps(value, ensure_ascii=False))}")
+    return lines
+
+
+@_discloses
+def _render_project_finding_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    return "\n".join([*_finding_detail_lines(value), _FINDING_CAVEAT])
+
+
+def _finding_page_line(value: dict[str, Any]) -> str:
+    return (f"total={_escape_control_chars(value.get('total', '?'))} "
+            f"offset={_escape_control_chars(value.get('offset', '?'))} "
+            f"limit={_escape_control_chars(value.get('limit', '?'))} "
+            f"has_more={_escape_control_chars(str(value.get('has_more', '?')).lower())}")
+
+
+@_discloses
+def _render_project_findings_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    lines = [_finding_page_line(value)]
+    rows = _field_list(value, "items")
+    if _field_skewed("items"):
+        lines.append(f"items: {_escape_control_chars(json.dumps(value['items'], ensure_ascii=False))}")
+    elif not rows:
+        lines.append(_empty_result("findings"))
+    for index, row in enumerate(rows):
+        if isinstance(row, dict):
+            lines.extend(_finding_detail_lines(row))
+        else:
+            _record_skew(f"items[{index}]")
+            lines.append(_escape_control_chars(json.dumps(row, ensure_ascii=False)))
+    lines.append(_FINDING_CAVEAT)
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_finding_context_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    lines = [_finding_page_line(value)]
+    # Record shape mismatches without disguising their raw payload as an empty
+    # group. The other groups can still carry usable findings.
+    groups = _field_dict(value, "groups")
+    if _field_skewed("groups"):
+        lines.append(f"groups: {_escape_control_chars(json.dumps(value['groups'], ensure_ascii=False))}")
+    for group in groups:
+        rows = _field_list(groups, group)
+        lines.append(f"{_escape_control_chars(group)}:")
+        if groups[group] is not None and not isinstance(groups[group], list):
+            lines.append(f"  {_escape_control_chars(json.dumps(groups[group], ensure_ascii=False))}")
+        elif not rows:
+            lines.append("  " + _empty_result("findings"))
+        for index, row in enumerate(rows):
+            if isinstance(row, dict):
+                detail = _finding_detail_lines(row)
+            else:
+                _record_skew(f"{group}[{index}]")
+                detail = [_escape_control_chars(json.dumps(row, ensure_ascii=False))]
+            lines.extend(f"  {line}" for line in detail)
+    lines.append(_FINDING_CAVEAT)
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_finding_check_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    return "\n".join([*_finding_detail_lines(value),
+                      "Read-only check: no review was added.", _FINDING_CAVEAT])
+
+
+@_discloses
+def _render_project_finding_types_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _escape_control_chars(_render_fallback_text(value))
+    lines = ["Finding types (counts of latest records):"]
+    for row in _field_list(value, "types"):
+        if not isinstance(row, dict):
+            lines.append(_escape_control_chars(_render_fallback_text(row)))
+            continue
+        lines.append(f"{_escape_control_chars(row.get('type', '<unknown>'))} "
+                     f"count={_escape_control_chars(row.get('count', '?'))}")
+        lines.append(f"  description: {_escape_control_chars(row.get('description', ''))}")
+        lines.append(f"  action: {_escape_control_chars(row.get('action', ''))}")
+    return "\n".join(lines)
 
 
 @_discloses
@@ -1567,6 +2089,15 @@ def _render_session_start_text(value: Any) -> str:
                     lines.append(f"  note: {note}")
             else:
                 lines.append(f"- {_render_fallback_text(item)}")
+    project = _field_dict(value, "project")
+    if project:
+        path = _escape_control_chars(project.get("path", "<unknown>"))
+        error = _text_value(project, "error")
+        lines.append("")
+        if error:
+            lines.append(f"project reopen FAILED: {path}: {_escape_control_chars(error)}")
+        elif _flag_field(project, "opened") is True:
+            lines.append(f"project reopened: {path}")
     project_roots = _field_list(value, "project_roots")
     if project_roots:
         lines.append("")
@@ -1720,6 +2251,10 @@ def _render_session_list_text(value: Any) -> str:
             parts.append(f"rss={rss}MB")
         if item.get("started_at"):
             parts.append(f"started={item['started_at']}")
+        # The project this bridge owns, when it publishes one.
+        project = _field_dict(item, "project")
+        if project and project.get("name"):
+            parts.append(f"project={project['name']}")
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
@@ -1836,6 +2371,9 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         # copies exported from it -- which are never where it saves or
         # restarts from.
         ("database", value.get("database_path")),
+        # The path-in-project of a project-backed target;
+        # absent (empty) on a standalone target, so the row drops out.
+        ("project", value.get("project_path")),
         ("exported to", ", ".join(str(p) for p in _field_list(value, "exports"))),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),
@@ -4729,7 +5267,7 @@ def _callsites_data_ref_note(raw_count: Any, raw_refs: Any, raw_vtables: Any = N
                          f"location with `bn xrefs {shlex.quote(ref)}` (not a virtual-caller list)")
     if raw_count > len(refs):
         lines.append(f"  +{raw_count - len(refs)} unlisted data location(s)")
-    census = raw_census if isinstance(raw_census, dict) else {}
+    census = _field_dict({"callee_data_ref_census": raw_census}, "callee_data_ref_census")
     reason = _text_value(census, "reason") if census else None
     if unknown and reason and not (census.get("status") == "ok" and census.get("symtab") is True):
         lines.append(f"  (vtable extents: {_escape_control_chars(reason)})")
@@ -7707,6 +8245,136 @@ def _go_rename_summary(value: Any) -> Any:
     return summary
 
 
+@_discloses_in_summary
+def _project_finding_summary(value: Any) -> dict[str, Any]:
+    """An append receipt measures a persisted finding, not its claim's truth."""
+    with disclosure_boundary() as unreadable:
+        row = _as_dict(value)
+        action = _field_dict(row, "action")
+        identity = _text_value(row, "id")
+        integrity = _text_value(row, "integrity")
+        project = _text_value(row, "project_id")
+        revision = _nonnegative_count(row, "revision")
+        claim_revision = _nonnegative_count(row, "claim_revision")
+        schema = _nonnegative_count(row, "schema_version")
+        kind = _text_value(action, "kind")
+        actor = _text_value(action, "actor")
+        timestamp = _text_value(action, "timestamp")
+        status = _text_value(row, "status")
+        message = _text_value(row, "message")
+    for key in unreadable:
+        _record_skew(key)
+    failed = status in FAILED_MUTATION_STATUSES
+    receipt = (not unreadable and schema == 1 and bool(project)
+               and bool(re.fullmatch(r"F-[0-9a-f]{32}", identity or ""))
+               and bool(re.fullmatch(r"[0-9a-f]{64}", integrity or ""))
+               and 0 < claim_revision <= revision
+               and kind in ("add", "update", "review") and bool(actor) and bool(timestamp))
+    summary = _build_mutation_summary(
+        measured=receipt,
+        unusable=not receipt,
+        unmeasured_cause="this finding's append receipt could not be read",
+        op_count=1 if receipt else 0,
+        reported_success=receipt and not failed,
+        failure_rows=[row] if failed else [],
+        failed=1 if failed else 0,
+        changed=1 if receipt and not failed else 0,
+        verified=1 if receipt and not failed else 0,
+        noop=0,
+        committed=receipt and not failed,
+        preview=False,
+        rolled_back=None,
+        message=message,
+        default_error="finding append failed",
+    )
+    if receipt and not failed:
+        # The append was read back from project storage. There is no unsaved
+        # BinaryView mutation for `bn save` to persist.
+        summary["dirty_after"] = False
+        summary["project_finding"] = {"id": identity, "revision": revision}
+    elif not receipt:
+        summary["op_count"] = None
+    return summary
+
+
+@_discloses_in_summary
+def _project_link_summary(value: Any) -> Any:
+    """Classify link writes from measured counters, never from fabricated zeroes."""
+    if not isinstance(value, dict):
+        return _mutation_summary(value)
+    with disclosure_boundary() as unreadable:
+        counts = {}
+        for key in ("linked", "relinked", "rebound", "already_linked"):
+            count = _nonnegative_count(value, key)
+            counts[key] = (count if _field_present(value, key)
+                           and not _field_skewed(key) else None)
+        unresolved = _row_list(value, "unresolved")
+        unresolved_readable = (_field_present(value, "unresolved")
+                               and not _field_skewed("unresolved"))
+        libraries = _row_list(value, "libraries")
+        ambiguous = _field_list(value, "ambiguous_libraries")
+        status = _text_value(value, "status")
+        preview_flag = _flag_field(value, "preview")
+        dry_run = _flag_field(value, "dry_run")
+        success_flag = _flag_field(value, "success")
+        committed_flag = _flag_field(value, "committed")
+        measured_flag = _flag_field(value, "measured")
+        rolled_back = _flag_field(value, "rolled_back")
+        message = _project_link_message(value)
+    for key in unreadable:
+        _record_skew(key)
+    failed_status = status in FAILED_MUTATION_STATUSES
+    status_known = failed_status or status in ("verified", "noop")
+    preview = preview_flag is True or dry_run is True
+    reported_success = success_flag is not False and not failed_status
+    committed = (committed_flag if committed_flag is not None
+                 else not preview and reported_success)
+    changed = sum(counts[key] or 0 for key in ("linked", "relinked", "rebound"))
+    already = counts["already_linked"] or 0
+    measured = (not unreadable and status_known and measured_flag is not False
+                and all(count is not None for count in counts.values())
+                and unresolved_readable)
+    failure_rows = ([{"status": status, "message": message}] if failed_status else [])
+    summary = _build_mutation_summary(
+        measured=measured,
+        unusable=bool(unreadable) or not status_known,
+        unmeasured_cause=(
+            "this op's own counters or flags could not be read" if unreadable
+            else f"this op reported an unknown status {status!r}" if not status_known
+            else "this op did not verify its planned writes" if measured_flag is False
+            else "this op reported no counters"),
+        # Unresolved imports have no provider and no attempted mutation. They
+        # remain visible below, but cannot inflate the operation count beyond
+        # its changed/noop/failed outcomes.
+        op_count=changed + already,
+        reported_success=reported_success,
+        failure_rows=failure_rows,
+        failed=1 if failed_status else 0,
+        changed=changed,
+        verified=changed if not failed_status else 0,
+        noop=already,
+        committed=committed,
+        preview=preview,
+        rolled_back=rolled_back,
+        message=message,
+        default_error="project link failed",
+    )
+    if not measured:
+        summary["op_count"] = None
+    # Link writes are not rolled back after a readback failure.
+    if failed_status and not preview and changed:
+        summary["dirty_after"] = True
+    summary["project_link"] = {
+        "status": status,
+        **counts,
+        "libraries": libraries,
+        "unresolved": unresolved if unresolved_readable else None,
+        "ambiguous_libraries": ambiguous,
+    }
+    return summary
+
+
+
 @_discloses
 def _render_mutation_summary_text(value: Any, *,
                                   save_command: Callable[[], str] | None = None) -> str:
@@ -7836,6 +8504,12 @@ def _render_mutation_summary_text(value: Any, *,
                 "skipped_interior_pc", "skipped_changed_during_apply",
             )
         )
+    if _field_declared(value, "project_link"):
+        line += "\n" + "\n".join(_project_link_lines(_field_dict(value, "project_link")))
+    if _field_declared(value, "project_finding"):
+        finding = _field_dict(value, "project_finding")
+        line += (f"\nfinding: {_escape_control_chars(_text_value(finding, 'id') or '<unknown>')} "
+                 f"r{_project_count_text(finding, 'revision')}")
     if _field_declared(value, "preview_skipped"):
         # #999 item 5: one line per op the preview left out, so the line above
         # is never read as covering the whole batch.
@@ -7871,14 +8545,14 @@ def _render_mutation_summary_text(value: Any, *,
         # why the counts are unknown (#619).
         cause = _unmeasured_cause(_text_value(value, "first_error"))
         line += ("\nwarning: unmeasured -- "
-                 + (f"{cause}; " if cause else "")
+                 + (f"{_escape_control_chars(cause)}; " if cause else "")
                  + "the changed/verified/noop/failed counts above are UNKNOWN. "
                  "dirty_after is reported True as a fail-safe, not confirmed. "
                  "Do not assume nothing changed: read the view back (e.g. "
                  "`bn target info` or a targeted readback) and `bn save` "
                  "before closing.")
     if value.get("first_error"):
-        line += f"\nfirst_error: {value['first_error']}"
+        line += f"\nfirst_error: {_escape_control_chars(value['first_error'])}"
     # #1042 review: the same `note: resolved …` lines `read`/`xrefs` print.
     for note in _resolved_symbol_notes(value):
         line += f"\n{note}"

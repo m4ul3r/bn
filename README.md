@@ -39,7 +39,13 @@ Install the bundled Claude Code/Codex skills:
 bn skill install
 ```
 
-That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
+That symlinks the ordinary skills (`bn`, `bn-kernel`, `bn-re`, `bn-vr`) into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
+
+Project workflows are separate and opt-in, even with a Commercial/Ultimate license. The default install excludes `bn-projects`; installation adds optional guidance, not a license check or new Binary Ninja capabilities. Install only that skill explicitly with:
+
+```bash
+bn skill install projects
+```
 
 Re-running either install is safe: an existing link (or byte-identical copy, under `--mode copy`) of the same source, or a skills root linked to the source itself, is reported as already installed. A different destination is not reported as installed: `skill install` lists it and exits `1`, and `plugin install` refuses it. Both installers default to text; use `--format json` for structured output.
 
@@ -242,6 +248,20 @@ wait and retry (or resume an intentionally stopped bridge) rather than starting
 a duplicate. Neither outcome establishes that the instance is absent.
 Complete-command reconstruction is limited to the top-level, close/target-close
 and batched-decompile text paths described above.
+### Projects (.bnpr)
+
+Binary Ninja projects (`.bnpr`) let several agents share and analyze the same project's databases. Each agent routes through a single bridge instance that owns the project (opened with `bn project open`). Inside the project, select files to load with `bn project load <selector>`, view with `bn project files`, and manage with the project command group below. After loading a file, use `bn save` to create its first database; subsequent saves snapshot it. Export with `bn project export` or import new files with `bn project import`. Two bridges must never open the same `.bndb`; your Binary Ninja build/license must support native project APIs.
+
+After opting in with `bn skill install projects`, agents use the `bn-projects` skill to automatically create or open a project when entering a supported firmware root filesystem. `bn project init` chooses the preferred `<parent>/<root-name>.bnpr`, using a root-hash project under the cache projects directory if the parent is unwritable, and syncs libraries found in startup `LD_LIBRARY_PATH` assignments, `ld.so.conf`, default Linux directories, or Android library directories; it does not import executables. Binary-only `RPATH`/`RUNPATH` directories are not inventoried—linking uses them only to rank matches in the existing inventory. Explicitly import the program before loading it. Linux and Android lookup support is best-effort, not full dynamic-loader emulation. Use `bn project libs` to inspect or sync libraries, and `bn project link --preview` to inspect a link plan before applying it; inspect persisted assignments with `bn project link -t <selector> --preview --format json` and its `locations[]`, not `bn imports`. Ordinary installed skills do not enable this automation.
+
+```bash
+bn project init [ROOT] [--name N] [--no-libs] [--dry-run] [--instance-id ID]
+bn project import /path/to/rootfs/usr/bin/app --folder usr/bin
+bn project load usr/bin/app
+bn project libs [--sync] [--root R] [--dry-run]
+bn project link [-t T] [--preview] [--relink]
+```
+
 
 ## Output Behavior
 
@@ -334,6 +354,46 @@ Each callsite row also includes:
 - `pre_branch_condition`: the nearest enclosing pre-call HLIL condition when it can be recovered confidently, otherwise `null`
 
 `hlil_statement` is intentionally local-or-null. If the best available HLIL mapping expands to a broad whole-function or multi-statement blob, `bn callsites` suppresses it instead of returning noisy context.
+
+## Project Commands
+
+Manage and load files from Binary Ninja projects:
+
+```bash
+bn project open /path/to/project.bnpr
+bn project attach /path/to/project.bnpr   # from another checkout: pin to the bridge that already owns it
+bn project info
+bn project files
+bn project load app.bndb
+bn project import /path/to/binary [--folder fw] [--name app]
+bn project export app.bndb /tmp/app.bndb
+bn project delete app.bndb
+bn project close
+```
+
+`bn project open` pins this checkout (the pin is per git root, like `bn instance use`) to the bridge instance that owns the project, attaching to an existing owner when one is running; another checkout joins with `bn project attach`. Inside a project, select a file with `bn project load <selector>`, which accepts the file's path-in-project, id (or an 8+ character id prefix), or unique name; once loaded it is an ordinary target, selected with `-t <path-in-project>` (leading `/` optional), its id, or its file name. `bn save -t <selector>` writes the first database as `<name>.bndb` beside the raw file inside the project; later saves snapshot it; `bn save` takes no output path for a project target. Use `bn project export` to copy files out, `bn project import` to add new files, and `bn project delete` to remove them. `bn project close` closes the project's targets and the project when none has unsaved changes (`--force` discards them).
+
+### Shared project findings
+
+`bn project finding` keeps typed, evidence-backed claims and their review history inside the project. Install the optional guidance with `bn skill install projects`; the [project skill](skills/bn-projects/SKILL.md#shared-findings-retrieve-record-independently-review) documents the JSON schemas and agent workflow.
+
+```bash
+bn project finding types
+bn project finding context --file usr/bin/app
+bn project finding list --type vulnerability --type dataflow
+bn project finding add claim.json --author analyst-a
+bn project finding show <finding-id>
+bn project finding check <finding-id>
+bn project finding review <finding-id> review.json --expected-revision 1 --reviewer reviewer-b
+bn project finding update <finding-id> corrected.json --expected-revision 2 --author analyst-a
+bn project finding history <finding-id>
+```
+
+Use the owning bridge's explicit `-i` when working concurrently. Claim documents require `type`, `kind`, `claim`, `scope`, and `evidence`; `type` identifies the domain/action, while `kind` distinguishes observations, hypotheses, and conclusions. Standard types and recorded `custom:<slug>` types are discoverable; repeated `--type` filters select any listed type. Documents may come from stdin with `-`.
+
+Updates and reviews require the exact latest revision and append immutable snapshots rather than overwrite another agent's work. Independent acceptance requires current machine-checkable evidence; rejection/dispute records counterevidence, and conflicting reviews remain disputed. An update resets acceptance. Review states and freshness are separate: an accepted finding can become stale when scoped file content, semantic evidence, or an exact dependency revision changes. A missing/dirty analysis view is unknown, never silently current. `check` reports evidence currency, not claim truth; its successful exit does not accept the finding.
+
+Declarative checks cover persisted file hashes/ranges, saved loaded function analysis, and project-library bindings. Large traces/logs can be imported as project-file attachments. Scope files are automatically fingerprinted; semantic checks additionally bind database/tool versions and require a loaded clean database. Findings and attachments never execute code. Discovery separates current accepted knowledge from proposals, disputed/rejected/superseded claims, and material needing review. Records survive project close/reopen under the reserved `/.bn-findings/` namespace, with integrity checks and no separately authoritative index. Agent identities are declared, not authenticated.
 
 ## Bundles And Python
 

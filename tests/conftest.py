@@ -158,6 +158,50 @@ def refuse_silent_skip(reason: str) -> NoReturn:
     pytest.skip(reason)
 
 
+def require_project_capability() -> None:
+    """Probe native project creation/close without loading BN into pytest."""
+    require_real_bn()
+    python_dir = bn_python_dir()
+    env = dict(os.environ)
+    env["BN_DISABLE_USER_PLUGINS"] = "1"
+    code = (
+        f"import sys; sys.path.insert(0, {str(python_dir)!r})\n"
+        "import json, tempfile\n"
+        "from pathlib import Path\n"
+        "import binaryninja\n"
+        "binaryninja.disable_default_log()\n"
+        "with tempfile.TemporaryDirectory(prefix='bn-project-probe-') as directory:\n"
+        "    try:\n"
+        "        project = binaryninja.Project.create_project("
+        "str(Path(directory) / 'probe.bnpr'), 'capability probe')\n"
+        "        if project is None:\n"
+        "            raise RuntimeError('create_project returned None')\n"
+        "        project.close()\n"
+        "    except Exception as exc:\n"
+        "        result = {'available': False, 'reason': str(exc)}\n"
+        "    else:\n"
+        "        result = {'available': True}\n"
+        "print('BN_PROJECT_CAPABILITY=' + json.dumps(result))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=120.0, env=env,
+    )
+    assert result.returncode == 0, (
+        f"Native project capability probe failed: {result.stderr}\n{result.stdout}"
+    )
+    marker = "BN_PROJECT_CAPABILITY="
+    reports = [line[len(marker):] for line in result.stdout.splitlines()
+               if line.startswith(marker)]
+    assert len(reports) == 1, f"Missing native project capability result: {result.stdout}"
+    capability = json.loads(reports[0])
+    if not capability["available"]:
+        refuse_silent_skip(
+            "Binary Ninja cannot create/close a native project with this install/licence: "
+            f"{capability['reason']} -- the project lane did not run"
+        )
+
+
 #: Wall-clock ceiling for the six-binary build. Generous: six -O0 compiles are
 #: sub-second, so blowing this means something is wedged, not merely slow.
 _BUILD_TIMEOUT_SECONDS = 300
@@ -303,6 +347,123 @@ def integration_fixtures() -> list[Path]:
     """Session-scoped owner of fixture generation for the real-BN lane."""
     require_real_bn()
     return build_integration_fixtures()
+
+
+# --- fake firmware rootfs (project lane) ------------------------------------
+
+ROOTFS_FIXTURE_DIR = FIXTURES_DIR / "rootfs"
+
+#: Linux musl cross compilers `tests/fixtures/rootfs/Makefile` knows how to use,
+#: in the order it tries them; `CROSS_CC` overrides. Homebrew's musl-cross keg
+#: is the one unlinked location worth looking in on macOS.
+ROOTFS_CROSS_COMPILERS = (
+    "aarch64-linux-musl-gcc", "x86_64-linux-musl-gcc", "arm-linux-musleabihf-gcc",
+    "musl-gcc",
+)
+_ROOTFS_CROSS_DIRS = ("/opt/homebrew/opt/musl-cross/bin",)
+
+#: Every path the rootfs build must leave behind (symlinks included). A build
+#: that "succeeds" without one of these is a broken fixture, not a passing one.
+REQUIRED_ROOTFS_PATHS = (
+    "etc/ld.so.conf", "etc/ld.so.conf.d/vendor.conf", "etc/profile",
+    "lib/libc.so", "opt/vendor/lib/libgreet.so.1", "opt/vendor/lib/libgreet.so",
+    "usr/bin/app", "usr/bin/libstray.so",
+)
+
+
+def find_rootfs_cross_compiler() -> str | None:
+    """The cross gcc the rootfs Makefile would pick, or None when there is none."""
+    override = os.environ.get("CROSS_CC")
+    if override:
+        return override if (shutil.which(override) or Path(override).is_file()) else None
+    for name in ROOTFS_CROSS_COMPILERS:
+        found = shutil.which(name)
+        if found:
+            return found
+        for directory in _ROOTFS_CROSS_DIRS:
+            candidate = Path(directory) / name
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def build_rootfs_fixture(*, out_dir: Path | None = None) -> Path:
+    """Build the fake rootfs into *out_dir* (default `tests/fixtures/rootfs/out`).
+
+    The caller has already established that a cross toolchain exists (see
+    `rootfs_fixture`); every failure here -- make error, timeout, a missing
+    output -- is a `FixtureBuildError` with the diagnostics attached, exactly
+    like `build_integration_fixtures`. Same flock as that build (the lock file
+    lives in `tests/fixtures/`), so xdist workers do not race each other.
+    """
+    out_dir = Path(out_dir) if out_dir is not None else ROOTFS_FIXTURE_DIR / "out"
+    if shutil.which("make") is None:
+        raise FixtureBuildError(
+            "'make' not found; the rootfs fixture needs it. Run: make -C tests/fixtures/rootfs"
+        )
+    env = dict(os.environ)
+    overrides = [f"{name}={env[name]}" for name in ("CROSS_CC", "LIBC_SRC", "LDMUSL")
+                 if name in env]
+    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    with _BUILD_THREAD_LOCK:
+        with open(FIXTURES_DIR / _BUILD_LOCK_NAME, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                proc = subprocess.run(
+                    ["make", "-C", str(ROOTFS_FIXTURE_DIR), f"OUT={out_dir}",
+                     *overrides, "all"],
+                    capture_output=True, text=True, timeout=_BUILD_TIMEOUT_SECONDS,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise FixtureBuildError(
+                    "Building the rootfs fixture timed out after "
+                    f"{_BUILD_TIMEOUT_SECONDS}s. Check for a wedged cross compiler and "
+                    "run: make -C tests/fixtures/rootfs\n"
+                    f"  stdout: {_decode(exc.stdout)}\n"
+                    f"  stderr: {_decode(exc.stderr)}"
+                ) from exc
+            except OSError as exc:
+                raise FixtureBuildError(
+                    "Could not execute the rootfs fixture build. "
+                    f"Run: make -C tests/fixtures/rootfs\n  error: {exc}"
+                ) from exc
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+    missing = [p for p in REQUIRED_ROOTFS_PATHS if not (out_dir / p).exists()]
+    if not any(path.is_file() for path in (out_dir / "lib").glob("ld-musl-*.so.1")):
+        missing.append("lib/ld-musl-*.so.1")
+    if proc.returncode != 0 or missing:
+        raise FixtureBuildError(
+            "Binary Ninja is installed and a cross toolchain was found, but the "
+            "rootfs fixture could not be built, so the project real-BN tests cannot "
+            "run. Run: make -C tests/fixtures/rootfs\n"
+            f"  exit status: {proc.returncode}\n"
+            f"  missing: {', '.join(missing) or 'none'}\n"
+            f"  stdout: {proc.stdout.strip()}\n"
+            f"  stderr: {proc.stderr.strip()}"
+        )
+    return out_dir
+
+
+@pytest.fixture(scope="session")
+def rootfs_fixture() -> Path:
+    """The built fake-firmware rootfs for the real-BN project lane.
+
+    Needs a Linux musl cross gcc, which a host may simply not have: that skip
+    is environment-bound, so it goes through `refuse_silent_skip` (a failure
+    under `BN_REQUIRE_REAL_TESTS`). With BN and a toolchain present, a build
+    problem is a `FixtureBuildError` -- never a skip.
+    """
+    require_project_capability()
+    if find_rootfs_cross_compiler() is None:
+        refuse_silent_skip(
+            "no Linux musl cross compiler found for the rootfs fixture (looked for "
+            f"{', '.join(ROOTFS_CROSS_COMPILERS)} on PATH and in "
+            f"{', '.join(_ROOTFS_CROSS_DIRS)}); install one (macOS: brew install "
+            "musl-cross) or set CROSS_CC"
+        )
+    return build_rootfs_fixture()
 
 
 # --- shared real-BN bridge -------------------------------------------------

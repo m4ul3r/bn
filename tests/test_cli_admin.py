@@ -165,6 +165,136 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
     assert (destination / "bn-kernel" / "SKILL.md").exists()
+    assert not (destination / "bn-projects").exists()
+
+
+@pytest.fixture
+def bundled_project_skills(tmp_path, monkeypatch):
+    root = tmp_path / "bundled-skills"
+    for name in ("bn", "bn-kernel", "bn-re", "bn-vr", "bn-projects"):
+        source = root / name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: root)
+    return root
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+@pytest.mark.parametrize("selection", [None, "projects"])
+@pytest.mark.parametrize("explicit_dest", [False, True])
+def test_skill_install_projects_are_explicitly_selected(
+    tmp_path, monkeypatch, capsys, bundled_project_skills, mode, selection, explicit_dest
+):
+    destination = tmp_path / "installed"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: destination)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "absent-codex")
+    argv = ["skill", "install"]
+    if selection is not None:
+        argv.append(selection)
+    argv.extend(["--mode", mode, "--format", "json"])
+    if explicit_dest:
+        argv.extend(["--dest", str(destination)])
+
+    assert bn.cli.main(argv) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    expected = {"bn-projects"} if selection else {"bn", "bn-kernel", "bn-re", "bn-vr"}
+    assert {entry.name for entry in destination.iterdir()} == expected
+    assert {row["skill"] for row in result["skills"]} == expected
+    assert result["installed"] is True
+    assert result["mode"] == mode
+    assert set(result["installed_destinations"]) == {
+        str(destination / name) for name in expected
+    }
+    assert {row["destination"] for row in result["force_plan"]} == {
+        str(destination / name) for name in expected
+    }
+    if selection:
+        assert result["bn_kernel_skill_dirs"] == []
+    for name in expected:
+        entry = destination / name
+        assert entry.is_symlink() == (mode == "symlink")
+        assert (entry / "SKILL.md").read_bytes() == (
+            bundled_project_skills / name / "SKILL.md"
+        ).read_bytes()
+
+
+def test_skill_install_rejects_an_unknown_selection(tmp_path, capsys):
+    destination = tmp_path / "installed"
+
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["skill", "install", "unknown", "--dest", str(destination)])
+
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "missing", ["root", "directory", "manifest", "manifest_is_directory"]
+)
+def test_skill_install_projects_requires_its_own_source(
+    tmp_path, monkeypatch, capsys, missing
+):
+    root = tmp_path / "bundled-skills"
+    if missing != "root":
+        regular = root / "bn"
+        regular.mkdir(parents=True)
+        (regular / "SKILL.md").write_text("---\nname: bn\n---\n")
+    project = root / "bn-projects"
+    if missing in ("manifest", "manifest_is_directory"):
+        project.mkdir()
+    if missing == "manifest_is_directory":
+        (project / "SKILL.md").mkdir()
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: root)
+    destination = tmp_path / "installed"
+
+    assert bn.cli.main([
+        "skill", "install", "projects", "--dest", str(destination),
+    ]) == 2
+
+    err = capsys.readouterr().err
+    assert "Optional projects skill source is missing or invalid" in err
+    assert str(project) in err
+    assert "Traceback" not in err
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("explicit_dest", [False, True])
+def test_skill_install_projects_force_rerun_preserves_selection(
+    tmp_path, monkeypatch, capsys, bundled_project_skills, fmt, explicit_dest
+):
+    destination = tmp_path / "installed"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: destination)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "absent-codex")
+    argv = ["skill", "install", "projects"]
+    if explicit_dest:
+        argv.extend(["--dest", str(destination)])
+    assert bn.cli.main(argv) == 0
+    capsys.readouterr()
+    argv.extend(["--mode", "copy"])
+    if fmt != "text":
+        argv.extend(["--format", fmt])
+
+    assert bn.cli.main(argv) == (2 if explicit_dest else 1)
+
+    captured = capsys.readouterr()
+    if fmt == "json":
+        result = json.loads(captured.out)
+        force_args = result["force_args"]
+        assert result["installed"] is False
+        assert [row["skill"] for row in result["skills"]] == ["bn-projects"]
+    else:
+        force_args = _printed_rerun(captured.err if explicit_dest else captured.out)[1:]
+    assert force_args == argv + ["--force"]
+    assert bn.cli.main(force_args) == 0
+    assert {entry.name for entry in destination.iterdir()} == {"bn-projects"}
+    installed = destination / "bn-projects"
+    assert not installed.is_symlink()
+    assert (installed / "SKILL.md").read_bytes() == (
+        bundled_project_skills / "bn-projects" / "SKILL.md"
+    ).read_bytes()
 
 
 def test_skill_install_copy_omits_python_bytecode(tmp_path, monkeypatch):
@@ -786,7 +916,7 @@ def test_a_refused_skill_install_replaces_no_other_destination(tmp_path):
     skills = sorted(
         entry
         for entry in bn.cli.skills_source_dir().iterdir()
-        if (entry / "SKILL.md").exists()
+        if entry.name != "bn-projects" and (entry / "SKILL.md").exists()
     )
     unsafe = skills[-1]
     destination_root = tmp_path / "skill-store"
@@ -811,7 +941,7 @@ def test_a_refused_skill_install_writes_nothing_for_a_spelled_destination(tmp_pa
     skills = sorted(
         entry
         for entry in bn.cli.skills_source_dir().iterdir()
-        if (entry / "SKILL.md").exists()
+        if entry.name != "bn-projects" and (entry / "SKILL.md").exists()
     )
     unsafe = skills[-1]
     store = tmp_path / "store"
@@ -1524,6 +1654,190 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
     # came back as 6 in the live repro.
     assert len(set(opened.values())) == 2
     assert set(opened) == {"/fw/svc_a", "/fw/svc_a.bndb"}
+
+
+def _restart_project_fixture(monkeypatch, *, meta, rows):
+    """Fake registry + bridge for `session restart` with a project payload
+    (project + project_targets registry keys). Returns the ordered `(op, params)` call log."""
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+        "meta": meta,
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me",
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, dict(params or {})))
+        if op == "project_open":
+            return {"ok": True, "result": {"path": params["path"], "name": "fw", "opened": True}}
+        if op == "project_load":
+            return {"ok": True, "result": {
+                "path": f"/proj/fw.bnpr/data/ab/{params['selector']}",
+                "project_file_id": params["selector"],
+                "project_path": "/fw/svc_a",
+            }}
+        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": rows},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    return calls
+
+
+_PROJECT_FILE_ID = "0f3c2a1e-9b7d-4c6a-8e5f-1234567890ab"
+_PROJECT_BLOB = "/proj/fw.bnpr/data/0f/3c2a1e9b7d4c6a8e5f1234567890abcdef"
+_PROJECT_META = {
+    "project": {"path": "/proj/fw.bnpr", "id": "proj-1", "name": "fw"},
+    "project_targets": [
+        {"target_id": "500:2:7", "view_id": 2, "project_file_id": _PROJECT_FILE_ID,
+         "project_path": "/fw/svc_a"},
+    ],
+}
+_PROJECT_ROWS = [
+    {"target_id": "500:1:7", "filename": "/fw/svc_b", "analysis_state": "full",
+     "unsaved": False, "project_file_id": "", "project_path": ""},
+    {"target_id": "500:2:7", "filename": _PROJECT_BLOB, "analysis_state": "quick",
+     "unsaved": False, "project_file_id": _PROJECT_FILE_ID, "project_path": "/fw/svc_a"},
+]
+
+
+def test_session_restart_replays_project_targets_by_file_id(monkeypatch, capsys):
+    """A project target's `filename` is a blob inside the
+    `.bnpr`; reloading it by path would come back WITHOUT project linkage. The
+    restart reopens the project once and then loads each project target by its
+    exact file id, and never replays the blob as a plain binary."""
+    calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=_PROJECT_ROWS)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    ops = [op for op, _ in calls]
+    assert ops.count("project_open") == 1
+    assert ops.index("shutdown") < ops.index("project_open") < ops.index("project_load")
+    assert [p for op, p in calls if op == "project_open"] == [{"path": "/proj/fw.bnpr"}]
+    assert [p for op, p in calls if op == "project_load"] == [
+        {"selector": _PROJECT_FILE_ID, "prefer_bndb": False, "quick": True},
+    ]
+    # The plain binary replays as before; the blob does not.
+    assert [p["path"] for op, p in calls if op == "load_binary"] == ["/fw/svc_b"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"] == {"path": "/proj/fw.bnpr", "opened": True}
+    assert len(payload["loaded"]) == 2
+    assert [x.get("project_file_id") for x in payload["loaded"]] == [None, _PROJECT_FILE_ID]
+
+
+@pytest.mark.parametrize("project_targets", [None, []])
+@pytest.mark.parametrize("reopen_fails", [False, True])
+def test_session_restart_preserves_project_without_open_targets(
+    monkeypatch, capsys, project_targets, reopen_fails
+):
+    """Project ownership survives restart even when all project tabs are closed."""
+    from bn.transport import BridgeError
+
+    meta = {"project": {"path": "/proj/fw.bnpr"}}
+    if project_targets is not None:
+        meta["project_targets"] = project_targets
+    calls = _restart_project_fixture(monkeypatch, meta=meta, rows=[])
+    inner = bn.cli.send_request
+
+    def send(op, **kwargs):
+        if reopen_fails and op == "project_open":
+            calls.append((op, dict(kwargs.get("params") or {})))
+            raise BridgeError("project is unavailable")
+        return inner(op, **kwargs)
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == (1 if reopen_fails else 0)
+    assert [params for op, params in calls if op == "project_open"] == [
+        {"path": "/proj/fw.bnpr"}
+    ]
+    assert not any(op in {"project_load", "load_binary"} for op, _ in calls)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["restarted"] is True
+    assert payload["loaded"] == []
+    assert payload["project"]["path"] == "/proj/fw.bnpr"
+    assert payload["project"]["opened"] is not reopen_fails
+    if reopen_fails:
+        assert payload["project"]["error"] == "project is unavailable"
+    else:
+        assert "error" not in payload["project"]
+
+
+def test_session_restart_replays_project_targets_when_capture_failed(monkeypatch, capsys):
+    # The registry alone carries enough to replay the project: an unreachable
+    # bridge's targets are still reopened by id, with full analysis.
+    from bn.transport import BridgeUnreachableError
+    calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=[])
+
+    def unreachable(instance, op, params=None, target=None, **kw):
+        raise BridgeUnreachableError("socket gone")
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", unreachable)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 1   # capture failure is still reported (#620)
+    assert [p for op, p in calls if op == "project_load"] == [
+        {"selector": _PROJECT_FILE_ID, "prefer_bndb": False, "quick": False},
+    ]
+    assert "load_binary" not in [op for op, _ in calls]
+
+
+def test_session_restart_project_open_failure_marks_each_project_target(monkeypatch, capsys):
+    from bn.transport import BridgeError
+    calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=_PROJECT_ROWS)
+    inner = bn.cli.send_request
+
+    def failing(op, **kw):
+        if op == "project_open":
+            calls.append((op, dict(kw.get("params") or {})))
+            raise BridgeError("Binary Ninja could not open project /proj/fw.bnpr: boom")
+        return inner(op, **kw)
+    monkeypatch.setattr(bn.cli, "send_request", failing)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 1
+    assert "project_load" not in [op for op, _ in calls]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"]["opened"] is False
+    assert "could not open project" in payload["project"]["error"]
+    errors = [x for x in payload["loaded"] if x.get("error")]
+    assert len(errors) == 1
+    assert errors[0]["path"] == "/fw/svc_a"
+    assert errors[0]["project_file_id"] == _PROJECT_FILE_ID
+    assert "project not reopened" in errors[0]["error"]
+
+
+def test_session_restart_without_project_is_unchanged(monkeypatch, capsys):
+    meta = {"project": None, "project_targets": []}
+    rows = [{"target_id": "500:1:7", "filename": "/fw/svc_b", "analysis_state": "full",
+             "unsaved": False, "project_file_id": "", "project_path": ""}]
+    calls = _restart_project_fixture(monkeypatch, meta=meta, rows=rows)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    ops = [op for op, _ in calls]
+    assert "project_open" not in ops and "project_load" not in ops
+    assert [p["path"] for op, p in calls if op == "load_binary"] == ["/fw/svc_b"]
+    assert "project" not in json.loads(capsys.readouterr().out)
 
 
 def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch, capsys):
