@@ -373,6 +373,28 @@ bn project close
 
 `bn project open` pins this checkout (the pin is per git root, like `bn instance use`) to the bridge instance that owns the project, attaching to an existing owner when one is running; another checkout joins with `bn project attach`. Inside a project, select a file with `bn project load <selector>`, which accepts the file's path-in-project, id (or an 8+ character id prefix), or unique name; once loaded it is an ordinary target, selected with `-t <path-in-project>` (leading `/` optional), its id, or its file name. `bn save -t <selector>` writes the first database as `<name>.bndb` beside the raw file inside the project; later saves snapshot it; `bn save` takes no output path for a project target. Use `bn project export` to copy files out, `bn project import` to add new files, and `bn project delete` to remove them. `bn project close` closes the project's targets and the project when none has unsaved changes (`--force` discards them).
 
+### Shared project findings
+
+`bn project finding` keeps typed, evidence-backed claims and their review history inside the project. Install the optional guidance with `bn skill install projects`; the [project skill](skills/bn-projects/SKILL.md#shared-findings-retrieve-record-independently-review) documents the JSON schemas and agent workflow.
+
+```bash
+bn project finding types
+bn project finding context --file usr/bin/app
+bn project finding list --type vulnerability --type dataflow
+bn project finding add claim.json --author analyst-a
+bn project finding show <finding-id>
+bn project finding check <finding-id>
+bn project finding review <finding-id> review.json --expected-revision 1 --reviewer reviewer-b
+bn project finding update <finding-id> corrected.json --expected-revision 2 --author analyst-a
+bn project finding history <finding-id>
+```
+
+Use the owning bridge's explicit `-i` when working concurrently. Claim documents require `type`, `kind`, `claim`, `scope`, and `evidence`; `type` identifies the domain/action, while `kind` distinguishes observations, hypotheses, and conclusions. Standard types and recorded `custom:<slug>` types are discoverable; repeated `--type` filters select any listed type. Documents may come from stdin with `-`.
+
+Updates and reviews require the exact latest revision and append immutable snapshots rather than overwrite another agent's work. Independent acceptance requires current machine-checkable evidence; rejection/dispute records counterevidence, and conflicting reviews remain disputed. An update resets acceptance. Review states and freshness are separate: an accepted finding can become stale when scoped file content, semantic evidence, or an exact dependency revision changes. A missing/dirty analysis view is unknown, never silently current. `check` reports evidence currency, not claim truth; its successful exit does not accept the finding.
+
+Declarative checks cover persisted file hashes/ranges, saved loaded function analysis, and project-library bindings. Large traces/logs can be imported as project-file attachments. Scope files are automatically fingerprinted; semantic checks additionally bind database/tool versions and require a loaded clean database. Findings and attachments never execute code. Discovery separates current accepted knowledge from proposals, disputed/rejected/superseded claims, and material needing review. Records survive project close/reopen under the reserved `/.bn-findings/` namespace, with integrity checks and no separately authoritative index. Agent identities are declared, not authenticated.
+
 ## Bundles And Python
 
 `bn decompile` is the HLIL-text convenience lane. It is useful for quick function reading, but typed layouts remain authoritative in `bn types show` and `bn struct show`.

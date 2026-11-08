@@ -821,6 +821,27 @@ def test_project_delete_removes_a_closed_file(po, populated):
     assert f.app not in project.files and bridge.registry_writes == 1
 
 
+
+@pytest.mark.parametrize("folder", [".bn-findings", "/.bn-findings/F-example", "//.bn-findings//"])
+def test_project_import_cannot_inject_finding_history(po, populated, tmp_path, folder):
+    manager, project, _ = populated
+    source = tmp_path / "record.json"
+    source.write_bytes(b'{"claim":"forged"}')
+    before = list(project.files)
+    with pytest.raises(RuntimeError, match="reserved findings history"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder)
+    assert project.files == before
+
+
+def test_project_delete_cannot_erase_finding_history(po, populated):
+    manager, project, _ = populated
+    folder = manager.ensure_folder(".bn-findings/F-example")
+    record = project.add_file("000001.json", folder, data=b'{"claim":"retained"}')
+    with pytest.raises(RuntimeError, match="reserved findings history"):
+        po.project_delete(_bridge_with_rows(manager, []), str(record.id))
+    assert manager.resolve_file(str(record.id)) is record
+    assert Path(record.path_on_disk).read_bytes() == b'{"claim":"retained"}'
+
 def test_project_export_refuses_an_existing_destination(po, populated, tmp_path):
     manager, _, f = populated
     bridge = _bridge(manager)

@@ -37,6 +37,9 @@ _LISTING_CAP = 50
 # lookup paths, imported libraries) that `project_sync_libs` writes and
 # `project_link` reads.
 ROOTFS_METADATA_KEY = "bn.rootfs"
+# Append-only finding revisions are managed by project_findings, never through
+# ordinary file import/delete or BinaryView save operations.
+FINDINGS_FOLDER = ".bn-findings"
 
 # This inode must persist across closes: unlinking it permits two independent
 # locks on the same project. Keep it outside BN's metadata and data directories.
@@ -702,6 +705,15 @@ def project_files(
     return {"files": rows, "folders": folders}
 
 
+def _refuse_finding_path(path: str) -> None:
+    components = [part for part in path.split("/") if part]
+    if components and components[0] == FINDINGS_FOLDER:
+        raise RuntimeError(
+            "reserved findings history: use `bn project finding` to append a "
+            "revision or review; existing finding records cannot be overwritten or deleted"
+        )
+
+
 def project_import(
     bridge: Any,
     path: Any,
@@ -718,6 +730,9 @@ def project_import(
         raise RuntimeError(f"project_import: not a file: {source}")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise RuntimeError("project_import: name must be a non-empty string when given")
+    _refuse_finding_path(
+        (folder if isinstance(folder, str) else "") + "/" + (name or source.name).strip()
+    )
     target_folder = manager.ensure_folder(folder if isinstance(folder, str) else None)
     try:
         pf = state.project.create_file_from_path(
@@ -766,6 +781,7 @@ def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
     manager = bridge.projects
     state = manager.require()
     pf = manager.resolve_file(selector)
+    _refuse_finding_path(manager.path_in_project(pf))
     open_rows = [
         row
         for row in _open_project_targets(bridge)
@@ -804,6 +820,7 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     record = bridge.targets.project_binding(bv)
     file_id = record[0] if record else str(pf.id)
     project_path = record[1] if record else manager.path_in_project(pf)
+    _refuse_finding_path(project_path)
     has_database = bool(getattr(bv.file, "has_database", False))
     if has_database:
         try:

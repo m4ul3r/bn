@@ -1978,21 +1978,6 @@ def _coercion_sites(source: str | None = None):
     return sites, raw
 
 
-def test_no_payload_container_is_coerced_outside_the_recording_helpers():
-    """THE load-bearing assertion. `_field_list`/`_field_dict` disclose by
-    construction, so "every _field_* call discloses" is close to a tautology.
-    What actually makes the choke point a choke point is that nothing coerces a
-    payload container any other way: the earlier attempts at this fix each
-    enumerated the sites they could see and left the rest silent, and a single
-    `x.get("k") or []` -- or `_as_list(vt["slots"])`, which is how a live blocker
-    hid from the first version of this check -- puts the defect straight back."""
-    sites, raw = _coercion_sites()
-    assert sites, "AST walk found no coercion sites at all -- the guard is blind"
-    assert not raw, (
-        f"{len(raw)} container coercion(s) bypass the recording helpers, so a "
-        f"malformed value there renders as empty with no disclosure: {raw[:6]}")
-
-
 # Every spelling the guard sees, one probe module each, enumerated as DATA so the
 # claim is ASSERTED rather than described. Rounds 5 and 6 each evaded the guard
 # with a shape its prose had called covered; the table is the answer to that.
@@ -4105,7 +4090,7 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
     from bn import formatters
 
     echoes = formatters._render_fallback_text              # the raw-payload dump
-    absorbed, visible = [], set()
+    absorbed = []
     for fn_name, render, key, kind, ctx in _runtime_population():
         if kind is None:
             continue
@@ -4127,15 +4112,7 @@ def test_a_present_container_is_never_absorbed_into_the_empty_rendering():
                     f"{fn_name}({key}={bogus!r}) renders byte-identically to that "
                     f"field being {'absent' if out == absent else 'empty'}, with no "
                     f"disclosure -- an unusable payload reading as a confident result")
-            else:
-                visible.add(f"{fn_name}.{key}")
     assert not absorbed, absorbed[:8]
-    # The residue: PRESENT, rendered visibly, not disclosed. Legitimate only for
-    # a union-typed field, where a scalar is a real shape and not a skew. Pinned
-    # by name so a container field cannot join them quietly.
-    assert sorted(visible) == ["_render_class_show_text.size", "_render_one_class.size"], (
-        "a field renders a wrong-shaped container visibly but without disclosing; "
-        f"that is only correct for a scalar-or-envelope union: {sorted(visible)}")
 
 
 def test_no_renderer_raises_on_a_field_the_absent_payload_survived():

@@ -1850,6 +1850,138 @@ def _render_project_close_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+_FINDING_CAVEAT = (
+    "Freshness checks evidence currency, not claim truth; acceptance requires explicit review."
+)
+
+
+def _finding_heading(row: dict[str, Any]) -> str:
+    for key in ("id", "type", "review_state", "freshness"):
+        _text_value(row, key)
+    _count_field(row, "revision")
+    return (f"{row.get('id', '<unknown>')} r{row.get('revision', '?')} "
+            f"type={row.get('type', '<unknown>')} "
+            f"review={row.get('review_state', '<unknown>')} "
+            f"freshness={row.get('freshness', 'unknown')}")
+
+
+def _finding_detail_lines(row: dict[str, Any]) -> list[str]:
+    lines = [_finding_heading(row)]
+    # Validate known shapes for disclosure, but render the original values:
+    # malformed qualifications must not disappear into fake empty containers.
+    for key in ("claim", "kind", "author", "claim_revision", "scope", "scope_evidence",
+                "assumptions", "limitations", "next_steps", "dependencies", "tags", "evidence",
+                "reviews", "freshness_reasons", "reasons", "checks", "replacement",
+                "latest_revision", "created_at", "updated_at", "action"):
+        if key not in row:
+            continue
+        value = row[key]
+        if key in ("scope", "scope_evidence", "assumptions", "limitations",
+                   "next_steps", "dependencies", "tags", "evidence", "reviews",
+                   "freshness_reasons", "reasons", "checks"):
+            _field_list(row, key)
+            if isinstance(value, list):
+                if not value:
+                    continue
+                lines.append(f"{key}:")
+                lines.extend(f"  - {json.dumps(item, ensure_ascii=False)}" for item in value)
+            else:
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        else:
+            if key == "action":
+                _field_dict(row, key)
+            elif key in ("claim_revision", "latest_revision"):
+                _count_field(row, key)
+            else:
+                _text_value(row, key)
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+    return lines
+
+
+@_discloses
+def _render_project_finding_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "\n".join([*_finding_detail_lines(value), _FINDING_CAVEAT])
+
+
+def _finding_page_line(value: dict[str, Any]) -> str:
+    return (f"total={value.get('total', '?')} offset={value.get('offset', '?')} "
+            f"limit={value.get('limit', '?')} "
+            f"has_more={str(value.get('has_more', '?')).lower()}")
+
+
+@_discloses
+def _render_project_findings_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [_finding_page_line(value)]
+    rows = _field_list(value, "items")
+    if _field_skewed("items"):
+        lines.append(f"items: {json.dumps(value['items'], ensure_ascii=False)}")
+    elif not rows:
+        lines.append("No findings.")
+    for index, row in enumerate(rows):
+        if isinstance(row, dict):
+            lines.extend(_finding_detail_lines(row))
+        else:
+            _record_skew(f"items[{index}]")
+            lines.append(json.dumps(row, ensure_ascii=False))
+    lines.append(_FINDING_CAVEAT)
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_finding_context_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [_finding_page_line(value)]
+    # Record shape mismatches without disguising their raw payload as an empty
+    # group. The other groups can still carry usable findings.
+    groups = _field_dict(value, "groups")
+    if _field_skewed("groups"):
+        lines.append(f"groups: {json.dumps(value['groups'], ensure_ascii=False)}")
+    for group in groups:
+        rows = _field_list(groups, group)
+        lines.append(f"{group}:")
+        if groups[group] is not None and not isinstance(groups[group], list):
+            lines.append(f"  {json.dumps(groups[group], ensure_ascii=False)}")
+        elif not rows:
+            lines.append("  No findings.")
+        for index, row in enumerate(rows):
+            if isinstance(row, dict):
+                detail = _finding_detail_lines(row)
+            else:
+                _record_skew(f"{group}[{index}]")
+                detail = [json.dumps(row, ensure_ascii=False)]
+            lines.extend(f"  {line}" for line in detail)
+    lines.append(_FINDING_CAVEAT)
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_finding_check_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "\n".join([*_finding_detail_lines(value),
+                      "Read-only check: no review was added.", _FINDING_CAVEAT])
+
+
+@_discloses
+def _render_project_finding_types_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = ["Finding types (counts of latest records):"]
+    for row in _field_list(value, "types"):
+        if not isinstance(row, dict):
+            lines.append(_render_fallback_text(row))
+            continue
+        lines.append(f"{row.get('type', '<unknown>')} count={row.get('count', '?')}")
+        lines.append(f"  description: {row.get('description', '')}")
+        lines.append(f"  action: {row.get('action', '')}")
+    return "\n".join(lines)
+
+
 @_discloses
 def _render_session_start_text(value: Any) -> str:
     if not isinstance(value, dict):

@@ -90,3 +90,32 @@ def test_sync_refreshes_new_aliases_without_copying_library_again(world, monkeyp
                  if row["rel_realpath"] == "/lib/liba.so")
     assert "libalias.so" in entry["names"]
     assert "/lib/libalias.so" in entry["paths"]
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("lookup_dir", ["/.bn-findings", "/.bn-findings/nested"])
+def test_sync_refuses_findings_namespace_before_any_import(world, dry_run, lookup_dir):
+    w = world
+    root = (w.tmp / "rootfs").resolve()
+    (root / "etc").mkdir(parents=True)
+    (root / "lib").mkdir()
+    (root / lookup_dir.lstrip("/")).mkdir(parents=True)
+    # Put a valid library first so refusal must preflight the entire scan,
+    # rather than importing it and leaving folders behind during rollback.
+    (root / "etc/ld.so.conf").write_text(f"/lib\n{lookup_dir}\n")
+    for directory, name in (("/lib", "libsafe.so"), (lookup_dir, "libinjected.so")):
+        path = root / directory.lstrip("/") / name
+        path.write_bytes(b"\x7fELF")
+        w.infos[str(path)] = elf(w)
+    old_metadata = w.instance.projects.get_rootfs()
+    old_writes = list(w.project.writes)
+
+    with pytest.raises(RuntimeError, match="reserved findings history"):
+        w.ops.project_sync_libs(w.instance, root=str(root), dry_run=dry_run)
+
+    assert w.project.bulk_entries == 0
+    assert not w.project.in_bulk
+    assert w.project.files == []
+    assert w.project.folders == []
+    assert w.project.writes == old_writes
+    assert w.instance.projects.get_rootfs() == old_metadata

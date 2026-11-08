@@ -126,6 +126,12 @@ def project_sync_libs(
     candidates, scan_notes = scan_libraries(chosen_root, paths)
     notes.extend(scan_notes)
 
+    # Validate the whole discovery before entering bulk mode or creating folders:
+    # a loader configuration must not inject files into the findings ledger.
+    for cand in candidates:
+        project_ops._refuse_finding_path(
+            cand.dir_in_root.rstrip("/") + "/" + cand.names[0])
+
     live_ids = {str(pf.id) for pf in state.project.files}
     libs = {file_id: dict(entry) for file_id, entry in (meta.get("libs") or {}).items()
             if file_id in live_ids}

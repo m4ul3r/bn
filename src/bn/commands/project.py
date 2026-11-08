@@ -28,6 +28,11 @@ from ..formatters import (
     _render_project_link_text,
     _render_project_load_text,
     _render_project_sync_text,
+    _render_project_finding_text,
+    _render_project_findings_text,
+    _render_project_finding_context_text,
+    _render_project_finding_check_text,
+    _render_project_finding_types_text,
 )
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT, _format_instance_choices
 from .admin import _associate_project_roots
@@ -456,3 +461,116 @@ def _project_close(args: argparse.Namespace) -> int:
         text_renderer=_render_project_close_text,
         stem="project-close",
     )
+
+
+def _finding_document(source: str) -> Any:
+    """Read JSON only; evidence paths and prose are never executed."""
+    if source == "-":
+        try:
+            raw = sys.stdin.read()
+        except (OSError, UnicodeError) as exc:
+            raise BridgeError(f"Could not read finding document from stdin: {exc}") from None
+        label = "stdin"
+    else:
+        raw = cli.read_text_input(Path(source).expanduser(), what="Finding document")
+        label = source
+    return cli.decode_json_input(raw, refusal=f"Invalid JSON in finding document ({label})")
+
+
+def _finding_call(args: argparse.Namespace, action: str, params: dict[str, Any],
+                  renderer: Any) -> int:
+    return _call(args, f"project_finding_{action}", params, require_target=False,
+                 text_renderer=renderer, stem=f"project-finding-{action}")
+
+
+@command("project", "finding", "add", help="Record an evidence-backed claim (not automatic acceptance)",
+         args=[arg("document", metavar="DOCUMENT", help="JSON document path, or - for stdin"),
+               arg("--author", required=True, help="Declared author identity")])
+def _project_finding_add(args: argparse.Namespace) -> int:
+    return _finding_call(args, "add",
+                         {"document": _finding_document(args.document), "author": args.author},
+                         _render_project_finding_text)
+
+
+@command("project", "finding", "update", help="Replace a claim, preserving history and resetting review",
+         args=[arg("id"), arg("document", metavar="DOCUMENT", help="JSON document path, or - for stdin"),
+               arg("--expected-revision", required=True, type=cli._positive_int),
+               arg("--author", required=True)])
+def _project_finding_update(args: argparse.Namespace) -> int:
+    return _finding_call(args, "update",
+                         {"id": args.id, "document": _finding_document(args.document),
+                          "expected_revision": args.expected_revision, "author": args.author},
+                         _render_project_finding_text)
+
+
+@command("project", "finding", "review", help="Append an explicit independent review",
+         args=[arg("id"), arg("document", metavar="DOCUMENT", help="Review JSON path, or - for stdin"),
+               arg("--expected-revision", required=True, type=cli._positive_int),
+               arg("--reviewer", required=True)])
+def _project_finding_review(args: argparse.Namespace) -> int:
+    return _finding_call(args, "review",
+                         {"id": args.id, "document": _finding_document(args.document),
+                          "expected_revision": args.expected_revision, "reviewer": args.reviewer},
+                         _render_project_finding_text)
+
+
+@command("project", "finding", "show", help="Show a finding and its evidence",
+         args=[arg("id"), arg("--revision", type=cli._positive_int, default=None)])
+def _project_finding_show(args: argparse.Namespace) -> int:
+    return _finding_call(args, "show", {"id": args.id, "revision": args.revision},
+                         _render_project_finding_text)
+
+
+@command("project", "finding", "check", help="Check freshness without accepting or proving the claim",
+         args=[arg("id"), arg("--revision", type=cli._positive_int, default=None)])
+def _project_finding_check(args: argparse.Namespace) -> int:
+    return _finding_call(args, "check", {"id": args.id, "revision": args.revision},
+                         _render_project_finding_check_text)
+
+
+def _finding_page_args() -> list[Any]:
+    return [arg("--offset", type=cli._non_negative_int, default=0),
+            arg("--limit", type=cli._positive_int, default=50, help="Page size (maximum 200)")]
+
+
+@command("project", "finding", "history", help="Show immutable finding revisions",
+         args=[arg("id"), *_finding_page_args()])
+def _project_finding_history(args: argparse.Namespace) -> int:
+    return _finding_call(args, "history",
+                         {"id": args.id, "offset": args.offset, "limit": args.limit},
+                         _render_project_findings_text)
+
+
+def _finding_filter_args() -> list[Any]:
+    return [
+        arg("--file", default=None, help="Project file selector"),
+        arg("--function", default=None, help="Function address or label"),
+        arg("--query", default=None, help="Case-insensitive text search"),
+        arg("--type", action="append", default=None, help="Finding type (repeat for OR filtering)"),
+        arg("--status", choices=("proposed", "accepted", "rejected", "disputed", "superseded"),
+            default=None),
+        arg("--freshness", choices=("current", "stale", "unknown"), default=None),
+        *_finding_page_args(),
+    ]
+
+
+def _finding_filters(args: argparse.Namespace) -> dict[str, Any]:
+    return {name: getattr(args, name)
+            for name in ("file", "function", "query", "type", "status", "freshness", "offset", "limit")}
+
+
+@command("project", "finding", "list", help="List findings with separate review and freshness states",
+         args=_finding_filter_args())
+def _project_finding_list(args: argparse.Namespace) -> int:
+    return _finding_call(args, "list", _finding_filters(args), _render_project_findings_text)
+
+
+@command("project", "finding", "context", help="Group reusable findings and findings needing review",
+         args=_finding_filter_args())
+def _project_finding_context(args: argparse.Namespace) -> int:
+    return _finding_call(args, "context", _finding_filters(args), _render_project_finding_context_text)
+
+
+@command("project", "finding", "types", help="Show standard and recorded finding types and actions")
+def _project_finding_types(args: argparse.Namespace) -> int:
+    return _finding_call(args, "types", {}, _render_project_finding_types_text)

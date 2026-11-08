@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -646,3 +647,158 @@ class TestRootfsProjects:
                 lane.wire("project_info", instance_id=other)
         finally:
             _stop_instance(other, lane.env())
+
+
+def test_findings_review_conflicts_persist_and_stale_after_source_deletion(lane: Lane, tmp_path):
+    """Actual project records survive reopen; concurrent reviews cannot lose a revision."""
+    lane.ensure_open()
+    source = tmp_path / "packet.bin"
+    source.write_bytes(b"PKTA\x00payload")
+    file = lane.project_import(source, "finding-review")
+    document = {
+        "type": "file-format", "kind": "observation",
+        "claim": "The sample starts with the ASCII PKTA marker.",
+        "scope": [{"file": file["id"]}],
+        "evidence": [{"check": "bytes", "file": file["id"], "offset": 0, "length": 4,
+                      "expected": {"hex": "504b5441"}}],
+        "limitations": ["The marker alone does not establish parser behavior."],
+        "next_steps": ["Inspect the parser before making stronger format claims."],
+    }
+    claim_path = tmp_path / "claim.json"
+    claim_path.write_text(json.dumps(document))
+    added = lane.json("project", "finding", "add", str(claim_path), "--author", "analyst-a")
+    finding_id = added["id"]
+    assert (added["type"], added["review_state"], added["freshness"]) == (
+        "file-format", "proposed", "current")
+    review_path = tmp_path / "review.json"
+    review_path.write_text(json.dumps({
+        "verdict": "accept", "rationale": "Independently checked the four persisted bytes.",
+        "evidence": document["evidence"],
+    }))
+    self_review = lane.run(
+        "project", "finding", "review", finding_id, str(review_path),
+        "--expected-revision", "1", "--reviewer", "analyst-a")
+    assert self_review.returncode == 2, self_review.stdout + self_review.stderr
+    assert lane.json("project", "finding", "show", finding_id)["revision"] == 1
+    reviewed = lane.json(
+        "project", "finding", "review", finding_id, str(review_path),
+        "--expected-revision", "1", "--reviewer", "reviewer-b")
+    assert (reviewed["revision"], reviewed["review_state"]) == (2, "accepted")
+
+    # Both callers have read revision 2. Only one may append revision 3.
+    def concurrent_review(reviewer: str) -> subprocess.CompletedProcess[str]:
+        return lane.run(
+            "project", "finding", "review", finding_id, str(review_path),
+            "--expected-revision", "2", "--reviewer", reviewer, "--format", "json")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(concurrent_review, ["reviewer-c", "reviewer-d"]))
+    assert sorted(result.returncode for result in outcomes) == [0, 2], [
+        (result.returncode, result.stdout, result.stderr) for result in outcomes]
+    refused = next(result for result in outcomes if result.returncode == 2)
+    assert "revision" in refused.stderr.lower()
+    context = lane.json(
+        "project", "finding", "context", "--file", file["id"], "--type", "file-format")
+    assert [row["id"] for row in context["groups"]["accepted"]] == [finding_id]
+    assert lane.json(
+        "project", "finding", "list", "--file", file["id"], "--type", "vulnerability"
+    )["items"] == []
+
+    lane.project_close(force=True)
+    lane.ensure_open()
+    reopened = lane.json("project", "finding", "show", finding_id)
+    assert (reopened["revision"], reopened["review_state"], reopened["freshness"]) == (
+        3, "accepted", "current")
+    history = lane.json("project", "finding", "history", finding_id)
+    assert [record["revision"] for record in history["items"]] == [1, 2, 3]
+    assert history["items"][0]["review_state"] == "proposed"
+
+    ledger_files = lane.project_files(f".bn-findings/{finding_id}")
+    assert len(ledger_files) == 3
+    protected = lane.run("project", "delete", ledger_files[0]["id"])
+    assert protected.returncode == 2
+    assert "reserved findings history" in protected.stderr
+    load_refused = lane.run("project", "load", ledger_files[0]["id"])
+    assert load_refused.returncode == 2
+    assert "reserved findings history" in load_refused.stderr
+
+    lane.json("project", "delete", file["id"])
+    stale = lane.json("project", "finding", "check", finding_id)
+    assert stale["freshness"] == "stale" and stale["review_state"] == "accepted"
+    assert stale["reasons"]
+    stale_context = lane.json("project", "finding", "context", "--query", "PKTA")
+    assert finding_id not in {row["id"] for row in stale_context["groups"]["accepted"]}
+    assert finding_id in {row["id"] for row in stale_context["groups"]["needs_review"]}
+
+
+def test_findings_function_evidence_tracks_saved_analysis_not_dirty_views(lane: Lane, tmp_path):
+    """Exercise real HLIL APIs and invalidate accepted evidence after a saved edit."""
+    lane.ensure_open()
+    raw = lane.ensure_imported("finding-function")
+    lane.project_load(raw["id"])
+    saved = lane.save(raw["id"])
+    assert saved.returncode == 0, saved.stderr
+    database_id = json.loads(saved.stdout)["project_file_id"]
+    functions = lane.json("function", "list", "-t", database_id, "--limit", "100")["items"]
+    main = next(row for row in functions if row["name"] in ("main", "_main"))
+    # A reopened database can defer HLIL. Explicitly materialize it with an
+    # ordinary read; the findings checker itself never generates missing IL.
+    lane.json("decompile", main["address"], "-t", database_id)
+    evidence = [{"check": "function", "file": database_id, "function": main["address"],
+                 "expected": {"name": main["name"]}}]
+    claim_path = tmp_path / "function-claim.json"
+    claim_path.write_text(json.dumps({
+        "type": "function-role", "kind": "observation",
+        "claim": "The entry function has the recorded analysis name and prototype.",
+        "scope": [{"file": database_id, "function": main["address"]}], "evidence": evidence,
+    }))
+    added = lane.json("project", "finding", "add", str(claim_path), "--author", "analyst-a")
+    assert added["freshness"] == "current", added["freshness_reasons"]
+    review_path = tmp_path / "function-review.json"
+    review_path.write_text(json.dumps({
+        "verdict": "accept", "rationale": "Independently inspected the saved function.",
+        "evidence": evidence,
+    }))
+    accepted = lane.json(
+        "project", "finding", "review", added["id"], str(review_path),
+        "--expected-revision", "1", "--reviewer", "reviewer-b")
+    assert accepted["review_state"] == "accepted" and accepted["freshness"] == "current"
+    lane.rename(database_id, main["address"], "reviewed_entry")
+    dirty = lane.json("project", "finding", "check", added["id"])
+    assert dirty["freshness"] != "current"
+    assert lane.save(database_id).returncode == 0
+    lane.json("close", "-t", database_id)
+    stale = lane.json("project", "finding", "check", added["id"])
+    assert stale["freshness"] == "stale" and stale["review_state"] == "accepted"
+
+
+def test_findings_links_invalidate_when_a_project_provider_disappears(rootfs_lane, tmp_path):
+    """Bindings must depend on provider files, not just the unchanged caller BNDB."""
+    lane, root = rootfs_lane
+    _rootfs_init(lane, root)
+    lane.project_import(root / "usr/bin/app", "usr/bin")
+    lane.project_load("usr/bin/app")
+    saved = lane.save("app")
+    assert saved.returncode == 0, saved.stderr
+    database_id = json.loads(saved.stdout)["project_file_id"]
+    claim_path = tmp_path / "bindings.json"
+    claim_path.write_text(json.dumps({
+        "type": "dependency", "kind": "observation",
+        "claim": "The caller has the captured project-library assignments.",
+        "scope": [{"file": database_id}],
+        "evidence": [{"check": "links", "file": database_id}],
+        "limitations": ["Bindings alone do not prove runtime-loader resolution or cross-library taint."],
+    }))
+    finding = lane.json("project", "finding", "add", str(claim_path), "--author", "link-analyst")
+    assert finding["freshness"] == "current", finding["freshness_reasons"]
+    observed = finding["evidence"][0]["observed"]
+    # The fixture's two native ProjectFile providers must be identified.
+    inventory = lane.json("project", "libs")["libs"]
+    provider_ids = {row["project_file_id"] for row in inventory}
+    assert set(observed["providers"]) == provider_ids
+    provider = next(row for row in inventory if "libgreet.so.1" in row["names"])
+    lane.json("project", "delete", provider["project_file_id"])
+    lane.json("close", "-t", database_id)
+    checked = lane.json("project", "finding", "check", finding["id"])
+    assert checked["freshness"] == "stale", checked
+    assert any("provider" in reason.lower() for reason in checked["reasons"])

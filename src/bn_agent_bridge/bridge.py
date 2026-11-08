@@ -28,6 +28,7 @@ from binaryninja.plugin import PluginCommand
 from . import create_comments
 from . import il_format
 from . import mutation_engine
+from . import project_findings
 from . import project_ops
 from . import project_rootfs
 from . import read_decompile
@@ -3485,6 +3486,7 @@ class BinaryNinjaBridge:
         with self._write_operation_lock():
             state = manager.require()
             pf = manager.resolve_file(selector)
+            project_ops._refuse_finding_path(manager.path_in_project(pf))
             notes: list[str] = []
             substituted_from: str | None = None
             if prefer_bndb:
@@ -5923,6 +5925,70 @@ def _bind_project_export(bridge, params, target):
 @op("project_delete", lock="write")
 def _bind_project_delete(bridge, params, target):
     return project_ops.project_delete(bridge, params.get("selector"))
+
+
+# Findings live in the project, not a selected BinaryView. The write gate is
+# also their optimistic-revision compare-and-append serialization boundary.
+@op("project_finding_add", lock="write")
+def _bind_project_finding_add(bridge, params, target):
+    return project_findings.project_finding_add(
+        bridge, document=params.get("document"), author=params.get("author"))
+
+
+@op("project_finding_update", lock="write")
+def _bind_project_finding_update(bridge, params, target):
+    return project_findings.project_finding_update(
+        bridge, id=params.get("id"), document=params.get("document"),
+        expected_revision=params.get("expected_revision"), author=params.get("author"))
+
+
+@op("project_finding_review", lock="write")
+def _bind_project_finding_review(bridge, params, target):
+    return project_findings.project_finding_review(
+        bridge, id=params.get("id"), document=params.get("document"),
+        expected_revision=params.get("expected_revision"), reviewer=params.get("reviewer"))
+
+
+@op("project_finding_show", lock="read")
+def _bind_project_finding_show(bridge, params, target):
+    return project_findings.project_finding_show(
+        bridge, id=params.get("id"), revision=params.get("revision"))
+
+
+@op("project_finding_check", lock="read")
+def _bind_project_finding_check(bridge, params, target):
+    return project_findings.project_finding_check(
+        bridge, id=params.get("id"), revision=params.get("revision"))
+
+
+@op("project_finding_history", lock="read")
+def _bind_project_finding_history(bridge, params, target):
+    return project_findings.project_finding_history(
+        bridge, id=params.get("id"), offset=params.get("offset", 0),
+        limit=params.get("limit", 50))
+
+
+@op("project_finding_list", lock="read")
+def _bind_project_finding_list(bridge, params, target):
+    return project_findings.project_finding_list(
+        bridge, file=params.get("file"), function=params.get("function"),
+        query=params.get("query"), type=params.get("type"), status=params.get("status"),
+        freshness=params.get("freshness"), offset=params.get("offset", 0),
+        limit=params.get("limit", 50))
+
+
+@op("project_finding_context", lock="read")
+def _bind_project_finding_context(bridge, params, target):
+    return project_findings.project_finding_context(
+        bridge, file=params.get("file"), function=params.get("function"),
+        query=params.get("query"), type=params.get("type"), status=params.get("status"),
+        freshness=params.get("freshness"), offset=params.get("offset", 0),
+        limit=params.get("limit", 50))
+
+
+@op("project_finding_types", lock="read")
+def _bind_project_finding_types(bridge, params, target):
+    return project_findings.project_finding_types(bridge)
 
 
 # Firmware rootfs projects: creation and library import mutate the project
