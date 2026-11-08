@@ -1512,7 +1512,474 @@ def _render_save_text(value: Any) -> str:
             line += ("\nnote: this cache entry is restored by default only for "
                      f"{' or '.join(owners) or 'nobody'}; any other load of these "
                      "bytes opens the raw file and prints the `bn load` that restores it")
+    if value.get("project_file_id"):
+        # A project-backed target saves into the project,
+        # never to a path of the caller's choosing; say which file and whether
+        # this save created the database or snapshotted an existing one.
+        line += (f"\nproject file: {value.get('project_path', '<unknown>')} "
+                 f"({value.get('mode', '<unknown>')})")
     return line
+
+
+def _project_file_kind(row: dict[str, Any]) -> str:
+    return "bndb" if _flag_field(row, "is_database") else "raw"
+
+
+def _render_project_open_targets(value: Any) -> list[str]:
+    rows = _field_list(value, "open_targets")
+    if not rows:
+        return []
+    lines = ["", "open targets:"]
+    for row in rows:
+        if not isinstance(row, dict):
+            lines.append(f"- {_render_fallback_text(row)}")
+            continue
+        lines.append(
+            f"- {row.get('project_path', '<unknown>')}  target={row.get('target_id', '<unknown>')}"
+            f"  view={row.get('view_id', '<unknown>')}  file={str(row.get('project_file_id', ''))[:8]}"
+        )
+    return lines
+
+
+@_discloses
+def _render_project_attach_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return (f"attached to instance {value.get('instance_id', '<unknown>')}"
+            f"\n\tproject: {value.get('path', '<unknown>')}")
+
+
+@_discloses
+def _render_project_info_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    head = f"project: {value.get('name', '<unknown>')}"
+    if value.get("opened") is False:
+        head += "  [already open]"
+    lines = [head]
+    details = [
+        ("instance", value.get("instance")),
+        ("path", value.get("path")),
+        ("id", value.get("id")),
+        ("description", value.get("description")),
+        ("files", value.get("file_count")),
+        ("folders", value.get("folder_count")),
+    ]
+    for key, item in details:
+        if item not in (None, ""):
+            lines.append(f"\t{key}: {item}")
+    lines.extend(_render_project_open_targets(value))
+    return "\n".join(lines)
+
+
+def _project_file_line(row: dict[str, Any]) -> str:
+    size = row.get("size")
+    size_text = str(size) if isinstance(size, int) and not isinstance(size, bool) else "-"
+    line = (f"{str(row.get('id', ''))[:8]:<8}  {_project_file_kind(row):<4}  {size_text:>10}  "
+            f"{row.get('path', '<unknown>')}")
+    open_target = row.get("open_target_id")
+    if open_target:
+        # The selector `-t` accepts is the path-in-project without its leading
+        # slash.
+        selector = str(row.get("path", "")).lstrip("/") or str(open_target)
+        line += f"  [open as -t {selector}]"
+    sibling = row.get("sibling_database_id")
+    if sibling and not _flag_field(row, "is_database"):
+        line += f"  sibling db: {str(sibling)[:8]}"
+    if _flag_field(row, "exists_on_disk") is False:
+        line += "  [missing on disk]"
+    return line
+
+
+@_discloses
+def _render_project_file_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "imported: " + _project_file_line(value)
+
+
+@_discloses
+def _render_project_files_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    files = _field_list(value, "files")
+    folders = _field_list(value, "folders")
+    if not files and not folders:
+        return _empty_result("project files")
+    lines = []
+    for row in files:
+        lines.append(_project_file_line(row) if isinstance(row, dict) else _render_fallback_text(row))
+    if folders:
+        if lines:
+            lines.append("")
+        lines.append("folders:")
+        for folder in folders:
+            if isinstance(folder, dict):
+                lines.append(f"- {folder.get('path', '<unknown>')}  ({str(folder.get('id', ''))[:8]})")
+            else:
+                lines.append(f"- {_render_fallback_text(folder)}")
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_load_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    text = _render_load_text(value)
+    project_path = value.get("project_path")
+    if project_path or value.get("project_file_id"):
+        text += (f"\nProject file: {project_path or '<unknown>'} "
+                 f"({value.get('project_file_id', '<unknown>')})")
+    # `substituted_from` is already explained by the bridge's own note in
+    # `notes` (which `_render_load_text` prints); no second line for it.
+    if _field_present(value, "link"):
+        link = _field_dict(value, "link")
+        text += (f"\nlinked: {_stated_count(link, 'linked')} "
+                 f"({len(_row_list(link, 'unresolved'))} unresolved)")
+    return text
+
+
+def _lookup_path_lines(rows: list[Any]) -> list[str]:
+    if not rows:
+        return ["lookup paths: none"]
+    lines = ["lookup paths:"]
+    for row in rows:
+        if isinstance(row, dict):
+            lines.append(f"  {row.get('path', '<unknown>')}  ({row.get('source', '<unknown>')})")
+        else:
+            lines.append(f"  {_render_fallback_text(row)}")
+    return lines
+
+
+def _sync_counts_line(sync: dict[str, Any]) -> str:
+    return (f"imported {len(_field_list(sync, 'imported'))} / "
+            f"skipped {_stated_count(sync, 'skipped_existing')} / "
+            f"changed {len(_field_list(sync, 'changed'))}")
+
+
+def _sync_detail_lines(sync: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for row in _field_list(sync, "imported"):
+        lines.append("  " + (_project_file_line(row) if isinstance(row, dict)
+                             else _render_fallback_text(row)))
+    changed = _field_list(sync, "changed")
+    if changed:
+        lines.append("changed on disk (not replaced; delete and re-sync to update):")
+        for row in changed:
+            if isinstance(row, dict):
+                lines.append(f"  {row.get('rel_realpath', '<unknown>')}  "
+                             f"({str(row.get('project_file_id', ''))[:8]})")
+            else:
+                lines.append(f"  {_render_fallback_text(row)}")
+    not_elf = sync.get("skipped_not_elf")
+    if isinstance(not_elf, int) and not isinstance(not_elf, bool) and not_elf:
+        lines.append(f"skipped (not ELF): {not_elf}")
+    for note in _field_list(sync, "notes"):
+        lines.append(f"note: {note}")
+    return lines
+
+
+@_discloses
+def _render_project_sync_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [f"rootfs: {value.get('root', '<unknown>')}  ({value.get('platform', '<unknown>')})"]
+    lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+    lines.append(_sync_counts_line(value))
+    lines.extend(_sync_detail_lines(value))
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_init_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    markers = ", ".join(str(m) for m in _field_list(value, "markers")) or _EMPTY_RESULT
+    lines = [
+        f"rootfs: {value.get('root', '<unknown>')}",
+        f"\tplatform: {value.get('platform', '<unknown>')}  (markers: {markers})",
+    ]
+    path = value.get("project_path", "<unknown>")
+    if value.get("dry_run"):
+        state = "exists" if value.get("project_exists") else "new"
+        lines.append(f"project: {path}  [{state}]")
+        lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+        lines.append(f"candidate libraries: {_stated_count(value, 'candidate_libraries')}")
+        for note in _field_list(value, "notes"):
+            lines.append(f"note: {note}")
+        lines.append("dry-run: nothing was created, opened or imported")
+        return "\n".join(lines)
+    if value.get("attached"):
+        state = "attached"
+    elif value.get("created"):
+        state = "created"
+    else:
+        state = "opened"
+    instance = value.get("instance")
+    lines.insert(0, f"project: {path}  [{state}]"
+                 + (f"  instance: {instance}" if instance else ""))
+    sync = _field_dict(value, "sync")
+    if sync:
+        lines.extend(_lookup_path_lines(_field_list(sync, "lookup_paths")))
+        lines.append("libraries: " + _sync_counts_line(sync))
+        lines.extend(_sync_detail_lines(sync))
+    else:
+        lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+        error = _text_value(value, "sync_error")
+        if error:
+            lines.append(f"libraries: sync FAILED -- {error}")
+        elif value.get("platform") == "unknown":
+            lines.append("libraries: not synced (platform unknown: no loader lookup paths)")
+        else:
+            lines.append("libraries: not synced (--no-libs); `bn project libs --sync` imports them")
+    lines.append("next: `bn project files` lists the project; "
+                 "`bn project load <path-in-project>` opens a file and links its imports")
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_libs_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    head = f"rootfs: {value.get('root', '<unknown>')}  ({value.get('platform', '<unknown>')})"
+    if value.get("synced_at"):
+        head += f"  synced: {value['synced_at']}"
+    libs = _field_list(value, "libs")
+    if not libs:
+        return head + "\n" + _empty_result("rootfs libraries") + "; `bn project libs --sync` imports them"
+    lines = [head]
+    for row in libs:
+        if not isinstance(row, dict):
+            lines.append(_render_fallback_text(row))
+            continue
+        elf_class = row.get("elf_class")
+        machine = row.get("e_machine")
+        kind = f"{elf_class if elf_class is not None else '?'}/{machine if machine is not None else '?'}"
+        names = ", ".join(str(n) for n in _field_list(row, "names"))
+        soname = _text_value(row, "soname")
+        if soname is None and _field_present(row, "soname"):
+            soname = _render_fallback_text(row["soname"])
+        line = (f"{str(row.get('project_file_id', ''))[:8]:<8}  {kind:<7}  "
+                f"{soname or '-':<24}  {row.get('project_path', '<unknown>')}  {names}")
+        if row.get("sibling_database_id"):
+            line += f"  [db {str(row['sibling_database_id'])[:8]}]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _project_link_lines(link: dict[str, Any]) -> list[str]:
+    """The lines both `project link` views share: the libraries table, the
+    counts line, the unresolved imports and the ambiguities."""
+    lines: list[str] = []
+    for row in _row_list(link, "libraries"):
+        name = _text_value(row, "name") or "<unknown>"
+        if row.get("resolved"):
+            lines.append(f"  {name:<24} -> {_text_value(row, 'project_path') or '<unknown>'}"
+                         f"  ({_text_value(row, 'backing') or 'raw'})")
+        else:
+            lines.append(f"  {name:<24} -> (not in project)")
+    unresolved = _row_list(link, "unresolved")
+    unresolved_count = (len(unresolved) if _field_present(link, "unresolved")
+                        and not _field_skewed("unresolved") else None)
+    lines.append(f"linked {_fmt_count(link.get('linked'))}  "
+                 f"relinked {_fmt_count(link.get('relinked'))}  "
+                 f"unresolved {_fmt_count(unresolved_count)}")
+    for row in _row_list(link, "unresolved"):
+        lines.append(f"  {_text_value(row, 'symbol') or '<unknown>'}  "
+                     f"{_text_value(row, 'reason') or ''}".rstrip())
+    ambiguous = _field_list(link, "ambiguous_libraries")
+    if ambiguous:
+        lines.append("ambiguous (first lookup-path match used): "
+                     + ", ".join(_render_fallback_text(a) if not isinstance(a, str) else a
+                                 for a in ambiguous))
+    return lines
+
+
+@_discloses
+def _render_project_link_text(value: Any) -> str:
+    """The `--verbose` view of `project link`: status, then the shared lines."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    status = _text_value(value, "status") or "<unknown>"
+    head = f"project link: {status}" + ("  [preview]" if value.get("preview") or value.get("dry_run") else "")
+    lines = [head, "libraries:"]
+    lines.extend(_project_link_lines(value))
+    scope = [str(s) for s in _field_list(value, "scope")]
+    if scope:
+        lines.append("scope: " + ", ".join(scope))
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_export_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return (f"exported: {value.get('dest', '<unknown>')}"
+            f"\n\tproject file: {value.get('project_file_id', '<unknown>')}")
+
+
+@_discloses
+def _render_project_delete_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"deleted: {value.get('project_file_id', '<unknown>')}"
+
+
+@_discloses
+def _render_project_close_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [f"closed project: {value.get('path', '<unknown>')}"]
+    closed = _field_list(value, "targets_closed")
+    if not closed:
+        lines.append(_empty_result("targets closed"))
+        return "\n".join(lines)
+    lines.append("targets closed:")
+    unsaved_any = False
+    for row in closed:
+        if not isinstance(row, dict):
+            lines.append(f"- {_render_fallback_text(row)}")
+            continue
+        unsaved = row.get("unsaved") is True
+        unsaved_any = unsaved_any or unsaved
+        marker = "  [unsaved changes discarded]" if unsaved else ""
+        lines.append(f"- {row.get('path', '<unknown>')}{marker}")
+    if unsaved_any:
+        lines.append("")
+        lines.append("warning: unsaved mutations were discarded (--force).")
+    return "\n".join(lines)
+
+
+_FINDING_CAVEAT = (
+    "Freshness checks evidence currency, not claim truth; acceptance requires explicit review."
+)
+
+
+def _finding_heading(row: dict[str, Any]) -> str:
+    for key in ("id", "type", "review_state", "freshness"):
+        _text_value(row, key)
+    _count_field(row, "revision")
+    return (f"{row.get('id', '<unknown>')} r{row.get('revision', '?')} "
+            f"type={row.get('type', '<unknown>')} "
+            f"review={row.get('review_state', '<unknown>')} "
+            f"freshness={row.get('freshness', 'unknown')}")
+
+
+def _finding_detail_lines(row: dict[str, Any]) -> list[str]:
+    lines = [_finding_heading(row)]
+    # Validate known shapes for disclosure, but render the original values:
+    # malformed qualifications must not disappear into fake empty containers.
+    for key in ("claim", "kind", "author", "claim_revision", "scope", "scope_evidence",
+                "assumptions", "limitations", "next_steps", "dependencies", "tags", "evidence",
+                "reviews", "freshness_reasons", "reasons", "checks", "replacement",
+                "latest_revision", "created_at", "updated_at", "action"):
+        if key not in row:
+            continue
+        value = row[key]
+        if key in ("scope", "scope_evidence", "assumptions", "limitations",
+                   "next_steps", "dependencies", "tags", "evidence", "reviews",
+                   "freshness_reasons", "reasons", "checks"):
+            _field_list(row, key)
+            if isinstance(value, list):
+                if not value:
+                    continue
+                lines.append(f"{key}:")
+                lines.extend(f"  - {json.dumps(item, ensure_ascii=False)}" for item in value)
+            else:
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        else:
+            if key == "action":
+                _field_dict(row, key)
+            elif key in ("claim_revision", "latest_revision"):
+                _count_field(row, key)
+            else:
+                _text_value(row, key)
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+    return lines
+
+
+@_discloses
+def _render_project_finding_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "\n".join([*_finding_detail_lines(value), _FINDING_CAVEAT])
+
+
+def _finding_page_line(value: dict[str, Any]) -> str:
+    return (f"total={value.get('total', '?')} offset={value.get('offset', '?')} "
+            f"limit={value.get('limit', '?')} "
+            f"has_more={str(value.get('has_more', '?')).lower()}")
+
+
+@_discloses
+def _render_project_findings_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [_finding_page_line(value)]
+    rows = _field_list(value, "items")
+    if _field_skewed("items"):
+        lines.append(f"items: {json.dumps(value['items'], ensure_ascii=False)}")
+    elif not rows:
+        lines.append("No findings.")
+    for index, row in enumerate(rows):
+        if isinstance(row, dict):
+            lines.extend(_finding_detail_lines(row))
+        else:
+            _record_skew(f"items[{index}]")
+            lines.append(json.dumps(row, ensure_ascii=False))
+    lines.append(_FINDING_CAVEAT)
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_finding_context_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [_finding_page_line(value)]
+    # Record shape mismatches without disguising their raw payload as an empty
+    # group. The other groups can still carry usable findings.
+    groups = _field_dict(value, "groups")
+    if _field_skewed("groups"):
+        lines.append(f"groups: {json.dumps(value['groups'], ensure_ascii=False)}")
+    for group in groups:
+        rows = _field_list(groups, group)
+        lines.append(f"{group}:")
+        if groups[group] is not None and not isinstance(groups[group], list):
+            lines.append(f"  {json.dumps(groups[group], ensure_ascii=False)}")
+        elif not rows:
+            lines.append("  No findings.")
+        for index, row in enumerate(rows):
+            if isinstance(row, dict):
+                detail = _finding_detail_lines(row)
+            else:
+                _record_skew(f"{group}[{index}]")
+                detail = [json.dumps(row, ensure_ascii=False)]
+            lines.extend(f"  {line}" for line in detail)
+    lines.append(_FINDING_CAVEAT)
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_finding_check_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "\n".join([*_finding_detail_lines(value),
+                      "Read-only check: no review was added.", _FINDING_CAVEAT])
+
+
+@_discloses
+def _render_project_finding_types_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = ["Finding types (counts of latest records):"]
+    for row in _field_list(value, "types"):
+        if not isinstance(row, dict):
+            lines.append(_render_fallback_text(row))
+            continue
+        lines.append(f"{row.get('type', '<unknown>')} count={row.get('count', '?')}")
+        lines.append(f"  description: {row.get('description', '')}")
+        lines.append(f"  action: {row.get('action', '')}")
+    return "\n".join(lines)
 
 
 @_discloses
@@ -1720,6 +2187,10 @@ def _render_session_list_text(value: Any) -> str:
             parts.append(f"rss={rss}MB")
         if item.get("started_at"):
             parts.append(f"started={item['started_at']}")
+        # The project this bridge owns, when it publishes one.
+        project = _field_dict(item, "project")
+        if project and project.get("name"):
+            parts.append(f"project={project['name']}")
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
@@ -1836,6 +2307,9 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         # copies exported from it -- which are never where it saves or
         # restarts from.
         ("database", value.get("database_path")),
+        # The path-in-project of a project-backed target;
+        # absent (empty) on a standalone target, so the row drops out.
+        ("project", value.get("project_path")),
         ("exported to", ", ".join(str(p) for p in _field_list(value, "exports"))),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),
@@ -7707,6 +8181,91 @@ def _go_rename_summary(value: Any) -> Any:
     return summary
 
 
+_PROJECT_LINK_STATUSES = ("verified", "noop", "verification_failed")
+
+
+@_discloses_in_summary
+def _project_link_summary(value: Any) -> Any:
+    """Compact status for `project link`, which reports through its OWN
+    counters (`linked`, `relinked`, `already_linked`, the `unresolved` rows) and
+    a single `status` rather than `results[]`.
+
+    Derives the shared builder's inputs from those, so the compact schema, the
+    `first_error` and `dirty_after` rules are the ones every mutation shares.
+    `measured` is DERIVED from whether the counters read (an unreadable one
+    must reach the exit-4 fail-safe, never render as a confident zero).
+    """
+    if not isinstance(value, dict):
+        return _mutation_summary(value)
+    token = _SKEWED_FIELDS.set([])
+    try:
+        linked = _count_field(value, "linked")
+        relinked = _count_field(value, "relinked")
+        already = _count_field(value, "already_linked")
+        unresolved = _row_list(value, "unresolved")
+        libraries = _row_list(value, "libraries")
+        status = _text_value(value, "status")
+        unreadable = list(_SKEWED_FIELDS.get() or ())
+    finally:
+        _SKEWED_FIELDS.reset(token)
+    for key in unreadable:
+        _record_skew(key)
+    status_known = status in _PROJECT_LINK_STATUSES
+    failed_status = status == "verification_failed"
+    preview = bool(value.get("preview", value.get("dry_run", False)))
+    reported_success = bool(value.get("success", not failed_status)) and not failed_status
+    committed = bool(value.get("committed", (not preview) and reported_success))
+    changed = linked + relinked
+    # The bridge reads every assignment back; `verified` is what read back,
+    # which on a verified run is everything it wrote.
+    measured = (not unreadable and status_known
+                and value.get("measured") is not False
+                and all(_field_present(value, key) for key in
+                        ("linked", "relinked", "already_linked", "unresolved")))
+    failure_rows = ([{"status": status, "message": _text_value(value, "message")}]
+                    if failed_status else [])
+    summary = _build_mutation_summary(
+        measured=measured,
+        unusable=bool(unreadable) or not status_known,
+        unmeasured_cause=(
+            "this op's own counters could not be read" if unreadable
+            else f"this op reported an unknown status {status!r}" if not status_known
+            else "this op reported no counters"),
+        op_count=changed + already + len(unresolved),
+        reported_success=reported_success,
+        failure_rows=failure_rows,
+        failed=1 if failed_status else 0,
+        changed=changed,
+        verified=changed if not failed_status else 0,
+        noop=already,
+        committed=committed,
+        preview=preview,
+        rolled_back=value.get("rolled_back"),
+        message=_text_value(value, "message"),
+        default_error="project link failed",
+    )
+    # Unlike results[] summaries, this total is derived from the op's counters,
+    # not a count of rows we actually received. Missing counters mean unknown.
+    if not measured:
+        summary["op_count"] = None
+    # Link writes are not rolled back after a readback failure.
+    if failed_status and not preview and changed:
+        summary["dirty_after"] = True
+    summary["project_link"] = {
+        "status": status,
+        "linked": linked if _field_present(value, "linked") and "linked" not in unreadable else None,
+        "relinked": relinked if _field_present(value, "relinked") and "relinked" not in unreadable else None,
+        "already_linked": already if _field_present(value, "already_linked")
+        and "already_linked" not in unreadable else None,
+        "libraries": libraries,
+        "unresolved": unresolved if _field_present(value, "unresolved")
+        and "unresolved" not in unreadable else None,
+        "ambiguous_libraries": _field_list(value, "ambiguous_libraries"),
+    }
+    return summary
+
+
+
 @_discloses
 def _render_mutation_summary_text(value: Any, *,
                                   save_command: Callable[[], str] | None = None) -> str:
@@ -7836,6 +8395,8 @@ def _render_mutation_summary_text(value: Any, *,
                 "skipped_interior_pc", "skipped_changed_during_apply",
             )
         )
+    if _field_declared(value, "project_link"):
+        line += "\n" + "\n".join(_project_link_lines(_field_dict(value, "project_link")))
     if _field_declared(value, "preview_skipped"):
         # #999 item 5: one line per op the preview left out, so the line above
         # is never read as covering the whole batch.

@@ -15,6 +15,8 @@ Use `bn` for Binary Ninja reads and writes through the bridge. Choose a methodol
 - Bound large reads with `--limit`, `--lines`, `--out`, or `--estimate-output`. `BN_SPILL_TOKENS` opt-in replaces oversized stdout with an artifact envelope, so a pipe may search the envelope rather than the data. Check stderr and the envelope before concluding that a search had no match.
 - For a bounds, access-width, or branch-predicate claim, confirm the relevant instructions with `bn disasm`. Include a preceding Thumb `IT` instruction when its condition governs the window.
 
+- Optional project workflows require the separately installed `bn-projects` skill: `bn skill install projects`.
+
 ## Command index
 
 - **Read** — `target info/list`, `function list/search/info/cfg/structured-il`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `evidence function/xrefs/table/message/init/calls/orient/surface/virtual-call`, `trace`, `dataflow defuse/callgraph/values`, `taint forward/backward/models`, `go functions`, `proto get`, `local list`, `data vars/symbols`, `read`, `types [show]`, `struct show`, `class list/show`, `strings`, `imports`, `exports`, `sections`, `tag list/get/types`, `comment list/get`, `bundle function` → `reference/reading.md`
