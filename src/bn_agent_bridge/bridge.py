@@ -28,6 +28,7 @@ from binaryninja.plugin import PluginCommand
 from . import create_comments
 from . import il_format
 from . import mutation_engine
+from . import project_ops
 from . import read_decompile
 from . import read_class
 from . import read_evidence
@@ -715,6 +716,32 @@ def _path_components(path: str) -> tuple[str, ...]:
     return tuple(p for p in path.split(os.sep) if p)
 
 
+def _project_components(path: str) -> tuple[str, ...]:
+    """Components of a path IN a project (`/fw/app.bndb`), which BN joins with
+    `/` on every platform -- unlike a filename, which splits on os.sep."""
+    return tuple(p for p in (path or "").split("/") if p)
+
+
+def _project_file_of(bv) -> Any | None:
+    """*bv*'s `ProjectFile` when it was loaded through a project, else None.
+
+    Judged by the real BN class, never by attribute presence: a fake view in a
+    test (or a wrapper with a permissive __getattr__) must not look
+    project-backed, because that diverts its SAVE (BNPR_PLAN.md §5.2)."""
+    try:
+        import binaryninja
+    except Exception:  # noqa: BLE001
+        return None
+    cls = getattr(binaryninja, "ProjectFile", None)
+    if not isinstance(cls, type):
+        return None
+    try:
+        pf = getattr(bv, "project_file", None)
+    except Exception:  # noqa: BLE001
+        return None
+    return pf if isinstance(pf, cls) else None
+
+
 @dataclass(slots=True)
 class TargetRecord:
     view_id: str
@@ -723,6 +750,12 @@ class TargetRecord:
     filename: str
     basename: str
     view_name: str
+    # BNPR_PLAN.md §5.3: set only for a view loaded through a project. The
+    # filename of such a view is an opaque blob path (F1), so these are what a
+    # human selector names.
+    project_file_id: str = ""
+    project_path: str = ""    # path IN the project, `/fw/app.bndb`
+    project_name: str = ""    # the project file's name, `app.bndb`
 
     def target_id(self) -> str:
         return f"{os.getpid()}:{self.view_id}:{self.session_id}"
@@ -752,6 +785,12 @@ class TargetManager:
         # discard annotations. We track dirtiness ourselves: set on a committed
         # change, cleared on save, surfaced by close. (L15)
         self._dirty_view_ids: set[str] = set()
+        # view_id -> (project file id, path in project) of the DATABASE project
+        # file this bridge created for a raw project view. BN keeps reporting
+        # the RAW file as `bv.project_file` after that first save (BNPR_PLAN.md
+        # F4), so the record must carry the truth itself; pruned to the live
+        # set on a complete refresh like `_database_paths`.
+        self._project_bindings: dict[str, tuple[str, str]] = {}
         # Stable view_id -> the .bndb that actually BACKS this view's analysis.
         #
         # Needed because `filename` cannot answer it: `_save_database` restores
@@ -833,6 +872,7 @@ class TargetManager:
                 vid: dict(ledger)
                 for vid, ledger in predecessor._session_annotations.items()
             }
+            self._project_bindings = dict(predecessor._project_bindings)
             predecessor._successor = self
 
     def _stable_view_id(self, bv) -> str | None:
@@ -1040,6 +1080,32 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             return vid is not None and vid in self._dirty_view_ids
 
+    def note_project_database(self, bv, file_id: str, project_path: str) -> None:
+        """Record that *bv* is now backed by project file *file_id* (F4)."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is not None:
+                self._project_bindings[vid] = (file_id, project_path)
+            successor = self._successor
+        if successor is not None:
+            successor.note_project_database(bv, file_id, project_path)
+
+    def project_binding(self, bv) -> tuple[str, str] | None:
+        """``(project file id, path in project)`` of the database this bridge
+        created for *bv*, or None when *bv* was never saved that way."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return self._project_bindings.get(vid) if vid is not None else None
+
+    def view_for_project_file(self, file_id: str):
+        """The open view loaded from project file *file_id* (as of the last
+        refresh), or None. The project-target analogue of a path dedup."""
+        with self._lock:
+            for record in self._records.values():
+                if record.project_file_id == file_id:
+                    return record.view
+        return None
+
     def forget(self, bv) -> None:
         """Release *bv*'s record, id mapping, and dirty-tracking entry when
         the view is closed.
@@ -1071,6 +1137,7 @@ class TargetManager:
                 self._database_identities.pop(vid, None)
                 self._exports.pop(vid, None)
                 self._session_annotations.pop(vid, None)
+                self._project_bindings.pop(vid, None)
                 self._records.pop(vid, None)
                 self._ids_by_object.pop(bv, None)
             successor = self._successor
@@ -1115,14 +1182,26 @@ class TargetManager:
             for variant, kind in self._tail_variants(parts):
                 for depth in range(1, len(variant) + 1):
                     _index(tails, variant[-depth:], vid, kind)
+            # A project target is also named by its path IN the project
+            # (BNPR_PLAN.md §5.3); index those components like a filename's.
+            for variant, kind in self._tail_variants(_project_components(record.project_path)):
+                for depth in range(1, len(variant) + 1):
+                    _index(tails, variant[-depth:], vid, kind)
         saved_pairs = self._saved_pairs(records)
 
         selectors: dict[str, str] = {}
         for vid, record in records.items():
             parts = paths[vid]
             chosen = record.target_id()
-            for depth in range(1, len(parts) + 1):
-                candidate = os.sep.join(parts[-depth:])
+            # A project target advertises its path in the project (shortest
+            # unique suffix, `app.bndb` before `fw/app.bndb`) ahead of any
+            # suffix of its opaque blob filename.
+            project_parts = _project_components(record.project_path)
+            candidates = [
+                "/".join(project_parts[-depth:])
+                for depth in range(1, len(project_parts) + 1)
+            ] + [os.sep.join(parts[-depth:]) for depth in range(1, len(parts) + 1)]
+            for candidate in candidates:
                 normalized = candidate.strip()
                 if normalized in ("", "active"):
                     continue
@@ -1173,6 +1252,15 @@ class TargetManager:
                 c in "0123456789abcdef" for c in digest
             ):
                 aliases.append((stem, self._STRIPPED))
+        if record.project_file_id:
+            # BNPR_PLAN.md §5.3: a project target answers to its path in the
+            # project (leading slash optional), its file id and its file name.
+            aliases.append((record.project_path, self._STRONG))
+            aliases.append((record.project_path.lstrip("/"), self._STRONG))
+            aliases.append((record.project_file_id, self._STRONG))
+            aliases.append((record.project_name, self._STRONG))
+            if record.project_name.endswith(".bndb"):
+                aliases.append((record.project_name[: -len(".bndb")], self._STRIPPED))
         return [(alias, kind) for alias, kind in aliases if alias]
 
     def _tail_variants(self, parts: tuple[str, ...]) -> list[tuple[tuple[str, ...], str]]:
@@ -1209,11 +1297,15 @@ class TargetManager:
                 found = kind
         suffix = _path_components(candidate)
         if suffix:
-            for variant, kind in self._tail_variants(_path_components(record.filename)):
-                if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
-                    if kind == self._STRONG:
-                        return kind
-                    found = kind
+            sources = [_path_components(record.filename)]
+            if record.project_path:
+                sources.append(_project_components(record.project_path))
+            for parts in sources:
+                for variant, kind in self._tail_variants(parts):
+                    if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
+                        if kind == self._STRONG:
+                            return kind
+                        found = kind
         return found
 
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
@@ -1418,6 +1510,22 @@ class TargetManager:
                 except Exception:
                     filename = ""
 
+                project_file_id = project_path = project_name = ""
+                pf = _project_file_of(bv)
+                if pf is not None:
+                    try:
+                        project_file_id = str(pf.id)
+                        project_name = str(pf.name)
+                        project_path = project_ops.ProjectManager.path_in_project(pf)
+                    except Exception:  # noqa: BLE001 - a view BN cannot describe is not a project target
+                        project_file_id = project_path = project_name = ""
+                # F4: after a first save BN still names the RAW project file;
+                # the database file this bridge created wins.
+                binding = self._project_bindings.get(view_id)
+                if binding is not None:
+                    project_file_id, project_path = binding
+                    project_name = project_path.rsplit("/", 1)[-1]
+
                 alive[view_id] = TargetRecord(
                     view_id=view_id,
                     view=bv,
@@ -1425,6 +1533,9 @@ class TargetManager:
                     filename=filename,
                     basename=os.path.basename(filename) if filename else "",
                     view_name=self._view_name(bv),
+                    project_file_id=project_file_id,
+                    project_path=project_path,
+                    project_name=project_name,
                 )
 
             self._records = alive
@@ -1464,6 +1575,10 @@ class TargetManager:
                 }
                 self._session_annotations = {
                     vid: ledger for vid, ledger in self._session_annotations.items()
+                    if vid in alive
+                }
+                self._project_bindings = {
+                    vid: binding for vid, binding in self._project_bindings.items()
                     if vid in alive
                 }
                 # The provenance verdicts and open-time annotation records,
@@ -1540,6 +1655,11 @@ class TargetManager:
                         # judged for (a raw load, a database with no record or
                         # no sibling). The load note is one-shot; this is not.
                         "source_verified": _source_verified.get(record.session_id),
+                        # BNPR_PLAN.md §5.3: empty for a view not loaded through
+                        # a project.
+                        "project_file_id": record.project_file_id,
+                        "project_path": record.project_path,
+                        "project_name": record.project_name,
                     }
                 )
             return result
@@ -2033,6 +2153,9 @@ class BinaryNinjaBridge:
         # It records its holder and waiters so a queued writer is observable
         # (`write_gate_status`) and refusable (`no_wait`) rather than silent (#976).
         self._write_gate = _WriteGate()
+        # BNPR_PLAN.md §3: at most one open project per bridge; the manager owns
+        # the BN handle and the file-selector grammar.
+        self.projects = project_ops.ProjectManager()
         self._request_state_lock = threading.Lock()
         self._requests_drained = threading.Condition(self._request_state_lock)
         self._request_threads: dict[threading.Thread, int] = {}
@@ -2075,6 +2198,7 @@ class BinaryNinjaBridge:
         self.targets.succeed(predecessor.targets)
         self._write_gate = predecessor._write_gate
         self._target_lock = predecessor._target_lock
+        self.projects = predecessor.projects
         self._predecessors = [weakref.ref(predecessor)] + [
             ref for ref in predecessor._predecessors if ref() is not None
         ]
@@ -2495,6 +2619,7 @@ class BinaryNinjaBridge:
         # biggest usability win for the many-bridges case. Best-effort: a registry
         # write must never fail because target enumeration hiccuped.
         binaries: list[str] = []
+        project_targets: list[dict[str, Any]] = []
         try:
             seen: set[str] = set()
             for rec in self.targets.refresh():
@@ -2502,10 +2627,28 @@ class BinaryNinjaBridge:
                 if fn and fn not in seen:
                     seen.add(fn)
                     binaries.append(str(fn))
+                if isinstance(rec, dict) and rec.get("project_file_id"):
+                    project_targets.append({
+                        "target_id": rec.get("target_id"),
+                        "view_id": rec.get("view_id"),
+                        "project_file_id": rec.get("project_file_id"),
+                        "project_path": rec.get("project_path"),
+                    })
             binaries.sort()
         except Exception:
             binaries = []
+            project_targets = []
         payload["binaries"] = binaries
+        # BNPR_PLAN.md §5.4: the owned project and its open targets, so another
+        # bridge's `project_open` can refuse (§5.5) and `session restart` can
+        # replay by (project path, file id) rather than by blob filename (F2).
+        project_state = self.projects.current
+        payload["project"] = (
+            {"path": project_state.path, "id": project_state.project_id,
+             "name": project_state.name}
+            if project_state is not None else None
+        )
+        payload["project_targets"] = project_targets
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists. Under the
         # teardown latch (#694): a detached load worker that finishes after stop()
@@ -3324,6 +3467,155 @@ class BinaryNinjaBridge:
                         _load_in_progress.pop(key, None)
                 waiter.set()
 
+    def _project_load(self, selector: Any, *, prefer_bndb: bool = True, quick: bool = False,
+                      workdir: str | None = None):
+        """`bn project load` (BNPR_PLAN.md §5.2): open a project file as a target.
+
+        The lean sibling of `_load_binary`, with the same lock discipline
+        (exclusive only around the BN open and the publish; analysis unlocked),
+        the same #609 leak cleanup, and dedup by identity -- here the project
+        file id, since a project view's filename is an opaque blob path (F1).
+        Sidecar/cache substitution does not apply; the project analogue is the
+        `<name>.bndb` sibling project file, preferred unless *prefer_bndb* is
+        false. A database-backed file carries its analysis, so `quick` is a
+        no-op there, as for a `.bndb` load.
+        """
+        manager = self.projects
+        manager.require()
+        pf = manager.resolve_file(selector)
+        notes: list[str] = []
+        substituted_from: str | None = None
+        if prefer_bndb:
+            sibling = manager.sibling_database(pf)
+            if sibling is not None:
+                notes.append(
+                    f"Loaded the project database {manager.path_in_project(sibling)} "
+                    f"instead of the raw file {manager.path_in_project(pf)} "
+                    "(pass --no-bndb to open the raw bytes)"
+                )
+                substituted_from = str(pf.id)
+                pf = sibling
+        file_id = str(pf.id)
+        project_path = manager.path_in_project(pf)
+
+        # One in-flight open per project file, like `_load_binary`'s per-path
+        # waiter: a second `project load` of the same file waits, then dedups.
+        load_key = f"project:{file_id}"
+        while True:
+            targets = self.targets.refresh()
+            existing = self.targets.view_for_project_file(file_id)
+            if existing is not None:
+                return {
+                    "loaded": False,
+                    "already_open": True,
+                    "path": str(getattr(pf, "path_on_disk", "") or ""),
+                    "project_file_id": file_id,
+                    "project_path": project_path,
+                    "substituted_from": substituted_from,
+                    "notes": notes,
+                    "targets": targets,
+                    "target": self._loaded_target_row(targets, existing),
+                }
+            with _load_in_progress_lock:
+                busy = _load_in_progress.get(load_key)
+                if busy is None:
+                    waiter = threading.Event()
+                    _load_in_progress[load_key] = waiter
+                    break
+            busy.wait()
+
+        import binaryninja
+
+        bv = None
+        published = False
+        try:
+            try:
+                with self._target_lock.write():
+                    bv = binaryninja.load(pf, update_analysis=False)
+            except Exception as exc:  # noqa: BLE001 - surface BN open failures cleanly
+                raise RuntimeError(
+                    f"Unable to open project file {project_path}: {exc}. The file may "
+                    "be corrupt, truncated, or an unsupported format."
+                ) from exc
+            if bv is None:
+                raise RuntimeError(f"Failed to open project file: {project_path}")
+
+            has_database = bool(getattr(bv.file, "has_database", False))
+            quick_effective = bool(quick) and not has_database
+            if quick_effective:
+                notes.append(
+                    "Quick load: sections/imports/symbols are ready; strings and the "
+                    "full function set need `bn refresh`."
+                )
+                _quick_loaded_views.add(bv)
+            elif not has_database:
+                # Slow phase, deliberately OUTSIDE the lock. bv is still
+                # unpublished, so concurrent reads cannot touch it.
+                bv.update_analysis_and_wait()
+                _quick_loaded_views.discard(bv)
+
+            with self._target_lock.write():
+                with _headless_views_lock:
+                    _headless_views.append(bv)
+                    published = True  # latched: view now owned by _headless_views
+                targets = self.targets.refresh()
+                loaded_target = self._loaded_target_row(targets, bv)
+                if loaded_target and loaded_target.get("selector_reason"):
+                    notes.append(
+                        f"Target selector: pass {target_option(loaded_target['selector'])} "
+                        f"({loaded_target['selector_reason']})"
+                    )
+            self._record_project_root(workdir)
+            self._write_registry()
+            return {
+                "loaded": True,
+                "path": str(getattr(bv.file, "filename", "") or ""),
+                "project_file_id": file_id,
+                "project_path": project_path,
+                "substituted_from": substituted_from,
+                "analyzed": not quick_effective,
+                "analysis_state": "quick" if quick_effective else "full",
+                "notes": notes,
+                "targets": targets,
+                "target": loaded_target,
+            }
+        except BaseException:
+            # #609 parity: a view opened but never published is otherwise leaked
+            # -- invisible to `target list`, uncloseable via `bn close`.
+            if bv is not None and not published:
+                with contextlib.suppress(Exception):
+                    _run_on_main_thread(lambda: bv.file.close())
+                _quick_loaded_views.discard(bv)
+            raise
+        finally:
+            with _load_in_progress_lock:
+                if _load_in_progress.get(load_key) is waiter:
+                    _load_in_progress.pop(load_key, None)
+            waiter.set()
+
+    def _project_close(self, *, force: bool = False):
+        """`bn project close` (BNPR_PLAN.md §5.2): close every target loaded
+        from the project, then release the project. Refuses while any of them
+        holds a committed-but-unsaved mutation unless *force*. Targets close
+        through `_close_binary` by PINNED identity, so no selector convenience
+        can land the close on another view."""
+        state = self.projects.require()
+        rows = [row for row in self.targets.refresh() if row.get("project_file_id")]
+        dirty = [row for row in rows if row.get("unsaved")]
+        if dirty and not force:
+            names = ", ".join(str(row.get("selector") or row.get("target_id")) for row in dirty)
+            raise RuntimeError(
+                f"project {state.name} has unsaved targets: {names}. Save them "
+                "(`bn save -t <selector>`) or pass --force to discard the changes."
+            )
+        closed: list[dict[str, Any]] = []
+        for row in rows:
+            result = self._close_binary(target=PinnedTarget(str(row["target_id"])))
+            closed.extend(result.get("closed", []))
+        self.projects.close()
+        self._write_registry()
+        return {"closed": True, "path": state.path, "targets_closed": closed}
+
     def _close_binary(self, path: str | None = None, target: str | None = None, all_: bool = False):
         def _snapshot(bv) -> dict[str, Any]:
             # Binary Ninja's generic modified bit also covers analysis/cache
@@ -3633,6 +3925,11 @@ class BinaryNinjaBridge:
                     "omit it to save to the default <filename>.bndb"
                 )
         bv = self.targets.resolve(target)
+        # BNPR_PLAN.md §5.2: a project-backed view is persisted through the
+        # project API (F3/F5), never by filename suffix -- the standalone path
+        # below would write an untracked stray blob inside the .bnpr.
+        if _project_file_of(bv) is not None:
+            return project_ops.save_project_database(self, bv, path)
         filename = getattr(bv.file, "filename", "")
         explicit = path is not None
         if path:
@@ -5537,6 +5834,61 @@ def _bind_close_binary(bridge, params, target):
 @op("save_database", lock="write", destructive=True)
 def _bind_save_database(bridge, params, target):
     return bridge._save_database(target, params.get("path"))
+
+
+# -- Binary Ninja projects (BNPR_PLAN.md §5.2). Lock classes are part of the
+# contract: metadata mutations and open/close are exclusive; listings are
+# reads; `project_load` self-manages like `load_binary` so a multi-minute
+# analysis never holds the dispatcher lock.
+
+@op("project_open", lock="write")
+def _bind_project_open(bridge, params, target):
+    return project_ops.project_open(bridge, params.get("path"))
+
+
+@op("project_close", lock="write")
+def _bind_project_close(bridge, params, target):
+    return bridge._project_close(
+        force=_validate_bool(params.get("force"), label="force", default=False))
+
+
+@op("project_info", lock="read")
+def _bind_project_info(bridge, params, target):
+    return project_ops.project_info(bridge)
+
+
+@op("project_files", lock="read")
+def _bind_project_files(bridge, params, target):
+    return project_ops.project_files(
+        bridge, params.get("folder"),
+        recursive=_validate_bool(params.get("recursive"), label="recursive", default=True))
+
+
+@op("project_load", lock="none")
+def _bind_project_load(bridge, params, target):
+    return bridge._project_load(
+        params.get("selector"),
+        prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
+        quick=_validate_bool(params.get("quick"), label="quick", default=False),
+        workdir=params.get("workdir"),
+    )
+
+
+@op("project_import", lock="write")
+def _bind_project_import(bridge, params, target):
+    return project_ops.project_import(
+        bridge, params.get("path"), folder=params.get("folder"),
+        name=params.get("name"), description=params.get("description"))
+
+
+@op("project_export", lock="write")
+def _bind_project_export(bridge, params, target):
+    return project_ops.project_export(bridge, params.get("selector"), params.get("dest"))
+
+
+@op("project_delete", lock="write")
+def _bind_project_delete(bridge, params, target):
+    return project_ops.project_delete(bridge, params.get("selector"))
 
 
 @op("list_functions", lock="read")
