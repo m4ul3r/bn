@@ -1,17 +1,21 @@
 """`project_ops.ProjectManager` and its free functions against a fake project.
 
-Everything here is BNPR_PLAN.md §5.1/§5.2/§5.5 behaviour a `bn project ...`
-caller can observe: selector grammar, file rows, the F3 save recipe, the
-ownership guard. The fake `Project`/`ProjectFile`/`ProjectFolder` model the
-measured BN facts the plan lists (opaque extensionless blobs under `data/`,
+Everything here is behaviour a `bn project ...` caller can observe: selector
+grammar, file rows, the first-save recipe, the ownership guard. The fake
+`Project`/`ProjectFile`/`ProjectFolder` model measured BN behaviour (opaque
+extensionless blobs under `data/`,
 `create_file(b"")` writing nothing, `get_files_in_folder`).
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
+import subprocess
 import sys
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -50,7 +54,8 @@ def opened(po, bnpr, monkeypatch):
     manager = po.ProjectManager()
     monkeypatch.setattr(po, "find_other_owner", lambda path, *, self_pid: None)
     manager.open(str(bnpr), self_pid=os.getpid())
-    return manager, project
+    yield manager, project
+    manager.close()
 
 
 class FakeTargets:
@@ -156,6 +161,10 @@ def test_open_wraps_project_exception_with_the_licence_hint(po, bnpr, monkeypatc
     assert "could not open project" in text and "Failed to open project" in text
     assert "Commercial or Ultimate" in text
     assert manager.current is None
+    replacement = FakeProject(bnpr)
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(open_project=lambda path: replacement)
+    manager.open(str(bnpr), self_pid=os.getpid())
+    manager.close()
 
 
 def test_close_releases_the_handle_and_the_state(opened):
@@ -167,7 +176,339 @@ def test_close_releases_the_handle_and_the_state(opened):
         manager.require()
 
 
-# --- ownership guard (§5.5) ---------------------------------------------------
+def _subprocess_open(po, bnpr, tmp_path):
+    """An unrelated interpreter, registry and fake native handle."""
+    script = """
+import importlib, json, os, sys, types
+package = types.ModuleType("lease_test_bridge")
+package.__path__ = [sys.argv[1]]
+sys.modules[package.__name__] = package
+po = importlib.import_module("lease_test_bridge.project_ops")
+calls = []
+def native_open(path):
+    calls.append(path)
+    return types.SimpleNamespace(id="fake", name="fake", close=lambda: None)
+sys.modules["binaryninja"] = types.SimpleNamespace(
+    Project=types.SimpleNamespace(open_project=native_open))
+manager = po.ProjectManager()
+try:
+    manager.open(sys.argv[2], self_pid=os.getpid())
+except RuntimeError as exc:
+    result = {"opened": False, "error": str(exc), "native_calls": len(calls)}
+else:
+    result = {"opened": True, "native_calls": len(calls)}
+    manager.close()
+print(json.dumps(result))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(Path(po.__file__).parent), str(bnpr)],
+        env={**os.environ, "BN_CACHE_DIR": str(tmp_path / "independent-cache")},
+        text=True, capture_output=True, timeout=15, check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_lifetime_lease_blocks_independent_process_and_reopens(opened, po, bnpr, tmp_path):
+    manager, _ = opened
+    lock = bnpr / po._LEASE_FILENAME
+    inode = lock.stat().st_ino
+    refused = _subprocess_open(po, bnpr, tmp_path)
+    assert refused["opened"] is False
+    assert refused["native_calls"] == 0
+    assert "exclusive project lease is held" in refused["error"]
+    manager.close()
+    assert lock.stat().st_ino == inode
+    assert _subprocess_open(po, bnpr, tmp_path) == {"opened": True, "native_calls": 1}
+    manager.open(str(bnpr), self_pid=os.getpid())
+    assert lock.stat().st_ino == inode
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is False
+
+
+def test_lease_is_acquired_before_native_open(po, bnpr, monkeypatch, tmp_path):
+    monkeypatch.setattr(po, "find_other_owner", lambda path, *, self_pid: None)
+    project = FakeProject(bnpr)
+
+    def native_open(path):
+        refused = _subprocess_open(po, bnpr, tmp_path)
+        assert refused["opened"] is False
+        assert refused["native_calls"] == 0
+        return project
+
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(open_project=native_open)
+    manager = po.ProjectManager()
+    try:
+        manager.open(str(bnpr), self_pid=os.getpid())
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("failure", ["exception", "none", "interrupt"])
+def test_failed_open_releases_lease_and_descriptor(po, bnpr, monkeypatch, tmp_path, failure):
+    monkeypatch.setattr(po, "find_other_owner", lambda path, *, self_pid: None)
+    descriptors = []
+    flock = fcntl.flock
+
+    def record_flock(fd, operation):
+        descriptors.append(fd)
+        return flock(fd, operation)
+
+    monkeypatch.setattr(po.fcntl, "flock", record_flock)
+
+    def native_open(path):
+        if failure == "exception":
+            raise FakeProjectException("open failed")
+        if failure == "interrupt":
+            raise KeyboardInterrupt()
+        return None
+
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(open_project=native_open)
+    manager = po.ProjectManager()
+    with pytest.raises(KeyboardInterrupt if failure == "interrupt" else RuntimeError):
+        manager.open(str(bnpr), self_pid=os.getpid())
+    assert manager.current is None
+    assert manager._lease_fd is None
+    assert manager._gate_fd is None
+    assert len(descriptors) == 2
+    for fd in descriptors:
+        with pytest.raises(OSError) as closed:
+            os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
+
+
+def test_contended_open_closes_unused_descriptor(opened, po, bnpr, monkeypatch):
+    descriptors = []
+    flock = fcntl.flock
+
+    def record_flock(fd, operation):
+        descriptors.append(fd)
+        return flock(fd, operation)
+
+    monkeypatch.setattr(po.fcntl, "flock", record_flock)
+    competitor = po.ProjectManager()
+    with pytest.raises(RuntimeError, match="exclusive project lease"):
+        competitor.open(str(bnpr), self_pid=os.getpid())
+    assert competitor.current is None
+    assert competitor._lease_fd is None
+    assert competitor._gate_fd is None
+    assert len(descriptors) == 2
+    for fd in descriptors:
+        with pytest.raises(OSError) as closed:
+            os.fstat(fd)
+        assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("failure", ["exception", "false"])
+def test_failed_close_preserves_state_cache_and_lease(opened, po, bnpr, tmp_path, failure):
+    manager, project = opened
+    state = manager.current
+    manager.export_cache[("file", 1, 2)] = object()
+    original_close = project.close
+
+    def fail_close():
+        if failure == "false":
+            return False
+        raise FakeProjectException("close failed")
+
+    project.close = fail_close
+    try:
+        with pytest.raises(RuntimeError, match="could not close project"):
+            manager.close()
+        assert manager.current is state
+        assert manager.export_cache
+        assert _subprocess_open(po, bnpr, tmp_path)["opened"] is False
+    finally:
+        project.close = original_close
+    manager.close()
+    assert not manager.export_cache
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
+
+
+def test_inherited_manager_cannot_unlock_parent_lease(opened, po, bnpr, tmp_path):
+    manager, _ = opened
+    lease_fd = manager._lease_fd
+    pid = os.fork()
+    if pid == 0:
+        try:
+            try:
+                manager.close()
+            except RuntimeError as exc:
+                assert "after fork" in str(exc)
+            else:
+                raise AssertionError("inherited manager was usable")
+            assert not po._LEASE_OWNERS
+            try:
+                os.fstat(lease_fd)
+            except OSError as exc:
+                assert exc.errno == errno.EBADF
+            else:
+                raise AssertionError("child retained the parent's lease descriptor")
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is False
+    manager.close()
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
+
+
+def test_lifetime_owner_retains_handle_when_bridge_reference_is_dropped(
+    po, bnpr, tmp_path, monkeypatch,
+):
+    project = FakeProject(bnpr)
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(open_project=lambda path: project)
+    monkeypatch.setattr(po, "find_other_owner", lambda path, *, self_pid: None)
+    manager = po.ProjectManager()
+    manager.open(str(bnpr), self_pid=os.getpid())
+    retained = weakref.ref(manager)
+    del manager
+    try:
+        assert retained() is not None
+        assert retained().current.project is project
+        assert _subprocess_open(po, bnpr, tmp_path)["opened"] is False
+    finally:
+        retained().close()
+    assert retained() is None
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
+
+
+def test_set_rootfs_checks_native_result_and_readback(opened):
+    manager, project = opened
+    metadata = {}
+
+    def store(key, value):
+        metadata[key] = value
+        return True
+
+    project.store_metadata = store
+    project.query_metadata = metadata.__getitem__
+    value = {"root": "/firmware", "libs": {}}
+    manager.set_rootfs(value)
+    assert manager.get_rootfs() == value
+    project.store_metadata = lambda key, value: False
+    with pytest.raises(RuntimeError, match="returned False"):
+        manager.set_rootfs(value)
+    project.store_metadata = lambda key, value: True
+    with pytest.raises(RuntimeError, match="did not match"):
+        manager.set_rootfs({"root": "/different"})
+
+
+def test_create_handoff_excludes_process_and_adopts_without_reopening(po, tmp_path):
+    root = tmp_path / "created.bnpr"
+    created = FakeProject(root)
+
+    def native_create(path, name):
+        assert path == str(root)
+        assert name == "created"
+        root.mkdir()
+        (root / "project.bnpm").write_bytes(SQLITE_MAGIC)
+        refused = _subprocess_open(po, root, tmp_path)
+        assert refused["opened"] is False
+        assert refused["native_calls"] == 0
+        assert "open/create is in progress" in refused["error"]
+        return created
+
+    # There deliberately is no open_project method: creation must not reopen.
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(create_project=native_create)
+    manager = po.ProjectManager()
+    try:
+        state = manager.create(str(root), "created")
+        assert state.project is created
+        assert not created.closed
+        assert manager._gate_fd is None
+        assert manager._lease_fd is not None
+        assert _subprocess_open(po, root, tmp_path)["opened"] is False
+    finally:
+        manager.close()
+    assert created.closed
+    assert _subprocess_open(po, root, tmp_path)["opened"] is True
+
+
+@pytest.mark.parametrize("failure", ["exception", "none"])
+def test_failed_create_releases_parent_gate(po, bnpr, tmp_path, failure):
+    def native_create(path, name):
+        if failure == "exception":
+            raise FakeProjectException("creation failed")
+        return None
+
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(create_project=native_create)
+    manager = po.ProjectManager()
+    with pytest.raises(RuntimeError, match="could not create project"):
+        manager.create(str(tmp_path / "failed.bnpr"), "failed")
+    assert manager.current is None
+    assert manager._gate_fd is None
+    assert manager._lease_fd is None
+    assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
+
+
+def test_failed_creation_handoff_and_close_keeps_parent_gate(po, tmp_path, monkeypatch):
+    root = tmp_path / "created.bnpr"
+    created = FakeProject(root)
+    original_close = created.close
+
+    def native_create(path, name):
+        root.mkdir()
+        (root / "project.bnpm").write_bytes(SQLITE_MAGIC)
+        return created
+
+    def lease_failure(canonical):
+        raise OSError("could not create lease file")
+
+    def close_failure():
+        raise FakeProjectException("close failed")
+
+    created.close = close_failure
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(create_project=native_create)
+    manager = po.ProjectManager()
+    monkeypatch.setattr(manager, "_acquire_lease", lease_failure)
+    try:
+        with pytest.raises(RuntimeError, match="could not close project"):
+            manager.create(str(root), "created")
+        assert manager.current.project is created
+        assert manager._gate_fd is not None
+        assert manager._lease_fd is None
+        refused = _subprocess_open(po, root, tmp_path)
+        assert refused["opened"] is False
+        assert "open/create is in progress" in refused["error"]
+    finally:
+        created.close = original_close
+        manager.close()
+    assert manager._gate_fd is None
+    assert _subprocess_open(po, root, tmp_path)["opened"] is True
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_native_property_failure_keeps_handle_protected_until_closed(
+    po, bnpr, tmp_path, monkeypatch, close_fails,
+):
+    class BrokenProperties:
+        closed = False
+
+        @property
+        def id(self):
+            raise FakeProjectException("property failed")
+
+        def close(self):
+            if close_fails and not self.closed:
+                raise FakeProjectException("close failed")
+            self.closed = True
+
+    project = BrokenProperties()
+    sys.modules["binaryninja"].Project = types.SimpleNamespace(open_project=lambda path: project)
+    monkeypatch.setattr(po, "find_other_owner", lambda path, *, self_pid: None)
+    manager = po.ProjectManager()
+    try:
+        with pytest.raises(RuntimeError if close_fails else FakeProjectException):
+            manager.open(str(bnpr), self_pid=os.getpid())
+        assert (manager.current is not None) is close_fails
+        assert _subprocess_open(po, bnpr, tmp_path)["opened"] is not close_fails
+    finally:
+        project.closed = True
+        manager.close()
+
+
+# --- ownership guard ---------------------------------------------------------
 
 
 def _registry_tree(po, monkeypatch, tmp_path, payloads: dict[str, dict]):
@@ -215,6 +556,7 @@ def test_open_ownership_guard(po, bnpr, tmp_path, monkeypatch, verdict, alive, r
     else:
         _, opened = manager.open(str(bnpr), self_pid=os.getpid())
         assert opened is True
+        manager.close()
 
 
 def test_ownership_guard_skips_own_pid_and_other_projects(po, bnpr, tmp_path, monkeypatch):
@@ -230,7 +572,7 @@ def test_ownership_guard_skips_own_pid_and_other_projects(po, bnpr, tmp_path, mo
     assert po.find_other_owner(canonical, self_pid=os.getpid()) is None
 
 
-# --- selectors (§5.1) ---------------------------------------------------------
+# --- selectors ---------------------------------------------------------------
 
 
 @pytest.fixture
@@ -365,7 +707,7 @@ def test_ensure_folder_creates_nested_folders_once_and_reuses_them(populated):
     assert manager.ensure_folder(None) is None and manager.ensure_folder("/") is None
 
 
-# --- save (§5.2 project branch) ---------------------------------------------
+# --- save (project branch) ---------------------------------------------------
 
 
 def test_save_project_database_refuses_an_explicit_path(po, populated):
@@ -397,7 +739,7 @@ def test_save_project_database_snapshot_false_is_an_error(po, populated):
 
 
 def test_save_project_database_snapshot_uses_the_recorded_binding(po, populated):
-    # F4: BN keeps naming the RAW file; the bridge's binding names the database.
+    # BN keeps naming the RAW file; the bridge's binding names the database.
     manager, _, f = populated
     targets = FakeTargets(binding=(f.app_db.id, "/fw/app.bndb"))
     bridge = _bridge(manager, targets)
@@ -428,7 +770,7 @@ def test_save_project_database_creates_the_tracked_database(po, populated):
     new = manager.resolve_file("/loader.bndb")
     assert new.folder is None and new is not f.loose
     assert bv.created_with == new.path_on_disk
-    assert bv.parent_existed is True, "F3: the blob's parent dir must exist before create_database"
+    assert bv.parent_existed is True, "the blob's parent dir exists before create_database"
     assert Path(new.path_on_disk).exists()
     assert result == {
         "ok": True, "saved": True, "path": new.path_on_disk,

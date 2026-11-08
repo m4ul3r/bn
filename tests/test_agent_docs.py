@@ -100,6 +100,55 @@ def test_agent_docs_do_not_point_at_the_ghost_plugin_tree(doc: Path):
     assert "plugin/bn_agent_bridge" not in _doc_text(doc), doc
 
 
+@pytest.mark.parametrize("skill_name", ("bn", "bn-kernel", "bn-re", "bn-vr"))
+def test_ordinary_skills_do_not_instruct_project_workflows(skill_name):
+    """Project guidance must not arrive through the default skill installation."""
+    root = REPO / "skills" / skill_name
+    assert (root / "SKILL.md").is_file()
+    project_command = re.compile(
+        r"\bproject\s+(?:init|open|attach|info|files|load|import|export|delete|close|libs|link)\b"
+    )
+    for path in root.rglob("*.md"):
+        text = _doc_text(path)
+        assert not project_command.search(text), f"project workflow leaked into {path}"
+    if skill_name == "bn":
+        text = _doc_text(root / "SKILL.md")
+        assert text.count("bn-projects") == 1
+        assert "bn skill install projects" in text
+
+
+@pytest.mark.parametrize("doc", (
+    REPO / "README.md",
+    CLAUDE_MD,
+    REPO / "skills" / "bn" / "reference" / "runtime.md",
+    REPO / "skills" / "bn-projects" / "SKILL.md",
+), ids=lambda path: str(path.relative_to(REPO)))
+def test_project_installation_is_documented_as_separate_and_opt_in(doc):
+    text = _doc_text(doc)
+    assert "bn skill install projects" in text
+    assert "opt-in" in text
+    assert "Commercial" in text and "Ultimate" in text
+    assert re.search(r"(?:excludes?|not)\s+(?:this skill|`bn-projects`)", text)
+
+
+def test_project_skill_preserves_load_and_link_safety_guidance():
+    text = _doc_text(REPO / "skills" / "bn-projects" / "SKILL.md")
+    assert re.search(r"\A---\nname: bn-projects\n", text)
+    assert "one bridge that owns the project" in text
+    assert "sticky" in text and "concurrent" in text
+    assert "individual" in text and "snapshot" in text
+    assert "ID prefixes" in text and "not** a `-t` form" in text
+    firmware = text.split("## Firmware initialization, import, and libraries\n", 1)[1]
+    commands = re.findall(r"^bn .*project (import|load)\b", firmware, re.M)
+    assert commands[:2] == ["import", "load"], "the firmware workflow must explicitly import before loading"
+    assert "does not import executables" in text
+    assert "not full dynamic-loader emulation" in text
+    assert "`RPATH`/`RUNPATH`" in text and "not inventoried" in text
+    assert "`locations[]`" in text and "not persisted project-library links" in text
+    assert 'bn_kernel.session(instance="<owner-instance-id>", target="usr/bin/app")' in text
+    assert "does not check or grant a license" in text
+
+
 @pytest.mark.parametrize("line", _runnable_lines(_doc_text()), ids=_short_id)
 def test_documented_pytest_invocations_resolve(line: str):
     """Every `uv run pytest <path>` in the docs must name a real module/test."""

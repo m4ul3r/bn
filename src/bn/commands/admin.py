@@ -817,6 +817,8 @@ def _plan_forced_installs(
 
 @command("skill", "install", help="Install the bundled agent skills", fmt="text",
          args=[
+             arg("selection", nargs="?", choices=["projects"],
+                 help="Install only the optional projects skill (Commercial/Ultimate)"),
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
              arg("--force", action="store_true",
@@ -825,11 +827,24 @@ def _plan_forced_installs(
          ])
 def _skill_install(args: argparse.Namespace) -> int:
     skills_root = cli.skills_source_dir()
+    if args.selection == "projects":
+        source = skills_root / "bn-projects"
+        if not source.is_dir() or not (source / "SKILL.md").is_file():
+            raise BridgeError(
+                f"Optional projects skill source is missing or invalid: {source} "
+                "(expected SKILL.md)."
+            )
+        sources = [source]
+    else:
+        sources = [
+            source for source in sorted(skills_root.iterdir())
+            if source.name != "bn-projects"
+        ]
     explicit_dest = args.dest is not None
     target_roots = [args.dest] if explicit_dest else _default_skill_install_roots()
     install_plan = []
     results = []
-    for source in sorted(skills_root.iterdir()):
+    for source in sources:
         if not source.is_dir() or not (source / "SKILL.md").exists():
             continue
         destinations = []
@@ -966,6 +981,8 @@ def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
     checks each printed a command that installed another checkout (#1043).
     The caller reruns its own invocation with these arguments."""
     argv = ["skill", "install"]
+    if args.selection is not None:
+        argv.append(args.selection)
     if args.dest is not None:
         dest = str(args.dest)
         argv.extend([f"--dest={dest}"] if dest.startswith("-") else ["--dest", dest])
@@ -1445,9 +1462,9 @@ def _session_restart(args: argparse.Namespace) -> int:
             f"{reload_capture_error}",
             file=sys.stderr,
         )
-    # BNPR_PLAN.md §5.7: project targets replay by (project path, file id), never
-    # by filename. A project target's `filename` is an opaque blob inside the
-    # `.bnpr`; loading it by path would reopen it WITHOUT project linkage (F2),
+    # Project targets replay by (project path, file id), never by filename. A
+    # project target's `filename` is an opaque blob inside the `.bnpr`; loading
+    # it by path reopens it WITHOUT project linkage (bv.project_file is None),
     # so those rows are excluded from the plain reload list below.
     project_meta = inst.meta.get("project") if isinstance(inst.meta, dict) else None
     project_path = (
@@ -1574,7 +1591,7 @@ def _session_restart(args: argparse.Namespace) -> int:
                 entry["attempted_path"] = attempted
             reloaded.append(entry)
 
-    # BNPR_PLAN.md §5.7: reopen the owned project once, then every project target
+    # Reopen the owned project once, then every project target
     # by its exact file id. `prefer_bndb` is off for the same reason as above:
     # the id names the file the target already IS. Reported under `loaded`
     # alongside the plain binaries, so a failed project reload is a partial
@@ -1886,7 +1903,7 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             and all(isinstance(root, str) for root in project_roots)
         ):
             entry["project_roots"] = list(project_roots)
-        # BNPR_PLAN.md §5.4: the project this bridge owns, when it publishes one.
+        # The project this bridge owns, when its registry publishes one.
         project = inst.meta.get("project") if isinstance(inst.meta, dict) else None
         if isinstance(project, dict) and project.get("path"):
             entry["project"] = dict(project)

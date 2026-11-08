@@ -1,12 +1,14 @@
-"""Project targets through `TargetManager` and `BinaryNinjaBridge` (BNPR_PLAN.md
-§5.2-§5.4): rows, selectors, the `save_database` dispatch, `_project_load`,
-`_project_close` and the registry payload, against fake views and the fake
-project model in `_project_fakes`.
+"""Project targets through `TargetManager` and `BinaryNinjaBridge`: rows,
+selectors, the `save_database` dispatch, `_project_load`, `_project_close` and
+the registry payload, against fake views and the fake project model in
+`_project_fakes`.
 """
 from __future__ import annotations
 
 import json
 import os
+import threading
+from contextlib import contextmanager
 import sys
 import types
 from pathlib import Path
@@ -93,7 +95,7 @@ def _row_for(rows, bv_filename):
     return next(r for r in rows if r["filename"] == bv_filename)
 
 
-# --- rows (§5.3) --------------------------------------------------------------
+# --- rows --------------------------------------------------------------------
 
 
 def test_refresh_rows_carry_project_fields_only_for_project_views(world):
@@ -121,7 +123,7 @@ def test_a_project_file_from_a_foreign_class_is_not_a_project_target(world):
 
 
 def test_note_project_database_overrides_what_bn_reports(world):
-    # F4: after the first save BN still names the RAW file; the binding wins.
+    # After the first save BN still names the RAW file; the binding wins.
     f = world.files
     bv = FakeView(f.loader.path_on_disk, f.loader)
     rows = _rows(world, bv)
@@ -175,7 +177,7 @@ def test_succeed_carries_the_binding_to_the_next_manager(world):
     assert successor.project_binding(bv) == ("new-db-id", "/loader.bndb")
 
 
-# --- selectors (§5.3) ---------------------------------------------------------
+# --- selectors ---------------------------------------------------------------
 
 
 @pytest.mark.parametrize("selector_of", [
@@ -253,7 +255,7 @@ def test_compute_selectors_disambiguates_two_project_files_with_one_name(world):
         world.targets.resolve("app")
 
 
-# --- save_database dispatch (§5.2) -------------------------------------------
+# --- save_database dispatch --------------------------------------------------
 
 
 def test_save_database_takes_the_project_branch_for_a_project_view(world):
@@ -271,7 +273,7 @@ def test_save_database_takes_the_project_branch_for_a_project_view(world):
     }
     assert bv.created_with == new.path_on_disk
     assert str(world.root) in new.path_on_disk, "the database is a blob INSIDE the project"
-    assert not Path(f.loader.path_on_disk + ".bndb").exists(), "no stray untracked file (F3)"
+    assert not Path(f.loader.path_on_disk + ".bndb").exists(), "no stray untracked file"
     row = world.targets.refresh()[0]
     assert row["unsaved"] is False
     assert row["project_path"] == "/loader.bndb" and row["selector"] == "loader.bndb"
@@ -309,7 +311,7 @@ def test_save_database_keeps_the_standalone_path_for_a_plain_view(world, tmp_pat
     assert len(world.project.files) == 4, "a plain save never touches the project"
 
 
-# --- _project_load (§5.2) ------------------------------------------------------
+# --- _project_load -----------------------------------------------------------
 
 
 def _install_load(world, factory):
@@ -406,7 +408,80 @@ def test_project_load_requires_an_open_project(world):
         world.instance._project_load("loader")
 
 
-# --- _project_close (§5.2) -----------------------------------------------------
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_project_load_rejects_project_close_or_swap_during_analysis(world, monkeypatch, reopen):
+    entered = threading.Event()
+    resume = threading.Event()
+    bv = FakeView(world.files.loader.path_on_disk, world.files.loader)
+    failures = []
+    linked = []
+
+    def analyze():
+        assert not world.instance._write_gate.locked()
+        entered.set()
+        assert resume.wait(5)
+
+    bv.update_analysis_and_wait = analyze
+    _install_load(world, lambda pf: bv)
+    monkeypatch.setattr(world.module.project_rootfs, "link_view",
+                        lambda *a, **kw: linked.append(True))
+
+    def load():
+        try:
+            world.instance._project_load("loader")
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=load)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with world.instance._write_operation_lock():
+            world.instance._project_close()
+            if reopen:
+                world.instance.projects.open(str(world.root), self_pid=os.getpid())
+    finally:
+        resume.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert len(failures) == 1 and "Project changed while loading" in str(failures[0])
+    assert bv.closed and not linked
+    assert world.module._headless_views == []
+    assert world.module._load_in_progress == {}
+
+
+def test_project_load_revalidates_before_native_open(world, monkeypatch):
+    original = world.instance._write_operation_lock
+    entries = 0
+    calls = _install_load(world, lambda pf: pytest.fail("must not open a stale project file"))
+
+    @contextmanager
+    def swap_before_open():
+        nonlocal entries
+        with original():
+            entries += 1
+            if entries == 3:
+                world.instance.projects.close()
+            yield
+
+    monkeypatch.setattr(world.instance, "_write_operation_lock", swap_before_open)
+    with pytest.raises(RuntimeError, match="Project changed while loading"):
+        world.instance._project_load("loader")
+    assert not calls and world.module._load_in_progress == {}
+
+
+def test_project_load_does_not_dedup_foreign_project_file_with_same_id(world, tmp_path):
+    foreign = FakeProject(tmp_path / "foreign.bnpr")
+    foreign_pf = foreign.add_file("loader", file_id=world.files.loader.id)
+    foreign_bv = FakeView(foreign_pf.path_on_disk, foreign_pf)
+    _rows(world, foreign_bv)
+    calls = _install_load(world, lambda pf: FakeView(pf.path_on_disk, pf))
+    result = world.instance._project_load("loader")
+    assert result["loaded"] and calls == [world.files.loader]
+    assert not foreign_bv.closed
+
+# --- _project_close ----------------------------------------------------------
 
 
 def test_project_close_refuses_dirty_targets_unless_forced(world):
@@ -447,7 +522,7 @@ def test_project_close_with_clean_targets_needs_no_force(world):
     assert proj.closed
 
 
-# --- registry payload (§5.4) ---------------------------------------------------
+# --- registry payload --------------------------------------------------------
 
 
 def test_registry_payload_publishes_the_project_and_its_targets(world):

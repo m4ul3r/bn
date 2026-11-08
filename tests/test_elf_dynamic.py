@@ -1,26 +1,48 @@
 """`elf_dynamic.parse_elf_dynamic` against synthetic ELF images (#969).
 
 The images are built here byte by byte -- a PT_LOAD over the whole file, a
-PT_DYNAMIC, `.dynstr`, `.dynsym`, `.gnu.version`, `.gnu.version_r` and a symbol
-count source -- so each test controls exactly which piece of the loader's
-answer is present, in both classes and both byte orders.
+PT_DYNAMIC, `.dynstr`, `.dynsym`, `.gnu.version`, `.gnu.version_r`,
+`.gnu.version_d` and a symbol count source -- so each test controls exactly
+which piece of the loader's answer is present, in both classes and both byte
+orders.
 """
 from __future__ import annotations
 
+import os
 import struct
+from dataclasses import dataclass
 
 import pytest
 
-from bn_agent_bridge.elf_dynamic import parse_elf_dynamic
+from bn_agent_bridge.elf_dynamic import ExportedSymbol, parse_elf_dynamic, parse_elf_file
 
 _BASE = 0x400000
 
+_STB_GLOBAL, _STB_WEAK, _STB_LOCAL = 1, 2, 0
+_STT_OBJECT, _STT_FUNC, _STT_TLS, _STT_SECTION = 1, 2, 6, 3
+_STV_DEFAULT, _STV_INTERNAL, _STV_HIDDEN, _STV_PROTECTED = 0, 1, 2, 3
+
+
+@dataclass(frozen=True)
+class _Def:
+    """A defined dynamic symbol for `_build_elf`: ``version`` names a verdef
+    entry (None: the global version index 1), ``hidden`` sets the versym
+    hidden bit (a non-default compatibility version)."""
+    name: str
+    version: str | None = None
+    bind: int = _STB_GLOBAL
+    vis: int = _STV_DEFAULT
+    type: int = _STT_FUNC
+    hidden: bool = False
+
 
 def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, runpath=None,
-               symbols=(), count_source="hash"):
-    """An ELF image whose dynamic symbols are ``symbols``: ``(name, library)``
-    pairs, ``library`` None for an unversioned symbol. ``count_source`` is
-    ``"hash"`` (DT_HASH), ``"section"`` (a SHT_DYNSYM header) or ``"none"``."""
+               symbols=(), defined=(), count_source="hash"):
+    """An ELF image whose dynamic symbols are the undefined ``symbols`` --
+    ``(name, library)`` pairs, ``library`` None for an unversioned symbol --
+    followed by the ``defined`` `_Def` rows. ``count_source`` is ``"hash"``
+    (DT_HASH), ``"gnu_hash"`` (DT_GNU_HASH), ``"section"`` (a SHT_DYNSYM
+    header) or ``"none"``."""
     e = endian
     strtab = bytearray(b"\x00")
 
@@ -39,6 +61,13 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
     lib_file = {lib: intern(lib) for lib in libraries}
     lib_ver = {lib: intern(f"V_{i}") for i, lib in enumerate(libraries)}
     sym_names = [intern(name) for name, _ in symbols]
+    # One verdef entry per distinct version a defined symbol names, after the
+    # verneed indices, plus the base entry (index 1) when there are any.
+    def_versions = sorted({d.version for d in defined if d.version})
+    def_index = {v: 2 + len(libraries) + i for i, v in enumerate(def_versions)}
+    def_name = {v: intern(v) for v in def_versions}
+    base_name = intern(soname or "base") if def_versions else None
+    def_names = [intern(d.name) for d in defined]
 
     syment = 24 if is64 else 16
     dynsym = bytearray(syment)  # index 0: the null symbol
@@ -47,21 +76,43 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
             dynsym += struct.pack(e + "IBBHQQ", name_off, 0x12, 0, 0, 0, 0)
         else:
             dynsym += struct.pack(e + "IIIBBH", name_off, 0, 0, 0x12, 0, 0)
+    for name_off, d in zip(def_names, defined):
+        info = (d.bind << 4) | d.type
+        if is64:
+            dynsym += struct.pack(e + "IBBHQQ", name_off, info, d.vis, 10, 0x1000, 8)
+        else:
+            dynsym += struct.pack(e + "IIIBBH", name_off, 0x1000, 8, info, d.vis, 10)
     versym = struct.pack(e + "H", 0) + b"".join(
         struct.pack(e + "H", version_index[lib] if lib else 1) for _, lib in symbols)
+    versym += b"".join(
+        struct.pack(e + "H", (def_index[d.version] if d.version else 1) | (0x8000 if d.hidden else 0))
+        for d in defined)
     verneed = bytearray()
     for i, lib in enumerate(libraries):
         next_need = 32 if i + 1 < len(libraries) else 0
         verneed += struct.pack(e + "HHIII", 1, 1, lib_file[lib], 16, next_need)
         verneed += struct.pack(e + "IHHII", 0, 0, version_index[lib], lib_ver[lib], 0)
-    nsyms = len(symbols) + 1
+    verdef = bytearray()
+    if def_versions:
+        rows = [(1, 1, base_name)] + [(def_index[v], 0, def_name[v]) for v in def_versions]
+        for i, (ndx, flags, name_off) in enumerate(rows):
+            next_def = 28 if i + 1 < len(rows) else 0
+            verdef += struct.pack(e + "HHHHIII", 1, flags, ndx, 1, 0, 20, next_def)
+            verdef += struct.pack(e + "II", name_off, 0)
+    nsyms = len(symbols) + len(defined) + 1
     hashtab = struct.pack(e + "II", 1, nsyms) + struct.pack(e + "I", 0) + bytes(4 * nsyms)
+    # One bucket pointing at symbol 1, one bloom word, chains over every symbol
+    # with the end-of-chain bit on the last: the count is the chain's extent.
+    gnu_hash = struct.pack(e + "IIII", 1, 1, 1, 0) + bytes(8 if is64 else 4) \
+        + struct.pack(e + "I", 1) \
+        + b"".join(struct.pack(e + "I", 1 if i == nsyms - 1 else 0) for i in range(1, nsyms))
 
     ehsize, phentsize = (64, 56) if is64 else (52, 32)
     cursor = ehsize + 2 * phentsize
     blobs = {}
     for key, blob in (("strtab", bytes(strtab)), ("dynsym", bytes(dynsym)),
-                      ("versym", versym), ("verneed", bytes(verneed)), ("hash", hashtab)):
+                      ("versym", versym), ("verneed", bytes(verneed)),
+                      ("verdef", bytes(verdef)), ("hash", hashtab), ("gnu_hash", gnu_hash)):
         cursor = (cursor + 7) & ~7
         blobs[key] = (cursor, blob)
         cursor += len(blob)
@@ -77,8 +128,12 @@ def _build_elf(*, is64=True, endian="<", needed=(), soname=None, rpath=None, run
              (0x6FFFFFF0, va("versym"))]
     if libraries:
         tags += [(0x6FFFFFFE, va("verneed")), (0x6FFFFFFF, len(libraries))]
+    if def_versions:
+        tags += [(0x6FFFFFFC, va("verdef")), (0x6FFFFFFD, len(def_versions) + 1)]
     if count_source == "hash":
         tags.append((4, va("hash")))
+    elif count_source == "gnu_hash":
+        tags.append((0x6FFFFEF5, va("gnu_hash")))
     tags.append((0, 0))
     dyn = b"".join(struct.pack(e + ("qQ" if is64 else "iI"), t, v) for t, v in tags)
     cursor = (cursor + 7) & ~7
@@ -348,3 +403,158 @@ def test_versions_unread_names_the_missing_dynamic_symbol_table_1037():
     info = _parse(bytes(image))
     assert info.versions_unread == (
         "the file declares symbol versions without a dynamic symbol table")
+
+
+# --- exports ----------------------------------------------------------------
+
+_DEFINED = (
+    _Def("widget_open", "WIDGET_1.0"),
+    _Def("widget_table", "WIDGET_1.0", type=_STT_OBJECT),
+    _Def("widget_tls", "WIDGET_1.1", type=_STT_TLS),
+    _Def("widget_hook", bind=_STB_WEAK),                       # unversioned weak
+    _Def("widget_internal_fn", "WIDGET_1.0", vis=_STV_HIDDEN),
+    _Def("widget_secret", vis=_STV_INTERNAL),
+    _Def("widget_protected", "WIDGET_1.1", vis=_STV_PROTECTED),
+    _Def("widget_local", bind=_STB_LOCAL),
+    _Def("widget_section", type=_STT_SECTION),
+)
+
+_EXPECTED_EXPORTS = {
+    "widget_open": ExportedSymbol("widget_open", "WIDGET_1.0", "func", False),
+    "widget_table": ExportedSymbol("widget_table", "WIDGET_1.0", "object", False),
+    "widget_tls": ExportedSymbol("widget_tls", "WIDGET_1.1", "object", False),
+    "widget_hook": ExportedSymbol("widget_hook", None, "func", True),
+    "widget_protected": ExportedSymbol("widget_protected", "WIDGET_1.1", "func", False),
+    "widget_section": ExportedSymbol("widget_section", None, "other", False),
+}
+
+
+@pytest.mark.parametrize("is64", [True, False])
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("count_source", ["hash", "gnu_hash", "section"])
+def test_exports_are_the_defined_bindable_symbols(is64, endian, count_source):
+    """Defined GLOBAL/WEAK symbols with DEFAULT/PROTECTED visibility, under
+    their verdef version; undefined imports, HIDDEN/INTERNAL and LOCAL rows
+    are not exports. The three symbol-count sources all drive the list."""
+    image = _build_elf(is64=is64, endian=endian, needed=("libc.so.6",), soname="libwidget.so.2",
+                       symbols=_SYMBOLS, defined=_DEFINED, count_source=count_source)
+    info = _parse(image)
+    assert info is not None
+    assert info.exports == _EXPECTED_EXPORTS
+    assert "printf" not in info.exports and "widget_internal_fn" not in info.exports
+    # The import side is untouched by the defined rows.
+    assert info.import_libraries["printf"] == "libc.so.6"
+    assert info.versions_unread is None
+
+
+@pytest.mark.parametrize("is64, expected", [(True, (183, 64)), (False, (8, 32))])
+def test_header_facts_are_reported(is64, expected):
+    info = _parse(_build_elf(is64=is64, symbols=_SYMBOLS))
+    assert (info.e_machine, info.elf_class, info.e_type) == (*expected, 3)
+
+
+def test_exports_without_any_version_table_are_unversioned():
+    # musl-style: no DT_VERSYM/DT_VERDEF at all; every export reads version None.
+    image = _build_elf(symbols=(("printf", None),),
+                       defined=(_Def("strdup"), _Def("environ", type=_STT_OBJECT, bind=_STB_WEAK)))
+    info = _parse(image)
+    assert info.exports == {
+        "strdup": ExportedSymbol("strdup", None, "func", False),
+        "environ": ExportedSymbol("environ", None, "object", True),
+    }
+
+
+def test_default_version_wins_over_a_hidden_compatibility_one():
+    # `memcpy@GLIBC_2.2.5` (hidden) and `memcpy@@GLIBC_2.14` (default) share the
+    # bare name: the default is the export, whichever order they appear in.
+    for defined in ((_Def("memcpy", "GLIBC_2.2.5", hidden=True), _Def("memcpy", "GLIBC_2.14")),
+                    (_Def("memcpy", "GLIBC_2.14"), _Def("memcpy", "GLIBC_2.2.5", hidden=True))):
+        info = _parse(_build_elf(defined=defined))
+        assert info.exports == {"memcpy": ExportedSymbol("memcpy", "GLIBC_2.14", "func", False)}
+    # Only a hidden definition: it is still the only thing the name binds to.
+    info = _parse(_build_elf(defined=(_Def("memcpy", "GLIBC_2.2.5", hidden=True),)))
+    assert info.exports["memcpy"].version == "GLIBC_2.2.5"
+
+
+def test_no_symbol_count_source_exports_nothing():
+    info = _parse(_build_elf(symbols=_SYMBOLS, defined=_DEFINED, count_source="none"))
+    assert info is not None and info.exports == {}
+
+
+def test_non_abi_dt_syment_exports_nothing_with_a_note():
+    image = _set_dynamic_tag(_build_elf(symbols=(("puts", None),), defined=_DEFINED), 11, 1 << 56)
+    info = _parse(image)
+    assert info.exports == {} and info.import_libraries == {}
+    assert any("DT_SYMENT" in note for note in info.notes), info.notes
+
+
+@pytest.mark.parametrize("value", [_BASE + (1 << 40), (1 << 64) - 1, 0])
+def test_unreadable_verdef_leaves_exports_unversioned(value):
+    image = _set_dynamic_tag(_build_elf(symbols=_SYMBOLS, defined=_DEFINED), 0x6FFFFFFC, value)
+    info = _parse(image)
+    assert set(info.exports) == set(_EXPECTED_EXPORTS)
+    assert all(export.version is None for export in info.exports.values())
+
+
+def test_truncated_image_with_exports_never_reads_past_the_end():
+    image = _build_elf(needed=("libc.so.6",), symbols=_SYMBOLS, defined=_DEFINED)
+    for cut in range(0, len(image), 7):
+        info = _parse(image[:cut])
+        assert info is None or isinstance(info.exports, dict)
+
+
+# --- parse_elf_file -----------------------------------------------------------
+
+
+def test_parse_elf_file_reads_a_file_piecewise(tmp_path, monkeypatch):
+    image = _build_elf(needed=("libc.so.6",), soname="libwidget.so.2",
+                       symbols=_SYMBOLS, defined=_DEFINED)
+    path = tmp_path / "libwidget.so.2"
+    path.write_bytes(image)
+    # Every read is one bounded window, never the whole file: shadow `open` in
+    # the module with one whose handle refuses an unsized or oversized read.
+    import bn_agent_bridge.elf_dynamic as elf_dynamic
+    windows = []
+
+    class CappedHandle:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._handle.close()
+
+        def fileno(self):
+            return self._handle.fileno()
+
+        def seek(self, offset):
+            return self._handle.seek(offset)
+
+        def read(self, size=-1):
+            assert 0 <= size <= len(image), f"read of {size} bytes"
+            windows.append(size)
+            return self._handle.read(size)
+
+    monkeypatch.setattr(elf_dynamic, "open", lambda p, mode: CappedHandle(open(p, mode)),
+                        raising=False)
+    info = parse_elf_file(str(path))
+    assert info is not None
+    assert len(windows) > 1 and max(windows) < len(image)
+    assert info.soname == "libwidget.so.2" and info.needed == ["libc.so.6"]
+    assert info.exports == _EXPECTED_EXPORTS
+    assert info.import_libraries["printf"] == "libc.so.6"
+    assert (info.e_machine, info.elf_class) == (183, 64)
+
+
+def test_parse_elf_file_is_none_for_non_elf_missing_or_directory(tmp_path):
+    text = tmp_path / "notes.txt"
+    text.write_bytes(b"MZ" + bytes(100))
+    assert parse_elf_file(str(text)) is None
+    assert parse_elf_file(str(tmp_path / "absent.so")) is None
+    assert parse_elf_file(str(tmp_path)) is None
+    (tmp_path / "empty.so").write_bytes(b"")
+    assert parse_elf_file(str(tmp_path / "empty.so")) is None
+
+

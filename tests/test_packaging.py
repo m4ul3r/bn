@@ -111,6 +111,7 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
         "bn-kernel/bootstrap.py",
         "bn-kernel/scripts/smoke.py",
         "bn-kernel/src/bn_kernel/__init__.py",
+        "bn-projects/SKILL.md",
     }
     shipped_data = {
         name.split(".data/data/", 1)[1]

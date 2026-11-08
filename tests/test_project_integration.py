@@ -1,15 +1,15 @@
-"""Real-BN lane for Binary Ninja project (`.bnpr`) support (BNPR_PLAN.md §6 row 8).
+"""Real-BN lane for Binary Ninja project (`.bnpr`) support.
 
-Projects are a Commercial/Ultimate feature (F10), so beyond the usual `real_bn`
+Projects are a Commercial/Ultimate feature, so beyond the usual `real_bn`
 gate this module checks `binaryninja.core_product()` and refuses to skip
 silently under `BN_REQUIRE_REAL_TESTS=1` when the edition lacks them.
 
-Project ownership is bridge-global (§3: one project per bridge instance), so the
+Project ownership is bridge-global (one project per bridge instance), so the
 lane does NOT use `shared_bn`: it spawns one private headless instance per
 module, with its own `BN_CACHE_DIR`, and creates the project with the BN API in
 a tmp dir. Everything after that goes through the CLI (`bn project ...`) when
 the command group is registered, else over the wire with the same ops -- the
-`Lane` helper hides which, so every assertion below is about the §5 contracts.
+`Lane` helper hides which, so each assertion covers the same public behavior.
 
 Each test imports the fixture binary into its OWN project folder and
 (re)opens the project idempotently, so the module stays correct when xdist
@@ -128,7 +128,7 @@ class Lane:
 
     def _cli_or_wire(self, cli_args: list[str], op: str, params: dict[str, Any], *,
                      timeout: float = 60.0) -> Any:
-        """Prefer `bn project <sub>`; fall back to the op it wraps (§5.6).
+        """Prefer `bn project <sub>`; fall back to the op it wraps.
 
         In CLI mode a refusal is exit 2 with the bridge's text on stderr; it is
         re-raised as `BridgeError` so callers assert one shape in both modes.
@@ -174,7 +174,7 @@ class Lane:
 
         Always the wire op: `bn project open` attaches to a published owner
         instead of sending `project_open`, and the lane wants the bridge-side
-        `opened` flag (§5.2) regardless of pins.
+        `opened` flag regardless of pins.
         """
         return self.wire("project_open", {"path": str(self.project_path)})
 
@@ -294,20 +294,20 @@ def test_open_info_and_reopen(lane: Lane):
     assert info["path"] == str(lane.project_path)
     assert isinstance(info["file_count"], int) and isinstance(info["open_targets"], list)
 
-    # Same canonical path again (the project.bnpm spelling, §5.1): a no-op success.
+    # Same canonical path again (the project.bnpm spelling): a no-op success.
     again = lane.wire("project_open", {"path": str(lane.project_path / "project.bnpm")})
     assert again["opened"] is False
     assert again["path"] == str(lane.project_path)
 
     if lane.cli_available:
-        # §5.6 step 1: the CLI sees the published owner and attaches to it.
+        # The CLI sees the published owner and attaches to it.
         res = lane.run("project", "open", str(lane.project_path), "--format", "json")
         assert res.returncode == 0, res.stderr
         attached = json.loads(res.stdout)
         assert attached["attached"] is True
         assert attached["instance_id"] == lane.instance_id
 
-    # Published for other bridges and `session restart` (§5.4).
+    # Published for other bridges and `session restart`.
     registry = json.loads((lane.cache_dir / "instances" / f"{lane.instance_id}.json").read_text())
     assert registry["project"] == {"path": str(lane.project_path), "id": info["id"], "name": "lane"}
 
@@ -317,7 +317,7 @@ def test_import_load_save_and_database_round_trip(lane: Lane, tmp_path):
     raw = lane.ensure_imported("fw")
     assert raw["path"] == "/fw/hello_x86_64"
     assert raw["is_database"] is False
-    assert raw["folder"] == "/fw"   # folder paths are path-in-project form (§5.1)
+    assert raw["folder"] == "/fw"   # folder paths use path-in-project form
     rows = {row["path"]: row for row in lane.project_files()}
     assert rows["/fw/hello_x86_64"]["is_database"] is False
     if lane.cli_available:
@@ -326,7 +326,7 @@ def test_import_load_save_and_database_round_trip(lane: Lane, tmp_path):
         assert "raw" in text.stdout and "/fw/hello_x86_64" in text.stdout
 
     # Load the raw file: the target is addressable by path-in-project, bare name
-    # and the leading-slash form (§5.3).
+    # and the leading-slash form.
     loaded = lane.project_load("fw/hello_x86_64", prefer_bndb=False)
     assert loaded["project_file_id"] == raw["id"]
     assert loaded["project_path"] == "/fw/hello_x86_64"
@@ -340,7 +340,7 @@ def test_import_load_save_and_database_round_trip(lane: Lane, tmp_path):
         assert lane.target_info(selector)["target_id"] == row["target_id"], selector
 
     # First save of a raw project file creates a sibling <name>.bndb project
-    # file (F3) and re-homes the target onto it (§5.2 save_database).
+    # file and re-homes the target onto it.
     # `greet` is `_greet` on Mach-O; pick it by suffix rather than by platform.
     greet = next(n for n in lane.function_names("fw/hello_x86_64") if n.lstrip("_") == "greet")
     lane.rename("fw/hello_x86_64", greet, "lane_renamed_once")
@@ -363,7 +363,7 @@ def test_import_load_save_and_database_round_trip(lane: Lane, tmp_path):
     assert after["project_path"] == "/fw/hello_x86_64.bndb"
     assert after["unsaved"] is False
 
-    # Second save: a snapshot into the same database (F5).
+    # Second save: a snapshot into the same database.
     lane.rename("hello_x86_64.bndb", "lane_renamed_once", "lane_renamed_twice")
     saved2 = lane.save("hello_x86_64.bndb")
     assert saved2.returncode == 0, f"{saved2.stderr}\n{saved2.stdout}"
@@ -423,7 +423,7 @@ def test_second_instance_cannot_open_an_owned_project(lane: Lane):
         assert "bn project attach" in message
         if lane.cli_available:
             # The CLI never reaches the guard: an explicit `-i other` still
-            # attaches to the published owner (§5.6 step 1).
+            # attaches to the published owner.
             res = lane.bn("-i", other, "project", "open", str(lane.project_path),
                           "--format", "json")
             assert res.returncode == 0, res.stderr
@@ -466,7 +466,7 @@ def test_session_restart_replays_project_targets(lane: Lane):
     assert not any(x.get("error") for x in payload["loaded"] if isinstance(x, dict)), payload
 
     # The new process owns the project and serves the same targets by project
-    # identity (F2): project_path intact, the blob never loaded as a plain file.
+    # identity: project_path intact, the blob never loaded as a plain file.
     info = lane.project_info()
     assert info["path"] == str(lane.project_path)
     after = {r["project_path"]: r for r in lane.target_rows() if r.get("project_file_id")}
@@ -477,3 +477,172 @@ def test_session_restart_replays_project_targets(lane: Lane):
     assert lane.target_info("rs/hello_x86_64")["project_path"] == "/rs/hello_x86_64"
     registry = json.loads((lane.cache_dir / "instances" / f"{lane.instance_id}.json").read_text())
     assert registry["project"]["path"] == str(lane.project_path)
+
+
+# --- firmware rootfs projects -------------------------------------------------
+
+
+@pytest.fixture
+def rootfs_lane(rootfs_fixture, _hermetic_session_env, tmp_path, tmp_path_factory,
+                monkeypatch) -> Iterator[tuple[Lane, Path]]:
+    """A private instance and a copied tree: no project or BNDB enters the repo."""
+    _require_project_edition()
+    root = shutil.copytree(rootfs_fixture, tmp_path / "firmware", symlinks=True)
+    root = root.resolve()
+    instance_id = f"rootfs-{uuid.uuid4().hex[:8]}"
+    cache_dir, cache_is_fallback = _cache_dir_within_socket_budget(tmp_path_factory, instance_id)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("BN_DISABLE_USER_PLUGINS", "1")
+    lane = Lane(instance_id, cache_dir, root.with_suffix(".bnpr"), cli_available=True)
+    lane.cli_available = lane.bn("project", "init", "--help").returncode == 0
+    _start_instance(instance_id, lane.env())
+    try:
+        yield lane, root
+    finally:
+        _stop_instance(instance_id, lane.env())
+        if cache_is_fallback:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _rootfs_init(lane: Lane, root: Path, *, cwd: Path | None = None) -> dict[str, Any]:
+    if lane.cli_available:
+        args = ["project", "init", *([] if cwd else [str(root)]), "--format", "json"]
+        result = subprocess.run(
+            [*_BN_CLI, "-i", lane.instance_id, *args], cwd=cwd,
+            capture_output=True, text=True, timeout=_LOAD_TIMEOUT, env=lane.env(),
+        )
+        assert result.returncode == 0, f"{result.stderr}\n{result.stdout}"
+        return json.loads(result.stdout)
+    # The bridge-only lane exercises the same create/open + sync operations.
+    exists = lane.project_path.exists()
+    if exists:
+        opened = lane.ensure_open()
+    else:
+        opened = lane.wire("project_create", {
+            "path": str(lane.project_path), "name": root.name,
+            "rootfs": {"root": str(root), "platform": "linux"},
+        })
+    sync = lane.wire("project_sync_libs", {"root": str(root), "platform": "linux"})
+    return {
+        "created": not exists, "project_path": opened["path"],
+        "platform": sync["platform"], "lookup_paths": sync["lookup_paths"], "sync": sync,
+    }
+
+
+def _rootfs_link(lane: Lane, selector: str, *, relink: bool = False) -> dict[str, Any]:
+    args = ["project", "link", "-t", selector, "--relink" if relink else "--preview"]
+    if lane.cli_available:
+        return lane.json(*args)
+    return lane.wire("project_link", {"dry_run": not relink, "relink": relink}, target=selector)
+
+
+_ROOTFS_IMPORT_LIBRARIES = {
+    "greet": "libgreet.so.1",
+    "vendor_sum": "libgreet.so.1",
+    "printf": "libc.so",
+    "strdup": "libc.so",
+    "strlen": "libc.so",
+    "free": "libc.so",
+}
+
+
+def _assert_rootfs_links(lane: Lane, selector: str) -> dict[str, Any]:
+    imports = lane.json("imports", "-t", selector, "--limit", "100")
+    rows = imports["items"]
+    by_name = {row["name"]: row for row in rows}
+    assert _ROOTFS_IMPORT_LIBRARIES.keys() <= by_name.keys(), rows
+    itm_rows = [row for row in rows if row["name"].startswith("_ITM_")]
+    assert itm_rows, rows
+    assert all(row["library"] is None for row in itm_rows), itm_rows
+
+    preview = _rootfs_link(lane, selector)
+    # The imports reader currently attributes namespace/verneed, not project
+    # ExternalLocations. The link preview exposes the actual location readback
+    # even for unversioned musl symbols whose imports row still says null.
+    locations = {row["symbol"]: row["library"] for row in preview["locations"]}
+    for symbol, library in _ROOTFS_IMPORT_LIBRARIES.items():
+        assert locations[symbol] == library, preview
+        if by_name[symbol]["library"] is not None:
+            assert by_name[symbol]["library"] == library, by_name[symbol]
+    unresolved = {row["symbol"] for row in preview["unresolved"]}
+    assert {row["name"] for row in itm_rows} <= unresolved, preview
+    assert all(symbol not in locations for symbol in unresolved), preview
+    return preview
+
+
+class TestRootfsProjects:
+    def test_init_link_persistence_and_attach(self, rootfs_lane):
+        lane, root = rootfs_lane
+        initialized = _rootfs_init(lane, root)
+        assert initialized["created"] is True
+        assert initialized["project_path"] == str(root.parent / f"{root.name}.bnpr")
+        assert (lane.project_path / "project.bnpm").is_file()
+        assert initialized["platform"] == "linux"
+        lookup = {row["path"]: row["source"] for row in initialized["lookup_paths"]}
+        assert lookup["/opt/vendor/lib"].startswith("ld_so_conf:")
+        assert "/lib" in lookup
+        assert "/opt/extra/lib" not in lookup
+        imported = initialized["sync"]["imported"]
+        assert len(imported) == 2, imported
+        assert {row["name"] for row in imported} == {"libc.so", "libgreet.so.1"}
+        inventory = lane._cli_or_wire(["project", "libs"], "project_libs", {})["libs"]
+        assert len(inventory) == 2, inventory
+        libraries = {Path(row["rel_realpath"]).name: row for row in inventory}
+        assert set(libraries) == {"libc.so", "libgreet.so.1"}
+        assert any(name.startswith("ld-musl-") and name.endswith(".so.1")
+                   for name in libraries["libc.so"]["names"])
+        assert "libgreet.so" in libraries["libgreet.so.1"]["names"]
+        assert not any("libstray.so" in row["names"] for row in inventory)
+
+        # Init imports only loader-visible libraries. Executables are explicitly
+        # imported into the project before project_load selects them.
+        raw = lane.project_import(root / "usr/bin/app", "usr/bin")
+        loaded = lane.project_load("usr/bin/app")
+        assert loaded["project_file_id"] == raw["id"]
+        assert loaded["link"]["linked"] >= 6, loaded
+        assert lane.target_info("app")["unsaved"] is False
+        _assert_rootfs_links(lane, "app")
+
+        saved = lane.save("app")
+        assert saved.returncode == 0, f"{saved.stderr}\n{saved.stdout}"
+        saved_result = json.loads(saved.stdout)
+        assert saved_result["project_path"] == "/usr/bin/app.bndb"
+        closed = lane.run("close", "-t", "app.bndb")
+        assert closed.returncode == 0, f"{closed.stderr}\n{closed.stdout}"
+        reloaded = lane.project_load("usr/bin/app")
+        assert reloaded["substituted_from"] == raw["id"]
+        assert reloaded["project_file_id"] == saved_result["project_file_id"]
+        assert reloaded["link"]["already_linked"] >= 6, reloaded
+        assert reloaded["link"]["linked"] == 0, reloaded
+        assert lane.target_info("app.bndb")["unsaved"] is False
+        preview = _assert_rootfs_links(lane, "app.bndb")
+        assert preview["already_linked"] >= 6
+        assert lane.target_info("app.bndb")["unsaved"] is False
+        relinked = _rootfs_link(lane, "app.bndb", relink=True)
+        assert relinked["status"] in ("verified", "noop"), relinked
+
+        reopened = _rootfs_init(lane, root, cwd=root / "usr/bin")
+        assert reopened["created"] is False
+        assert reopened["project_path"] == str(lane.project_path)
+        assert reopened["sync"]["skipped_existing"] == 2
+        assert reopened["sync"]["imported"] == []
+
+        other = f"{lane.instance_id}-b"
+        _start_instance(other, lane.env())
+        try:
+            if lane.cli_available:
+                attached = lane.bn(
+                    "-i", other, "project", "open", str(lane.project_path), "--format", "json",
+                )
+                assert attached.returncode == 0, f"{attached.stderr}\n{attached.stdout}"
+                assert json.loads(attached.stdout) == {
+                    "attached": True, "instance_id": lane.instance_id,
+                    "path": str(lane.project_path),
+                }
+            else:
+                with pytest.raises(BridgeError, match="already open in bridge instance"):
+                    lane.wire("project_open", {"path": str(lane.project_path)}, instance_id=other)
+            with pytest.raises(BridgeError, match="No project is open"):
+                lane.wire("project_info", instance_id=other)
+        finally:
+            _stop_instance(other, lane.env())

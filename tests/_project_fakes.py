@@ -1,9 +1,9 @@
 """Fake Binary Ninja project objects shared by the project test modules.
 
-They model the measured facts in BNPR_PLAN.md §2: a `.bnpr` is a directory with
-extensionless blobs under `data/<2 hex>/<34 hex>` (F1), `create_file(b"")`
-writes neither a blob nor its parent directory (F3), and two files may share a
-path while ids stay unique (F9).
+They model measured Binary Ninja behaviour: a `.bnpr` is a directory with
+extensionless blobs under `data/<2 hex>/<34 hex>`, `create_file(b"")` writes
+neither a blob nor its parent directory, and two files may share a path in the
+project while ids stay unique.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class FakeProjectFile:
 
 
 class FakeProject:
-    """A `.bnpr` rooted at *root*: blobs live at `data/<2 hex>/<34 hex>` (F1)."""
+    """A `.bnpr` rooted at *root*: blobs live at `data/<2 hex>/<34 hex>`."""
 
     def __init__(self, root: Path, name: str = "demo"):
         self.root = root
@@ -91,7 +91,7 @@ class FakeProject:
         return self.add_folder(name, parent)
 
     def create_file(self, contents: bytes, folder, name: str, description: str = ""):
-        # F3: a row, but neither a blob nor its parent directory.
+        # A row exists without a blob or its parent directory.
         assert contents == b""
         return self.add_file(name, folder, data=None, description=description)
 

@@ -15,7 +15,7 @@ Use `bn` for Binary Ninja reads and writes through the bridge. Choose a methodol
 - Bound large reads with `--limit`, `--lines`, `--out`, or `--estimate-output`. `BN_SPILL_TOKENS` opt-in replaces oversized stdout with an artifact envelope, so a pipe may search the envelope rather than the data. Check stderr and the envelope before concluding that a search had no match.
 - For a bounds, access-width, or branch-predicate claim, confirm the relevant instructions with `bn disasm`. Include a preceding Thumb `IT` instruction when its condition governs the window.
 
-- For Binary Ninja projects: use `bn project open <path>` to open/attach to a project and pin the owning bridge instance (or `bn project attach <path>` to pin an already-running one); subsequent commands route to it. List files with `bn project files` and select one with `bn project load <selector>` (file name, path-in-project, or ID); do not `bn load` raw file paths inside a `.bnpr` directly. After loading a project file, `bn save -t <selector>` with no path creates the first database beside the raw file or snapshots it later. Manage with `bn project import/export/delete`; close with `--force` if targets have unsaved work.
+- Optional project workflows require the separately installed `bn-projects` skill: `bn skill install projects`.
 
 ## Command index
 
@@ -23,7 +23,6 @@ Use `bn` for Binary Ninja reads and writes through the bridge. Choose a methodol
 - **Mutate** — `symbol rename`, `proto set`, `local rename/retype`, `comment set/delete`, `struct field set/rename/delete`, `types declare`, `class apply-types`, `data retype`, `function create/delete`, `tag add/remove`, `tag type create/remove`, `go rename`, `batch apply` → `reference/mutating.md`
 - **Discover** — `capabilities` → `reference/runtime.md`
 - **Session** — `load`, `save`, `close`, `refresh`, `session start/list/stop/restart/status`, `instance list/find/gc`, `target close` → `reference/runtime.md`
-- **Projects** — `project info/files/load/import/export/delete/close` (use `project open`/`attach` in prose) → `reference/reading.md`
 - **Tooling** — `doctor`, `help`, `plugin install`, `skill install`, `spill gc` → `reference/runtime.md`
 - **Escape hatch** — `py exec` → `reference/runtime.md`
 

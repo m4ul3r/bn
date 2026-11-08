@@ -1,5 +1,5 @@
-"""ELF dynamic-section facts BN does not expose: SONAME, RPATH/RUNPATH and the
-library each versioned import binds to (#969).
+"""ELF dynamic-section facts BN does not expose: SONAME, RPATH/RUNPATH, the
+library each versioned import binds to (#969) and the file's own exports.
 
 BN's ELF view publishes the DT_NEEDED list (``bv.libraries``) and nothing else
 from ``.dynamic``: an import symbol carries a sentinel namespace, so every
@@ -28,9 +28,11 @@ reader for an out-of-range window.
 """
 from __future__ import annotations
 
+import os
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Literal
 
 _PT_LOAD = 1
 _PT_DYNAMIC = 2
@@ -47,6 +49,8 @@ _DT_RPATH = 15
 _DT_RUNPATH = 29
 _DT_GNU_HASH = 0x6FFFFEF5
 _DT_VERSYM = 0x6FFFFFF0
+_DT_VERDEF = 0x6FFFFFFC
+_DT_VERDEFNUM = 0x6FFFFFFD
 _DT_VERNEED = 0x6FFFFFFE
 _DT_VERNEEDNUM = 0x6FFFFFFF
 
@@ -58,6 +62,7 @@ _MAX_SECTIONS = 1 << 16
 _MAX_DYNAMIC_ENTRIES = 4096
 _MAX_SYMBOLS = 1 << 20
 _MAX_VERNEED = 4096
+_MAX_VERDEF = 4096
 _MAX_STRING = 4096
 # The largest single read the parser ever issues. The biggest legitimate one is
 # the dynamic symbol table: _MAX_SYMBOLS * 24 bytes.
@@ -66,8 +71,24 @@ _MAX_READ = _MAX_SYMBOLS * 24
 Reader = Callable[[int, int], bytes]
 
 
+@dataclass(frozen=True)
+class ExportedSymbol:
+    """A dynamic symbol this file defines for other objects to bind to."""
+    name: str
+    # The verdef version the symbol is published under (`GLIBC_2.17`), or None
+    # when the file has no verdef table or the symbol is unversioned.
+    version: str | None
+    kind: Literal["func", "object", "other"]
+    weak: bool
+
+
 @dataclass
 class ElfDynamicInfo:
+    # ELF header facts a linker needs to decide whether two objects can be
+    # loaded together: e_machine, EI_CLASS as 32/64 and e_type (ET_DYN = 3).
+    e_machine: int = 0
+    elf_class: int = 0
+    e_type: int = 0
     needed: list[str] = field(default_factory=list)
     soname: str | None = None
     rpath: str | None = None
@@ -75,6 +96,10 @@ class ElfDynamicInfo:
     # Dynamic symbol name -> the verneed library its version binds it to. Only
     # names with ONE library: a name versioned against two is not attributed.
     import_libraries: dict[str, str] = field(default_factory=dict)
+    # Defined dynamic symbols (st_shndx != SHN_UNDEF, GLOBAL or WEAK binding,
+    # DEFAULT or PROTECTED visibility) keyed by bare name. A name defined under
+    # several versions keeps its default (non-hidden) one.
+    exports: dict[str, ExportedSymbol] = field(default_factory=dict)
     # Why part of the dynamic section was not parsed: a value out of range for
     # this file, so that part is skipped rather than guessed. Empty when the
     # whole answer was read.
@@ -146,18 +171,39 @@ def parse_elf_dynamic(read: Reader, file_size: int) -> ElfDynamicInfo | None:
         return None
 
 
+def parse_elf_file(path: str) -> ElfDynamicInfo | None:
+    """`parse_elf_dynamic` over the file at *path*, read piecewise with
+    seek+read so no window larger than `_MAX_READ` is ever in memory; None for
+    an unreadable path as for a non-ELF file."""
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+
+            def read(offset: int, length: int) -> bytes:
+                handle.seek(offset)
+                return handle.read(length)
+
+            return parse_elf_dynamic(read, size)
+    except OSError:
+        return None
+
+
 def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     probe = _Elf(read, file_size, False, "<")
     ident = probe.bytes_at(0, 16)
     if ident is None or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
         return None
     elf = _Elf(read, file_size, ident[4] == 2, "<" if ident[5] == 1 else ">")
-    # e_phoff, then (past e_shoff/e_flags/e_ehsize) e_phentsize and e_phnum.
+    # e_type, e_machine; e_phoff, then (past e_shoff/e_flags/e_ehsize)
+    # e_phentsize and e_phnum.
+    kinds = elf.unpack("HH", 0x10)
     phoff = elf.unpack("Q" if elf.is64 else "I", 0x20 if elf.is64 else 0x1C)
     counts = elf.unpack("HH", 0x36 if elf.is64 else 0x2A)
-    if phoff is None or counts is None:
+    if kinds is None or phoff is None or counts is None:
         return None
     phoff, (phentsize, phnum) = phoff[0], counts
+    info = ElfDynamicInfo(e_machine=kinds[1], elf_class=64 if elf.is64 else 32,
+                          e_type=kinds[0], notes=elf.notes)
     if not phoff or not phnum:
         return None
     # The entry size is fixed by the ABI; anything else is a file this parser
@@ -186,7 +232,7 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
         return None
     entries = _dynamic_entries(elf, *dynamic)
     if entries is None:
-        return ElfDynamicInfo(notes=elf.notes)
+        return info
     tags: dict[int, int] = {}
     needed_offsets: list[int] = []
     for tag, value in entries:
@@ -194,7 +240,6 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
             needed_offsets.append(value)
         else:
             tags.setdefault(tag, value)
-    info = ElfDynamicInfo(notes=elf.notes)
     strtab = elf.file_offset(tags[_DT_STRTAB]) if _DT_STRTAB in tags else None
     if strtab is None:
         info.versions_unread = "the dynamic string table is not in the file"
@@ -219,8 +264,10 @@ def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
     info.soname = dynstr(tags[_DT_SONAME]) if _DT_SONAME in tags else None
     info.rpath = dynstr(tags[_DT_RPATH]) if _DT_RPATH in tags else None
     info.runpath = dynstr(tags[_DT_RUNPATH]) if _DT_RUNPATH in tags else None
+    table = _load_symbol_table(elf, tags)
     info.import_libraries, info.versions_unread = _versioned_import_libraries(
-        elf, tags, dynstr)
+        elf, tags, dynstr, table)
+    info.exports = _exports(elf, tags, dynstr, table)
     return info
 
 
@@ -346,8 +393,56 @@ def _verneed_files(elf: _Elf, tags: dict[int, int], dynstr) -> dict[int, str]:
     return files
 
 
-def _versioned_import_libraries(elf: _Elf, tags: dict[int, int],
-                                dynstr) -> tuple[dict[str, str], str | None]:
+@dataclass
+class _SymbolTable:
+    """The dynamic symbol table read into memory: ``count`` entries of
+    ``syment`` bytes in ``data``, and each entry's ``.gnu.version`` index when
+    the file has a DT_VERSYM table."""
+    count: int
+    syment: int
+    data: bytes
+    versions: tuple[int, ...] | None
+
+
+def _load_symbol_table(elf: _Elf, tags: dict[int, int]) -> _SymbolTable | str:
+    """The dynamic symbol table (with its version indices when DT_VERSYM is
+    declared), or the reason it was not read. Both the import attribution and
+    the export list are built from this one read."""
+    if _DT_SYMTAB not in tags:
+        return "the file has no dynamic symbol table"
+    # DT_SYMENT is fixed by the ABI (sizeof(ElfN_Sym)); the loader ignores it,
+    # so a file can carry any value and still run. Any other value is refused,
+    # never used as a stride or a read size.
+    expected = 24 if elf.is64 else 16
+    syment = tags.get(_DT_SYMENT, expected)
+    if syment != expected:
+        elf.notes.append(f"DT_SYMENT {syment} is not the ABI symbol size {expected}; "
+                         "per-import library attribution and exports were skipped")
+        return f"DT_SYMENT {syment} is not the ABI symbol size {expected}"
+    count = _symbol_count(elf, tags)
+    symtab = elf.file_offset(tags[_DT_SYMTAB])
+    versym = elf.file_offset(tags[_DT_VERSYM]) if _DT_VERSYM in tags else None
+    if not count or symtab is None or (_DT_VERSYM in tags and versym is None):
+        return "the dynamic symbol table, its size or its version table could not be located"
+    if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment) \
+            or (versym is not None and not elf.fits(versym, count * 2)):
+        elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
+                         "the file; per-import library attribution and exports were skipped")
+        return "the dynamic symbol table does not fit in the file"
+    symbols = elf.bytes_at(symtab, count * syment)
+    if symbols is None:
+        return "the dynamic symbol table could not be read"
+    versions = None
+    if versym is not None:
+        data = elf.bytes_at(versym, count * 2)
+        if data is None:
+            return "the dynamic symbol table could not be read"
+        versions = struct.unpack(f"{elf.endian}{count}H", data)
+    return _SymbolTable(count, syment, symbols, versions)
+
+
+def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr,
+                                table: _SymbolTable | str) -> tuple[dict[str, str], str | None]:
     """``(name -> library, why the version table was not read)``; the reason
     is None when it was read, or when the file declares no version table."""
     if _DT_VERSYM not in tags and _DT_VERNEED not in tags:
@@ -362,30 +457,10 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int],
         if _DT_VERNEED in tags:
             return {}, "the version-requirement table (DT_VERNEED) could not be read"
         return {}, None
-    # DT_SYMENT is fixed by the ABI (sizeof(ElfN_Sym)); the loader ignores it,
-    # so a file can carry any value and still run. Any other value is refused,
-    # never used as a stride or a read size.
-    expected = 24 if elf.is64 else 16
-    syment = tags.get(_DT_SYMENT, expected)
-    if syment != expected:
-        elf.notes.append(f"DT_SYMENT {syment} is not the ABI symbol size {expected}; "
-                         "per-import library attribution was skipped")
-        return {}, f"DT_SYMENT {syment} is not the ABI symbol size {expected}"
-    count = _symbol_count(elf, tags)
-    symtab = elf.file_offset(tags[_DT_SYMTAB])
-    versym = elf.file_offset(tags[_DT_VERSYM])
-    if not count or symtab is None or versym is None:
-        return {}, "the dynamic symbol table, its size or its version table could not be located"
-    if count > _MAX_SYMBOLS or not elf.fits(symtab, count * syment) \
-            or not elf.fits(versym, count * 2):
-        elf.notes.append(f"the dynamic symbol table ({count} symbols) does not fit in "
-                         "the file; per-import library attribution was skipped")
-        return {}, "the dynamic symbol table does not fit in the file"
-    symbols = elf.bytes_at(symtab, count * syment)
-    versions = elf.bytes_at(versym, count * 2)
-    if symbols is None or versions is None:
-        return {}, "the dynamic symbol table could not be read"
-    version_of = struct.unpack(f"{elf.endian}{count}H", versions)
+    if isinstance(table, str):
+        return {}, table
+    if table.versions is None:  # unreachable: DT_VERSYM is in tags, so the loader read it
+        return {}, "the symbol version table could not be read"
     # st_name is the first field of both Elf32_Sym and Elf64_Sym. Definedness
     # is not consulted: a version index that names a verneed entry IS the
     # requirement on that library, and a copy-relocated data import (a vtable,
@@ -394,11 +469,11 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int],
     name_fmt = elf.endian + "I"
     attributed: dict[str, str] = {}
     conflicted: set[str] = set()
-    for index in range(1, count):
-        library = files.get(version_of[index] & 0x7FFF)
+    for index in range(1, table.count):
+        library = files.get(table.versions[index] & 0x7FFF)
         if library is None:
             continue
-        (name_index,) = struct.unpack_from(name_fmt, symbols, index * syment)
+        (name_index,) = struct.unpack_from(name_fmt, table.data, index * table.syment)
         name = dynstr(name_index)
         if not name or name in conflicted:
             continue
@@ -406,3 +481,70 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int],
             del attributed[name]
             conflicted.add(name)
     return attributed, None
+
+
+def _verdef_names(elf: _Elf, tags: dict[int, int], dynstr) -> dict[int, str]:
+    """Version index -> the name its verdef entry defines (the first verdaux;
+    later ones name parent versions). Index 1, the base version that just
+    restates the SONAME, is left out so such symbols read as unversioned."""
+    at = elf.file_offset(tags[_DT_VERDEF]) if _DT_VERDEF in tags else None
+    if at is None:
+        return {}
+    remaining = min(tags.get(_DT_VERDEFNUM, _MAX_VERDEF), _MAX_VERDEF)
+    names: dict[int, str] = {}
+    while remaining > 0:
+        entry = elf.unpack("HHHHIII", at)  # version, flags, ndx, cnt, hash, aux, next
+        if entry is None:
+            break
+        _version, _flags, ndx, cnt, _hash, aux, next_def = entry
+        if cnt and (ndx & 0x7FFF) > 1:
+            daux = elf.unpack("II", at + aux)  # name, next
+            name = dynstr(daux[0]) if daux is not None else None
+            if name:
+                names[ndx & 0x7FFF] = name
+        remaining -= 1
+        if not next_def:
+            break
+        at += next_def
+    return names
+
+
+def _exports(elf: _Elf, tags: dict[int, int], dynstr,
+             table: _SymbolTable | str) -> dict[str, ExportedSymbol]:
+    """The symbols this file defines for others: a dynsym entry with a section
+    (st_shndx != SHN_UNDEF), GLOBAL or WEAK binding and DEFAULT or PROTECTED
+    visibility. HIDDEN and INTERNAL symbols are in the table but not bindable."""
+    if isinstance(table, str):
+        return {}
+    names = _verdef_names(elf, tags, dynstr) if table.versions is not None else {}
+    # Elf64_Sym: st_name, st_info, st_other, st_shndx; Elf32_Sym: st_name,
+    # st_value, st_size, st_info, st_other, st_shndx.
+    fmt = elf.endian + ("IBBH" if elf.is64 else "IIIBBH")
+    exports: dict[str, ExportedSymbol] = {}
+    hidden_version: set[str] = set()
+    for index in range(1, table.count):
+        fields = struct.unpack_from(fmt, table.data, index * table.syment)
+        name_index, st_info, st_other, st_shndx = fields[0], fields[-3], fields[-2], fields[-1]
+        if st_shndx == 0 or (st_info >> 4) not in (1, 2) or (st_other & 3) not in (0, 3):
+            continue
+        name = dynstr(name_index)
+        if not name:
+            continue
+        version = None
+        hidden = False
+        if table.versions is not None:
+            versym = table.versions[index]
+            hidden = bool(versym & 0x8000)
+            version = names.get(versym & 0x7FFF)
+        # `memcpy@GLIBC_2.2.5` and `memcpy@@GLIBC_2.14` share a bare name: the
+        # default (non-hidden) definition is the one an unversioned reference
+        # binds to, so it wins over a hidden compatibility one.
+        if name in exports and (hidden or name not in hidden_version):
+            continue
+        if hidden:
+            hidden_version.add(name)
+        else:
+            hidden_version.discard(name)
+        kind = {2: "func", 1: "object", 5: "object", 6: "object"}.get(st_info & 0xF, "other")
+        exports[name] = ExportedSymbol(name, version, kind, (st_info >> 4) == 2)
+    return exports

@@ -1,10 +1,9 @@
 """Binary Ninja project (`.bnpr`) support for the bridge.
 
-Contracts, measured BN facts and the ownership model live in `BNPR_PLAN.md` at the
-repo root; the section numbers in comments below refer to it. In one line: a
-project is owned by exactly one bridge (F6/F7), each file loaded from it is an
-ordinary target, and a project view is saved through the project API (F3), never
-by filename suffix.
+A project is owned by exactly one bridge: a second process cannot create files
+while another owns it, and concurrent database writers can corrupt a database.
+Each file loaded from it is an ordinary target, saved through the project API
+rather than by filename suffix.
 
 This module never imports `bridge` (import cycle) and imports `binaryninja` only
 inside functions (tests substitute a fake module). The handlers that need the
@@ -15,6 +14,7 @@ take the bridge instance.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import threading
@@ -25,14 +25,48 @@ from typing import Any
 from .paths import bridge_registry_path, instances_dir
 from .proc_identity import identity_verdict
 
-# A project database blob has no extension (F1); its kind is read off the bytes.
+# A project database blob has no extension; its kind is read off the bytes.
 _SQLITE_MAGIC = b"SQLite format 3\x00"
-# §5.1: an id prefix shorter than this is not a selector (UUID hex is dense
+# An id prefix shorter than this is not a selector (UUID hex is dense
 # enough that 8 characters are unique in any realistic project, and a shorter
 # prefix invites `-t 7` style accidents).
 MIN_ID_PREFIX = 8
 # Cap on the "did you mean" listing appended to selector errors.
 _LISTING_CAP = 50
+# Project metadata key holding the firmware rootfs inventory (root, platform,
+# lookup paths, imported libraries) that `project_sync_libs` writes and
+# `project_link` reads.
+ROOTFS_METADATA_KEY = "bn.rootfs"
+
+# This inode must persist across closes: unlinking it permits two independent
+# locks on the same project. Keep it outside BN's metadata and data directories.
+_LEASE_FILENAME = ".bn-bridge.lock"
+_LEASE_LOCK = threading.RLock()
+# A live native handle must not lose its lease when a GUI bridge is replaced or
+# its last Python owner disappears. Only a successful explicit close removes it.
+_LEASE_OWNERS: dict[int, ProjectManager] = {}
+# Do not invoke native handle destructors from a post-fork child callback.
+_FORKED_OWNERS: list[ProjectManager] = []
+
+
+def _after_fork_child() -> None:
+    # flock locks belong to open file descriptions shared across fork. Closing
+    # the child's duplicate is safe; LOCK_UN would unlock the parent's lease.
+    # Inherited managers reject use before touching inherited Python/BN locks.
+    try:
+        _FORKED_OWNERS.extend(_LEASE_OWNERS.values())
+        for fd in _LEASE_OWNERS:
+            os.close(fd)
+        _LEASE_OWNERS.clear()
+    finally:
+        _LEASE_LOCK.release()
+
+
+os.register_at_fork(
+    before=_LEASE_LOCK.acquire,
+    after_in_parent=_LEASE_LOCK.release,
+    after_in_child=_after_fork_child,
+)
 
 
 def canonical_project_path(path: str | os.PathLike[str]) -> Path:
@@ -53,10 +87,10 @@ class ProjectState:
 
 
 class ProjectManager:
-    """At most ONE open project per bridge (§3).
+    """At most ONE open project per bridge.
 
     Holds the strong reference to the `Project` handle for the bridge's lifetime,
-    resolves §5.1 file selectors, builds §5.2 file rows, and performs the F3 save
+    resolves file selectors, builds file rows, and performs the first-save
     recipe. Thread-safe for the handful of state transitions it has; the heavy
     BN calls run under whichever dispatcher lock the op declared.
     """
@@ -64,11 +98,80 @@ class ProjectManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._state: ProjectState | None = None
+        self._pid = os.getpid()
+        self._lease_fd: int | None = None
+        self._gate_fd: int | None = None
+        # Parsed dynamic-section facts (exports, NEEDED) of project library
+        # blobs, keyed by (file id, size, mtime) so a replaced blob re-parses.
+        # Export tables are never stored in project metadata; `project_link`
+        # rebuilds them from the blobs on demand.
+        self.export_cache: dict[tuple[str, int, int], Any] = {}
 
     # -- state -------------------------------------------------------------
 
+    def _check_process(self) -> None:
+        if os.getpid() != self._pid:
+            raise RuntimeError(
+                "An inherited project manager cannot be used after fork; "
+                "create a new bridge in the child process"
+            )
+
+    def _acquire_gate(self, canonical: Path) -> None:
+        # BN refuses creation into a directory containing the lease file, so
+        # it cannot exist until create_project returns. All opens/creates briefly
+        # lock the parent directory to cover that handoff without another file.
+        with _LEASE_LOCK:
+            fd = os.open(canonical.parent, os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException as exc:
+                os.close(fd)
+                if isinstance(exc, BlockingIOError):
+                    raise RuntimeError(
+                        f"Project open/create is in progress under {canonical.parent}; "
+                        "retry after the other bridge finishes."
+                    ) from exc
+                raise
+            self._gate_fd = fd
+            _LEASE_OWNERS[fd] = self
+
+    def _release_gate(self) -> None:
+        with _LEASE_LOCK:
+            fd = self._gate_fd
+            if fd is not None:
+                os.close(fd)
+                self._gate_fd = None
+                del _LEASE_OWNERS[fd]
+
+    def _acquire_lease(self, canonical: Path) -> None:
+        with _LEASE_LOCK:
+            fd = os.open(canonical / _LEASE_FILENAME, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException as exc:
+                os.close(fd)
+                if isinstance(exc, BlockingIOError):
+                    raise RuntimeError(
+                        f"Project already open in another bridge: {canonical}. "
+                        "Its exclusive project lease is held (possibly under a "
+                        "different BN_CACHE_DIR); close it in the owning bridge first."
+                    ) from exc
+                raise
+            self._lease_fd = fd
+            _LEASE_OWNERS[fd] = self
+
+    def _release_lease(self) -> None:
+        with _LEASE_LOCK:
+            fd = self._lease_fd
+            if fd is not None:
+                # Never unlink the file or explicitly unlock a shared fork fd.
+                os.close(fd)
+                self._lease_fd = None
+                del _LEASE_OWNERS[fd]
+
     @property
     def current(self) -> ProjectState | None:
+        self._check_process()
         with self._lock:
             return self._state
 
@@ -80,10 +183,61 @@ class ProjectManager:
             )
         return state
 
+    def _adopt(self, project: Any, canonical: Path) -> ProjectState:
+        # Publish before reading fallible native properties: cleanup failure
+        # must retain the strong handle reference and whichever lease protects it.
+        state = ProjectState(project, str(canonical), "", canonical.stem)
+        self._state = state
+        state.project_id = str(getattr(project, "id", "") or "")
+        state.name = str(getattr(project, "name", "") or canonical.stem)
+        return state
+
+    def create(self, path: str, name: str) -> ProjectState:
+        """Create under the handoff gate and retain the opened native handle."""
+        self._check_process()
+        canonical = canonical_project_path(path)
+        with self._lock:
+            if self._state is not None:
+                raise RuntimeError(
+                    f"A different project is already open in this bridge: {self._state.path}. "
+                    "Run `bn project close` first (one project per bridge instance)."
+                )
+            self._acquire_gate(canonical)
+            try:
+                if canonical.exists():
+                    raise RuntimeError(
+                        f"project_create: {canonical} already exists; "
+                        f"run `bn project open {canonical}`"
+                    )
+                import binaryninja
+
+                try:
+                    project = binaryninja.Project.create_project(str(canonical), name)
+                except Exception as exc:  # noqa: BLE001 - ProjectException
+                    raise RuntimeError(
+                        f"Binary Ninja could not create project {canonical}: {exc}. "
+                        "Projects require a Commercial or Ultimate licence."
+                    ) from exc
+                if project is None:
+                    raise RuntimeError(f"Binary Ninja could not create project {canonical}")
+                state = self._adopt(project, canonical)
+                self._acquire_lease(canonical)
+            except BaseException:
+                if self._state is not None:
+                    # If close fails, keep the parent gate as a conservative
+                    # lifetime lease until a later explicit close succeeds.
+                    self.close()
+                else:
+                    self._release_gate()
+                raise
+            self._release_gate()
+            return state
+
     def open(self, path: str, *, self_pid: int) -> tuple[ProjectState, bool]:
         """Open *path*; ``(state, opened)`` where ``opened`` is False when the same
-        project was already open here (F8 makes a second BN open a no-op anyway,
+        project was already open here (BN dedupes a second open in-process,
         but the registry and the result should say which happened)."""
+        self._check_process()
         canonical = canonical_project_path(path)
         with self._lock:
             state = self._state
@@ -99,9 +253,8 @@ class ProjectManager:
                     f"Not a Binary Ninja project: {canonical} (no project.bnpm inside). "
                     "Pass the .bnpr directory or its project.bnpm file."
                 )
-            # §5.5: refuse a project another LIVE bridge publishes, before BN
-            # opens it (BN itself would still let a second process open it, and
-            # only fail later on the first create_file -- F6).
+            # Registry ownership gives useful routing guidance, but only the
+            # project-local lifetime lease arbitrates concurrent bridge opens.
             owner = find_other_owner(str(canonical), self_pid=self_pid)
             if owner is not None:
                 raise RuntimeError(
@@ -109,39 +262,88 @@ class ProjectManager:
                     f"(pid {owner['pid']}): run `bn project attach {canonical}` "
                     f"(or pass -i {owner['instance_id']})"
                 )
-            import binaryninja
-
+            self._acquire_gate(canonical)
             try:
-                project = binaryninja.Project.open_project(str(canonical))
-            except Exception as exc:  # noqa: BLE001 - ProjectException and friends
-                raise RuntimeError(
-                    f"Binary Ninja could not open project {canonical}: {exc}. "
-                    "Projects require a Commercial or Ultimate licence."
-                ) from exc
-            if project is None:
-                raise RuntimeError(f"Binary Ninja could not open project {canonical}")
-            state = ProjectState(
-                project=project,
-                path=str(canonical),
-                project_id=str(getattr(project, "id", "") or ""),
-                name=str(getattr(project, "name", "") or canonical.stem),
-            )
-            self._state = state
+                self._acquire_lease(canonical)
+            finally:
+                self._release_gate()
+            try:
+                import binaryninja
+
+                try:
+                    project = binaryninja.Project.open_project(str(canonical))
+                except Exception as exc:  # noqa: BLE001 - ProjectException and friends
+                    raise RuntimeError(
+                        f"Binary Ninja could not open project {canonical}: {exc}. "
+                        "Projects require a Commercial or Ultimate licence."
+                    ) from exc
+                if project is None:
+                    raise RuntimeError(f"Binary Ninja could not open project {canonical}")
+            except BaseException:
+                self._release_lease()
+                raise
+            try:
+                state = self._adopt(project, canonical)
+            except BaseException:
+                self.close()
+                raise
             return state, True
 
     def close(self) -> ProjectState | None:
-        """Close the project handle. Callers close the project's TARGETS first;
-        this only releases the project itself."""
+        """Close after callers close all project TARGETS.
+
+        Failure retains the native handle, state, cache and exclusive lease so
+        another bridge cannot open a database that may still be in use.
+        """
+        self._check_process()
         with self._lock:
             state = self._state
+            if state is None:
+                return None
+            try:
+                if state.project.close() is False:
+                    raise RuntimeError("Binary Ninja returned False")
+            except Exception as exc:  # noqa: BLE001 - retain ownership on failure
+                raise RuntimeError(
+                    f"Binary Ninja could not close project {state.path}: {exc}"
+                ) from exc
             self._state = None
-        if state is None:
-            return None
+            self.export_cache.clear()
+            self._release_lease()
+            self._release_gate()
+            return state
+
+    # -- rootfs metadata ----------------------------------------------------
+
+    def get_rootfs(self) -> dict[str, Any] | None:
+        """The `bn.rootfs` project metadata (a JSON object), or None when the
+        project records no rootfs or the stored value is unreadable."""
+        project = self.require().project
         try:
-            state.project.close()
-        except Exception:  # noqa: BLE001 - already dropped from our state; report nothing
-            pass
-        return state
+            raw = project.query_metadata(ROOTFS_METADATA_KEY)
+        except Exception:  # noqa: BLE001 - BN raises for a missing key
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None
+        return raw if isinstance(raw, dict) else None
+
+    def set_rootfs(self, value: dict[str, Any]) -> None:
+        """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
+        project = self.require().project
+        try:
+            if project.store_metadata(ROOTFS_METADATA_KEY, json.dumps(value, sort_keys=True)) is False:
+                raise RuntimeError("Binary Ninja returned False")
+            if self.get_rootfs() != value:
+                raise RuntimeError("stored metadata did not match the requested value")
+        except Exception as exc:  # noqa: BLE001 - ProjectException
+            raise RuntimeError(
+                f"Binary Ninja could not store the rootfs metadata in the project: {exc}"
+            ) from exc
 
     # -- file lookups ------------------------------------------------------
 
@@ -150,7 +352,7 @@ class ProjectManager:
 
     @staticmethod
     def path_in_project(pf: Any) -> str:
-        """`/folder/name` (F1 shape). Computed from the folder chain when BN's
+        """`/folder/name`. Computed from the folder chain when BN's
         own answer is unavailable, so a row never lacks a path."""
         try:
             direct = pf.get_path_in_project()
@@ -175,7 +377,7 @@ class ProjectManager:
         return "/" + "/".join(reversed(parts)) if parts else ""
 
     def resolve_file(self, selector: Any) -> Any:
-        """§5.1 file selector -> ProjectFile, or a RuntimeError that lists the
+        """File selector -> ProjectFile, or a RuntimeError that lists the
         candidates (ambiguous) or every file (unknown)."""
         if not isinstance(selector, str) or not selector.strip():
             raise RuntimeError(
@@ -239,8 +441,8 @@ class ProjectManager:
     def sibling_database(self, pf: Any, index: dict[str, list[Any]] | None = None) -> Any | None:
         """The `<name>.bndb` project file in *pf*'s folder, if any: the project
         analogue of the adjacent-`.bndb` preference (#717). None for a file that
-        is itself a `.bndb`, and None when two siblings share that name (F9:
-        BN allows the duplicate; a save must not pick one at random)."""
+        is itself a `.bndb`, and None when two siblings share that name:
+        BN allows the duplicate; a save must not pick one at random."""
         name = str(pf.name)
         if name.endswith(".bndb"):
             return None
@@ -283,7 +485,7 @@ class ProjectManager:
         self, pf: Any, open_targets: dict[str, str] | None = None,
         index: dict[str, list[Any]] | None = None,
     ) -> dict[str, Any]:
-        """§5.2 file row. *open_targets* maps project_file_id -> target_id;
+        """File row. *open_targets* maps project_file_id -> target_id;
         *index* is `sibling_index()` over the listing being built, so one row
         costs one path lookup rather than a folder listing."""
         blob = str(getattr(pf, "path_on_disk", "") or "")
@@ -311,13 +513,13 @@ class ProjectManager:
             "sibling_database_id": str(sibling.id) if sibling is not None else None,
         }
 
-    # -- save (F3) ---------------------------------------------------------
+    # -- save --------------------------------------------------------------
 
     def create_database_file(self, bv: Any, pf: Any) -> Any:
         """Create the project-tracked `<name>.bndb` for the raw project file *pf*
         and write *bv*'s database into it. Returns the new ProjectFile.
 
-        F3: `create_file(b"")` makes a row but neither a blob nor its parent
+        `create_file(b"")` makes a row but neither a blob nor its parent
         directory; `create_database` needs the directory. A write that fails
         leaves no half-registered file behind.
         """
@@ -359,7 +561,7 @@ class ProjectManager:
             pass
 
 
-# -- ownership (§5.5) ------------------------------------------------------
+# -- ownership -------------------------------------------------------------
 
 
 def _record_is_live(payload: dict[str, Any], pid: int) -> bool:
@@ -370,7 +572,7 @@ def _record_is_live(payload: dict[str, Any], pid: int) -> bool:
         return False
     # "unrecorded": no identity to compare; a pid that still answers is treated
     # as live (the conservative direction -- refusing to open costs one command,
-    # a wrong open costs F6 failures later).
+    # a wrong open causes project file creation to fail later).
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -588,7 +790,7 @@ def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
 
 
 def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
-    """§5.2 project branch of `save_database`. The caller established
+    """Project branch of `save_database`. The caller established
     ``bv.project_file is not None`` and holds the write lock."""
     manager = bridge.projects
     if path is not None:
@@ -597,7 +799,7 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
             "`bn project export <selector> <dest>`"
         )
     pf = bv.project_file
-    # F4: after a first save BN keeps reporting the RAW file here, but the
+    # After a first save BN keeps reporting the RAW file here, but the
     # record we published knows the database file; prefer that.
     record = bridge.targets.project_binding(bv)
     file_id = record[0] if record else str(pf.id)

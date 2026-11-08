@@ -35,8 +35,8 @@ EXPECTED_READ = {
     # Project associations update only the private registry payload, which
     # enumerates open targets; this remains a read of BN state.
     "associate_project_roots",
-    # BNPR_PLAN.md §5.2: project listings read BN's project metadata only.
-    "project_info", "project_files",
+    # Project listings read BN's project metadata only.
+    "project_info", "project_files", "project_libs",
 }
 EXPECTED_WRITE = {
     # True short writers: gate + exclusive target lock for the whole op.
@@ -49,11 +49,11 @@ EXPECTED_WRITE = {
     # serializes writers for the whole op, while the exclusive target lock covers
     # only the BN-mutating/snapshotting phases, leaving the post-apply reanalysis
     # readable), exactly like "refresh"/"load_binary" below.
-    # BNPR_PLAN.md §5.2: project open/close and metadata mutations are
+    # Project open/close and metadata mutations are
     # exclusive -- `create_file`/`delete_file` must not race a read of the
     # file list, and open/close swap the handle every project op reads.
     "project_open", "project_close", "project_import", "project_export",
-    "project_delete",
+    "project_delete", "project_create", "project_sync_libs", "project_link",
 }
 # Ops that are registered lock="none" and therefore belong to NEITHER derived
 # set. This is the test-side pin for them; the registry stays the single source
@@ -71,7 +71,7 @@ EXPECTED_SELF_MANAGED = {
     # #993 item 3: holds the write gate across its read-locked plan and the
     # bridge._mutation() that applies it.
     "class_apply_types",
-    # BNPR_PLAN.md §5.2: `project_load` self-manages like `load_binary` so a
+    # `project_load` self-manages like `load_binary` so a
     # multi-minute analysis never holds the dispatcher lock.
     "project_load",
 }
@@ -189,7 +189,9 @@ def test_escalation_exists_only_for_force_analysis(op_registry):
 # is a policy declaration, so an op gaining or losing it is a deliberate
 # change. `close_binary` is absent on purpose -- it refuses the ambiguous case
 # in `_resolve_sole_target_for_close`, which also names its `all=true` escape.
-EXPECTED_DESTRUCTIVE = {"save_database", "py_exec", "batch_apply", "go_rename", "function_delete"}
+EXPECTED_DESTRUCTIVE = {
+    "save_database", "py_exec", "batch_apply", "go_rename", "function_delete", "project_link",
+}
 
 
 def test_the_destructive_ops_are_exactly_these(op_registry):

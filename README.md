@@ -39,7 +39,13 @@ Install the bundled Claude Code/Codex skills:
 bn skill install
 ```
 
-That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
+That symlinks the ordinary skills (`bn`, `bn-kernel`, `bn-re`, `bn-vr`) into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
+
+Project workflows are separate and opt-in, even with a Commercial/Ultimate license. The default install excludes `bn-projects`; installation adds optional guidance, not a license check or new Binary Ninja capabilities. Install only that skill explicitly with:
+
+```bash
+bn skill install projects
+```
 
 Re-running either install is safe: an existing link (or byte-identical copy, under `--mode copy`) of the same source, or a skills root linked to the source itself, is reported as already installed. A different destination is not reported as installed: `skill install` lists it and exits `1`, and `plugin install` refuses it. Both installers default to text; use `--format json` for structured output.
 
@@ -245,6 +251,17 @@ and batched-decompile text paths described above.
 ### Projects (.bnpr)
 
 Binary Ninja projects (`.bnpr`) let several agents share and analyze the same project's databases. Each agent routes through a single bridge instance that owns the project (opened with `bn project open`). Inside the project, select files to load with `bn project load <selector>`, view with `bn project files`, and manage with the project command group below. After loading a file, use `bn save` to create its first database; subsequent saves snapshot it. Export with `bn project export` or import new files with `bn project import`. Two bridges must never open the same `.bndb`; projects are Commercial/Ultimate only.
+
+After opting in with `bn skill install projects`, agents use the `bn-projects` skill to automatically create or open a project when entering a supported firmware root filesystem. `bn project init` chooses the preferred `<parent>/<root-name>.bnpr`, using a root-hash project under the cache projects directory if the parent is unwritable, and syncs libraries found in startup `LD_LIBRARY_PATH` assignments, `ld.so.conf`, default Linux directories, or Android library directories; it does not import executables. Binary-only `RPATH`/`RUNPATH` directories are not inventoried—linking uses them only to rank matches in the existing inventory. Explicitly import the program before loading it. Linux and Android lookup support is best-effort, not full dynamic-loader emulation. Use `bn project libs` to inspect or sync libraries, and `bn project link --preview` to inspect a link plan before applying it; inspect persisted assignments with `bn project link -t <selector> --preview --format json` and its `locations[]`, not `bn imports`. Ordinary installed skills do not enable this automation.
+
+```bash
+bn project init [ROOT] [--name N] [--no-libs] [--dry-run] [--instance-id ID]
+bn project import /path/to/rootfs/usr/bin/app --folder usr/bin
+bn project load usr/bin/app
+bn project libs [--sync] [--root R] [--dry-run]
+bn project link [-t T] [--preview] [--relink]
+```
+
 
 ## Output Behavior
 

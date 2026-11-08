@@ -165,6 +165,136 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
     assert (destination / "bn-kernel" / "SKILL.md").exists()
+    assert not (destination / "bn-projects").exists()
+
+
+@pytest.fixture
+def bundled_project_skills(tmp_path, monkeypatch):
+    root = tmp_path / "bundled-skills"
+    for name in ("bn", "bn-kernel", "bn-re", "bn-vr", "bn-projects"):
+        source = root / name
+        source.mkdir(parents=True)
+        (source / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: root)
+    return root
+
+
+@pytest.mark.parametrize("mode", ["symlink", "copy"])
+@pytest.mark.parametrize("selection", [None, "projects"])
+@pytest.mark.parametrize("explicit_dest", [False, True])
+def test_skill_install_projects_are_explicitly_selected(
+    tmp_path, monkeypatch, capsys, bundled_project_skills, mode, selection, explicit_dest
+):
+    destination = tmp_path / "installed"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: destination)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "absent-codex")
+    argv = ["skill", "install"]
+    if selection is not None:
+        argv.append(selection)
+    argv.extend(["--mode", mode, "--format", "json"])
+    if explicit_dest:
+        argv.extend(["--dest", str(destination)])
+
+    assert bn.cli.main(argv) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    expected = {"bn-projects"} if selection else {"bn", "bn-kernel", "bn-re", "bn-vr"}
+    assert {entry.name for entry in destination.iterdir()} == expected
+    assert {row["skill"] for row in result["skills"]} == expected
+    assert result["installed"] is True
+    assert result["mode"] == mode
+    assert set(result["installed_destinations"]) == {
+        str(destination / name) for name in expected
+    }
+    assert {row["destination"] for row in result["force_plan"]} == {
+        str(destination / name) for name in expected
+    }
+    if selection:
+        assert result["bn_kernel_skill_dirs"] == []
+    for name in expected:
+        entry = destination / name
+        assert entry.is_symlink() == (mode == "symlink")
+        assert (entry / "SKILL.md").read_bytes() == (
+            bundled_project_skills / name / "SKILL.md"
+        ).read_bytes()
+
+
+def test_skill_install_rejects_an_unknown_selection(tmp_path, capsys):
+    destination = tmp_path / "installed"
+
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["skill", "install", "unknown", "--dest", str(destination)])
+
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "missing", ["root", "directory", "manifest", "manifest_is_directory"]
+)
+def test_skill_install_projects_requires_its_own_source(
+    tmp_path, monkeypatch, capsys, missing
+):
+    root = tmp_path / "bundled-skills"
+    if missing != "root":
+        regular = root / "bn"
+        regular.mkdir(parents=True)
+        (regular / "SKILL.md").write_text("---\nname: bn\n---\n")
+    project = root / "bn-projects"
+    if missing in ("manifest", "manifest_is_directory"):
+        project.mkdir()
+    if missing == "manifest_is_directory":
+        (project / "SKILL.md").mkdir()
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: root)
+    destination = tmp_path / "installed"
+
+    assert bn.cli.main([
+        "skill", "install", "projects", "--dest", str(destination),
+    ]) == 2
+
+    err = capsys.readouterr().err
+    assert "Optional projects skill source is missing or invalid" in err
+    assert str(project) in err
+    assert "Traceback" not in err
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("explicit_dest", [False, True])
+def test_skill_install_projects_force_rerun_preserves_selection(
+    tmp_path, monkeypatch, capsys, bundled_project_skills, fmt, explicit_dest
+):
+    destination = tmp_path / "installed"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: destination)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: tmp_path / "absent-codex")
+    argv = ["skill", "install", "projects"]
+    if explicit_dest:
+        argv.extend(["--dest", str(destination)])
+    assert bn.cli.main(argv) == 0
+    capsys.readouterr()
+    argv.extend(["--mode", "copy"])
+    if fmt != "text":
+        argv.extend(["--format", fmt])
+
+    assert bn.cli.main(argv) == (2 if explicit_dest else 1)
+
+    captured = capsys.readouterr()
+    if fmt == "json":
+        result = json.loads(captured.out)
+        force_args = result["force_args"]
+        assert result["installed"] is False
+        assert [row["skill"] for row in result["skills"]] == ["bn-projects"]
+    else:
+        force_args = _printed_rerun(captured.err if explicit_dest else captured.out)[1:]
+    assert force_args == argv + ["--force"]
+    assert bn.cli.main(force_args) == 0
+    assert {entry.name for entry in destination.iterdir()} == {"bn-projects"}
+    installed = destination / "bn-projects"
+    assert not installed.is_symlink()
+    assert (installed / "SKILL.md").read_bytes() == (
+        bundled_project_skills / "bn-projects" / "SKILL.md"
+    ).read_bytes()
 
 
 def test_skill_install_copy_omits_python_bytecode(tmp_path, monkeypatch):
@@ -786,7 +916,7 @@ def test_a_refused_skill_install_replaces_no_other_destination(tmp_path):
     skills = sorted(
         entry
         for entry in bn.cli.skills_source_dir().iterdir()
-        if (entry / "SKILL.md").exists()
+        if entry.name != "bn-projects" and (entry / "SKILL.md").exists()
     )
     unsafe = skills[-1]
     destination_root = tmp_path / "skill-store"
@@ -811,7 +941,7 @@ def test_a_refused_skill_install_writes_nothing_for_a_spelled_destination(tmp_pa
     skills = sorted(
         entry
         for entry in bn.cli.skills_source_dir().iterdir()
-        if (entry / "SKILL.md").exists()
+        if entry.name != "bn-projects" and (entry / "SKILL.md").exists()
     )
     unsafe = skills[-1]
     store = tmp_path / "store"
@@ -1528,7 +1658,7 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
 
 def _restart_project_fixture(monkeypatch, *, meta, rows):
     """Fake registry + bridge for `session restart` with a project payload
-    (BNPR_PLAN.md §5.4/§5.7). Returns the ordered `(op, params)` call log."""
+    (project + project_targets registry keys). Returns the ordered `(op, params)` call log."""
     from bn.transport import BridgeInstance
     old = type("FakeInstance", (), {
         "instance_id": "keep-me", "pid": 500,
@@ -1586,7 +1716,7 @@ _PROJECT_ROWS = [
 
 
 def test_session_restart_replays_project_targets_by_file_id(monkeypatch, capsys):
-    """BNPR_PLAN.md §5.7 / F2: a project target's `filename` is a blob inside the
+    """A project target's `filename` is a blob inside the
     `.bnpr`; reloading it by path would come back WITHOUT project linkage. The
     restart reopens the project once and then loads each project target by its
     exact file id, and never replays the blob as a plain binary."""
@@ -1611,8 +1741,8 @@ def test_session_restart_replays_project_targets_by_file_id(monkeypatch, capsys)
 
 
 def test_session_restart_replays_project_targets_when_capture_failed(monkeypatch, capsys):
-    # The registry alone carries enough to replay the project (§5.4): an
-    # unreachable bridge's targets are still reopened by id, with full analysis.
+    # The registry alone carries enough to replay the project: an unreachable
+    # bridge's targets are still reopened by id, with full analysis.
     from bn.transport import BridgeUnreachableError
     calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=[])
 

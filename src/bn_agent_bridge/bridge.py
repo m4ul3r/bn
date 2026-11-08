@@ -29,6 +29,7 @@ from . import create_comments
 from . import il_format
 from . import mutation_engine
 from . import project_ops
+from . import project_rootfs
 from . import read_decompile
 from . import read_class
 from . import read_evidence
@@ -562,7 +563,7 @@ def _collect_open_views_state(*, strict: bool = False) -> tuple[list[Any], bool]
     snapshot: `refresh()` dropped the unsaved-ledger marker of a view that was
     merely INVISIBLE, so a UI hiccup during a `session list` erased the record
     of unsaved work on a still-open tab and the probe then reported a confident
-    zero (#733 F1 review). Completeness is therefore RETURNED, not only
+    zero (#733 review). Completeness is therefore RETURNED, not only
     enforced, so a non-strict reader can decline to act on a lossy snapshot.
 
     A headless bridge has no UI to fail: its snapshot is always complete.
@@ -727,7 +728,7 @@ def _project_file_of(bv) -> Any | None:
 
     Judged by the real BN class, never by attribute presence: a fake view in a
     test (or a wrapper with a permissive __getattr__) must not look
-    project-backed, because that diverts its SAVE (BNPR_PLAN.md §5.2)."""
+    project-backed, because that diverts its save into the project API."""
     try:
         import binaryninja
     except Exception:  # noqa: BLE001
@@ -750,8 +751,8 @@ class TargetRecord:
     filename: str
     basename: str
     view_name: str
-    # BNPR_PLAN.md §5.3: set only for a view loaded through a project. The
-    # filename of such a view is an opaque blob path (F1), so these are what a
+    # Set only for a view loaded through a project. Its filename is an opaque
+    # extensionless blob path, so these are what a
     # human selector names.
     project_file_id: str = ""
     project_path: str = ""    # path IN the project, `/fw/app.bndb`
@@ -787,8 +788,8 @@ class TargetManager:
         self._dirty_view_ids: set[str] = set()
         # view_id -> (project file id, path in project) of the DATABASE project
         # file this bridge created for a raw project view. BN keeps reporting
-        # the RAW file as `bv.project_file` after that first save (BNPR_PLAN.md
-        # F4), so the record must carry the truth itself; pruned to the live
+        # RAW file as `bv.project_file` after that first save, so the record
+        # must carry the truth itself; pruned to the live
         # set on a complete refresh like `_database_paths`.
         self._project_bindings: dict[str, tuple[str, str]] = {}
         # Stable view_id -> the .bndb that actually BACKS this view's analysis.
@@ -1081,7 +1082,7 @@ class TargetManager:
             return vid is not None and vid in self._dirty_view_ids
 
     def note_project_database(self, bv, file_id: str, project_path: str) -> None:
-        """Record that *bv* is now backed by project file *file_id* (F4)."""
+        """Record the database backing *bv*; BN still reports its raw project file."""
         with self._lock:
             vid = self._stable_view_id(bv)
             if vid is not None:
@@ -1183,7 +1184,7 @@ class TargetManager:
                 for depth in range(1, len(variant) + 1):
                     _index(tails, variant[-depth:], vid, kind)
             # A project target is also named by its path IN the project
-            # (BNPR_PLAN.md §5.3); index those components like a filename's.
+            # rather than its opaque blob; index those components like a filename's.
             for variant, kind in self._tail_variants(_project_components(record.project_path)):
                 for depth in range(1, len(variant) + 1):
                     _index(tails, variant[-depth:], vid, kind)
@@ -1253,7 +1254,7 @@ class TargetManager:
             ):
                 aliases.append((stem, self._STRIPPED))
         if record.project_file_id:
-            # BNPR_PLAN.md §5.3: a project target answers to its path in the
+            # A project target answers to its path in the
             # project (leading slash optional), its file id and its file name.
             aliases.append((record.project_path, self._STRONG))
             aliases.append((record.project_path.lstrip("/"), self._STRONG))
@@ -1487,7 +1488,7 @@ class TargetManager:
             # invisible makes it reborn under a NEW id when the UI recovers,
             # and the ledger marker keyed on the old id then answers about
             # nothing -- which erased the unsaved state just as surely as
-            # pruning the marker itself did (#733 F1 review). Retention lasts
+            # pruning the marker itself did (#733 review). Retention lasts
             # until the next complete refresh, so a view that really closed
             # during a lossy walk is still released promptly.
             current = set(views)
@@ -1519,7 +1520,7 @@ class TargetManager:
                         project_path = project_ops.ProjectManager.path_in_project(pf)
                     except Exception:  # noqa: BLE001 - a view BN cannot describe is not a project target
                         project_file_id = project_path = project_name = ""
-                # F4: after a first save BN still names the RAW project file;
+                # After a first save BN still names the RAW project file;
                 # the database file this bridge created wins.
                 binding = self._project_bindings.get(view_id)
                 if binding is not None:
@@ -1551,7 +1552,7 @@ class TargetManager:
             # makes a still-open tab invisible, and pruning off that snapshot
             # DESTROYED the record of unsaved work on a view nobody closed --
             # permanently, since nothing re-marks it, so the answer stayed a
-            # confident `unsaved: false` after the UI recovered (#733 F1
+            # confident `unsaved: false` after the UI recovered (#733
             # review). Retaining a marker for a tab that really did close costs
             # one stale `unsaved: true` until the next complete refresh, which
             # is the recoverable direction: the same rule the socket sweep
@@ -1625,7 +1626,7 @@ class TargetManager:
                             else "unanalyzed" if view in _unanalyzed_views
                             else "full"
                         ),
-                        # #733 F1: the committed-but-unsaved ledger, published on
+                        # #733: the committed-but-unsaved ledger, published on
                         # the READ path. It was reachable only by `close` (the
                         # destructive op) or `py exec`, so "is it safe to close
                         # this bridge?" had no read-only answer. `unsaved` is this
@@ -1655,7 +1656,7 @@ class TargetManager:
                         # judged for (a raw load, a database with no record or
                         # no sibling). The load note is one-shot; this is not.
                         "source_verified": _source_verified.get(record.session_id),
-                        # BNPR_PLAN.md §5.3: empty for a view not loaded through
+                        # Empty for a view not loaded through
                         # a project.
                         "project_file_id": record.project_file_id,
                         "project_path": record.project_path,
@@ -2153,7 +2154,7 @@ class BinaryNinjaBridge:
         # It records its holder and waiters so a queued writer is observable
         # (`write_gate_status`) and refusable (`no_wait`) rather than silent (#976).
         self._write_gate = _WriteGate()
-        # BNPR_PLAN.md §3: at most one open project per bridge; the manager owns
+        # At most one open project per bridge; the manager owns
         # the BN handle and the file-selector grammar.
         self.projects = project_ops.ProjectManager()
         self._request_state_lock = threading.Lock()
@@ -2639,9 +2640,9 @@ class BinaryNinjaBridge:
             binaries = []
             project_targets = []
         payload["binaries"] = binaries
-        # BNPR_PLAN.md §5.4: the owned project and its open targets, so another
-        # bridge's `project_open` can refuse (§5.5) and `session restart` can
-        # replay by (project path, file id) rather than by blob filename (F2).
+        # Publish the owned project and its targets for ownership checks and
+        # session restart. Replay by (project path, file id): loading a blob by
+        # plain filename loses its project linkage.
         project_state = self.projects.current
         payload["project"] = (
             {"path": project_state.path, "id": project_state.project_id,
@@ -3468,60 +3469,68 @@ class BinaryNinjaBridge:
                 waiter.set()
 
     def _project_load(self, selector: Any, *, prefer_bndb: bool = True, quick: bool = False,
-                      workdir: str | None = None):
-        """`bn project load` (BNPR_PLAN.md §5.2): open a project file as a target.
+                      workdir: str | None = None, link: bool = True):
+        """`bn project load`: open a project file as a target.
 
         The lean sibling of `_load_binary`, with the same lock discipline
         (exclusive only around the BN open and the publish; analysis unlocked),
         the same #609 leak cleanup, and dedup by identity -- here the project
-        file id, since a project view's filename is an opaque blob path (F1).
+        file id, since a project view's filename is an opaque blob path.
         Sidecar/cache substitution does not apply; the project analogue is the
         `<name>.bndb` sibling project file, preferred unless *prefer_bndb* is
         false. A database-backed file carries its analysis, so `quick` is a
         no-op there, as for a `.bndb` load.
         """
         manager = self.projects
-        manager.require()
-        pf = manager.resolve_file(selector)
-        notes: list[str] = []
-        substituted_from: str | None = None
-        if prefer_bndb:
-            sibling = manager.sibling_database(pf)
-            if sibling is not None:
-                notes.append(
-                    f"Loaded the project database {manager.path_in_project(sibling)} "
-                    f"instead of the raw file {manager.path_in_project(pf)} "
-                    "(pass --no-bndb to open the raw bytes)"
-                )
-                substituted_from = str(pf.id)
-                pf = sibling
-        file_id = str(pf.id)
-        project_path = manager.path_in_project(pf)
+        with self._write_operation_lock():
+            state = manager.require()
+            pf = manager.resolve_file(selector)
+            notes: list[str] = []
+            substituted_from: str | None = None
+            if prefer_bndb:
+                sibling = manager.sibling_database(pf)
+                if sibling is not None:
+                    notes.append(
+                        f"Loaded the project database {manager.path_in_project(sibling)} "
+                        f"instead of the raw file {manager.path_in_project(pf)} "
+                        "(pass --no-bndb to open the raw bytes)"
+                    )
+                    substituted_from = str(pf.id)
+                    pf = sibling
+            file_id = str(pf.id)
+            project_path = manager.path_in_project(pf)
 
         # One in-flight open per project file, like `_load_binary`'s per-path
         # waiter: a second `project load` of the same file waits, then dedups.
-        load_key = f"project:{file_id}"
+        load_key = f"project:{state.path}:{file_id}"
         while True:
-            targets = self.targets.refresh()
-            existing = self.targets.view_for_project_file(file_id)
-            if existing is not None:
-                return {
-                    "loaded": False,
-                    "already_open": True,
-                    "path": str(getattr(pf, "path_on_disk", "") or ""),
-                    "project_file_id": file_id,
-                    "project_path": project_path,
-                    "substituted_from": substituted_from,
-                    "notes": notes,
-                    "targets": targets,
-                    "target": self._loaded_target_row(targets, existing),
-                }
-            with _load_in_progress_lock:
-                busy = _load_in_progress.get(load_key)
-                if busy is None:
-                    waiter = threading.Event()
-                    _load_in_progress[load_key] = waiter
-                    break
+            with self._write_operation_lock():
+                if manager.current is not state:
+                    raise RuntimeError("Project changed while loading; retry against the open project")
+                targets = self.targets.refresh()
+                existing = self.targets.view_for_project_file(file_id)
+                existing_pf = getattr(existing, "project_file", None)
+                if existing is not None and existing_pf is not None and (
+                    os.path.realpath(str(existing_pf.path_on_disk))
+                    == os.path.realpath(str(pf.path_on_disk))
+                ):
+                    return {
+                        "loaded": False,
+                        "already_open": True,
+                        "path": str(getattr(pf, "path_on_disk", "") or ""),
+                        "project_file_id": file_id,
+                        "project_path": project_path,
+                        "substituted_from": substituted_from,
+                        "notes": notes,
+                        "targets": targets,
+                        "target": self._loaded_target_row(targets, existing),
+                    }
+                with _load_in_progress_lock:
+                    busy = _load_in_progress.get(load_key)
+                    if busy is None:
+                        waiter = threading.Event()
+                        _load_in_progress[load_key] = waiter
+                        break
             busy.wait()
 
         import binaryninja
@@ -3530,7 +3539,9 @@ class BinaryNinjaBridge:
         published = False
         try:
             try:
-                with self._target_lock.write():
+                with self._write_operation_lock():
+                    if manager.current is not state:
+                        raise RuntimeError("Project changed while loading; retry against the open project")
                     bv = binaryninja.load(pf, update_analysis=False)
             except Exception as exc:  # noqa: BLE001 - surface BN open failures cleanly
                 raise RuntimeError(
@@ -3554,27 +3565,49 @@ class BinaryNinjaBridge:
                 bv.update_analysis_and_wait()
                 _quick_loaded_views.discard(bv)
 
-            with self._target_lock.write():
+            with self._write_operation_lock():
+                if manager.current is not state:
+                    raise RuntimeError("Project changed while loading; retry against the open project")
                 with _headless_views_lock:
                     _headless_views.append(bv)
                     published = True  # latched: view now owned by _headless_views
+                # Register before dirty tracking, but publish no response/registry
+                # snapshot until linking has completed under the writer gate.
+                self.targets.refresh()
+                link_result = None
+                if link:
+                    try:
+                        rootfs = manager.get_rootfs()
+                        if rootfs and rootfs.get("libs"):
+                            link_result = project_rootfs.link_view(
+                                self, bv, dry_run=False, relink=False, from_load=True)
+                            if not link_result["success"]:
+                                notes.append(
+                                    "import linking verification failed"
+                                    if link_result["status"] == "verification_failed"
+                                    else "import linking failed")
+                                notes.extend(link_result.get("notes") or [])
+                    except Exception as exc:  # noqa: BLE001 - linking is best-effort on load
+                        notes.append(f"import linking skipped: {exc}")
                 targets = self.targets.refresh()
                 loaded_target = self._loaded_target_row(targets, bv)
+                loaded_path = str(getattr(bv.file, "filename", "") or "")
                 if loaded_target and loaded_target.get("selector_reason"):
                     notes.append(
                         f"Target selector: pass {target_option(loaded_target['selector'])} "
                         f"({loaded_target['selector_reason']})"
                     )
-            self._record_project_root(workdir)
-            self._write_registry()
+                self._record_project_root(workdir)
+                self._write_registry()
             return {
                 "loaded": True,
-                "path": str(getattr(bv.file, "filename", "") or ""),
+                "path": loaded_path,
                 "project_file_id": file_id,
                 "project_path": project_path,
                 "substituted_from": substituted_from,
                 "analyzed": not quick_effective,
                 "analysis_state": "quick" if quick_effective else "full",
+                "link": link_result,
                 "notes": notes,
                 "targets": targets,
                 "target": loaded_target,
@@ -3594,7 +3627,7 @@ class BinaryNinjaBridge:
             waiter.set()
 
     def _project_close(self, *, force: bool = False):
-        """`bn project close` (BNPR_PLAN.md §5.2): close every target loaded
+        """`bn project close`: close every target loaded
         from the project, then release the project. Refuses while any of them
         holds a committed-but-unsaved mutation unless *force*. Targets close
         through `_close_binary` by PINNED identity, so no selector convenience
@@ -3925,8 +3958,8 @@ class BinaryNinjaBridge:
                     "omit it to save to the default <filename>.bndb"
                 )
         bv = self.targets.resolve(target)
-        # BNPR_PLAN.md §5.2: a project-backed view is persisted through the
-        # project API (F3/F5), never by filename suffix -- the standalone path
+        # A project-backed view is persisted through tracked project files and
+        # database snapshots, never by filename suffix -- the standalone path
         # below would write an untracked stray blob inside the .bnpr.
         if _project_file_of(bv) is not None:
             return project_ops.save_project_database(self, bv, path)
@@ -4319,7 +4352,7 @@ class BinaryNinjaBridge:
             "analysis_state": (
                 "quick" if quick else "unanalyzed" if unanalyzed else "full"
             ),
-            # #733 F1: set explicitly rather than inherited from the row above,
+            # #733: set explicitly rather than inherited from the row above,
             # because `record` can be absent (no matching row) and the whole
             # point of the field is that it is never silently missing on the
             # read path. `TargetManager._lock` is an RLock, so asking the
@@ -4826,7 +4859,7 @@ class BinaryNinjaBridge:
         return read_types._types(self.ctx, *a, **k)
 
     def _find_type(self, *a, **k):
-        # Relocated to the BridgeContext seam (cycle-break, design spec §3.2).
+        # Relocated to the BridgeContext seam to break the import cycle.
         return self.ctx._find_type(*a, **k)
 
     def _type_entry(self, *a, **k):
@@ -5378,7 +5411,7 @@ class BinaryNinjaBridge:
         return il_format._render_warnings(*a, **k)
 
     def _render_type_layout(self, *a, **k) -> str:
-        # Relocated to the BridgeContext seam (cycle-break, design spec §3.2).
+        # Relocated to the BridgeContext seam to break the import cycle.
         return self.ctx._render_type_layout(*a, **k)
 
     # ---- mutation engine: delegating shims ----
@@ -5713,7 +5746,7 @@ def _bind_list_targets(bridge, params, target):
     # -- a listing has no business failing because one UI query hiccuped -- but
     # a SAFETY count read off that listing must refuse a lossy snapshot instead
     # of answering a definitive zero from it, which is what `session list`'s
-    # unsaved probe asks for (#733 F1 review).
+    # unsaved probe asks for (#733 review).
     return bridge.targets.refresh(strict=bool(params.get("strict", False)))
 
 
@@ -5836,7 +5869,7 @@ def _bind_save_database(bridge, params, target):
     return bridge._save_database(target, params.get("path"))
 
 
-# -- Binary Ninja projects (BNPR_PLAN.md §5.2). Lock classes are part of the
+# -- Binary Ninja projects. Lock classes are part of the
 # contract: metadata mutations and open/close are exclusive; listings are
 # reads; `project_load` self-manages like `load_binary` so a multi-minute
 # analysis never holds the dispatcher lock.
@@ -5871,6 +5904,7 @@ def _bind_project_load(bridge, params, target):
         prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
         quick=_validate_bool(params.get("quick"), label="quick", default=False),
         workdir=params.get("workdir"),
+        link=_validate_bool(params.get("link"), label="link", default=True),
     )
 
 
@@ -5889,6 +5923,37 @@ def _bind_project_export(bridge, params, target):
 @op("project_delete", lock="write")
 def _bind_project_delete(bridge, params, target):
     return project_ops.project_delete(bridge, params.get("selector"))
+
+
+# Firmware rootfs projects: creation and library import mutate the project
+# like `project_import`; `project_link` writes external library/location
+# bindings on a view (short writes, verified by readback); the inventory
+# listing is a read of project metadata.
+
+@op("project_create", lock="write")
+def _bind_project_create(bridge, params, target):
+    return project_rootfs.project_create(
+        bridge, params.get("path"), name=params.get("name"), rootfs=params.get("rootfs"))
+
+
+@op("project_sync_libs", lock="write")
+def _bind_project_sync_libs(bridge, params, target):
+    return project_rootfs.project_sync_libs(
+        bridge, root=params.get("root"), platform=params.get("platform"),
+        dry_run=_validate_bool(params.get("dry_run"), label="dry_run", default=False))
+
+
+@op("project_libs", lock="read")
+def _bind_project_libs(bridge, params, target):
+    return project_rootfs.project_libs(bridge)
+
+
+@op("project_link", lock="write", destructive=True)
+def _bind_project_link(bridge, params, target):
+    return project_rootfs.project_link(
+        bridge, target,
+        dry_run=_validate_bool(params.get("dry_run"), label="dry_run", default=False),
+        relink=_validate_bool(params.get("relink"), label="relink", default=False))
 
 
 @op("list_functions", lock="read")
@@ -7398,7 +7463,7 @@ def _view_engine_modified(bv) -> bool:
     """BN's generic modified bit, or False when the view cannot be asked.
 
     The ONE accessor behind `target info`, `target list` and `close`, so the
-    three surfaces cannot disagree about the same view (#733 F1). Guarded
+    three surfaces cannot disagree about the same view (#733). Guarded
     because ``bv.file`` itself can raise on a stale/odd view, which is exactly
     where the inline form propagated while the read paths reported False.
     """
