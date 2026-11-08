@@ -2272,6 +2272,7 @@ _COMPOSED_ENTRY_POINTS = {
     "_mutation_summary": "_render_mutation_summary_text",
     "_go_rename_summary": "_render_mutation_summary_text",
     "_project_link_summary": "_render_mutation_summary_text",
+    "_project_finding_summary": "_render_mutation_summary_text",
     "_add_mutation_ok": "_render_mutation_text",
 }
 
@@ -6337,18 +6338,18 @@ def test_project_libs_preserves_and_discloses_malformed_sonames(soname):
     }]}
     before = copy.deepcopy(payload)
     text = formatters._render_project_libs_text(payload)
-    assert formatters._render_fallback_text(soname) in text.split("\n! malformed")[0]
+    assert formatters._escape_control_chars(formatters._render_fallback_text(soname)) in text.split("\n! malformed")[0]
     assert "lib/libc.so" in text
     assert _disclosed(text, "soname")
     assert payload == before
 
 
-@pytest.mark.parametrize("key", ["linked", "relinked", "already_linked", "unresolved"])
+@pytest.mark.parametrize("key", ["linked", "relinked", "rebound", "already_linked", "unresolved"])
 def test_project_link_unknown_counts_do_not_claim_a_measured_noop(key):
     from bn import formatters
 
     base = {"status": "noop", "success": True, "committed": True,
-            "linked": 0, "relinked": 0, "already_linked": 0,
+            "linked": 0, "relinked": 0, "rebound": 0, "already_linked": 0,
             "unresolved": [], "libraries": []}
     real = formatters._project_link_summary(base)
     assert real["measured"] is True
@@ -6372,7 +6373,7 @@ def test_project_link_unknown_counts_do_not_claim_a_measured_noop(key):
         assert bn.cli._mutation_exit_code(payload, formatters._project_link_summary) == 4
         text = formatters._render_mutation_summary_text(summary)
         assert "warning: unmeasured" in text
-        if key in ("linked", "relinked", "unresolved"):
+        if key in ("linked", "relinked", "rebound", "unresolved"):
             assert f"{key} ?" in text
         if raw is not _ABSENT and raw is not None:
             assert _disclosed(text, key)
@@ -6383,15 +6384,15 @@ def test_project_link_readback_failure_keeps_the_failure_exit_and_dirty_view():
 
     payload = {"status": "verification_failed", "success": False,
                "committed": False, "linked": 2, "relinked": 0,
-               "already_linked": 0, "unresolved": [], "libraries": [],
-               "message": "import link did not read back"}
+               "rebound": 0, "already_linked": 0, "unresolved": [], "libraries": [],
+               "measured": False, "notes": ["import link did not read back"]}
     summary = formatters._project_link_summary(payload)
-    assert summary["measured"] is True
+    assert summary["measured"] is False
     assert summary["ok"] is False
-    assert summary["failed_count"] == 1
-    assert summary["changed_count"] == 2
+    assert summary["failed_count"] is None
+    assert summary["changed_count"] is None
     assert summary["dirty_after"] is True
-    assert summary["first_error"] == payload["message"]
+    assert payload["notes"][0] in summary["first_error"]
     assert bn.cli._mutation_exit_code(payload, formatters._project_link_summary) == 3
     payload["linked"] = {"count": 2}
     assert formatters._project_link_summary(payload)["measured"] is False

@@ -619,6 +619,28 @@ def test_save_multi_target_surfaces_bridge_error_without_recovery(monkeypatch, c
     assert "multi-line bridge error\nsecond line sentinel" in err
 
 
+@pytest.mark.parametrize("status,expected_exit", [
+    ("rollback_failed", 3),
+    ("invalid_request", 2),
+])
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_save_distinguishes_failed_rollback_from_file_refusal(
+    monkeypatch, capsys, status, expected_exit, output_format,
+):
+    def fail_save(*args, **kwargs):
+        raise bn.cli.BridgeError(
+            "project save cleanup failed" if status == "rollback_failed" else "cache entry exists",
+            status=status,
+            observed={"rolled_back": False, "project_file_id": "orphan-db"},
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_save)
+    assert bn.cli.main(["save", "--format", output_format]) == expected_exit
+    output = capsys.readouterr()
+    if output_format == "json":
+        assert json.loads(output.out)["observed"]["rolled_back"] is False
+
+
 _TWO_TARGETS = {
     "ok": True,
     "result": [

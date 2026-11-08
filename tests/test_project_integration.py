@@ -1,8 +1,8 @@
 """Real-BN lane for Binary Ninja project (`.bnpr`) support.
 
-Projects are a Commercial/Ultimate feature, so beyond the usual `real_bn`
-gate this module checks `binaryninja.core_product()` and refuses to skip
-silently under `BN_REQUIRE_REAL_TESTS=1` when the edition lacks them.
+Projects are gated by an isolated native create/close capability probe, not
+the product label. Unsupported installs refuse to skip silently under
+`BN_REQUIRE_REAL_TESTS=1`.
 
 Project ownership is bridge-global (one project per bridge instance), so the
 lane does NOT use `shared_bn`: it spawns one private headless instance per
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-from conftest import bn_python_dir, refuse_silent_skip, require_real_bn
+from conftest import bn_python_dir, require_project_capability, require_real_bn
 
 from bn.transport import BridgeError
 
@@ -38,7 +38,7 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 
 pytestmark = [
     pytest.mark.real_bn,
-    pytest.mark.usefixtures("integration_fixtures"),
+    pytest.mark.usefixtures("project_integration_fixtures"),
 ]
 
 _BN_CLI = [str(Path(sys.executable).parent / "bn")]
@@ -49,7 +49,12 @@ _SESSION_STOP_TIMEOUT = 60.0
 #: restart = stop + spawn + project_open + full analysis of each replayed target.
 _RESTART_TIMEOUT = 240.0
 
-_PROJECT_EDITIONS = ("Commercial", "Ultimate")
+
+@pytest.fixture(scope="session")
+def project_integration_fixtures(request: pytest.FixtureRequest) -> list[Path]:
+    """Refuse unsupported native projects before invoking fixture toolchains."""
+    require_project_capability()
+    return request.getfixturevalue("integration_fixtures")
 
 
 def _bn_api_python(code: str, *, timeout: float = 120.0) -> str:
@@ -75,12 +80,8 @@ def _bn_api_python(code: str, *, timeout: float = 120.0) -> str:
 
 
 def _require_project_edition() -> None:
-    product = _bn_api_python("print(binaryninja.core_product())")
-    if not any(edition in product for edition in _PROJECT_EDITIONS):
-        refuse_silent_skip(
-            f"Binary Ninja projects need a Commercial or Ultimate licence; this install "
-            f"reports {product!r} -- the project lane did not run"
-        )
+    """Keep the native-lane helper callable while probing actual capability."""
+    require_project_capability()
 
 
 class Lane:
@@ -552,9 +553,9 @@ def _assert_rootfs_links(lane: Lane, selector: str) -> dict[str, Any]:
     rows = imports["items"]
     by_name = {row["name"]: row for row in rows}
     assert _ROOTFS_IMPORT_LIBRARIES.keys() <= by_name.keys(), rows
-    itm_rows = [row for row in rows if row["name"].startswith("_ITM_")]
-    assert itm_rows, rows
-    assert all(row["library"] is None for row in itm_rows), itm_rows
+    weak_hook = "firmware_startup_hook"
+    assert weak_hook in by_name, rows
+    assert by_name[weak_hook]["library"] is None, by_name[weak_hook]
 
     preview = _rootfs_link(lane, selector)
     # The imports reader currently attributes namespace/verneed, not project
@@ -566,7 +567,7 @@ def _assert_rootfs_links(lane: Lane, selector: str) -> dict[str, Any]:
         if by_name[symbol]["library"] is not None:
             assert by_name[symbol]["library"] == library, by_name[symbol]
     unresolved = {row["symbol"] for row in preview["unresolved"]}
-    assert {row["name"] for row in itm_rows} <= unresolved, preview
+    assert weak_hook in unresolved, preview
     assert all(symbol not in locations for symbol in unresolved), preview
     return preview
 

@@ -119,3 +119,112 @@ def test_sync_refuses_findings_namespace_before_any_import(world, dry_run, looku
     assert w.project.folders == []
     assert w.project.writes == old_writes
     assert w.instance.projects.get_rootfs() == old_metadata
+
+
+def test_sync_aggregate_discovery_refusal_never_commits_a_partial_inventory(world, monkeypatch):
+    w = world
+    root = _sources(w, monkeypatch)
+    monkeypatch.setenv("BN_ROOTFS_MAX_BYTES", "4")
+    old_metadata = w.instance.projects.get_rootfs()
+    old_writes = list(w.project.writes)
+
+    with pytest.raises(RuntimeError, match="rootfs discovery refused: discovery byte limit"):
+        w.ops.project_sync_libs(w.instance, root=str(root))
+
+    assert w.project.files == []
+    assert w.project.folders == []
+    assert w.project.bulk_entries == 0
+    assert w.project.writes == old_writes
+    assert w.instance.projects.get_rootfs() == old_metadata
+
+
+def test_sync_cancellation_during_elf_discovery_preserves_inventory(world, monkeypatch):
+    w = world
+    root = _sources(w, monkeypatch)
+    old_metadata = w.instance.projects.get_rootfs()
+    cancelled = False
+    original = w.ops.parse_elf_file
+
+    def parse(path, *, check=None):
+        nonlocal cancelled
+        info = original(path, check=check)
+        cancelled = True
+        check()
+        return info
+
+    monkeypatch.setattr(w.ops, "parse_elf_file", parse)
+    with pytest.raises(RuntimeError, match="request cancelled"):
+        w.ops.project_sync_libs(w.instance, root=str(root), cancelled=lambda: cancelled)
+
+    assert w.project.files == []
+    assert w.project.folders == []
+    assert w.project.bulk_entries == 0
+    assert w.instance.projects.get_rootfs() == old_metadata
+
+
+def test_sync_cancellation_during_copy_rolls_back_and_exits_bulk(world, monkeypatch):
+    w = world
+    root = _sources(w, monkeypatch)
+    old_metadata = w.instance.projects.get_rootfs()
+    original = w.project.create_file_from_path
+    cancelled = False
+
+    def copy(*args):
+        nonlocal cancelled
+        pf = original(*args)
+        cancelled = True
+        return pf
+
+    monkeypatch.setattr(w.project, "create_file_from_path", copy)
+    with pytest.raises(RuntimeError, match="request cancelled"):
+        w.ops.project_sync_libs(w.instance, root=str(root), cancelled=lambda: cancelled)
+
+    assert not w.project.in_bulk
+    assert w.project.files == []
+    assert w.instance.projects.get_rootfs() == old_metadata
+
+
+@pytest.mark.parametrize("change", ["close", "metadata", "files"])
+def test_sync_revalidates_project_after_unlocked_discovery(world, monkeypatch, change):
+    w = world
+    root = _sources(w, monkeypatch)
+    original = w.ops.scan_libraries
+    old_metadata = w.instance.projects.get_rootfs()
+
+    def discover(*args):
+        result = original(*args)
+        if change == "close":
+            w.instance.projects.close()
+        elif change == "metadata":
+            w.instance.projects.set_rootfs({**old_metadata, "platform": "android"})
+        else:
+            w.project.add_file("unrelated")
+        return result
+
+    monkeypatch.setattr(w.ops, "scan_libraries", discover)
+    with pytest.raises(RuntimeError, match="project changed during discovery"):
+        w.ops.project_sync_libs(w.instance, root=str(root))
+
+    assert w.project.bulk_entries == 0
+    assert all(pf.name == "unrelated" for pf in w.project.files)
+    if change == "close":
+        assert w.instance.projects.current is None
+    else:
+        expected = {**old_metadata, "platform": "android"} if change == "metadata" else old_metadata
+        assert w.instance.projects.get_rootfs() == expected
+
+
+def test_sync_discloses_skipped_nul_loader_paths(world):
+    w = world
+    root = (w.tmp / "rootfs").resolve()
+    (root / "etc").mkdir(parents=True)
+    (root / "lib").mkdir()
+    (root / "etc/ld.so.conf").write_bytes(b"/bad\0path\n/lib\n")
+    path = root / "lib/libvalid.so"
+    path.write_bytes(b"\x7fELF")
+    w.infos[str(path)] = elf(w)
+
+    result = w.ops.project_sync_libs(w.instance, root=str(root))
+
+    assert [row["name"] for row in result["imported"]] == ["libvalid.so"]
+    assert "skipped loader path containing NUL" in result["notes"]

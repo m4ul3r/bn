@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +30,9 @@ from typing import Any
 
 from . import project_ops
 from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic, parse_elf_file
-from .rootfs_layout import detect_root, lookup_paths, scan_libraries
+from .rootfs_layout import (
+    DiscoveryBudget, detect_root, discovery_budget, lookup_paths, scan_libraries,
+)
 
 METADATA_VERSION = 1
 # ld.so builds the global scope breadth-first over NEEDED; a firmware tree
@@ -93,45 +96,72 @@ def _empty_metadata(root: str, platform: str) -> dict[str, Any]:
 
 
 def project_sync_libs(
-    bridge: Any, root: Any = None, platform: Any = None, dry_run: bool = False,
+    bridge: Any, root: Any = None, platform: Any = None, dry_run: bool = False, *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Import every shared object on the loader's lookup paths that the project
-    does not hold yet (one import per real file; every symlink spelling goes
-    into `names`), and record the inventory under `bn.rootfs`."""
+    """Discover unlocked, then revalidate and commit one atomic inventory update."""
     manager = bridge.projects
-    state = manager.require()
-    meta = manager.get_rootfs() or {}
-    if root is not None and (not isinstance(root, str) or not root.strip()):
-        raise RuntimeError("project_sync_libs: root must be a directory path when given")
-    if platform is not None and (not isinstance(platform, str) or not platform.strip()):
-        raise RuntimeError("project_sync_libs: platform must be a string when given")
-    chosen_root = root or meta.get("root")
-    if not chosen_root:
-        raise RuntimeError(
-            "project_sync_libs: this project records no rootfs; pass root (or run "
-            "`bn project init <root>`)"
-        )
-    chosen_root = os.path.realpath(os.path.expanduser(str(chosen_root)))
-    if not os.path.isdir(chosen_root):
-        raise RuntimeError(f"project_sync_libs: rootfs is not a directory: {chosen_root}")
-    chosen_platform = platform or meta.get("platform")
-    if not chosen_platform or chosen_platform == "unknown":
-        detected = detect_root(chosen_root, explicit=True)
-        chosen_platform = detected.platform if detected is not None else "unknown"
+    with bridge._target_lock.read():
+        state = manager.require()
+        meta = manager.get_rootfs() or {}
+        live_ids = {str(pf.id) for pf in state.project.files}
+    budget = DiscoveryBudget(cancelled=cancelled)
+    with discovery_budget(budget):
+        if root is not None and (not isinstance(root, str) or not root.strip() or "\0" in root):
+            raise RuntimeError("project_sync_libs: root must be a directory path when given")
+        if platform is not None and (not isinstance(platform, str) or not platform.strip()):
+            raise RuntimeError("project_sync_libs: platform must be a string when given")
+        chosen_root = root or meta.get("root")
+        if not chosen_root:
+            raise RuntimeError(
+                "project_sync_libs: this project records no rootfs; pass root (or run "
+                "`bn project init <root>`)"
+            )
+        if not isinstance(chosen_root, str) or "\0" in chosen_root:
+            raise RuntimeError("project_sync_libs: recorded root must be a directory path")
+        chosen_root = os.path.realpath(os.path.expanduser(chosen_root))
+        if not os.path.isdir(chosen_root):
+            raise RuntimeError(f"project_sync_libs: rootfs is not a directory: {chosen_root}")
+        chosen_platform = platform or meta.get("platform")
+        if not chosen_platform or chosen_platform == "unknown":
+            detected = detect_root(chosen_root, explicit=True)
+            chosen_platform = detected.platform if detected is not None else "unknown"
+        notes: list[str] = []
+        paths = lookup_paths(chosen_root, str(chosen_platform))
+        if not paths:
+            notes.append(f"no library lookup paths for platform {chosen_platform!r} under {chosen_root}")
+        candidates, scan_notes = scan_libraries(chosen_root, paths)
+        notes.extend(scan_notes)
+        existing = {
+            str(entry.get("rel_realpath"))
+            for file_id, entry in (meta.get("libs") or {}).items() if file_id in live_ids
+        }
+        parsed: dict[str, ElfDynamicInfo | None] = {}
+        # Validate every candidate and parse new blobs before entering bulk mode.
+        for cand in candidates:
+            budget.check()
+            project_ops._refuse_finding_path(
+                cand.dir_in_root.rstrip("/") + "/" + cand.names[0])
+            if cand.rel_realpath not in existing:
+                parsed[cand.rel_realpath] = parse_elf_file(cand.realpath, check=budget.check)
+        notes.extend(budget.notes)
+        with bridge._write_operation_lock():
+            budget.check()
+            if manager.current is not state or (manager.get_rootfs() or {}) != meta or (
+                {str(pf.id) for pf in state.project.files} != live_ids
+            ):
+                raise RuntimeError("project_sync_libs: project changed during discovery; retry the sync")
+            return _apply_sync(
+                manager, state, meta, chosen_root, str(chosen_platform),
+                paths, candidates, parsed, notes, bool(dry_run), budget,
+            )
 
-    notes: list[str] = []
-    paths = lookup_paths(chosen_root, str(chosen_platform))
-    if not paths:
-        notes.append(f"no library lookup paths for platform {chosen_platform!r} under {chosen_root}")
-    candidates, scan_notes = scan_libraries(chosen_root, paths)
-    notes.extend(scan_notes)
 
-    # Validate the whole discovery before entering bulk mode or creating folders:
-    # a loader configuration must not inject files into the findings ledger.
-    for cand in candidates:
-        project_ops._refuse_finding_path(
-            cand.dir_in_root.rstrip("/") + "/" + cand.names[0])
-
+def _apply_sync(
+    manager: Any, state: Any, meta: dict[str, Any], chosen_root: str, chosen_platform: str,
+    paths: list[Any], candidates: list[Any], parsed: dict[str, ElfDynamicInfo | None],
+    notes: list[str], dry_run: bool, budget: DiscoveryBudget,
+) -> dict[str, Any]:
     live_ids = {str(pf.id) for pf in state.project.files}
     libs = {file_id: dict(entry) for file_id, entry in (meta.get("libs") or {}).items()
             if file_id in live_ids}
@@ -154,11 +184,12 @@ def project_sync_libs(
                 entry["names"] = _library_names(cand.names, entry.get("soname"))
                 entry["paths"] = list(cand.paths)
             continue
-        info = parse_elf_file(cand.realpath)
+        info = parsed[cand.rel_realpath]
         if info is None:
             skipped_not_elf += 1
             notes.append(f"{cand.rel_realpath}: not a dynamic ELF object; skipped")
             continue
+        notes.extend(f"{cand.rel_realpath}: {note}" for note in info.notes)
         to_import.append((cand, info))
     lookup_rows = [{"path": lp.path_in_root, "source": lp.source} for lp in paths]
 
@@ -187,6 +218,7 @@ def project_sync_libs(
                 with project.bulk_operation():
                     try:
                         for cand, info in to_import:
+                            budget.check()
                             names = _library_names(cand.names, info.soname)
                             folder = manager.ensure_folder(cand.dir_in_root)
                             pf = project.create_file_from_path(
@@ -208,6 +240,7 @@ def project_sync_libs(
                         import_error = exc
                 if import_error is not None:
                     raise import_error
+            budget.check()
             metadata_attempted = True
             manager.set_rootfs({
                 "version": METADATA_VERSION,
@@ -279,7 +312,9 @@ def project_libs(bridge: Any) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for file_id, entry in (meta.get("libs") or {}).items():
         pf = by_id.get(str(file_id))
-        sibling = manager.sibling_database(pf, index) if pf is not None else None
+        if pf is None:
+            continue  # A deleted provider is not part of the live library inventory.
+        sibling = manager.sibling_database(pf, index, allow_ambiguous=True)
         rows.append({
             "project_file_id": str(file_id),
             "project_path": manager.path_in_project(pf) if pf is not None else None,
@@ -351,21 +386,31 @@ def link_view(
     """Bind *bv*'s NEEDED libraries to the project files that provide them and
     assign each unassigned external location the library exporting its symbol.
 
-    Resolution follows ld.so: a NEEDED name matches a project library by any of
-    its spellings (SONAME, symlink names, real basename) of the target's ELF
-    class and machine; several matches prefer the one on the target's RPATH,
-    then the earliest loader lookup path (RUNPATH after LD_LIBRARY_PATH). The
-    global scope is the breadth-first closure over NEEDED. A symbol binds to the
-    library its verneed entry names when that is a resolved NEEDED, else to the
-    first library in scope order that exports it.
+    Resolution prefers matching loader filenames of the target's ELF class and
+    machine, ordered by RPATH then loader lookup paths (RUNPATH after the
+    environment). SONAME-only inventory aliases are a disclosed fallback, not
+    allowed to outrank an exact filename. The global scope is the breadth-first
+    closure over NEEDED. A symbol binds to its known verneed provider, or to the
+    first scope export unless parsing explicitly reports unread requirements.
 
     *from_load* keeps verified deterministic links clean. A failed automatic
     apply is dirty, just like an explicit link, because writes may have landed.
     """
     manager = bridge.projects
     state = manager.require()
+    binding = bridge.targets.project_binding(bv)
     pf = getattr(bv, "project_file", None)
-    if pf is not None and not any(
+    if binding is not None:
+        # A first save records the database identity while BN can keep exposing
+        # the raw ProjectFile, even after that raw row/blob has been deleted.
+        file_id, project_path = binding
+        pf = next((
+            owned for owned in state.project.files
+            if str(owned.id) == file_id and manager.path_in_project(owned) == project_path
+        ), None)
+        if pf is None:
+            raise RuntimeError("project_link: target belongs to a different project")
+    elif pf is not None and not any(
         _same_file(pf, owned)
         and os.path.realpath(str(pf.path_on_disk)) == os.path.realpath(str(owned.path_on_disk))
         for owned in state.project.files
@@ -452,6 +497,9 @@ def link_view(
             if from_load and attempted and not verified:
                 bridge.targets.mark_dirty(bv)
     success = status not in {"verification_failed", "internal_error"}
+    if not success:
+        plan.notes.append(
+            "link counters describe the planned changes, not verified completed writes")
     return {
         "status": status,
         "success": success,
@@ -468,7 +516,7 @@ def link_view(
         "unresolved": plan.unresolved,
         "ambiguous_libraries": plan.ambiguous,
         "notes": plan.notes,
-        "measured": True,
+        "measured": success,
     }
 
 
@@ -536,11 +584,29 @@ class _Resolver:
                 if exact_path else wanted in lib.names
             )
         ]
+        filename_matches: list[_Library] = []
+        if not exact_path:
+            # SONAME is an identity alias, not a filename ld.so searches for.
+            # Never let an unrelated spelling outrank an available exact file.
+            filename_matches = [
+                lib for lib in matches
+                if any(os.path.basename(path) == wanted for path in lib.paths)
+            ]
+            if filename_matches:
+                matches = filename_matches
+            elif matches:
+                self._plan.notes.append(
+                    f"{name}: only SONAME/identity aliases match; no loader filename match")
         chosen: _Library | None = None
+        # list.sort temporarily empties its list while evaluating keys. Capture
+        # this before sorting: matches may be the filename_matches list itself.
+        rank_filename_paths = not exact_path and bool(filename_matches)
         if matches:
             matches.sort(key=lambda lib: (
                 min((rank.get(os.path.dirname(path) or "/", len(rank))
-                     for path in lib.paths), default=len(rank)),
+                     for path in lib.paths
+                     if not rank_filename_paths
+                     or os.path.basename(path) == wanted), default=len(rank)),
                 lib.project_path))
             chosen = matches[0]
             if len(matches) > 1:
@@ -696,7 +762,7 @@ def _plan_locations(
         verneed = import_libraries.get(bare)
         if verneed is not None and direct.get(verneed) is not None:
             chosen = direct[verneed]
-        elif verneed is None:
+        elif verneed is None and (target_elf is None or target_elf.versions_unread is None):
             for lib, table in exports:
                 if bare in table:
                     chosen = lib
@@ -705,7 +771,12 @@ def _plan_locations(
             reason = (
                 f"library {verneed} not in project"
                 if verneed is not None and direct.get(verneed) is None
-                else "not exported by any linked library"
+                else (
+                    "symbol version requirements were not read: "
+                    + target_elf.versions_unread
+                    if target_elf is not None and target_elf.versions_unread is not None
+                    else "not exported by any linked library"
+                )
             )
             plan.unresolved.append({"symbol": bare, "reason": reason})
             continue

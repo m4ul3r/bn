@@ -8,6 +8,7 @@ import pytest
 
 import bn.cli
 from bn import formatters
+from bn.transport import BridgeError
 
 
 def _record(**changes):
@@ -96,7 +97,7 @@ def test_context_keeps_stale_acceptance_in_needs_review():
     result = {"groups": {"accepted": [], "needs_review": [_record()]},
               "total": 1, "offset": 0, "limit": 50, "has_more": False}
     text = formatters._render_project_finding_context_text(result)
-    assert "accepted:\n  No findings." in text
+    assert "accepted:\n  (no findings)" in text
     assert "needs_review:\n  F-example" in text
     assert "review=accepted freshness=stale" in text
     assert "No dynamic reproduction" in text
@@ -108,7 +109,7 @@ def test_context_discloses_and_preserves_malformed_group(malformed):
     text = formatters._render_project_finding_context_text(result)
     assert f"a:\n  {json.dumps(malformed)}" in text
     assert "malformed a field" in text
-    assert "No findings." not in text
+    assert "(no findings)" not in text
     for expected in ("F-example", "type=vulnerability", "review=accepted",
                      "freshness=stale", "No dynamic reproduction", "not claim truth"):
         assert expected in text
@@ -119,7 +120,7 @@ def test_context_discloses_and_preserves_malformed_groups_container(malformed):
     text = formatters._render_project_finding_context_text({"groups": malformed})
     assert f"groups: {json.dumps(malformed)}" in text
     assert "malformed groups field" in text
-    assert "No findings." not in text
+    assert "(no findings)" not in text
     assert "not claim truth" in text
 
 
@@ -136,7 +137,7 @@ def test_finding_lists_preserve_and_disclose_malformed_rows(render, payload, fie
     assert "F-example" in text
     assert "review=accepted freshness=stale" in text
     assert "No dynamic reproduction" in text
-    assert "No findings." not in text
+    assert "(no findings)" not in text
 
 
 @pytest.mark.parametrize("malformed", [1, 0, False, "", {"claim": "retained"}])
@@ -144,7 +145,7 @@ def test_findings_preserve_malformed_items_without_claiming_empty(malformed):
     text = formatters._render_project_findings_text({"items": malformed})
     assert f"items: {json.dumps(malformed)}" in text
     assert "malformed items field" in text
-    assert "No findings." not in text
+    assert "(no findings)" not in text
 
 
 def test_history_displays_revision_types_and_page_boundaries():
@@ -223,3 +224,104 @@ def test_valid_structured_finding_details_are_not_reported_as_malformed():
                      "Recheck changed bytes", "Independent byte check", "9090",
                      "Persisted file changed", "F-other", "F-replacement", "not claim truth"):
         assert expected in text
+
+
+def _write_argv(action):
+    args = ["project", "finding", action]
+    if action != "add":
+        args += ["F-" + "a" * 32]
+    args += ["-", "--reviewer" if action == "review" else "--author", "analyst"]
+    if action != "add":
+        args += ["--expected-revision", "2"]
+    return args
+
+
+@pytest.mark.parametrize("action", ["add", "update", "review"])
+@pytest.mark.parametrize("output_format", ["text", "json", "ndjson"])
+def test_finding_storage_rollback_failure_is_mutation_exit_three(
+        action, output_format, monkeypatch, capsys):
+    observed = {"rolled_back": False, "dirty_after": True,
+                "candidate_file_ids": ["leftover-snapshot"],
+                "append_error": "readback mismatch", "rollback_error": "native delete refused"}
+    requested = {"finding_id": "F-" + "a" * 32, "revision": 3,
+                 "snapshot_path": "/.bn-findings/synthetic/000003.json"}
+    def refuse(op, **kwargs):
+        assert op == f"project_finding_{action}"
+        raise BridgeError(
+            "STORAGE ROLLBACK FAILED: native delete refused",
+            status="rollback_failed", requested=requested, observed=observed,
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    assert bn.cli.main(_write_argv(action) + ["--format", output_format]) == 3
+    output = capsys.readouterr()
+    assert "STORAGE ROLLBACK FAILED" in output.err
+    if output_format != "text":
+        error = json.loads(output.out)
+        assert error["status"] == "rollback_failed"
+        assert error["observed"] == observed
+        assert error["requested"] == requested
+
+
+@pytest.mark.parametrize("action", ["update", "review"])
+def test_finding_revision_conflict_remains_nonmutation_exit_two(
+        action, monkeypatch, capsys):
+    def refuse(op, **kwargs):
+        assert op == f"project_finding_{action}"
+        raise BridgeError("Revision conflict: expected revision 2, current revision 3")
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    assert bn.cli.main(_write_argv(action) + ["--format", "json"]) == 2
+    output = capsys.readouterr()
+    assert "Revision conflict" in output.err
+    assert "rollback_failed" not in output.out
+
+
+def test_finding_read_failure_is_not_misclassified_as_write(monkeypatch, capsys):
+    def refuse(op, **kwargs):
+        assert op == "project_finding_show"
+        raise BridgeError("synthetic read failure", status="rollback_failed")
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
+    assert bn.cli.main(["project", "finding", "show", "F-example"]) == 2
+    assert "synthetic read failure" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("action", ["add", "update", "review"])
+@pytest.mark.parametrize("freshness", ["current", "stale", "unknown"])
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_verified_finding_snapshot_write_succeeds_independently_of_claim_freshness(
+        action, freshness, output_format, monkeypatch, fake_transport, capsys):
+    stamp = "2026-11-08T00:00:00Z"
+    revision = 1 if action == "add" else 3
+    result = _record(
+        schema_version=1, id="F-" + "a" * 32, project_id="synthetic-project",
+        integrity="b" * 64, freshness=freshness, created_at=stamp, updated_at=stamp,
+        revision=revision, claim_revision=1 if action == "review" else revision,
+        previous_digest=None if action == "add" else "c" * 64,
+        action={"kind": action, "actor": "analyst", "timestamp": stamp},
+    )
+    fake_transport({f"project_finding_{action}": {"ok": True, "result": result}})
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    assert bn.cli.main(_write_argv(action) + ["--format", output_format]) == 0
+    output = capsys.readouterr()
+    assert "could not classify" not in output.err
+    if output_format == "json":
+        assert json.loads(output.out) == result
+    else:
+        assert f"freshness={freshness}" in output.out
+
+
+@pytest.mark.parametrize("result,expected_exit", [
+    ({}, 4), ({"id": "F-" + "a" * 32, "revision": True}, 4),
+    ({"success": False, "status": "rollback_failed"}, 3), ([], 2),
+])
+def test_malformed_finding_write_result_cannot_report_success(
+        result, expected_exit, monkeypatch, fake_transport, capsys):
+    fake_transport({"project_finding_add": {"ok": True, "result": result}})
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+    assert bn.cli.main(_write_argv("add") + ["--format", "json"]) == expected_exit
+    output = capsys.readouterr()
+    assert "Traceback" not in output.err

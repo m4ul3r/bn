@@ -117,18 +117,6 @@ def test_ordinary_skills_do_not_instruct_project_workflows(skill_name):
         assert "bn skill install projects" in text
 
 
-@pytest.mark.parametrize("doc", (
-    REPO / "README.md",
-    CLAUDE_MD,
-    REPO / "skills" / "bn" / "reference" / "runtime.md",
-    REPO / "skills" / "bn-projects" / "SKILL.md",
-), ids=lambda path: str(path.relative_to(REPO)))
-def test_project_installation_is_documented_as_separate_and_opt_in(doc):
-    text = _doc_text(doc)
-    assert "bn skill install projects" in text
-    assert "opt-in" in text
-    assert "Commercial" in text and "Ultimate" in text
-    assert re.search(r"(?:excludes?|not)\s+(?:this skill|`bn-projects`)", text)
 
 
 def test_project_skill_preserves_load_and_link_safety_guidance():

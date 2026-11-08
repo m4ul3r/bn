@@ -146,6 +146,73 @@ def test_streaming_file_observation_handles_multiple_chunks(env):
     assert row["observed"] == {"sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
 
 
+@pytest.mark.parametrize("kind", ["file", "bytes"])
+@pytest.mark.parametrize("mutation", ["replace", "truncate"])
+@pytest.mark.parametrize("phase", ["capture", "recheck"])
+def test_blob_change_during_read_never_establishes_currency(
+        env, monkeypatch, kind, mutation, phase):
+    path = Path(env.blob.path_on_disk)
+    content = b"A" * (1024 * 1024 + 32)
+    path.write_bytes(content)
+    options = {"file": env.blob.id}
+    if kind == "bytes":
+        options.update(offset=0, length=16)
+    baseline = capture(env, kind, **options)
+    original_open = open
+    changed = False
+
+    class ChangingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def seek(self, offset):
+            return self.stream.seek(offset)
+
+        def read(self, length):
+            nonlocal changed
+            data = self.stream.read(length)
+            if not changed:
+                changed = True
+                if mutation == "replace":
+                    replacement = path.with_name("replacement-blob")
+                    # Identical content/length still cannot prove the named
+                    # ProjectFile was stable across the observation.
+                    replacement.write_bytes(content)
+                    replacement.replace(path)
+                else:
+                    with original_open(path, "r+b") as writer:
+                        writer.truncate(8)
+            return data
+
+    def changing_open(name, mode):
+        stream = original_open(name, mode)
+        return ChangingStream(stream) if Path(name) == path else stream
+
+    monkeypatch.setattr(env.api, "open", changing_open, raising=False)
+    if phase == "capture":
+        captured = capture(env, kind, **options)
+        row = captured[0]
+        assert row["capture_state"] == "unknown"
+        assert row["observed"] is None and row["fingerprint"] is None
+        assert "changed" in row["reason"]
+        assert check(env, captured)["freshness"] == "unknown"
+    else:
+        result = check(env, baseline)
+        assert result["freshness"] == "unknown"
+        assert "changed" in result["checks"][0]["reason"]
+        assert "observed" not in result["checks"][0]
+    assert changed
+
+
 def test_bytes_are_persisted_file_offsets_not_virtual_addresses(env):
     captured = capture(env, "bytes", file=env.blob.id, offset=6, length=4,
                        expected={"hex": "01020304"})

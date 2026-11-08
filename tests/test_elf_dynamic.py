@@ -8,6 +8,7 @@ orders.
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
 import struct
 from dataclasses import dataclass
@@ -405,6 +406,207 @@ def test_versions_unread_names_the_missing_dynamic_symbol_table_1037():
         "the file declares symbol versions without a dynamic symbol table")
 
 
+@pytest.mark.parametrize("is64", [True, False])
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("damage", [
+    "unsupported-version", "zero-version", "zero-aux", "overlapping-header-aux",
+    "truncated-requirements", "overlapping-requirements", "unreadable-requirement",
+    "truncated-aux", "overlapping-aux", "unreadable-aux",
+    "conflicting-indices", "shared-aux", "malformed-later-requirement",
+])
+def test_malformed_verneed_discards_all_attribution_but_preserves_exports(is64, endian, damage):
+    image = bytearray(_build_elf(
+        is64=is64, endian=endian, needed=("liba.so", "libb.so"),
+        symbols=(("from_a", "liba.so"), ("from_b", "libb.so")), defined=_DEFINED))
+    rows, _ = _dynamic_entries_at(image, is64=is64, endian=endian)
+    at = next(value for _, tag, value in rows if tag == 0x6FFFFFFE) - _BASE
+    patches = {
+        "unsupported-version": ("H", at, 2),
+        "zero-version": ("H", at, 0),
+        "zero-aux": ("I", at + 8, 0),
+        "overlapping-header-aux": ("I", at + 8, 8),
+        "truncated-requirements": ("I", at + 12, 0),
+        "overlapping-requirements": ("I", at + 12, 8),
+        "unreadable-requirement": ("I", at + 12, len(image) - at - 8),
+        "truncated-aux": ("H", at + 2, 2),
+        "overlapping-aux": ("H", at + 2, 2),
+        "unreadable-aux": ("I", at + 8, len(image) - at - 8),
+        "conflicting-indices": ("H", at + 32 + 16 + 6, 2),
+        # Both requirements point at the second requirement's vernaux record.
+        "shared-aux": ("I", at + 8, 48),
+        "malformed-later-requirement": ("H", at + 32, 2),
+    }
+    fmt, offset, value = patches[damage]
+    struct.pack_into(endian + fmt, image, offset, value)
+    if damage == "overlapping-aux":
+        struct.pack_into(endian + "I", image, at + 16 + 12, 8)
+    info = _parse(bytes(image))
+    assert info is not None
+    assert info.import_libraries == {}
+    assert info.versions_unread
+    assert info.notes
+    assert info.needed == ["liba.so", "libb.so"]
+    assert info.exports == _EXPECTED_EXPORTS
+
+
+@pytest.mark.parametrize("is64", [True, False])
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("other", [0, 1, 0x8000, 0x8001])
+@pytest.mark.parametrize("requirement", [0, 1])
+def test_reserved_vernaux_indices_cannot_claim_local_or_global_imports(
+        is64, endian, other, requirement):
+    image = bytearray(_build_elf(
+        is64=is64, endian=endian, needed=("liba.so", "libb.so"),
+        symbols=(("from_a", "liba.so"), ("from_b", "libb.so"),
+                 ("local_import", None), ("global_import", None)),
+        defined=_DEFINED))
+    rows, _ = _dynamic_entries_at(image, is64=is64, endian=endian)
+    verneed_at = next(value for _, tag, value in rows if tag == 0x6FFFFFFE) - _BASE
+    versym_at = next(value for _, tag, value in rows if tag == 0x6FFFFFF0) - _BASE
+    # The third import uses VER_NDX_LOCAL; the fourth retains VER_NDX_GLOBAL.
+    # Neither may acquire the foreign library named by this malformed vernaux,
+    # including when its reserved index is disguised with the high bit.
+    struct.pack_into(endian + "H", image, versym_at + 3 * 2, 0)
+    struct.pack_into(endian + "H", image, verneed_at + requirement * 32 + 16 + 6, other)
+
+    info = _parse(bytes(image))
+    assert info is not None
+    # Reject the whole table, even if a valid requirement was already read.
+    assert info.import_libraries == {}
+    reason = "uses a reserved local/global version index"
+    assert info.versions_unread and reason in info.versions_unread
+    assert any(reason in note for note in info.notes), info.notes
+    assert info.needed == ["liba.so", "libb.so"]
+    assert info.exports == _EXPECTED_EXPORTS
+
+
+@pytest.mark.parametrize("is64", [True, False])
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("other", [2, 0x8002])
+def test_first_nonreserved_vernaux_index_attributes_only_its_versioned_import(
+        is64, endian, other):
+    image = bytearray(_build_elf(
+        is64=is64, endian=endian, needed=("liba.so",),
+        symbols=(("from_a", "liba.so"), ("local_import", None), ("global_import", None)),
+        defined=_DEFINED))
+    rows, _ = _dynamic_entries_at(image, is64=is64, endian=endian)
+    verneed_at = next(value for _, tag, value in rows if tag == 0x6FFFFFFE) - _BASE
+    versym_at = next(value for _, tag, value in rows if tag == 0x6FFFFFF0) - _BASE
+    struct.pack_into(endian + "H", image, verneed_at + 16 + 6, other)
+    struct.pack_into(endian + "H", image, versym_at + 2 * 2, 0)
+
+    info = _parse(bytes(image))
+    assert info is not None
+    assert info.import_libraries == {"from_a": "liba.so"}
+    assert info.versions_unread is None
+    assert info.needed == ["liba.so"]
+    assert info.exports == _EXPECTED_EXPORTS
+
+
+@pytest.mark.parametrize("is64", [True, False])
+@pytest.mark.parametrize("endian", ["<", ">"])
+@pytest.mark.parametrize("total_aux", [16384, 16385])
+def test_vernaux_work_limit_is_shared_across_requirements(is64, endian, total_aux):
+    image = _build_elf(
+        is64=is64, endian=endian, needed=("liba.so", "libb.so"),
+        symbols=(("from_a", "liba.so"), ("from_b", "libb.so")), defined=_DEFINED)
+    rows, _ = _dynamic_entries_at(image, is64=is64, endian=endian)
+    old_at = next(value for _, tag, value in rows if tag == 0x6FFFFFFE) - _BASE
+    table = bytearray()
+    next_index = 16  # Leave the fixture's import/export version indices intact.
+    for i, count in enumerate((8192, total_aux - 8192)):
+        _, _, filename, _, _ = struct.unpack_from(endian + "HHIII", image, old_at + 32 * i)
+        _, _, other, name, _ = struct.unpack_from(endian + "IHHII", image, old_at + 32 * i + 16)
+        table += struct.pack(endian + "HHIII", 1, count, filename, 16,
+                             16 + 16 * count if i == 0 else 0)
+        for index in range(count):
+            version = other if index == 0 else next_index
+            next_index += 1
+            table += struct.pack(endian + "IHHII", 0, 0, version, name,
+                                 16 if index + 1 < count else 0)
+    table_at = len(image)
+    image = bytearray(_set_dynamic_tag(
+        image, 0x6FFFFFFE, _BASE + table_at, is64=is64, endian=endian))
+    image.extend(table)
+    # Extend the fixture's whole-file PT_LOAD to include the replacement table.
+    load_size_at = 64 + 32 if is64 else 52 + 16
+    struct.pack_into(endian + ("QQ" if is64 else "II"),
+                     image, load_size_at, len(image), len(image))
+    table_bytes_read = 0
+    invalid_windows = []
+
+    def read(offset, length):
+        nonlocal table_bytes_read
+        if not (0 <= offset and 0 <= length and offset + length <= len(image)):
+            invalid_windows.append((offset, length))
+            return b""
+        table_bytes_read += max(0, min(offset + length, len(image)) - max(offset, table_at))
+        # Stop excess work even under a regression; assert the budget outside
+        # the reader, where a parser's short-read handling cannot swallow it.
+        if table_bytes_read > 16384 * 16 + 2 * 16:
+            return b""
+        return bytes(image[offset:offset + length])
+
+    info = parse_elf_dynamic(read, len(image))
+    assert not invalid_windows
+    assert table_bytes_read <= 16384 * 16 + 2 * 16
+    assert info is not None
+    assert info.needed == ["liba.so", "libb.so"]
+    assert info.exports == _EXPECTED_EXPORTS
+    if total_aux == 16384:
+        assert info.import_libraries == {"from_a": "liba.so", "from_b": "libb.so"}
+        assert info.versions_unread is None
+    else:
+        assert info.import_libraries == {}
+        assert info.versions_unread
+        assert info.notes
+
+
+def test_cancellation_check_precedes_every_reader_call():
+    image = _build_elf(needed=("libc.so.6",), symbols=_SYMBOLS, defined=_DEFINED)
+    events = []
+
+    def check():
+        events.append("check")
+
+    def read(offset, length):
+        events.append("read")
+        return image[offset:offset + length]
+
+    info = parse_elf_dynamic(read, len(image), check=check)
+    assert info is not None and info.exports == _EXPECTED_EXPORTS
+    assert "read" in events
+    assert all(index > 0 and events[index - 1] == "check"
+               for index, event in enumerate(events) if event == "read")
+
+
+@pytest.mark.parametrize("cancel_immediately", [True, False])
+def test_cancellation_runtime_error_escapes_dynamic_parser(cancel_immediately):
+    image = _build_elf(needed=("libc.so.6",), symbols=_SYMBOLS, defined=_DEFINED)
+    rows, _ = _dynamic_entries_at(image)
+    verneed_at = next(value for _, tag, value in rows if tag == 0x6FFFFFFE) - _BASE
+    cancelled = cancel_immediately
+    reads_after_cancellation = []
+    error = RuntimeError("cancel ELF discovery")
+
+    def check():
+        if cancelled:
+            raise error
+
+    def read(offset, length):
+        nonlocal cancelled
+        if cancelled:
+            reads_after_cancellation.append((offset, length))
+        if offset <= verneed_at < offset + length:
+            cancelled = True
+        return image[offset:offset + length]
+
+    with pytest.raises(RuntimeError) as raised:
+        parse_elf_dynamic(read, len(image), check=check)
+    assert raised.value is error
+    assert not reads_after_cancellation
+
+
 # --- exports ----------------------------------------------------------------
 
 _DEFINED = (
@@ -506,15 +708,25 @@ def test_truncated_image_with_exports_never_reads_past_the_end():
 # --- parse_elf_file -----------------------------------------------------------
 
 
-def test_parse_elf_file_reads_a_file_piecewise(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cancel_at", [None, "before-open", "after-read"])
+def test_parse_elf_file_reads_a_file_piecewise(tmp_path, monkeypatch, cancel_at):
     image = _build_elf(needed=("libc.so.6",), soname="libwidget.so.2",
                        symbols=_SYMBOLS, defined=_DEFINED)
     path = tmp_path / "libwidget.so.2"
     path.write_bytes(image)
-    # Every read is one bounded window, never the whole file: shadow `open` in
-    # the module with one whose handle refuses an unsized or oversized read.
+    # Observe the real descriptor-backed handle, including its closure when
+    # cancellation interrupts parsing after a read.
     import bn_agent_bridge.elf_dynamic as elf_dynamic
     windows = []
+    handles = []
+    events = []
+    error = RuntimeError("cancel file discovery")
+    real_fdopen = os.fdopen
+
+    def check():
+        events.append("check")
+        if cancel_at == "before-open" or (cancel_at == "after-read" and windows):
+            raise error
 
     class CappedHandle:
         def __init__(self, handle):
@@ -534,12 +746,27 @@ def test_parse_elf_file_reads_a_file_piecewise(tmp_path, monkeypatch):
 
         def read(self, size=-1):
             assert 0 <= size <= len(image), f"read of {size} bytes"
+            events.append("read")
             windows.append(size)
             return self._handle.read(size)
 
-    monkeypatch.setattr(elf_dynamic, "open", lambda p, mode: CappedHandle(open(p, mode)),
-                        raising=False)
-    info = parse_elf_file(str(path))
+    def fdopen(fd, mode):
+        handle = real_fdopen(fd, mode)
+        handles.append(handle)
+        return CappedHandle(handle)
+
+    monkeypatch.setattr(elf_dynamic.os, "fdopen", fdopen)
+    if cancel_at is not None:
+        with pytest.raises(RuntimeError) as raised:
+            parse_elf_file(str(path), check=check)
+        assert raised.value is error
+        assert bool(windows) == (cancel_at == "after-read")
+        assert all(handle.closed for handle in handles)
+        return
+    info = parse_elf_file(str(path), check=check)
+    assert all(handle.closed for handle in handles)
+    assert all(index > 0 and events[index - 1] == "check"
+               for index, event in enumerate(events) if event == "read")
     assert info is not None
     assert len(windows) > 1 and max(windows) < len(image)
     assert info.soname == "libwidget.so.2" and info.needed == ["libc.so.6"]
@@ -558,3 +785,44 @@ def test_parse_elf_file_is_none_for_non_elf_missing_or_directory(tmp_path):
     assert parse_elf_file(str(tmp_path / "empty.so")) is None
 
 
+
+def _parse_fifo_in_worker(path, connection):
+    try:
+        connection.send("ready")
+        connection.send(parse_elf_file(path))
+    finally:
+        connection.close()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
+def test_parse_elf_file_rejects_fifo_without_waiting_for_a_writer(tmp_path):
+    path = tmp_path / "library.fifo"
+    os.mkfifo(path)
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_parse_fifo_in_worker, args=(str(path), sender))
+    started = False
+    try:
+        process.start()
+        started = True
+        sender.close()
+        assert receiver.poll(10), "FIFO worker did not start"
+        assert receiver.recv() == "ready"
+        process.join(timeout=2)
+        assert not process.is_alive(), "parse_elf_file blocked opening a FIFO"
+        assert process.exitcode == 0
+        assert receiver.poll(1), "FIFO worker returned no result"
+        assert receiver.recv() is None
+    finally:
+        if started:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+            if not process.is_alive():
+                process.close()
+        receiver.close()
+        sender.close()
+        path.unlink()

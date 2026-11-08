@@ -72,6 +72,18 @@ os.register_at_fork(
 )
 
 
+def refuse_raw_project_path(path: str | os.PathLike[str]) -> None:
+    """Reject standalone access to project storage, including symlink aliases."""
+    requested = Path(path).expanduser().absolute()
+    for candidate in (requested, requested.resolve()):
+        for ancestor in candidate.parents:
+            if (ancestor / "project.bnpm").is_file():
+                raise RuntimeError(
+                    f"Cannot load project storage as a standalone binary: {candidate}. "
+                    f"Use `bn project open {ancestor}` and `bn project load <selector>`."
+                )
+
+
 def canonical_project_path(path: str | os.PathLike[str]) -> Path:
     """The `.bnpr` DIRECTORY for *path*, which may name the directory or its
     `project.bnpm` metadata file (BN accepts both; the registry publishes one)."""
@@ -123,6 +135,7 @@ class ProjectManager:
         # BN refuses creation into a directory containing the lease file, so
         # it cannot exist until create_project returns. All opens/creates briefly
         # lock the parent directory to cover that handoff without another file.
+        # This needs no parent write access or shared lock-file ownership policy.
         with _LEASE_LOCK:
             fd = os.open(canonical.parent, os.O_RDONLY)
             try:
@@ -148,7 +161,18 @@ class ProjectManager:
 
     def _acquire_lease(self, canonical: Path) -> None:
         with _LEASE_LOCK:
-            fd = os.open(canonical / _LEASE_FILENAME, os.O_CREAT | os.O_RDWR, 0o600)
+            lease = canonical / _LEASE_FILENAME
+            try:
+                # Honour the creator's umask and group-sharing policy. Existing
+                # lease permissions are never widened implicitly.
+                fd = os.open(lease, os.O_CREAT | os.O_RDWR, 0o660)
+            except PermissionError as exc:
+                raise RuntimeError(
+                    f"Cannot access project lease {lease}: check its ownership and "
+                    "read/write permissions (and directory access) for this user/group. "
+                    "Ask the project owner to adjust permissions; do not delete the "
+                    "lease file, because another bridge may still hold its lock."
+                ) from exc
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BaseException as exc:
@@ -441,11 +465,15 @@ class ProjectManager:
             index.setdefault(self.path_in_project(pf), []).append(pf)
         return index
 
-    def sibling_database(self, pf: Any, index: dict[str, list[Any]] | None = None) -> Any | None:
-        """The `<name>.bndb` project file in *pf*'s folder, if any: the project
-        analogue of the adjacent-`.bndb` preference (#717). None for a file that
-        is itself a `.bndb`, and None when two siblings share that name:
-        BN allows the duplicate; a save must not pick one at random."""
+    def sibling_database(
+        self, pf: Any, index: dict[str, list[Any]] | None = None, *,
+        allow_ambiguous: bool = False,
+    ) -> Any | None:
+        """The unique `<name>.bndb` beside *pf*, or None when absent.
+
+        Loads and saves refuse ambiguous siblings instead of treating them as
+        absent. Listings may opt out so the conflicting files remain visible.
+        """
         name = str(pf.name)
         if name.endswith(".bndb"):
             return None
@@ -459,6 +487,8 @@ class ProjectManager:
             except Exception:  # noqa: BLE001 - fall back to the full list
                 siblings = list(project.files)
             matches = [f for f in siblings if self.path_in_project(f) == wanted_path]
+        if len(matches) > 1 and not allow_ambiguous:
+            raise RuntimeError(self._ambiguous(wanted_path, matches))
         return matches[0] if len(matches) == 1 else None
 
     def ensure_folder(self, path: str | None) -> Any | None:
@@ -502,7 +532,7 @@ class ProjectManager:
                     is_database = fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
             except OSError:
                 size = None
-        sibling = self.sibling_database(pf, index)
+        sibling = self.sibling_database(pf, index, allow_ambiguous=True)
         return {
             "id": str(pf.id),
             "name": str(pf.name),
@@ -523,8 +553,8 @@ class ProjectManager:
         and write *bv*'s database into it. Returns the new ProjectFile.
 
         `create_file(b"")` makes a row but neither a blob nor its parent
-        directory; `create_database` needs the directory. A write that fails
-        leaves no half-registered file behind.
+        directory; `create_database` needs the directory. Failed writes verify
+        cleanup and disclose any row/blob that could not be removed.
         """
         project = self.require().project
         name = f"{pf.name}.bndb"
@@ -543,25 +573,56 @@ class ProjectManager:
         try:
             Path(dest).parent.mkdir(parents=True, exist_ok=True)
             created = bv.create_database(dest)
-        except Exception as exc:  # noqa: BLE001 - surface BN I/O errors, after cleanup
-            self._discard_file(project, new)
-            raise RuntimeError(
-                f"Failed to save project database to {dest}: {exc}"
-            ) from exc
-        if created is False or not Path(dest).exists():
-            self._discard_file(project, new)
-            raise RuntimeError(
-                f"Failed to save project database to {dest}: Binary Ninja reported no "
-                "file was written"
-            )
+            if created is False or not Path(dest).is_file():
+                raise RuntimeError("Binary Ninja reported no file was written")
+        except BaseException as exc:
+            primary_error = f"Failed to save project database to {dest}: {exc}"
+            self._discard_file(project, new, dest, primary_error)
+            if not isinstance(exc, Exception):
+                raise
+            raise RuntimeError(primary_error) from exc
         return new
 
     @staticmethod
-    def _discard_file(project: Any, pf: Any) -> None:
+    def _discard_file(project: Any, pf: Any, dest: str, primary_error: str) -> None:
+        file_id = str(pf.id)
+        cleanup_errors: list[str] = []
         try:
-            project.delete_file(pf)
-        except Exception:  # noqa: BLE001 - best effort; the primary error is reported
-            pass
+            if project.delete_file(pf) is False:
+                cleanup_errors.append("Binary Ninja refused to delete the project file")
+        except Exception as exc:  # noqa: BLE001 - verify both kinds of residue below
+            cleanup_errors.append(str(exc))
+        row_remains: bool | None = None
+        blob_remains: bool | None = None
+        try:
+            row_remains = any(str(candidate.id) == file_id for candidate in project.files)
+        except Exception as exc:  # noqa: BLE001 - an unverified rollback is not success
+            cleanup_errors.append(f"could not verify project row removal: {exc}")
+        try:
+            os.lstat(dest)
+            blob_remains = True
+        except FileNotFoundError:
+            blob_remains = False
+        except OSError as exc:
+            cleanup_errors.append(f"could not verify blob removal: {exc}")
+        if row_remains is False and blob_remains is False:
+            return
+        from ._shared import OperationFailure
+
+        raise OperationFailure(
+            "rollback_failed",
+            f"{primary_error}; cleanup failed for project file {file_id} at {dest}",
+            requested={"project_file_id": file_id, "path": dest},
+            observed={
+                "rolled_back": False,
+                "primary_error": primary_error,
+                "project_file_id": file_id,
+                "path": dest,
+                "row_remains": row_remains,
+                "blob_remains": blob_remains,
+                "cleanup_errors": cleanup_errors,
+            },
+        )
 
 
 # -- ownership -------------------------------------------------------------
@@ -805,6 +866,22 @@ def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
     return {"deleted": True, "project_file_id": file_id, "project_path": path}
 
 
+def _other_database_writers(bridge: Any, bv: Any, blob: str) -> list[str]:
+    rows = bridge.targets.refresh()
+    current = bridge._loaded_target_row(rows, bv)
+    current_id = current.get("target_id") if current is not None else None
+    canonical = os.path.realpath(blob)
+    return [
+        str(row.get("selector") or row["target_id"]) + f" ({row['target_id']})"
+        for row in rows
+        if row.get("target_id") != current_id
+        and any(
+            value and os.path.realpath(value) == canonical
+            for value in (row.get("database_path"), row.get("filename"))
+        )
+    ]
+
+
 def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     """Project branch of `save_database`. The caller established
     ``bv.project_file is not None`` and holds the write lock."""
@@ -823,6 +900,13 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     _refuse_finding_path(project_path)
     has_database = bool(getattr(bv.file, "has_database", False))
     if has_database:
+        blob = str(manager.resolve_file(file_id).path_on_disk)
+        writers = _other_database_writers(bridge, bv, blob)
+        if writers:
+            raise RuntimeError(
+                f"Refusing to save {project_path}: another open target writes the same "
+                f"project database: {', '.join(writers)}. Close the duplicate targets first."
+            )
         try:
             ok = bv.file.save_auto_snapshot()
         except Exception as exc:  # noqa: BLE001
@@ -834,7 +918,6 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
                 "Binary Ninja could not write the project database snapshot"
             )
         bridge.targets.clear_dirty(bv)
-        blob = str(getattr(bv.file, "filename", "") or "")
         return {
             "ok": True,
             "saved": True,
@@ -849,10 +932,12 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     # duplicate, and two databases for one binary is never what a save means).
     sibling = manager.sibling_database(pf)
     if sibling is not None:
+        writers = _other_database_writers(bridge, bv, str(sibling.path_on_disk))
+        open_note = f" Open targets: {', '.join(writers)}." if writers else ""
         raise RuntimeError(
             f"{manager.path_in_project(pf)} already has a database file "
             f"{manager.path_in_project(sibling)} ({sibling.id}); load that file instead. "
-            "A second database for one binary is not created implicitly."
+            f"A second database for one binary is not created implicitly.{open_note}"
         )
     new = manager.create_database_file(bv, pf)
     new_id = str(new.id)

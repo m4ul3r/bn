@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+from threading import Event, Thread
+from typing import Callable, TypeVar
 
 import pytest
 
@@ -517,3 +519,476 @@ def test_implicit_detection_never_scores_host_root(
     assert rl.detect_root("/", explicit=True) == rl.RootfsInfo("/", "linux", ["host"])
     assert calls[-1] == "/"
 
+
+@pytest.mark.parametrize(
+    ("start", "candidate"),
+    [("/usr", "/usr"), ("/usr/share/doc", "/usr"), ("/dev", "/dev")],
+)
+def test_implicit_detection_rejects_host_direct_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: str, candidate: str,
+) -> None:
+    if not os.path.isdir(start):
+        pytest.skip(f"host does not provide {start}")
+    firmware = rl.detect_root(str(_linux_rootfs(tmp_path)))
+    assert firmware is not None and firmware.platform == "linux"
+    original_score = rl._score
+    host_info = rl.RootfsInfo(candidate, firmware.platform, firmware.markers)
+
+    def score_with_host_markers(root: str) -> rl.RootfsInfo | None:
+        # Host marker availability differs across Linux and macOS installations.
+        return host_info if root == candidate else original_score(root)
+
+    monkeypatch.setattr(rl, "_score", score_with_host_markers)
+    assert rl.detect_root(start) is None
+    assert rl.detect_root(candidate, explicit=True) == host_info
+
+
+@pytest.mark.parametrize("relative_start", ["", "share/doc"])
+def test_implicit_detection_rejects_real_symlink_to_host_usr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative_start: str,
+) -> None:
+    alias = _link(tmp_path, "host-usr", "/usr")
+    start = alias / relative_start
+    if not start.is_dir():
+        pytest.skip(f"host does not provide /usr/{relative_start}")
+    original_score = rl._score
+
+    def score_with_host_markers(root: str) -> rl.RootfsInfo | None:
+        if root == "/usr":
+            return rl.RootfsInfo(root, "linux", ["bin", "lib", "lib*/libc.so*"])
+        return original_score(root)
+
+    monkeypatch.setattr(rl, "_score", score_with_host_markers)
+    assert rl.detect_root(str(start)) is None
+
+
+@pytest.mark.parametrize("identity", ["same", "different-device", "different-inode"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_host_usr_identity_requires_both_device_and_inode_unless_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str, explicit: bool,
+) -> None:
+    root = _linux_rootfs(tmp_path)
+    nested = root / "usr/share/doc"
+    nested.mkdir(parents=True)
+    canonical_root = os.path.realpath(root)
+    expected = rl.detect_root(canonical_root)
+    assert expected is not None and expected.platform == "linux"
+    original_stat = os.stat
+    host_usr = original_stat("/usr")
+
+    def stat_with_mount_identity(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == canonical_root:
+            fields = list(result)
+            fields[1] = host_usr.st_ino + (identity == "different-inode")
+            fields[2] = host_usr.st_dev + (identity == "different-device")
+            return os.stat_result(fields)
+        return result
+
+    # A bind mount retains the target's device/inode without resolving as a
+    # symlink. Keep all filesystem contents and every other stat call real.
+    monkeypatch.setattr(rl.os, "stat", stat_with_mount_identity)
+    wanted = None if identity == "same" and not explicit else expected
+    assert rl.detect_root(canonical_root, explicit=explicit) == wanted
+    if not explicit:
+        assert rl.detect_root(str(nested)) == wanted
+
+
+def test_nested_extracted_firmware_is_detected_inside_host_usr_mount_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias = _linux_rootfs(tmp_path)
+    root = _linux_rootfs(alias / "extracted")
+    nested = root / "usr/share/doc"
+    nested.mkdir(parents=True)
+    canonical_alias = os.path.realpath(alias)
+    expected = rl.detect_root(str(root))
+    assert expected is not None and expected.root == os.path.realpath(root)
+    original_stat = os.stat
+    host_usr = original_stat("/usr")
+
+    def stat_with_mount_identity(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == canonical_alias:
+            fields = list(result)
+            fields[1:3] = [host_usr.st_ino, host_usr.st_dev]
+            return os.stat_result(fields)
+        return result
+
+    monkeypatch.setattr(rl.os, "stat", stat_with_mount_identity)
+    assert rl.detect_root(canonical_alias) is None
+    assert rl.detect_root(str(nested)) == expected
+
+
+def test_recursive_startup_alias_dag_shares_work_and_deduplicates_files(
+    tmp_path: Path,
+) -> None:
+    root = _linux_rootfs(tmp_path)
+    for index in range(18):
+        for alias in ("a", "b"):
+            _link(root, f"startup/{index}/{alias}", f"/startup/{index + 1}")
+    _touch(root, "startup/18/start", b"LD_LIBRARY_PATH=/opt/vendor/lib\n")
+    _link(root, "etc/rc.d/entry", "/startup/0")
+    _link(root, "etc/environment", "/startup/18/start")
+    _link(root, "etc/init.d/duplicate", "/startup/18/start")
+
+    # There are exponentially many spellings, but only nineteen real nodes.
+    with rl.discovery_budget(rl.DiscoveryBudget(max_steps=30_000, timeout=5)):
+        assert rl.env_hint(str(root)) == [
+            ("/etc/profile", "/opt/extra/lib:$LD_LIBRARY_PATH"),
+            ("/etc/environment", "/opt/vendor/lib"),
+        ]
+        assert _paths(rl.lookup_paths(str(root), "linux")) == [
+            "/opt/vendor/lib", "/lib", "/usr/lib",
+        ]
+
+
+def test_embedded_nul_loader_entries_preserve_valid_and_default_paths(
+    tmp_path: Path,
+) -> None:
+    root = _linux_rootfs(tmp_path)
+    for directory in ("opt/env-before", "opt/env-after", "opt/conf", "opt/included"):
+        (root / directory).mkdir(parents=True)
+    _touch(
+        root, "etc/profile",
+        b"LD_LIBRARY_PATH=/opt/env-before:/opt/bad\0path:/opt/env-after\n",
+    )
+    _touch(
+        root, "etc/ld.so.conf",
+        b"/opt/bad\0path /opt/conf\n"
+        b"include /etc/bad\0/*.conf /etc/ld.so.conf.d/*.conf\n",
+    )
+    _touch(
+        root, "etc/ld.so.conf.d/vendor.conf",
+        b"include bad\0.conf\n/opt/included\n",
+    )
+
+    assert _paths(rl.lookup_paths(str(root), "linux")) == [
+        "/opt/env-before", "/opt/env-after", "/opt/conf", "/opt/included",
+        "/lib", "/usr/lib",
+    ]
+
+
+def test_discovery_byte_budget_is_shared_between_lookup_and_scan(tmp_path: Path) -> None:
+    root = tmp_path / "rootfs"
+    profile = b"LD_LIBRARY_PATH=/lib\n"
+    payload = ELF_STUB + b"library payload" * 8
+    _touch(root, "etc/profile", profile)
+    _elf(root, "lib/libgood.so", payload)
+
+    # Each operation fits separately; their combined bytes must not reset.
+    with rl.discovery_budget(rl.DiscoveryBudget(max_bytes=len(payload))):
+        paths = rl.lookup_paths(str(root), "linux")
+        assert _paths(paths) == ["/lib"]
+    with rl.discovery_budget(rl.DiscoveryBudget(max_bytes=len(payload))):
+        candidates, notes = rl.scan_libraries(str(root), paths)
+        assert [candidate.rel_realpath for candidate in candidates] == ["/lib/libgood.so"]
+        assert notes == []
+
+    with rl.discovery_budget(rl.DiscoveryBudget(max_bytes=len(payload))):
+        paths = rl.lookup_paths(str(root), "linux")
+        with pytest.raises(RuntimeError, match="rootfs discovery refused"):
+            rl.scan_libraries(str(root), paths)
+
+
+def test_scan_byte_refusal_does_not_return_an_already_discovered_subset(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/liba.so")
+    _elf(root, "lib/libz.so", ELF_STUB + b"later candidate")
+
+    with rl.discovery_budget(rl.DiscoveryBudget(max_bytes=len(ELF_STUB))):
+        with pytest.raises(RuntimeError, match="rootfs discovery refused"):
+            rl.scan_libraries(str(root), [rl.LookupPath("/lib", "default")])
+
+
+def test_discovery_step_budget_is_shared_between_calls(tmp_path: Path) -> None:
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/libgood.so")
+    paths = [rl.LookupPath("/lib", "default")]
+
+    with rl.discovery_budget(rl.DiscoveryBudget(max_steps=500, timeout=30)):
+        candidates, notes = rl.scan_libraries(str(root), paths)
+        assert [candidate.rel_realpath for candidate in candidates] == ["/lib/libgood.so"]
+        assert notes == []
+        # Repeated individually small calls must eventually exhaust one budget.
+        with pytest.raises(RuntimeError, match="rootfs discovery refused"):
+            for _ in range(501):
+                rl.scan_libraries(str(root), paths)
+
+
+@pytest.mark.parametrize("operation", ["env_hint", "lookup_paths", "scan_libraries"])
+@pytest.mark.parametrize("stop", ["cancelled", "deadline"])
+def test_discovery_checks_cancellation_and_deadline_between_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, stop: str,
+) -> None:
+    root = _linux_rootfs(tmp_path)
+    cancelled = Event()
+    budget = rl.DiscoveryBudget(timeout=30, cancelled=cancelled.is_set)
+    expired_time = rl.time.monotonic() + 60
+    operations = {
+        "env_hint": lambda: rl.env_hint(str(root)),
+        "lookup_paths": lambda: rl.lookup_paths(str(root), "linux"),
+        "scan_libraries": lambda: rl.scan_libraries(
+            str(root), [rl.LookupPath("/lib", "default")],
+        ),
+    }
+
+    with rl.discovery_budget(budget):
+        assert operations[operation]()
+        if stop == "cancelled":
+            cancelled.set()
+        else:
+            monkeypatch.setattr(rl.time, "monotonic", lambda: expired_time)
+        with pytest.raises(RuntimeError, match=f"rootfs discovery refused: .*{stop}"):
+            operations[operation]()
+
+
+_DiscoveryResult = TypeVar("_DiscoveryResult")
+
+
+def _run_fifo_discovery(
+    fifo: Path, operation: Callable[[], _DiscoveryResult],
+) -> _DiscoveryResult:
+    results: list[_DiscoveryResult] = []
+    errors: list[BaseException] = []
+
+    def discover() -> None:
+        try:
+            results.append(operation())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=discover, daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    blocked = worker.is_alive()
+    if blocked:
+        # Release a regressed blocking read-open, then provide EOF without ever
+        # blocking the test runner on a FIFO writer that has no reader.
+        fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        os.close(fd)
+        worker.join(timeout=2)
+    assert not worker.is_alive(), "FIFO discovery worker did not stop after cleanup"
+    assert not blocked, "rootfs discovery blocked on a FIFO"
+    if errors:
+        raise errors[0]
+    return results[0]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
+def test_scan_rejects_regular_candidate_replaced_by_fifo_at_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "rootfs"
+    candidate = _elf(root, "lib/liba-raced.so")
+    _elf(root, "lib/libz-good.so")
+    original_open = os.open
+    replaced = Event()
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        if os.fspath(path) == str(candidate) and not replaced.is_set():
+            candidate.unlink()
+            os.mkfifo(candidate)
+            replaced.set()
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(rl.os, "open", replace_before_open)
+    candidates, notes = _run_fifo_discovery(
+        candidate,
+        lambda: rl.scan_libraries(str(root), [rl.LookupPath("/lib", "default")]),
+    )
+
+    assert replaced.is_set(), "the candidate must reach the stat/open race"
+    assert [item.rel_realpath for item in candidates] == ["/lib/libz-good.so"]
+    assert any(note.startswith("skipped /lib/liba-raced.so:") for note in notes)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
+@pytest.mark.parametrize(
+    "fifo_rel", ["etc/ld.so.conf", "etc/ld.so.conf.d/pipe.conf", "etc/environment"],
+)
+def test_fifo_loader_configs_do_not_block_or_hide_valid_paths(
+    tmp_path: Path, fifo_rel: str,
+) -> None:
+    root = _linux_rootfs(tmp_path)
+    _touch(root, "etc/profile", b"LD_LIBRARY_PATH=/opt/vendor/lib\n")
+    fifo = _touch(root, fifo_rel)
+    fifo.unlink()
+    os.mkfifo(fifo)
+
+    paths = _run_fifo_discovery(
+        fifo, lambda: rl.lookup_paths(str(root), "linux"),
+    )
+    assert _paths(paths) == ["/opt/vendor/lib", "/lib", "/usr/lib"]
+
+
+@pytest.mark.parametrize("stop", ["cancelled", "deadline"])
+def test_scan_propagates_mid_inventory_cancellation_and_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: str,
+) -> None:
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/liba.so")
+    later = _elf(root, "lib/libz.so")
+    cancelled = Event()
+    reached_later = Event()
+    budget = rl.DiscoveryBudget(timeout=30, cancelled=cancelled.is_set)
+    expired_time = rl.time.monotonic() + 60
+    original_open = os.open
+
+    def interrupt_later_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if os.fspath(path) == str(later):
+            reached_later.set()
+            if stop == "cancelled":
+                cancelled.set()
+            else:
+                monkeypatch.setattr(rl.time, "monotonic", lambda: expired_time)
+        return fd
+
+    monkeypatch.setattr(rl.os, "open", interrupt_later_open)
+    with rl.discovery_budget(budget):
+        with pytest.raises(RuntimeError, match=f"rootfs discovery refused: .*{stop}"):
+            rl.scan_libraries(str(root), [rl.LookupPath("/lib", "default")])
+    assert reached_later.is_set(), "refusal must interrupt an in-progress inventory"
+
+
+def test_lookup_step_refusal_does_not_return_partial_or_default_paths(
+    tmp_path: Path,
+) -> None:
+    root = _linux_rootfs(tmp_path)
+    _touch(root, "etc/ld.so.conf", b"/opt/vendor/lib\n" * 1_000)
+
+    with rl.discovery_budget(rl.DiscoveryBudget(max_steps=500, timeout=30)):
+        with pytest.raises(RuntimeError, match="rootfs discovery refused"):
+            rl.lookup_paths(str(root), "linux")
+
+
+@pytest.mark.parametrize(
+    ("name", "small", "workable"),
+    [
+        ("BN_ROOTFS_MAX_WORK", "1", "100000"),
+        ("BN_ROOTFS_MAX_BYTES", "4", "1048576"),
+        ("BN_ROOTFS_TIMEOUT", "1", "30"),
+    ],
+)
+def test_environment_limits_can_be_raised_to_allow_complete_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    name: str, small: str, workable: str,
+) -> None:
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/libgood.so")
+    paths = [rl.LookupPath("/lib", "default")]
+    for variable in (
+        "BN_ROOTFS_MAX_WORK", "BN_ROOTFS_MAX_BYTES", "BN_ROOTFS_TIMEOUT",
+        "BN_ROOTFS_MAX_CONFIG_BYTES",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    for value, refuses in ((small, True), (workable, False)):
+        with monkeypatch.context() as limits:
+            limits.setenv(name, value)
+            budget = rl.DiscoveryBudget()
+            if name == "BN_ROOTFS_TIMEOUT":
+                elapsed_time = rl.time.monotonic() + 2
+                limits.setattr(rl.time, "monotonic", lambda: elapsed_time)
+            if refuses:
+                with pytest.raises(RuntimeError, match="rootfs discovery refused"):
+                    with rl.discovery_budget(budget):
+                        rl.scan_libraries(str(root), paths)
+            else:
+                with rl.discovery_budget(budget):
+                    candidates, notes = rl.scan_libraries(str(root), paths)
+                assert [item.rel_realpath for item in candidates] == ["/lib/libgood.so"]
+                assert notes == []
+
+
+@pytest.mark.parametrize(
+    "name", [
+        "BN_ROOTFS_MAX_WORK", "BN_ROOTFS_MAX_BYTES", "BN_ROOTFS_TIMEOUT",
+        "BN_ROOTFS_MAX_CONFIG_BYTES",
+    ],
+)
+@pytest.mark.parametrize("value", ["invalid", "", "0", "-1", "NaN", "inf", "-inf"])
+def test_invalid_environment_limits_refuse_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str,
+) -> None:
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/libgood.so")
+    for variable in (
+        "BN_ROOTFS_MAX_WORK", "BN_ROOTFS_MAX_BYTES", "BN_ROOTFS_TIMEOUT",
+        "BN_ROOTFS_MAX_CONFIG_BYTES",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match=f"{name} must be a positive finite"):
+        rl.scan_libraries(str(root), [rl.LookupPath("/lib", "default")])
+
+
+@pytest.mark.parametrize("limit", ["max_steps", "max_bytes", "timeout", "max_text_bytes"])
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), -float("inf")])
+def test_invalid_explicit_discovery_limits_are_rejected(limit: str, value: float) -> None:
+    with pytest.raises(ValueError, match="rootfs"):
+        rl.DiscoveryBudget(**{limit: value})
+
+
+@pytest.mark.parametrize(
+    "config_rel", ["etc/profile", "etc/ld.so.conf", "etc/ld.so.conf.d/vendor.conf"],
+)
+@pytest.mark.parametrize("configuration", ["environment", "explicit"])
+def test_config_byte_limit_refuses_truncation_and_can_be_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    config_rel: str, configuration: str,
+) -> None:
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/libgood.so")
+    (root / "opt/late").mkdir(parents=True)
+    if config_rel.startswith("etc/ld.so.conf.d/"):
+        _touch(root, "etc/ld.so.conf", b"include /etc/ld.so.conf.d/*.conf\n")
+    last_line = (
+        b"LD_LIBRARY_PATH=/opt/late\n" if config_rel == "etc/profile" else b"/opt/late\n"
+    )
+    contents = b"# harmless padding before a required loader path\n" * 8 + last_line
+    _touch(root, config_rel, contents)
+    for variable in (
+        "BN_ROOTFS_MAX_WORK", "BN_ROOTFS_MAX_BYTES", "BN_ROOTFS_TIMEOUT",
+        "BN_ROOTFS_MAX_CONFIG_BYTES",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    def discover(limit: int) -> list[rl.LookupPath]:
+        if configuration == "environment":
+            monkeypatch.setenv("BN_ROOTFS_MAX_CONFIG_BYTES", str(limit))
+            budget = rl.DiscoveryBudget()
+        else:
+            budget = rl.DiscoveryBudget(max_text_bytes=limit)
+        with rl.discovery_budget(budget):
+            return rl.lookup_paths(str(root), "linux")
+
+    with pytest.raises(
+        RuntimeError,
+        match="rootfs discovery refused: loader config .* exceeds the text limit; "
+              "no inventory committed",
+    ):
+        discover(64)
+    assert _paths(discover(len(contents))) == ["/opt/late", "/lib"]
+
+
+def test_android_loader_globs_preserve_all_alias_spellings(tmp_path: Path) -> None:
+    root = tmp_path / "rootfs"
+    real = _elf(root, "objects/runtime/lib64/libshared.so")
+    _link(root, "apex/a", "/objects/runtime")
+    _link(root, "apex/b", "/objects/runtime")
+
+    paths = rl.lookup_paths(str(root), "android")
+    assert _paths(paths) == ["/apex/a/lib64", "/apex/b/lib64"]
+    candidates, notes = rl.scan_libraries(str(root), paths)
+
+    assert notes == []
+    assert len(candidates) == 1
+    assert candidates[0].realpath == str(real)
+    assert candidates[0].paths == [
+        "/apex/a/lib64/libshared.so", "/apex/b/lib64/libshared.so",
+    ]

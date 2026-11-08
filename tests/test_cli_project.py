@@ -10,6 +10,8 @@ import bn.cli
 import pytest
 
 from _cli_helpers import _fake_bridge_instance  # noqa: F401
+from bn.mutation_statuses import FAILED_MUTATION_STATUSES
+from bn.transport import BridgeError
 
 
 FILE_ID_A = "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b"
@@ -573,10 +575,14 @@ def test_project_init_dry_run_json_and_explicit_root(monkeypatch, tmp_path, caps
     assert data["candidate_libraries"] == 2
 
 
-def test_project_init_outside_a_rootfs_is_exit_2(monkeypatch, tmp_path, capsys):
+def test_project_init_outside_a_rootfs_is_exit_2(monkeypatch, tmp_path, capsys, fake_transport):
     import bn.commands.project
     _patch_layout(monkeypatch, str(tmp_path), detect=False)
     monkeypatch.chdir(tmp_path)
+    calls = fake_transport()
+    monkeypatch.setattr(
+        bn.commands.project.rootfs_layout, "lookup_paths",
+        lambda *_: pytest.fail("refused implicit root must not scan host lookup paths"))
 
     rc = bn.cli.main(["project", "init"])
 
@@ -584,7 +590,8 @@ def test_project_init_outside_a_rootfs_is_exit_2(monkeypatch, tmp_path, capsys):
     err = capsys.readouterr().err
     assert "not inside a firmware root filesystem" in err
     assert f"looked from {os.getcwd()} up to /" in err
-    assert "pass the root explicitly" in err
+    assert "pass an explicit firmware root: bn project init ROOT" in err
+    assert calls == []
 
 
 def test_project_init_creates_syncs_and_pins(fake_transport, monkeypatch, tmp_path, capsys):
@@ -921,8 +928,8 @@ def test_project_libs_root_without_sync_is_refused(fake_transport, monkeypatch, 
 # --- project link ---------------------------------------------------------------
 
 
-def _link_result(status="verified", *, dry_run=False, linked=3, relinked=0, **extra):
-    failed = status == "verification_failed"
+def _link_result(status="verified", *, dry_run=False, linked=3, relinked=0, rebound=0, **extra):
+    failed = status in bn.cli.FAILED_MUTATION_STATUSES
     result = {
         "status": status,
         "success": not failed,
@@ -938,12 +945,12 @@ def _link_result(status="verified", *, dry_run=False, linked=3, relinked=0, **ex
              "project_path": None, "backing": None},
         ],
         "scope": ["libgreet.so.1", "libc.so"],
-        "linked": linked, "already_linked": 1, "relinked": relinked,
+        "linked": linked, "already_linked": 1, "relinked": relinked, "rebound": rebound,
         "unresolved": [{"symbol": "_ITM_registerTMCloneTable",
                         "reason": "not exported by any linked library"},
                        {"symbol": "vendor_hash", "reason": "library libmissing.so not in project"}],
         "ambiguous_libraries": [],
-        "measured": True,
+        "measured": not failed,
     }
     result.update(extra)
     return result
@@ -964,7 +971,7 @@ def test_project_link_params_and_compact_text(fake_transport, monkeypatch, capsy
     assert "libgreet.so.1            -> /opt/vendor/lib/libgreet.so.1.0  (raw)" in out
     assert "libc.so                  -> /lib/libc.so  (database)" in out
     assert "libmissing.so            -> (not in project)" in out
-    assert "linked 3  relinked 0  unresolved 2" in out
+    assert "linked 3  relinked 0  rebound 0  unresolved 2" in out
     assert "_ITM_registerTMCloneTable  not exported by any linked library" in out
     assert "vendor_hash  library libmissing.so not in project" in out
     assert "next: `bn -t usr/bin/app save`" in out
@@ -991,13 +998,13 @@ def test_project_link_noop_is_exit_0_and_clean(fake_transport, monkeypatch, caps
 
     out = capsys.readouterr().out
     assert "changed=0" in out and "dirty_after=False" in out
-    assert "linked 0  relinked 0  unresolved 2" in out
+    assert "linked 0  relinked 0  rebound 0  unresolved 2" in out
 
 
 def test_project_link_verification_failed_is_exit_3(fake_transport, monkeypatch, capsys):
     _one_instance(monkeypatch)
     fake_transport({"project_link": {"ok": True, "result": _link_result(
-        "verification_failed", message="libc.so did not read back on printf")}})
+        "verification_failed", notes=["libc.so did not read back on printf"])}})
 
     rc = bn.cli.main(["project", "link", "-t", "usr/bin/app"])
 
@@ -1016,7 +1023,7 @@ def test_project_link_unreadable_counter_is_exit_4(fake_transport, monkeypatch, 
     assert rc == 4
     out = capsys.readouterr().out
     assert "warning: unmeasured" in out
-    assert "this op's own counters could not be read" in out
+    assert "this op's own counters or flags could not be read" in out
     assert "linked ?" in out
 
 
@@ -1030,6 +1037,7 @@ def test_project_link_json_summary_and_verbose_detail(fake_transport, monkeypatc
     assert summary["kind"] == "mutation_summary"
     assert summary["ok"] is True and summary["measured"] is True
     assert summary["changed_count"] == 3 and summary["noop_count"] == 1
+    assert summary["op_count"] == 4  # Three writes and one noop; unresolved imports are findings.
     assert summary["project_link"]["linked"] == 3
     assert [u["symbol"] for u in summary["project_link"]["unresolved"]] == [
         "_ITM_registerTMCloneTable", "vendor_hash"]
@@ -1039,7 +1047,7 @@ def test_project_link_json_summary_and_verbose_detail(fake_transport, monkeypatc
     out = capsys.readouterr().out
     assert "project link: verified" in out
     assert "scope: libgreet.so.1, libc.so" in out
-    assert "linked 3  relinked 0  unresolved 2" in out
+    assert "linked 3  relinked 0  rebound 0  unresolved 2" in out
 
 
 # --- project load --no-link ------------------------------------------------------
@@ -1065,6 +1073,76 @@ def test_project_load_no_link_and_linked_line(fake_transport, monkeypatch, capsy
 
     assert calls[0]["params"]["link"] is True
     assert no_link_calls[0]["params"]["link"] is False
+
+
+@pytest.mark.parametrize("status", sorted(FAILED_MUTATION_STATUSES))
+@pytest.mark.parametrize("output_format", ["text", "json", "ndjson"])
+@pytest.mark.parametrize("declare_success", [False, True])
+def test_project_load_auto_link_failure_keeps_target_and_exits_three(
+        fake_transport, monkeypatch, capsys, status, output_format, declare_success):
+    _one_instance(monkeypatch)
+    target = {"selector": "usr/bin/app", "target_id": "loaded-target"}
+    result = {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd", "targets": [target],
+        "target": target, "project_file_id": FILE_ID_A,
+        "project_path": "/usr/bin/app", "substituted_from": None,
+        "link": {"status": status,
+                 "notes": ["synthetic provider binding failed"]},
+        "notes": ["import linking failed"],
+    }
+    if declare_success:
+        result["link"]["success"] = False
+    calls = fake_transport({"project_load": {"ok": True, "result": result}})
+    assert bn.cli.main([
+        "project", "load", "usr/bin/app", "--format", output_format,
+    ]) == 3
+    captured = capsys.readouterr()
+    assert len(calls) == 1 and calls[0]["params"]["link"] is True
+    if output_format == "text":
+        assert "loaded" in captured.out
+        assert "usr/bin/app" in captured.out
+        assert f"auto-link FAILED: {status}" in captured.out
+        assert "synthetic provider binding failed" in captured.out
+    else:
+        assert json.loads(captured.out) == result
+
+
+@pytest.mark.parametrize("link,no_link", [
+    (None, False),
+    (None, True),
+    ({"status": "noop", "success": True}, False),
+    ({"status": "verified", "success": True}, False),
+])
+def test_project_load_no_link_skipped_and_successful_link_exit_zero(
+        fake_transport, monkeypatch, capsys, link, no_link):
+    _one_instance(monkeypatch)
+    result = {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd",
+        "project_file_id": FILE_ID_A, "project_path": "/usr/bin/app",
+        "targets": [{"selector": "usr/bin/app"}], "link": link,
+    }
+    calls = fake_transport({"project_load": {"ok": True, "result": result}})
+    argv = ["project", "load", "usr/bin/app", "--format", "json"]
+    if no_link:
+        argv.append("--no-link")
+    assert bn.cli.main(argv) == 0
+    assert json.loads(capsys.readouterr().out) == result
+    assert calls[0]["params"]["link"] is not no_link
+
+
+@pytest.mark.parametrize("status", [None, "invalid_request", "internal_error"])
+def test_project_load_refusal_still_exits_two(monkeypatch, capsys, status):
+    _one_instance(monkeypatch)
+
+    def refuse(op, **kwargs):
+        assert op == "project_load"
+        raise BridgeError("synthetic project file unavailable", status=status)
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
+    assert bn.cli.main(["project", "load", "missing", "--format", "json"]) == 2
+    captured = capsys.readouterr()
+    assert "synthetic project file unavailable" in captured.err
+    assert json.loads(captured.out)["error"] == "synthetic project file unavailable"
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -1099,7 +1177,7 @@ def test_project_init_multiple_bridges_need_explicit_instance(
 
 
 @pytest.mark.parametrize("options", [[], ["--verbose"], ["--format", "json"]])
-@pytest.mark.parametrize("counter", ["linked", "relinked", "already_linked", "unresolved"])
+@pytest.mark.parametrize("counter", ["linked", "relinked", "rebound", "already_linked", "unresolved"])
 def test_project_link_unreadable_counts_fail_safe_in_every_output_mode(
     fake_transport, monkeypatch, capsys, options, counter
 ):
@@ -1109,3 +1187,32 @@ def test_project_link_unreadable_counts_fail_safe_in_every_output_mode(
     fake_transport({"project_link": {"ok": True, "result": result}})
 
     assert bn.cli.main(["project", "link", "-t", "usr/bin/app", *options]) == 4
+
+
+@pytest.mark.parametrize("options", [[], ["--verbose"], ["--summary", "--format", "json"]])
+def test_project_link_rebind_only_reports_dirty_changes(fake_transport, monkeypatch, capsys, options):
+    _one_instance(monkeypatch)
+    fake_transport({"project_link": {"ok": True, "result": _link_result(
+        linked=0, rebound=1, already_linked=0, unresolved=[])}})
+    assert bn.cli.main(["project", "link", "-t", "usr/bin/app", *options]) == 0
+    out = capsys.readouterr().out
+    if "--format" in options:
+        summary = json.loads(out)
+        assert summary["changed_count"] == summary["op_count"] == 1
+        assert summary["dirty_after"] is True
+        assert summary["project_link"]["rebound"] == 1
+    else:
+        assert "rebound 1" in out
+        if "--verbose" not in options:
+            assert "changed=1" in out and "dirty_after=True" in out
+
+
+@pytest.mark.parametrize("options", [[], ["--verbose"], ["--summary", "--format", "json"]])
+def test_project_link_internal_error_preserves_bridge_notes(fake_transport, monkeypatch, capsys, options):
+    _one_instance(monkeypatch)
+    fake_transport({"project_link": {"ok": True, "result": _link_result(
+        "internal_error", notes=["provider assignment raised before readback"])}})
+    assert bn.cli.main(["project", "link", "-t", "usr/bin/app", *options]) == 3
+    out = capsys.readouterr().out
+    assert "provider assignment raised before readback" in out
+    assert "unknown status" not in out

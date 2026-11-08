@@ -403,14 +403,21 @@ def _save(args: argparse.Namespace) -> int:
         )
     if out_path:
         params["path"] = str(Path(out_path).expanduser().resolve())
-    return _call(
-        args,
-        "save_database",
-        params,
-        require_target=False,
-        text_renderer=_render_save_text,
-        stem="save",
-    )
+    try:
+        return _call(
+            args,
+            "save_database",
+            params,
+            require_target=False,
+            text_renderer=_render_save_text,
+            stem="save",
+        )
+    except BridgeError as exc:
+        # Ordinary file refusals remain exit 2. A failed rollback means the
+        # save left persistent state behind, not a harmless pre-write refusal.
+        if getattr(exc, "status", None) == "rollback_failed":
+            args._mutation_call = True
+        raise
 
 
 @command("refresh",

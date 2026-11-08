@@ -15,6 +15,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+from ._shared import OperationFailure
 from .project_finding_evidence import capture_evidence, check_evidence, validate_captured_evidence
 from .project_ops import FINDINGS_FOLDER
 
@@ -552,11 +553,13 @@ class _Ledger:
             if len(registered) != 1 or str(registered[0].id) != str(created.id):
                 raise RuntimeError("Snapshot registration verification failed")
         except Exception as exc:
+            rollback_ids = []
             try:
                 # A native exception may occur after registering the new row.
                 candidates = [pf for pf in self.manager.files() if str(pf.id) not in prior_ids and self.manager.path_in_project(pf) == path]
                 if created is not None and not isinstance(created, bool) and str(created.id) not in prior_ids and all(str(pf.id) != str(created.id) for pf in candidates):
                     candidates.append(created)
+                rollback_ids = [str(pf.id) for pf in candidates]
                 for pf in candidates:
                     if self.project.delete_file(pf) is not True:
                         raise RuntimeError(f"Native delete_file refused {pf.id}")
@@ -564,7 +567,15 @@ class _Ledger:
                 if any(str(pf.id) in remaining for pf in candidates):
                     raise RuntimeError("Rolled-back snapshot remains registered")
             except Exception as rollback:
-                raise RuntimeError(f"Finding append failed: {exc}; STORAGE ROLLBACK FAILED: {rollback}") from exc
+                raise OperationFailure(
+                    "rollback_failed",
+                    f"Finding append failed: {exc}; STORAGE ROLLBACK FAILED: {rollback}",
+                    requested={"finding_id": record["id"], "revision": record["revision"],
+                               "snapshot_path": path},
+                    observed={"rolled_back": False, "dirty_after": True,
+                              "candidate_file_ids": rollback_ids,
+                              "append_error": str(exc), "rollback_error": str(rollback)},
+                ) from exc
             raise RuntimeError(f"Finding append failed: {exc} (new snapshot rolled back)") from exc
         self.records.setdefault(record["id"], []).append(record)
         self.latest[record["id"]] = record

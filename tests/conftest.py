@@ -158,6 +158,50 @@ def refuse_silent_skip(reason: str) -> NoReturn:
     pytest.skip(reason)
 
 
+def require_project_capability() -> None:
+    """Probe native project creation/close without loading BN into pytest."""
+    require_real_bn()
+    python_dir = bn_python_dir()
+    env = dict(os.environ)
+    env["BN_DISABLE_USER_PLUGINS"] = "1"
+    code = (
+        f"import sys; sys.path.insert(0, {str(python_dir)!r})\n"
+        "import json, tempfile\n"
+        "from pathlib import Path\n"
+        "import binaryninja\n"
+        "binaryninja.disable_default_log()\n"
+        "with tempfile.TemporaryDirectory(prefix='bn-project-probe-') as directory:\n"
+        "    try:\n"
+        "        project = binaryninja.Project.create_project("
+        "str(Path(directory) / 'probe.bnpr'), 'capability probe')\n"
+        "        if project is None:\n"
+        "            raise RuntimeError('create_project returned None')\n"
+        "        project.close()\n"
+        "    except Exception as exc:\n"
+        "        result = {'available': False, 'reason': str(exc)}\n"
+        "    else:\n"
+        "        result = {'available': True}\n"
+        "print('BN_PROJECT_CAPABILITY=' + json.dumps(result))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=120.0, env=env,
+    )
+    assert result.returncode == 0, (
+        f"Native project capability probe failed: {result.stderr}\n{result.stdout}"
+    )
+    marker = "BN_PROJECT_CAPABILITY="
+    reports = [line[len(marker):] for line in result.stdout.splitlines()
+               if line.startswith(marker)]
+    assert len(reports) == 1, f"Missing native project capability result: {result.stdout}"
+    capability = json.loads(reports[0])
+    if not capability["available"]:
+        refuse_silent_skip(
+            "Binary Ninja cannot create/close a native project with this install/licence: "
+            f"{capability['reason']} -- the project lane did not run"
+        )
+
+
 #: Wall-clock ceiling for the six-binary build. Generous: six -O0 compiles are
 #: sub-second, so blowing this means something is wedged, not merely slow.
 _BUILD_TIMEOUT_SECONDS = 300
@@ -314,6 +358,7 @@ ROOTFS_FIXTURE_DIR = FIXTURES_DIR / "rootfs"
 #: is the one unlinked location worth looking in on macOS.
 ROOTFS_CROSS_COMPILERS = (
     "aarch64-linux-musl-gcc", "x86_64-linux-musl-gcc", "arm-linux-musleabihf-gcc",
+    "musl-gcc",
 )
 _ROOTFS_CROSS_DIRS = ("/opt/homebrew/opt/musl-cross/bin",)
 
@@ -356,15 +401,19 @@ def build_rootfs_fixture(*, out_dir: Path | None = None) -> Path:
         raise FixtureBuildError(
             "'make' not found; the rootfs fixture needs it. Run: make -C tests/fixtures/rootfs"
         )
+    env = dict(os.environ)
+    overrides = [f"{name}={env[name]}" for name in ("CROSS_CC", "LIBC_SRC", "LDMUSL")
+                 if name in env]
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     with _BUILD_THREAD_LOCK:
         with open(FIXTURES_DIR / _BUILD_LOCK_NAME, "w") as lock_file:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
                 proc = subprocess.run(
-                    ["make", "-C", str(ROOTFS_FIXTURE_DIR), f"OUT={out_dir}", "all"],
+                    ["make", "-C", str(ROOTFS_FIXTURE_DIR), f"OUT={out_dir}",
+                     *overrides, "all"],
                     capture_output=True, text=True, timeout=_BUILD_TIMEOUT_SECONDS,
-                    env=dict(os.environ),
+                    env=env,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise FixtureBuildError(
@@ -406,7 +455,7 @@ def rootfs_fixture() -> Path:
     under `BN_REQUIRE_REAL_TESTS`). With BN and a toolchain present, a build
     problem is a `FixtureBuildError` -- never a skip.
     """
-    require_real_bn()
+    require_project_capability()
     if find_rootfs_cross_compiler() is None:
         refuse_silent_skip(
             "no Linux musl cross compiler found for the rootfs fixture (looked for "

@@ -137,7 +137,9 @@ def world(monkeypatch, tmp_path):
     infos = {}
     parsed = []
 
-    def parse(path):
+    def parse(path, *, check=None):
+        if check is not None:
+            check()
         parsed.append(str(path))
         return infos.get(str(path))
 
@@ -153,7 +155,8 @@ def world(monkeypatch, tmp_path):
 def elf(world, **kwargs):
     module = importlib.import_module(world.ops.__package__ + ".elf_dynamic")
     return module.ElfDynamicInfo(e_machine=kwargs.pop("e_machine", 183),
-                                 elf_class=kwargs.pop("elf_class", 64), **kwargs)
+                                 elf_class=kwargs.pop("elf_class", 64),
+                                 versions_unread=kwargs.pop("versions_unread", None), **kwargs)
 
 
 def exports(*names, weak=False):
@@ -451,10 +454,14 @@ def test_load_verification_failure_is_a_note_and_marks_dirty(world):
 
 def test_unreadable_target_header_does_not_filter_machine(world):
     w = world
-    library(w, "/lib/liba.so", info=elf(w, e_machine=62, exports=exports("call")))
+    provider = library(w, "/lib/liba.so", info=elf(w, e_machine=62, exports=exports("call")))
+    library(w, "/lib/libunrelated.so", info=elf(w, exports=exports("call")))
     bv = target(w, ["liba.so"], ["call"])
     w.infos.pop(bv.file.filename)
     assert link(w)["linked"] == 1
+    assert bv.externals["liba.so"].backing_file is provider
+    assert bv.locations[0].library is bv.externals["liba.so"]
+    assert "libunrelated.so" not in bv.externals
 
 
 def test_scope_depth_is_bounded(world):
@@ -751,3 +758,164 @@ def test_ancestor_rpath_is_inherited_but_requester_runpath_takes_precedence(worl
     assert bv.externals["libchild.so"].backing_file.id == inherited.id
     assert bv.externals["libleaf.so"].backing_file.id == nearest.id
     assert bv.externals["libgrandchild.so"].backing_file.id == own.id
+
+
+@pytest.mark.parametrize("exact_directory", ["/early", "/late"])
+def test_exact_loader_filename_beats_competing_soname(world, exact_directory):
+    w = world
+    impostor = library(
+        w, "/early/aaa-unrelated.so",
+        names=["aaa-unrelated.so", "libwanted.so"],
+        info=elf(w, soname="libwanted.so", exports=exports("call")),
+    )
+    exact = library(
+        w, exact_directory + "/libwanted.so", info=elf(w, exports=exports("call")),
+    )
+    w.meta["lookup_paths"] = [
+        {"path": "/early", "source": "default"},
+        {"path": "/late", "source": "default"},
+    ]
+    w.instance.projects.set_rootfs(w.meta)
+    bv = target(w, ["libwanted.so"], ["call"])
+
+    result = link(w)
+
+    assert result["linked"] == 1
+    assert bv.externals["libwanted.so"].backing_file is exact
+    assert bv.externals["libwanted.so"].backing_file is not impostor
+    assert result["ambiguous_libraries"] == []
+
+
+def test_filename_ranking_uses_only_matching_alias_directories(world):
+    w = world
+    wrong_alias = library(w, "/early/real.so", names=["real.so", "libwanted.so"])
+    exact = library(w, "/middle/libwanted.so")
+    w.meta["libs"][wrong_alias.id]["paths"] = ["/early/real.so", "/late/libwanted.so"]
+    w.meta["libs"][exact.id]["paths"] = ["/middle/libwanted.so"]
+    w.meta["lookup_paths"] = [
+        {"path": path, "source": "default"} for path in ("/early", "/middle", "/late")
+    ]
+    w.instance.projects.set_rootfs(w.meta)
+    bv = target(w, ["libwanted.so"])
+
+    link(w)
+
+    assert bv.externals["libwanted.so"].backing_file is exact
+
+
+def test_deleted_provider_disappears_from_libs_and_link_inventory(world):
+    w = world
+    removed = library(w, "/lib/libgone.so", database=True)
+    kept = library(w, "/lib/liblive.so")
+    w.project.delete_file(removed)
+    bv = target(w, ["libgone.so", "liblive.so"])
+
+    listing = w.ops.project_libs(w.instance)
+    result = link(w)
+
+    assert [row["project_file_id"] for row in listing["libs"]] == [kept.id]
+    assert bv.externals["libgone.so"].backing_file is None
+    assert bv.externals["liblive.so"].backing_file is kept
+    assert next(row for row in result["libraries"] if row["name"] == "libgone.so")[
+        "project_file_id"] is None
+
+
+def test_unread_version_requirements_never_guess_unrelated_exports(world):
+    w = world
+    library(w, "/lib/libunrelated.so", info=elf(w, exports=exports("call")))
+    bv = target(
+        w, ["libunrelated.so"], ["call"],
+        versions_unread="DT_VERNEED exceeds the total vernaux work limit",
+    )
+
+    result = link(w)
+
+    assert bv.locations[0].library is None
+    assert result["linked"] == 0
+    assert "vernaux" in result["unresolved"][0]["reason"]
+
+
+def test_sync_preserves_android_alias_for_exact_needed_resolution(world):
+    w = world
+    root = w.tmp / "android"
+    real = root / "objects/runtime/lib64/libshared.so"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"\x7fELF")
+    (root / "apex").mkdir()
+    (root / "apex/a").symlink_to("/objects/runtime")
+    (root / "apex/b").symlink_to("/objects/runtime")
+    w.infos[str(real)] = elf(w)
+
+    result = w.ops.project_sync_libs(w.instance, root=str(root), platform="android")
+    provider_id = result["imported"][0]["id"]
+    entry = w.instance.projects.get_rootfs()["libs"][provider_id]
+    assert entry["paths"] == [
+        "/apex/a/lib64/libshared.so", "/apex/b/lib64/libshared.so",
+    ]
+    needed = "/apex/b/lib64/libshared.so"
+    bv = target(w, [needed])
+
+    linked = link(w)
+
+    assert linked["libraries"][0]["resolved"] is True
+    assert bv.externals[needed].backing_file.id == provider_id
+
+
+def test_link_uses_saved_database_binding_after_raw_project_file_is_deleted(world):
+    w = world
+    provider = library(w, "/lib/liba.so", info=elf(w, exports=exports("call")))
+    bv = target(w, ["liba.so"], ["call"])
+    raw = bv.project_file
+    saved = w.instance._save_database("app")
+    database = w.instance.projects.resolve_file(saved["project_file_id"])
+    assert bv.project_file is raw
+
+    deleted = w.bridge.project_ops.project_delete(w.instance, raw.id)
+    Path(raw.path_on_disk).unlink()
+    assert deleted["deleted"] is True
+    assert w.instance.targets.project_binding(bv) == (database.id, "/app.bndb")
+
+    result = w.ops.project_link(w.instance, "app.bndb")
+
+    assert result["success"] is True
+    assert result["linked"] == 1
+    assert bv.externals["liba.so"].backing_file is provider
+    assert bv.locations[0].library is bv.externals["liba.so"]
+
+
+@pytest.mark.parametrize("invalid_binding", ["missing-file", "wrong-path"])
+def test_link_rejects_invalid_saved_binding_without_falling_back_to_raw(world, invalid_binding):
+    w = world
+    library(w, "/lib/liba.so", info=elf(w, exports=exports("call")))
+    bv = target(w, ["liba.so"], ["call"])
+    saved = w.instance._save_database("app")
+    database = w.instance.projects.resolve_file(saved["project_file_id"])
+    if invalid_binding == "missing-file":
+        w.project.delete_file(database)
+    else:
+        w.instance.targets.note_project_database(bv, database.id, "/not-app.bndb")
+    w.parsed.clear()
+
+    with pytest.raises(RuntimeError, match="different project"):
+        w.ops.link_view(w.instance, bv)
+
+    assert bv.writes == []
+    assert w.parsed == []
+
+
+def test_standalone_view_without_project_binding_can_link_owned_inventory(world):
+    w = world
+    provider = library(w, "/lib/liba.so", info=elf(w, exports=exports("call")))
+    outside = FakeProject(w.tmp / "outside.bnpr").add_file("standalone")
+    bv = LinkView(outside, ["liba.so"], ["call"])
+    bv.project_file = None
+    w.infos[bv.file.filename] = elf(w, needed=["liba.so"])
+    _register_views(w.bridge, bv)
+    w.instance.targets.refresh()
+    assert w.instance.targets.project_binding(bv) is None
+
+    result = w.ops.link_view(w.instance, bv)
+
+    assert result["success"] is True
+    assert result["linked"] == 1
+    assert bv.externals["liba.so"].backing_file is provider

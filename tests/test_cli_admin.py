@@ -1740,6 +1740,46 @@ def test_session_restart_replays_project_targets_by_file_id(monkeypatch, capsys)
     assert [x.get("project_file_id") for x in payload["loaded"]] == [None, _PROJECT_FILE_ID]
 
 
+@pytest.mark.parametrize("project_targets", [None, []])
+@pytest.mark.parametrize("reopen_fails", [False, True])
+def test_session_restart_preserves_project_without_open_targets(
+    monkeypatch, capsys, project_targets, reopen_fails
+):
+    """Project ownership survives restart even when all project tabs are closed."""
+    from bn.transport import BridgeError
+
+    meta = {"project": {"path": "/proj/fw.bnpr"}}
+    if project_targets is not None:
+        meta["project_targets"] = project_targets
+    calls = _restart_project_fixture(monkeypatch, meta=meta, rows=[])
+    inner = bn.cli.send_request
+
+    def send(op, **kwargs):
+        if reopen_fails and op == "project_open":
+            calls.append((op, dict(kwargs.get("params") or {})))
+            raise BridgeError("project is unavailable")
+        return inner(op, **kwargs)
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == (1 if reopen_fails else 0)
+    assert [params for op, params in calls if op == "project_open"] == [
+        {"path": "/proj/fw.bnpr"}
+    ]
+    assert not any(op in {"project_load", "load_binary"} for op, _ in calls)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["restarted"] is True
+    assert payload["loaded"] == []
+    assert payload["project"]["path"] == "/proj/fw.bnpr"
+    assert payload["project"]["opened"] is not reopen_fails
+    if reopen_fails:
+        assert payload["project"]["error"] == "project is unavailable"
+    else:
+        assert "error" not in payload["project"]
+
+
 def test_session_restart_replays_project_targets_when_capture_failed(monkeypatch, capsys):
     # The registry alone carries enough to replay the project: an unreachable
     # bridge's targets are still reopened by id, with full analysis.

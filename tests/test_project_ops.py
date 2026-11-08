@@ -70,6 +70,9 @@ class FakeTargets:
     def project_binding(self, bv):
         return self.binding
 
+    def refresh(self):
+        return []
+
     def clear_dirty(self, bv):
         self.cleared.append(bv)
 
@@ -82,6 +85,7 @@ class FakeTargets:
 
 def _bridge(manager, targets=None):
     bridge = types.SimpleNamespace(projects=manager, targets=targets or FakeTargets())
+    bridge._loaded_target_row = lambda rows, bv: None
     bridge.registry_writes = 0
 
     def _write():
@@ -176,7 +180,7 @@ def test_close_releases_the_handle_and_the_state(opened):
         manager.require()
 
 
-def _subprocess_open(po, bnpr, tmp_path):
+def _subprocess_open(po, bnpr, tmp_path, *, readonly_parent=False, umask=None, group_peer=False):
     """An unrelated interpreter, registry and fake native handle."""
     script = """
 import importlib, json, os, sys, types
@@ -190,6 +194,20 @@ def native_open(path):
     return types.SimpleNamespace(id="fake", name="fake", close=lambda: None)
 sys.modules["binaryninja"] = types.SimpleNamespace(
     Project=types.SimpleNamespace(open_project=native_open))
+if sys.argv[4]:
+    os.umask(int(sys.argv[4]))
+if sys.argv[5] == "group":
+    assert os.geteuid() == 0
+    os.setgroups([])
+    os.setuid(65534)  # distinct user, retaining the project owner's primary group
+if sys.argv[3] == "readonly":
+    # Import while privileged, then drop privilege before exercising filesystem
+    # access. Root must not make the read-only-parent regression vacuous.
+    if os.geteuid() == 0:
+        os.setgroups([])
+        os.setgid(65534)
+        os.setuid(65534)
+    assert not os.access(os.path.dirname(sys.argv[2]), os.W_OK)
 manager = po.ProjectManager()
 try:
     manager.open(sys.argv[2], self_pid=os.getpid())
@@ -201,7 +219,12 @@ else:
 print(json.dumps(result))
 """
     completed = subprocess.run(
-        [sys.executable, "-c", script, str(Path(po.__file__).parent), str(bnpr)],
+        [
+            sys.executable, "-c", script, str(Path(po.__file__).parent), str(bnpr),
+            "readonly" if readonly_parent else "",
+            str(umask) if umask is not None else "",
+            "group" if group_peer else "",
+        ],
         env={**os.environ, "BN_CACHE_DIR": str(tmp_path / "independent-cache")},
         text=True, capture_output=True, timeout=15, check=True,
     )
@@ -653,10 +676,14 @@ def test_sibling_database_is_none_for_a_bndb_itself(populated):
     assert manager.sibling_database(f.app_db) is None
 
 
-def test_sibling_database_is_none_when_two_siblings_share_the_name(populated):
+def test_sibling_database_ambiguity_is_distinct_from_absence(populated):
     manager, project, f = populated
-    project.add_file("app.bndb", f.fw)
-    assert manager.sibling_database(f.app) is None
+    duplicate = project.add_file("app.bndb", f.fw)
+    with pytest.raises(RuntimeError, match="Ambiguous") as error:
+        manager.sibling_database(f.app)
+    assert f.app_db.id in str(error.value) and duplicate.id in str(error.value)
+    assert manager.file_row(f.app)["sibling_database_id"] is None
+    assert manager.sibling_database(f.loose) is None
 
 
 def test_sibling_database_ignores_a_same_named_file_in_another_folder(populated):
@@ -794,6 +821,76 @@ def test_save_project_database_create_false_deletes_the_new_file_and_errors(po, 
     assert bridge.registry_writes == 0
 
 
+def test_save_with_ambiguous_databases_never_creates_a_third(po, populated):
+    manager, project, f = populated
+    duplicate = project.add_file("app.bndb", f.fw)
+    before = list(project.files)
+    bv = SaveBV(f.app)
+    with pytest.raises(RuntimeError, match="Ambiguous") as error:
+        po.save_project_database(_bridge(manager), bv, None)
+    assert duplicate.id in str(error.value) and f.app_db.id in str(error.value)
+    assert project.files == before
+    assert bv.created_with is None
+
+
+@pytest.mark.parametrize("cleanup", ["false", "raises", "row_only", "blob_only", "no_op"])
+def test_first_save_reports_verified_cleanup_residue(po, populated, cleanup):
+    manager, project, f = populated
+    bridge = _bridge(manager)
+    bv = SaveBV(f.loose)
+
+    def broken_save(dest):
+        Path(dest).write_bytes(b"partial database")
+        raise OSError("primary write failure")
+
+    def broken_cleanup(pf):
+        if cleanup == "raises":
+            raise OSError("cleanup failure")
+        if cleanup == "row_only":
+            project.files.remove(pf)
+        if cleanup == "blob_only":
+            Path(pf.path_on_disk).unlink()
+        return cleanup != "false"
+
+    bv.create_database = broken_save
+    project.delete_file = broken_cleanup
+    with pytest.raises(RuntimeError) as error:
+        po.save_project_database(bridge, bv, None)
+    failure = error.value
+    assert failure.status == "rollback_failed"
+    residue = failure.observed
+    assert "primary write failure" in residue["primary_error"]
+    assert residue["row_remains"] is (cleanup != "row_only")
+    assert residue["blob_remains"] is (cleanup != "blob_only")
+    assert residue["path"] in str(failure)
+    assert residue["project_file_id"] in str(failure)
+    assert bridge.registry_writes == 0 and bridge.targets.cleared == []
+
+
+def test_first_save_verifies_complete_cleanup_after_partial_blob(po, populated):
+    manager, project, f = populated
+    bv = SaveBV(f.loose)
+    written = []
+    original_delete = project.delete_file
+
+    def broken_save(dest):
+        written.append(Path(dest))
+        Path(dest).write_bytes(b"partial database")
+        return False
+
+    def complete_cleanup(pf):
+        Path(pf.path_on_disk).unlink()
+        return original_delete(pf)
+
+    bv.create_database = broken_save
+    project.delete_file = complete_cleanup
+    before = list(project.files)
+    with pytest.raises(RuntimeError, match="no file was written") as error:
+        po.save_project_database(_bridge(manager), bv, None)
+    assert not hasattr(error.value, "status")
+    assert project.files == before and not written[0].exists()
+
+
 # --- delete / export / import / files ----------------------------------------
 
 
@@ -918,3 +1015,81 @@ def test_project_info_and_open_handler(po, bnpr, monkeypatch):
     assert po.project_open(bridge, str(bnpr / "project.bnpm"))["opened"] is False
     with pytest.raises(RuntimeError, match="path must be the .bnpr directory"):
         po.project_open(bridge, "")
+
+
+def test_open_writable_project_under_readonly_parent(po):
+    import tempfile
+
+    # /tmp stays traversable after a root-run child drops privilege, unlike
+    # pytest's private root-owned ancestor directories.
+    with tempfile.TemporaryDirectory(prefix="bn-readonly-", dir="/tmp") as temporary:
+        sandbox = Path(temporary)
+        sandbox.chmod(0o755)
+        parent = sandbox / "readonly"
+        parent.mkdir()
+        root = parent / "project.bnpr"
+        root.mkdir()
+        root.chmod(0o777)
+        (root / "project.bnpm").write_bytes(SQLITE_MAGIC)
+        parent.chmod(0o555)
+        try:
+            assert _subprocess_open(
+                po, root, sandbox, readonly_parent=True,
+            ) == {"opened": True, "native_calls": 1}
+        finally:
+            parent.chmod(0o755)
+
+
+@pytest.mark.parametrize("mask,expected", [(0o002, 0o660), (0o077, 0o600)])
+def test_new_lease_permissions_respect_group_policy_and_umask(po, bnpr, tmp_path, mask, expected):
+    assert _subprocess_open(po, bnpr, tmp_path, umask=mask)["opened"] is True
+    lease = bnpr / po._LEASE_FILENAME
+    assert lease.stat().st_mode & 0o777 == expected
+    lease.chmod(0o600)
+    assert _subprocess_open(po, bnpr, tmp_path, umask=0o002)["opened"] is True
+    assert lease.stat().st_mode & 0o777 == 0o600
+
+
+def test_lease_permission_refusal_names_path_without_changing_permissions(po):
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="bn-lease-denied-", dir="/tmp") as temporary:
+        sandbox = Path(temporary)
+        sandbox.chmod(0o755)
+        parent = sandbox / "readonly"
+        parent.mkdir()
+        root = parent / "project.bnpr"
+        root.mkdir()
+        root.chmod(0o777)
+        (root / "project.bnpm").write_bytes(SQLITE_MAGIC)
+        lease = root / po._LEASE_FILENAME
+        lease.touch()
+        lease.chmod(0o400)
+        parent.chmod(0o555)
+        try:
+            refused = _subprocess_open(po, root, sandbox, readonly_parent=True)
+            assert not refused["opened"] and refused["native_calls"] == 0
+            assert str(lease) in refused["error"]
+            assert "read/write permissions" in refused["error"]
+            assert "do not delete" in refused["error"]
+            assert lease.stat().st_mode & 0o777 == 0o400
+        finally:
+            parent.chmod(0o755)
+            lease.chmod(0o600)
+
+
+def test_group_peer_can_reopen_released_group_writable_project(po):
+    import tempfile
+
+    if os.geteuid() != 0:
+        pytest.skip("changing to a distinct group-sharing user requires root")
+    with tempfile.TemporaryDirectory(prefix="bn-group-project-", dir="/tmp") as temporary:
+        sandbox = Path(temporary)
+        sandbox.chmod(0o755)
+        root = sandbox / "shared.bnpr"
+        root.mkdir()
+        os.chown(root, -1, os.getgid())
+        root.chmod(0o770)
+        (root / "project.bnpm").write_bytes(SQLITE_MAGIC)
+        assert _subprocess_open(po, root, sandbox, umask=0o002)["opened"] is True
+        assert _subprocess_open(po, root, sandbox, group_peer=True)["opened"] is True

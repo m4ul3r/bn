@@ -16,6 +16,8 @@ from .. import cli, paths, rootfs_layout
 from ..cli import _call, _mutate, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
     _project_link_summary,
+    _project_finding_summary,
+    _render_mutation_summary_text,
     _render_project_attach_text,
     _render_project_close_text,
     _render_project_delete_text,
@@ -34,6 +36,7 @@ from ..formatters import (
     _render_project_finding_check_text,
     _render_project_finding_types_text,
 )
+from ..mutation_statuses import FAILED_MUTATION_STATUSES
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT, _format_instance_choices
 from .admin import _associate_project_roots
 
@@ -163,7 +166,7 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     if info is None:
         raise BridgeError(
             f"not inside a firmware root filesystem (looked from {start} up to /); "
-            "pass the root explicitly")
+            "pass an explicit firmware root: bn project init ROOT")
     preferred, fallback = rootfs_layout.project_location(info.root, str(paths.projects_dir()))
     if os.path.isdir(preferred):
         project_path, exists = preferred, True
@@ -352,6 +355,13 @@ def _project_files(args: argparse.Namespace) -> int:
     )
 
 
+def _project_load_exit_code(result: Any) -> int:
+    link = result.get("link")
+    if link is None:
+        return 0
+    return 3 if link.get("status") in FAILED_MUTATION_STATUSES or link.get("success") is False else 0
+
+
 @command("project", "load", help="Open a project file as a target",
          args=[
              arg("selector", help="Project file: id, >=8-char id prefix, path-in-project, or "
@@ -379,6 +389,7 @@ def _project_load(args: argparse.Namespace) -> int:
         require_target=False,
         text_renderer=_render_project_load_text,
         stem="project-load",
+        result_exit_code=_project_load_exit_code,
         # Same one-time full-analysis budget as `bn load` (#321).
         op_default_timeout=REFRESH_REQUEST_TIMEOUT,
     )
@@ -479,8 +490,17 @@ def _finding_document(source: str) -> Any:
 
 def _finding_call(args: argparse.Namespace, action: str, params: dict[str, Any],
                   renderer: Any) -> int:
-    return _call(args, f"project_finding_{action}", params, require_target=False,
-                 text_renderer=renderer, stem=f"project-finding-{action}")
+    writing = action in {"add", "update", "review"}
+    if writing:
+        args._mutation_call = True
+    return _call(
+        args, f"project_finding_{action}", params, require_target=False,
+        text_renderer=renderer, stem=f"project-finding-{action}",
+        result_exit_code=(lambda result: cli._mutation_exit_code(result, _project_finding_summary))
+        if writing else None,
+        spill_status=_project_finding_summary if writing else None,
+        spill_status_renderer=_render_mutation_summary_text if writing else None,
+    )
 
 
 @command("project", "finding", "add", help="Record an evidence-backed claim (not automatic acceptance)",

@@ -1099,13 +1099,29 @@ class TargetManager:
             vid = self._stable_view_id(bv)
             return self._project_bindings.get(vid) if vid is not None else None
 
-    def view_for_project_file(self, file_id: str):
-        """The open view loaded from project file *file_id* (as of the last
-        refresh), or None. The project-target analogue of a path dedup."""
+    def view_for_project_file(self, file_id: str, *, blob_path: str | None = None):
+        """Find an open project view, optionally requiring its backing blob.
+
+        A first save leaves BN's native project_file pointing at the raw file;
+        the recorded or live database filename identifies the saved backing.
+        """
+        expected = os.path.realpath(blob_path) if blob_path is not None else None
         with self._lock:
             for record in self._records.values():
-                if record.project_file_id == file_id:
-                    return record.view
+                if record.project_file_id != file_id:
+                    continue
+                if expected is not None:
+                    backing = self.recorded_database(record.view)
+                    if backing is None:
+                        metadata = getattr(record.view, "file", None)
+                        if bool(getattr(metadata, "has_database", False)):
+                            backing = str(getattr(metadata, "filename", "") or "")
+                    if not backing:
+                        pf = getattr(record.view, "project_file", None)
+                        backing = str(getattr(pf, "path_on_disk", "") or "")
+                    if not backing or os.path.realpath(backing) != expected:
+                        continue
+                return record.view
         return None
 
     def forget(self, bv) -> None:
@@ -3166,6 +3182,10 @@ class BinaryNinjaBridge:
 
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
                      workdir: str | None = None):
+        # Project blobs must be opened through their leased Project handle,
+        # never through the standalone loader (including symlink aliases and
+        # owners using a different cache directory).
+        project_ops.refuse_raw_project_path(path)
         resolved = Path(path).expanduser().resolve()
         if not resolved.exists():
             raise RuntimeError(f"File not found: {resolved}")
@@ -3181,6 +3201,7 @@ class BinaryNinjaBridge:
             instance_id=self.instance_id, project=_caller_project(workdir))
         if substitute is not None:
             load_path = substitute.path
+            project_ops.refuse_raw_project_path(load_path)
         if sidecar_note:
             notes.append(sidecar_note)
         # A preferred database `_database_provenance` refused: its note's first
@@ -3510,12 +3531,9 @@ class BinaryNinjaBridge:
                 if manager.current is not state:
                     raise RuntimeError("Project changed while loading; retry against the open project")
                 targets = self.targets.refresh()
-                existing = self.targets.view_for_project_file(file_id)
-                existing_pf = getattr(existing, "project_file", None)
-                if existing is not None and existing_pf is not None and (
-                    os.path.realpath(str(existing_pf.path_on_disk))
-                    == os.path.realpath(str(pf.path_on_disk))
-                ):
+                existing = self.targets.view_for_project_file(
+                    file_id, blob_path=str(pf.path_on_disk))
+                if existing is not None:
                     return {
                         "loaded": False,
                         "already_open": True,
@@ -3589,8 +3607,18 @@ class BinaryNinjaBridge:
                                     if link_result["status"] == "verification_failed"
                                     else "import linking failed")
                                 notes.extend(link_result.get("notes") or [])
-                    except Exception as exc:  # noqa: BLE001 - linking is best-effort on load
-                        notes.append(f"import linking skipped: {exc}")
+                    except Exception as exc:  # noqa: BLE001 - retain the loaded target
+                        message = f"import linking failed: {_serialize_error(exc)}"
+                        link_result = {
+                            "success": False,
+                            "status": exc.status if isinstance(exc, OperationFailure) else "internal_error",
+                            "error": _serialize_error(exc),
+                            "notes": [message],
+                        }
+                        if isinstance(exc, OperationFailure):
+                            link_result["requested"] = exc.requested
+                            link_result["observed"] = exc.observed
+                        notes.append(message)
                 targets = self.targets.refresh()
                 loaded_target = self._loaded_target_row(targets, bv)
                 loaded_path = str(getattr(bv.file, "filename", "") or "")
@@ -6002,11 +6030,12 @@ def _bind_project_create(bridge, params, target):
         bridge, params.get("path"), name=params.get("name"), rootfs=params.get("rootfs"))
 
 
-@op("project_sync_libs", lock="write")
+@op("project_sync_libs", lock="none")
 def _bind_project_sync_libs(bridge, params, target):
     return project_rootfs.project_sync_libs(
         bridge, root=params.get("root"), platform=params.get("platform"),
-        dry_run=_validate_bool(params.get("dry_run"), label="dry_run", default=False))
+        dry_run=_validate_bool(params.get("dry_run"), label="dry_run", default=False),
+        cancelled=_request_cancelled)
 
 
 @op("project_libs", lock="read")

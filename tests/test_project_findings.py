@@ -133,6 +133,23 @@ def test_no_self_accept_and_manual_evidence_cannot_establish_acceptance(ledger):
     assert rejected["reviews"][0]["evidence"][0]["text"] == "Unsupported interpretation"
 
 
+def test_acceptance_uses_declared_author_of_current_claim_revision(ledger):
+    first = add(ledger)
+    changed = ledger.api.project_finding_update(
+        ledger.bridge, first["id"], claim(ledger, claim="Corrected interpretation"),
+        first["revision"], "corrector")
+    with pytest.raises(RuntimeError, match="Self acceptance"):
+        review(ledger, changed, reviewer=" corrector ")
+    accepted = review(ledger, changed, reviewer="analyst")
+    assert accepted["author"] == "corrector"
+    assert accepted["claim_revision"] == changed["revision"]
+    assert accepted["reviews"][-1]["reviewer"] == "analyst"
+    assert accepted["review_state"] == "accepted"
+    history = ledger.api.project_finding_history(ledger.bridge, first["id"])
+    assert history["items"][0]["author"] == "analyst"
+
+
+
 def test_active_reviewer_votes_and_freshness_are_independent(ledger):
     row = add(ledger)
     row = review(ledger, row, reviewer="one")
@@ -267,6 +284,34 @@ def test_supersede_is_terminal_and_replacement_cycles_are_refused(ledger):
         review(ledger, replacement, verdict="supersede", replacement=first["id"], evidence=[])
     dependent = add(ledger, dependencies=[{"id": first["id"], "revision": 2}])
     assert dependent["freshness"] == "stale"
+
+
+def test_supersession_records_correction_without_endorsing_replacement(ledger):
+    first = review(ledger, review(ledger, add(ledger)), reviewer="another-peer")
+    replacement = review(ledger, add(ledger, claim="Alternative interpretation"), verdict="reject")
+    superseded = review(
+        ledger, first, verdict="supersede", reviewer="analyst",
+        replacement=replacement["id"], evidence=[])
+    context = ledger.api.project_finding_context(ledger.bridge)["groups"]
+    assert context["accepted"] == []
+    assert [row["id"] for row in context["superseded"]] == [first["id"]]
+    assert [row["id"] for row in context["rejected"]] == [replacement["id"]]
+    assert superseded["reviews"][:2] == first["reviews"]
+    assert superseded["replacement"] == replacement["id"]
+    assert ledger.api.project_finding_show(
+        ledger.bridge, first["id"], first["revision"])["review_state"] == "accepted"
+
+
+def test_literal_dot_folder_does_not_alias_reserved_finding_history(ledger):
+    first = add(ledger)
+    native_dot = ledger.project.add_folder(".")
+    lookalike = ledger.project.add_folder(".bn-findings", native_dot)
+    finding_folder = ledger.project.add_folder(first["id"], lookalike)
+    unrelated = ledger.project.add_file("000001.json", finding_folder, data=b"not a snapshot")
+    assert unrelated.get_path_in_project() == f"/./.bn-findings/{first['id']}/000001.json"
+    assert ledger.api.project_finding_show(ledger.bridge, first["id"])["integrity"] == first["integrity"]
+    assert [row["id"] for row in ledger.api.project_finding_list(ledger.bridge)["items"]] == [first["id"]]
+
 
 
 @pytest.mark.parametrize("changes", [{"rationale": ""}, {"evidence": []}, {"replacement": "F-" + "0" * 32}, {"unknown": True}])
@@ -446,7 +491,10 @@ def test_create_then_raise_rolls_back_registered_file(ledger, monkeypatch):
 
 
 @pytest.mark.parametrize("rollback", ["false", "raise", "lies"])
-def test_rollback_failure_is_explicit(ledger, monkeypatch, rollback):
+@pytest.mark.parametrize("action", ["add", "update", "review"])
+def test_rollback_failure_is_explicit(ledger, monkeypatch, rollback, action):
+    first = add(ledger) if action != "add" else None
+    originals = [(pf, Path(pf.path_on_disk).read_bytes()) for pf in snapshots(ledger)]
     create = ledger.project.create_file
     monkeypatch.setattr(ledger.project, "create_file", lambda contents, folder, name, description: create(b"bad", folder, name, description))
 
@@ -456,9 +504,27 @@ def test_rollback_failure_is_explicit(ledger, monkeypatch, rollback):
         return rollback == "lies"
 
     monkeypatch.setattr(ledger.project, "delete_file", delete)
-    with pytest.raises(RuntimeError, match="STORAGE ROLLBACK FAILED"):
-        add(ledger)
-    assert len(snapshots(ledger)) == 1
+    with pytest.raises(ledger.api.OperationFailure, match="STORAGE ROLLBACK FAILED") as error:
+        if action == "add":
+            add(ledger)
+        elif action == "update":
+            ledger.api.project_finding_update(ledger.bridge, first["id"], claim(ledger), 1, "analyst")
+        else:
+            review(ledger, first)
+    retained = snapshots(ledger)
+    assert len(retained) == len(originals) + 1
+    for pf, data in originals:
+        assert pf in retained and Path(pf.path_on_disk).read_bytes() == data
+    leftover = retained[-1]
+    assert error.value.status == "rollback_failed"
+    assert error.value.requested["snapshot_path"] == leftover.get_path_in_project()
+    assert error.value.requested["revision"] == (2 if first else 1)
+    assert error.value.requested["finding_id"] in leftover.get_path_in_project()
+    assert error.value.observed["rolled_back"] is False
+    assert error.value.observed["dirty_after"] is True
+    assert error.value.observed["candidate_file_ids"] == [leftover.id]
+    assert "readback" in error.value.observed["append_error"]
+    assert error.value.observed["rollback_error"]
 
 
 def test_structural_and_snapshot_limits_do_not_write(ledger):

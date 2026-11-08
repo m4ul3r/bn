@@ -36,7 +36,7 @@ bn batch apply -t <selector> /tmp/changes.json --preview
 bn save
 ```
 
-`go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only** as recognized by the name-shape check: exactly `sub_<address>` or any `nullsub_` prefix. A user-chosen name of that shape is also replaced; other names are skipped. After Go names land, it is idempotent and safe to re-run.
+Use `local_id` from `local list --format json` for local edits; auto variable names can change after analysis. `comment set/get/delete` take an address (positional or `--address`) or `--function` for a function documentation comment, exactly one location per call. The comment body is positional. A bookmark is a tag with `--type Bookmarks`; a custom tag type must exist before use. `struct field delete` accepts a field name or offset. Declare a named type before `data retype` binds it to an address. `go rename` applies names recovered by `bn go functions` and renames **auto-named `sub_*`/`nullsub_*` functions only** as recognized by the name-shape check: exactly `sub_<address>` or any `nullsub_` prefix. A user-chosen name of that shape is also replaced; other names are skipped. After Go names land, it is idempotent and safe to re-run.
 
 
 

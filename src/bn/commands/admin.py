@@ -1591,13 +1591,12 @@ def _session_restart(args: argparse.Namespace) -> int:
                 entry["attempted_path"] = attempted
             reloaded.append(entry)
 
-    # Reopen the owned project once, then every project target
-    # by its exact file id. `prefer_bndb` is off for the same reason as above:
-    # the id names the file the target already IS. Reported under `loaded`
-    # alongside the plain binaries, so a failed project reload is a partial
-    # restart (rc 1) like any other failed reload.
+    # Restore project ownership even when every project tab was closed, then
+    # reopen project targets by exact file id. `prefer_bndb` stays off because
+    # the id already names the file. A failed project reopen is a partial
+    # restart (rc 1) even when there are no target reloads to report.
     project_result: dict[str, Any] | None = None
-    if project_reloads:
+    if isinstance(project_path, str) and project_path:
         project_result = {"path": project_path, "opened": False}
         try:
             r = cli.send_request(
@@ -1660,7 +1659,8 @@ def _session_restart(args: argparse.Namespace) -> int:
     if discarded:
         result["discarded_unsaved"] = discarded
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
-    return 1 if failures or association_error or reload_capture_failed else 0
+    project_reopen_failed = project_result is not None and not project_result["opened"]
+    return 1 if failures or project_reopen_failed or association_error or reload_capture_failed else 0
 
 
 def _require_headless_lifecycle(inst: Any) -> None:

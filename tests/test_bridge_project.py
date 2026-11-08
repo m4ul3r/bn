@@ -374,6 +374,114 @@ def test_project_load_dedups_by_file_id(world):
     assert world.instance._project_load("fw/app")["substituted_from"] == f.app.id
 
 
+@pytest.mark.parametrize("updates_live_filename", [False, True])
+@pytest.mark.parametrize("selector_kind", ["raw", "database_path", "database_id"])
+def test_project_reload_after_first_save_reuses_live_view(world, selector_kind, updates_live_filename):
+    raw = world.files.loader
+    bv = FakeView(raw.path_on_disk, raw)
+    original_save = bv.create_database
+
+    def native_save(dest):
+        result = original_save(dest)
+        bv.file.has_database = True
+        if updates_live_filename:
+            bv.file.filename = dest
+        return result
+
+    bv.create_database = native_save
+    calls = _install_load(world, lambda pf: bv)
+    first = world.instance._project_load(raw.id, quick=True)
+    saved = world.instance._save_database("loader")
+    assert bv.project_file is raw  # BN retains this stale native association.
+    selector = {
+        "raw": raw.id,
+        "database_path": saved["project_path"],
+        "database_id": saved["project_file_id"],
+    }[selector_kind]
+    again = world.instance._project_load(selector)
+    assert again["already_open"] and not again["loaded"]
+    assert again["target"]["target_id"] == first["target"]["target_id"]
+    assert calls == [raw] and world.module._headless_views == [bv]
+
+
+def test_project_load_refuses_ambiguous_siblings_before_native_open(world):
+    duplicate = world.project.add_file("app.bndb", world.files.app.folder)
+    calls = _install_load(world, lambda pf: pytest.fail("must refuse before native open"))
+    with pytest.raises(RuntimeError, match="Ambiguous") as error:
+        world.instance._project_load(world.files.app.id)
+    assert duplicate.id in str(error.value) and world.files.app_db.id in str(error.value)
+    assert not calls
+
+
+def test_project_snapshot_refuses_duplicate_writer_and_names_target(world):
+    pf = world.files.app_db
+    first = FakeView(pf.path_on_disk, pf, has_database=True)
+    second = FakeView(pf.path_on_disk, pf, has_database=True)
+    rows = _rows(world, first, second)
+    snapshots = []
+    first.file.save_auto_snapshot = lambda: snapshots.append("saved") or True
+    second.file.save_auto_snapshot = lambda: snapshots.append("duplicate") or True
+    original_blob = Path(pf.path_on_disk).read_bytes()
+    for view, other in ((first, second), (second, first)):
+        current = world.instance._loaded_target_row(rows, view)
+        duplicate = world.instance._loaded_target_row(rows, other)
+        world.targets.mark_dirty(view)
+        with pytest.raises(RuntimeError, match="another open target") as error:
+            world.instance._save_database(world.module.PinnedTarget(current["target_id"]))
+        assert duplicate["target_id"] in str(error.value)
+        assert duplicate["selector"] in str(error.value)
+        assert not snapshots and world.targets.is_dirty(view)
+        assert Path(pf.path_on_disk).read_bytes() == original_blob
+    _rows(world, first)
+    assert world.instance._save_database("app.bndb")["mode"] == "snapshot"
+    assert snapshots == ["saved"] and not world.targets.is_dirty(first)
+
+
+def test_raw_save_names_existing_database_target(world):
+    raw = FakeView(world.files.app.path_on_disk, world.files.app)
+    saved = FakeView(world.files.app_db.path_on_disk, world.files.app_db, has_database=True)
+    rows = _rows(world, raw, saved)
+    raw_row = world.instance._loaded_target_row(rows, raw)
+    saved_row = world.instance._loaded_target_row(rows, saved)
+    with pytest.raises(RuntimeError, match="already has a database") as error:
+        world.instance._save_database(world.module.PinnedTarget(raw_row["target_id"]))
+    assert saved_row["target_id"] in str(error.value)
+    assert saved_row["selector"] in str(error.value)
+    assert raw.created_with is None
+
+
+@pytest.mark.parametrize("alias_kind", ["direct", "file_symlink", "directory_symlink", "outward_symlink"])
+def test_standalone_load_refuses_project_storage_across_cache_owners(
+    world, tmp_path, monkeypatch, alias_kind,
+):
+    blob = Path(world.files.app_db.path_on_disk)
+    if alias_kind == "file_symlink":
+        path = tmp_path / "alias.bndb"
+        path.symlink_to(blob)
+    elif alias_kind == "directory_symlink":
+        alias = tmp_path / "alias-directory"
+        alias.symlink_to(blob.parent, target_is_directory=True)
+        path = alias / blob.name
+    elif alias_kind == "outward_symlink":
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"synthetic")
+        path = world.root / "outside-link"
+        path.symlink_to(outside)
+    else:
+        path = blob
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory(prefix="bn-raw-", dir="/tmp") as cache:
+        monkeypatch.setenv("BN_CACHE_DIR", cache)
+        other = world.module.BinaryNinjaBridge(instance_id="other-owner")
+        calls = _install_load(world, lambda pf: pytest.fail("must refuse before native open"))
+        with pytest.raises(RuntimeError, match="Cannot load project storage") as error:
+            other._load_binary(str(path), prefer_bndb=False)
+        assert "bn project load" in str(error.value)
+        assert not calls and other.projects.current is None
+        assert world.instance.projects.current is not None
+
+
 def test_project_load_closes_an_unpublished_view_on_failure(world):
     # #609 parity: a view BN opened but the bridge never published would leak.
     f = world.files
@@ -552,3 +660,56 @@ def test_registry_payload_without_a_project(monkeypatch, tmp_path):
     instance._write_registry()
     payload = json.loads(instance.registry_path.read_text(encoding="utf-8"))
     assert payload["project"] is None and payload["project_targets"] == []
+
+
+def test_failed_first_save_dispatch_discloses_primary_error_and_residue(world):
+    bv = FakeView(world.files.loader.path_on_disk, world.files.loader)
+    _rows(world, bv)
+    world.targets.mark_dirty(bv)
+
+    def incomplete_save(dest):
+        Path(dest).write_bytes(b"partial")
+        raise OSError("database write interrupted")
+
+    bv.create_database = incomplete_save
+    world.project.delete_file = lambda pf: False
+    response = world.instance.dispatch({
+        "op": "save_database", "params": {}, "target": "loader",
+    })
+    assert response["ok"] is False and response["status"] == "rollback_failed"
+    residue = response["observed"]
+    assert "database write interrupted" in residue["primary_error"]
+    assert residue["rolled_back"] is False
+    assert residue["row_remains"] is True and residue["blob_remains"] is True
+    leftover = world.instance.projects.resolve_file(residue["project_file_id"])
+    assert leftover.path_on_disk == residue["path"]
+    assert Path(residue["path"]).read_bytes() == b"partial"
+    assert world.targets.is_dirty(bv)
+
+
+@pytest.mark.parametrize("failure", ["verification_failed", "internal_error", "rollback_failed"])
+def test_project_load_retains_link_failure_and_loaded_target(world, monkeypatch, failure):
+    bv = FakeView(world.files.loader.path_on_disk, world.files.loader)
+    _install_load(world, lambda pf: bv)
+    monkeypatch.setattr(world.instance.projects, "get_rootfs", lambda: {"libs": [{}]})
+
+    def failing_link(*args, **kwargs):
+        if failure == "internal_error":
+            raise ValueError("linking interrupted")
+        if failure == "rollback_failed":
+            raise world.module.OperationFailure(
+                failure, "link rollback failed", observed={"rolled_back": False},
+            )
+        return {"success": False, "status": failure, "notes": ["link readback failed"]}
+
+    monkeypatch.setattr(world.module.project_rootfs, "link_view", failing_link)
+    result = world.instance._project_load(world.files.loader.id, quick=True)
+    assert result["loaded"] is True and result["target"] is not None
+    assert result["link"]["success"] is False
+    assert result["link"]["status"] == failure
+    assert result["target"] in result["targets"]
+    assert world.module._headless_views == [bv] and not bv.closed
+    if failure == "rollback_failed":
+        assert result["link"]["observed"]["rolled_back"] is False
+    if failure == "internal_error":
+        assert "linking interrupted" in result["link"]["error"]

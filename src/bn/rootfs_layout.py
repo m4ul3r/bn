@@ -19,11 +19,114 @@ from __future__ import annotations
 import errno
 import fnmatch
 import hashlib
+import math
 import os
 import re
 import stat
+import time
 from collections import deque
+from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
+
+
+def _positive_limit(name: str, default: int | float) -> int | float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw) if isinstance(default, int) else float(raw)
+        if value <= 0 or not math.isfinite(value):
+            raise ValueError
+        return value
+    except (ValueError, OverflowError) as exc:
+        kind = "integer" if isinstance(default, int) else "number"
+        raise RuntimeError(f"{name} must be a positive finite {kind}") from exc
+
+
+@dataclass
+class DiscoveryBudget:
+    """One aggregate limit for lookup, hashing and ELF discovery."""
+
+    max_steps: int = field(default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_WORK", 100_000))
+    max_bytes: int = field(default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_BYTES", 1 << 30))
+    timeout: float = field(default_factory=lambda: _positive_limit("BN_ROOTFS_TIMEOUT", 30.0))
+    max_text_bytes: int = field(
+        default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_CONFIG_BYTES", 1 << 20))
+    cancelled: Callable[[], bool] | None = None
+    notes: list[str] = field(default_factory=list)
+    _steps: int = 0
+    _bytes: int = 0
+    _started: float = field(default_factory=lambda: time.monotonic())
+
+    def __post_init__(self) -> None:
+        if type(self.max_steps) is not int or self.max_steps <= 0:
+            raise ValueError("rootfs max_steps must be a positive integer")
+        if type(self.max_bytes) is not int or self.max_bytes <= 0:
+            raise ValueError("rootfs max_bytes must be a positive integer")
+        if type(self.max_text_bytes) is not int or self.max_text_bytes <= 0:
+            raise ValueError("rootfs max_text_bytes must be a positive integer")
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("rootfs timeout must be positive and finite")
+
+    def check(self, *, bytes_read: int = 0) -> None:
+        self._steps += 1
+        self._bytes += bytes_read
+        reason = None
+        if self.cancelled is not None and self.cancelled():
+            reason = "request cancelled"
+        elif time.monotonic() - self._started >= self.timeout:
+            reason = "discovery deadline exceeded"
+        elif self._steps > self.max_steps:
+            reason = "filesystem/ELF work limit exceeded"
+        elif self._bytes > self.max_bytes:
+            reason = "discovery byte limit exceeded"
+        if reason is not None:
+            raise RuntimeError(f"rootfs discovery refused: {reason}; no inventory committed")
+
+
+_discovery: ContextVar[DiscoveryBudget | None] = ContextVar("rootfs_discovery", default=None)
+
+
+@contextmanager
+def discovery_budget(budget: DiscoveryBudget | None = None):
+    """Share limits across a complete sync; standalone calls are bounded too."""
+    existing = _discovery.get()
+    if existing is not None and budget is None:
+        yield existing
+        return
+    budget = budget if budget is not None else DiscoveryBudget()
+    token = _discovery.set(budget)
+    try:
+        budget.check()
+        yield budget
+    finally:
+        _discovery.reset(token)
+
+
+def _bounded(function):
+    @wraps(function)
+    def bounded(*args, **kwargs):
+        with discovery_budget():
+            return function(*args, **kwargs)
+    return bounded
+
+
+def _check_work(*, bytes_read: int = 0) -> None:
+    budget = _discovery.get()
+    if budget is not None:
+        budget.check(bytes_read=bytes_read)
+
+
+def _invalid_path(rel: str) -> bool:
+    if "\0" not in rel:
+        return False
+    budget = _discovery.get()
+    if budget is not None and "skipped loader path containing NUL" not in budget.notes:
+        budget.notes.append("skipped loader path containing NUL")
+    return True
 
 
 @dataclass(slots=True)
@@ -69,9 +172,6 @@ _LINUX_LOADER = (
     "etc/inittab",
 )
 
-# Text files are read whole for scraping; cap so a stray blob on a rootfs cannot
-# pull gigabytes into memory.
-_MAX_TEXT_READ = 1 << 20
 _LD_LIBRARY_PATH_RE = re.compile(r"LD_LIBRARY_PATH=[\"']?([^\"'\s;]+)")
 _LD_LIBRARY_PATH_FILES = (
     "etc/profile",
@@ -95,10 +195,13 @@ _ELF_MAGIC = b"\x7fELF"
 
 def _resolve_in_root(root: str, rel: str) -> str:
     """Resolve an existing firmware path without letting the host follow links."""
+    if _invalid_path(rel):
+        raise OSError(errno.EINVAL, "embedded NUL in firmware path")
     pending = deque(rel.split("/"))
     parts: list[str] = []
     links = 0
     while pending:
+        _check_work()
         part = pending.popleft()
         if part in ("", "."):
             continue
@@ -136,48 +239,54 @@ def _is_dir_in_root(root: str, rel: str) -> bool:
     return path is not None and os.path.isdir(path)
 
 
+@_bounded
 def _glob_in_root(root: str, pattern: str, *, recursive: bool = False) -> list[str]:
-    """Expand firmware paths, retaining spelling and bounding recursive link loops."""
+    """Preserve loader aliases; memoize recursive scraping by resolved state."""
+    if _invalid_path(pattern):
+        return []
     components = [part for part in pattern.split("/") if part]
     hits: set[str] = set()
-    stack: list[tuple[str, int, frozenset[str]]] = [("", 0, frozenset())]
+    stack: list[tuple[str, int]] = [("", 0)]
+    visited: set[tuple[str, int]] = set()
     while stack:
-        rel, index, ancestors = stack.pop()
+        _check_work()
+        rel, index = stack.pop()
         full = _resolved_path(root, rel)
         if full is None:
             continue
         if index == len(components):
             hits.add(rel or "/")
             continue
-        if not os.path.isdir(full):
+        if not os.path.isdir(full) or (recursive and (full, index) in visited):
             continue
+        if recursive:
+            visited.add((full, index))
         part = components[index]
         descend = recursive and part == "**"
         if descend:
-            if full in ancestors:
-                continue
-            stack.append((rel, index + 1, frozenset()))
-            ancestors = ancestors | {full}
+            stack.append((rel, index + 1))
         elif not any(ch in part for ch in "*?["):
-            stack.append((rel + "/" + part, index + 1, ancestors))
+            stack.append((rel + "/" + part, index + 1))
             continue
+        names: list[str] = []
         try:
             with os.scandir(full) as entries:
-                names = [entry.name for entry in entries
-                         if (not entry.name.startswith(".") or part.startswith("."))
-                         and (descend or fnmatch.fnmatchcase(entry.name, part))]
+                for entry in entries:
+                    _check_work()
+                    if (not entry.name.startswith(".") or part.startswith(".")) and (
+                        descend or fnmatch.fnmatchcase(entry.name, part)
+                    ):
+                        names.append(entry.name)
         except OSError:
             continue
-        for name in names:
+        for name in reversed(sorted(names)):
             child = rel + "/" + name
             if descend:
-                # Files are also terminal matches for a trailing **.
-                if index + 1 == len(components):
-                    if _resolved_path(root, child) is not None:
-                        hits.add(child)
-                stack.append((child, index, ancestors))
+                if index + 1 == len(components) and _resolved_path(root, child) is not None:
+                    hits.add(child)
+                stack.append((child, index))
             else:
-                stack.append((child, index + 1, ancestors))
+                stack.append((child, index + 1))
     return sorted(hits)
 
 
@@ -199,25 +308,38 @@ def _score(root: str) -> RootfsInfo | None:
     return RootfsInfo(root, "linux", layout + loader)
 
 
+@_bounded
 def detect_root(start: str, *, explicit: bool = False) -> RootfsInfo | None:
     """Find the rootfs containing ``start``.
 
-    Walks up from ``start`` but never implicitly scores host ``/``. With
-    ``explicit=True`` only ``start`` itself is scored (the caller named the root),
-    and a directory matching no detector yields ``platform="unknown"`` instead of
-    ``None``. A non-directory ``start`` is ``None`` either way.
+    Walks up from ``start`` without adopting host ``/``, its direct children,
+    or another mount of host ``/usr``. With ``explicit=True`` only ``start`` is
+    scored (the caller named the root), and a directory matching no detector
+    yields ``platform="unknown"``. A non-directory is ``None`` either way.
     """
     cur = os.path.realpath(os.path.expanduser(start))
     if not os.path.isdir(cur):
         return None
     if explicit:
         return _score(cur) or RootfsInfo(cur, "unknown", [])
-    while os.path.dirname(cur) != cur:
-        info = _score(cur)
-        if info is not None:
-            return info
-        parent = os.path.dirname(cur)
-        cur = parent
+    try:
+        host_usr = os.stat("/usr")
+        host_usr_id = (host_usr.st_dev, host_usr.st_ino)
+    except OSError:
+        host_usr_id = None
+    parent = os.path.dirname(cur)
+    while os.path.dirname(parent) != parent:
+        _check_work()
+        try:
+            candidate = os.stat(cur)
+            candidate_id = (candidate.st_dev, candidate.st_ino)
+        except OSError:
+            candidate_id = None
+        if candidate_id is not None and candidate_id != host_usr_id:
+            info = _score(cur)
+            if info is not None:
+                return info
+        cur, parent = parent, os.path.dirname(parent)
     return None
 
 
@@ -240,13 +362,38 @@ def project_location(root: str, cache_projects_dir: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _open_regular(path: str):
+    # NONBLOCK closes the stat/open FIFO race; NOFOLLOW refuses replaced links.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        with handle:
+            yield handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _read_text(root: str, rel: str) -> str:
     try:
         path = _resolve_in_root(root, rel)
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            return ""
-        with open(path, "rb") as fh:
-            return fh.read(_MAX_TEXT_READ).decode("utf-8", "replace")
+        with _open_regular(path) as fh:
+            budget = _discovery.get()
+            limit = budget.max_text_bytes if budget is not None else 1 << 20
+            if budget is not None:
+                # Bound even the allocation by the remaining aggregate allowance.
+                limit = min(limit, max(0, budget.max_bytes - budget._bytes))
+            data = fh.read(limit + 1)
+            _check_work(bytes_read=len(data))
+            if len(data) > limit:
+                raise RuntimeError(
+                    f"rootfs discovery refused: loader config {rel} exceeds the text limit; "
+                    "no inventory committed")
+            return data.decode("utf-8", "replace")
     except OSError:
         return ""
 
@@ -259,13 +406,14 @@ def _scrape_files(root: str) -> list[str]:
         recursive = "**" in pat
         for rel in _glob_in_root(root, pat, recursive=recursive):
             full = _resolved_path(root, rel)
-            if rel in seen or full is None or not os.path.isfile(full):
+            if full is None or full in seen or not os.path.isfile(full):
                 continue
-            seen.add(rel)
+            seen.add(full)
             out.append(rel)
     return out
 
 
+@_bounded
 def env_hint(root: str) -> list[tuple[str, str]]:
     """Every ``LD_LIBRARY_PATH=`` assignment found under ``etc/`` as ``(file, value)``.
 
@@ -293,27 +441,33 @@ def _ld_library_path_entries(root: str) -> list[tuple[str, str]]:
 
 def _ld_so_conf_entries(root: str, rel_conf: str, visited: set[str],
                         out: list[tuple[str, str]]) -> None:
-    full = _resolved_path(root, rel_conf)
-    if full is None or full in visited or not os.path.isfile(full):
-        return
-    visited.add(full)
-    conf_dir = os.path.dirname(rel_conf)
-    for raw in _read_text(root, rel_conf).splitlines():
+    pending: list[tuple[str, str | None]] = [(rel_conf, None)]
+    while pending:
+        _check_work()
+        conf, raw = pending.pop()
+        if raw is None:
+            full = _resolved_path(root, conf)
+            if full is None or full in visited or not os.path.isfile(full):
+                continue
+            visited.add(full)
+            pending.extend((conf, line) for line in reversed(_read_text(root, conf).splitlines()))
+            continue
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         if line.startswith("include") and (len(line) == 7 or line[7].isspace()):
+            includes: list[str] = []
             for pattern in line[7:].split():
                 if not pattern.startswith("/"):
-                    pattern = os.path.join(conf_dir, pattern)
-                for rel in _glob_in_root(root, pattern):
-                    _ld_so_conf_entries(root, rel, visited, out)
+                    pattern = os.path.join(os.path.dirname(conf), pattern)
+                includes.extend(_glob_in_root(root, pattern))
+            pending.extend((rel, None) for rel in reversed(includes))
             continue
         if line.startswith("hwcap"):
             continue
         for entry in re.split(r"[\s:,]+", line):
-            if entry.startswith("/"):
-                out.append((entry, rel_conf))
+            if entry.startswith("/") and not _invalid_path(entry):
+                out.append((entry, conf))
 
 
 def _linux_defaults(root: str) -> list[str]:
@@ -333,6 +487,7 @@ def _android_defaults(root: str) -> list[str]:
     return paths
 
 
+@_bounded
 def lookup_paths(root: str, platform: str) -> list[LookupPath]:
     """Directories the loader of ``platform`` searches, in loader order.
 
@@ -387,22 +542,22 @@ def _is_so_name(name: str) -> bool:
     return name.endswith(".so") or ".so." in name
 
 
-def _is_elf(path: str) -> bool:
-    try:
-        with open(path, "rb") as fh:
-            return fh.read(4) == _ELF_MAGIC
-    except OSError:
-        return False
-
-
-def _sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
+def _library_digest(path: str) -> tuple[os.stat_result, str] | None:
+    with _open_regular(path) as fh:
+        st = os.fstat(fh.fileno())
+        magic = fh.read(4)
+        _check_work(bytes_read=len(magic))
+        if magic != _ELF_MAGIC:
+            return None
+        h = hashlib.sha256(magic)
         while chunk := fh.read(1 << 20):
+            _check_work(bytes_read=len(chunk))
             h.update(chunk)
-    return h.hexdigest()
+        _check_work()
+        return st, h.hexdigest()
 
 
+@_bounded
 def scan_libraries(root: str, paths: list[LookupPath]) -> tuple[list[LibraryCandidate], list[str]]:
     """Shared objects on ``paths`` (non-recursive), one candidate per real file.
 
@@ -420,13 +575,19 @@ def scan_libraries(root: str, paths: list[LookupPath]) -> tuple[list[LibraryCand
     by_real: dict[str, tuple[LibraryCandidate, set[str]]] = {}
     notes: list[str] = []
     for lp in paths:
+        _check_work()
         try:
             dir_full = _resolve_in_root(root, lp.path_in_root)
             with os.scandir(dir_full) as directory:
-                entries = sorted(directory, key=lambda e: e.name)
+                entries = []
+                for entry in directory:
+                    _check_work()
+                    entries.append(entry)
+                entries.sort(key=lambda e: e.name)
         except OSError:
             continue
         for entry in entries:
+            _check_work()
             if not _is_so_name(entry.name):
                 continue
             spelling = lp.path_in_root.rstrip("/") + "/" + entry.name
@@ -444,11 +605,11 @@ def scan_libraries(root: str, paths: list[LookupPath]) -> tuple[list[LibraryCand
                     spellings.add(spelling)
                     cand.paths.append(spelling)
                 continue
-            if not _is_elf(real):
-                continue
             try:
-                st = os.stat(real)
-                digest = _sha256(real)
+                result = _library_digest(real)
+                if result is None:
+                    continue
+                st, digest = result
             except OSError as exc:
                 notes.append(f"skipped {spelling}: {exc.strerror or exc}")
                 continue

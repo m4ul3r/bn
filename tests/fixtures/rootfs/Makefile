@@ -23,7 +23,7 @@
 # Toolchain: CROSS_CC wins; else the first known Linux musl cross gcc on PATH
 # or in Homebrew's musl-cross keg.
 CROSS_CC ?=
-_CANDIDATES := aarch64-linux-musl-gcc x86_64-linux-musl-gcc arm-linux-musleabihf-gcc
+_CANDIDATES := aarch64-linux-musl-gcc x86_64-linux-musl-gcc arm-linux-musleabihf-gcc musl-gcc
 _SEARCH     := $(subst :, ,$(PATH)) /opt/homebrew/opt/musl-cross/bin
 _FOUND      := $(firstword $(foreach c,$(_CANDIDATES),$(wildcard $(addsuffix /$(c),$(_SEARCH)))))
 CC          := $(or $(CROSS_CC),$(_FOUND))
@@ -31,10 +31,18 @@ CC          := $(or $(CROSS_CC),$(_FOUND))
 OUT    ?= out
 SRCDIR := src
 
-LIBC_SRC  = $(if $(CC),$(shell $(CC) -print-sysroot)/lib/libc.so)
-# The loader alias is named after the arch (ld-musl-aarch64.so.1,
-# ld-musl-armhf.so.1, ...); take the toolchain's own spelling.
-LDMUSL    = $(notdir $(firstword $(wildcard $(dir $(LIBC_SRC))ld-musl-*.so.1)))
+# A distro musl-gcc wrapper may have an empty sysroot and report glibc's
+# generic compiler paths. Resolve the actual linked musl runtime instead.
+PYTHON    ?= python3
+LIBC_SRC  ?=
+LDMUSL    ?=
+ifneq ($(MAKECMDGOALS),clean)
+ifneq ($(CC),)
+_RUNTIME := $(shell $(PYTHON) toolchain.py --cc "$(CC)" --libc "$(LIBC_SRC)" --loader "$(LDMUSL)")
+endif
+endif
+_LIBC_SRC := $(word 1,$(_RUNTIME))
+_LDMUSL   := $(word 2,$(_RUNTIME))
 
 LIBGREET := $(OUT)/opt/vendor/lib/libgreet.so.1
 APP      := $(OUT)/usr/bin/app
@@ -43,14 +51,14 @@ STRAY    := $(OUT)/usr/bin/libstray.so
 CONFS    := $(OUT)/etc/ld.so.conf $(OUT)/etc/ld.so.conf.d/vendor.conf $(OUT)/etc/profile
 
 all: check-toolchain $(LIBGREET) $(OUT)/opt/vendor/lib/libgreet.so $(APP) $(LIBC) \
-     $(OUT)/lib/$(LDMUSL) $(STRAY) $(CONFS)
+     $(OUT)/lib/$(_LDMUSL) $(STRAY) $(CONFS)
 
 check-toolchain:
 ifeq ($(CC),)
 	$(error no Linux musl cross compiler found: set CROSS_CC=<path to *-linux-musl*-gcc> or install one of $(_CANDIDATES) (Homebrew: brew install musl-cross))
 endif
-ifeq ($(LDMUSL),)
-	$(error $(CC) has no ld-musl-*.so.1 next to $(LIBC_SRC); is it a musl toolchain?)
+ifeq ($(_LDMUSL),)
+	$(error could not resolve $(CC)'s musl runtime; see diagnostics above, or set LIBC_SRC=<musl libc.so> and LDMUSL=ld-musl-<arch>.so.1)
 endif
 
 $(LIBGREET): $(SRCDIR)/greet.c
@@ -60,15 +68,17 @@ $(LIBGREET): $(SRCDIR)/greet.c
 $(OUT)/opt/vendor/lib/libgreet.so: $(LIBGREET)
 	ln -sfn libgreet.so.1 $@
 
-$(APP): $(SRCDIR)/app.c $(OUT)/opt/vendor/lib/libgreet.so
+# PIE keeps optional weak imports dynamically resolvable instead of allowing
+# a non-PIE linker to fold their addresses to zero.
+$(APP): $(SRCDIR)/app.c $(OUT)/opt/vendor/lib/libgreet.so Makefile
 	@mkdir -p $(dir $@)
-	$(CC) -o $@ $< -L$(dir $(LIBGREET)) -lgreet -Wl,-rpath,/opt/vendor/lib
+	$(CC) -fPIE -pie -o $@ $< -L$(dir $(LIBGREET)) -lgreet -Wl,-rpath,/opt/vendor/lib
 
-$(LIBC): $(LIBC_SRC)
+$(LIBC): $(_LIBC_SRC)
 	@mkdir -p $(dir $@)
 	cp $< $@
 
-$(OUT)/lib/$(LDMUSL): $(LIBC)
+$(OUT)/lib/$(_LDMUSL): $(LIBC)
 	ln -sfn libc.so $@
 
 $(STRAY): $(LIBGREET)

@@ -29,6 +29,7 @@ reader for an out-of-range window.
 from __future__ import annotations
 
 import os
+import stat
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -62,6 +63,7 @@ _MAX_SECTIONS = 1 << 16
 _MAX_DYNAMIC_ENTRIES = 4096
 _MAX_SYMBOLS = 1 << 20
 _MAX_VERNEED = 4096
+_MAX_VERNAUX = 1 << 14
 _MAX_VERDEF = 4096
 _MAX_STRING = 4096
 # The largest single read the parser ever issues. The biggest legitimate one is
@@ -113,13 +115,15 @@ class ElfDynamicInfo:
 
 
 class _Elf:
-    def __init__(self, read: Reader, file_size: int, is64: bool, endian: str):
+    def __init__(self, read: Reader, file_size: int, is64: bool, endian: str,
+                 check: Callable[[], None] | None = None):
         self._read = read
         self.file_size = file_size
         self.is64 = is64
         self.endian = endian
         self.loads: list[tuple[int, int, int]] = []  # (vaddr, filesz, offset)
         self.notes: list[str] = []
+        self.check = check
 
     def fits(self, offset: int, size: int) -> bool:
         """Is ``[offset, offset + size)`` a window this parser may read?"""
@@ -128,6 +132,8 @@ class _Elf:
     def bytes_at(self, offset: int, size: int) -> bytes | None:
         """The ONE gate to the reader: an out-of-range window is refused here,
         so a hostile size can never reach ``BinaryView.read``."""
+        if self.check is not None:
+            self.check()
         if not self.fits(offset, size):
             return None
         try:
@@ -159,41 +165,55 @@ class _Elf:
         return data[:end].decode("utf-8", errors="replace")
 
 
-def parse_elf_dynamic(read: Reader, file_size: int) -> ElfDynamicInfo | None:
+def parse_elf_dynamic(read: Reader, file_size: int, *,
+                      check: Callable[[], None] | None = None) -> ElfDynamicInfo | None:
     """The dynamic-section facts of the ELF file *read* serves (*file_size*
     bytes long), or ``None`` when it is not an ELF, carries no PT_DYNAMIC (a
     static binary), or its headers are out of range for the file."""
     if file_size <= 0:
         return None
     try:
-        return _parse(read, int(file_size))
+        return _parse(read, int(file_size), check=check)
     except (struct.error, ValueError, OverflowError):
         return None
 
 
-def parse_elf_file(path: str) -> ElfDynamicInfo | None:
+def parse_elf_file(path: str, *,
+                   check: Callable[[], None] | None = None) -> ElfDynamicInfo | None:
     """`parse_elf_dynamic` over the file at *path*, read piecewise with
     seek+read so no window larger than `_MAX_READ` is ever in memory; None for
     an unreadable path as for a non-ELF file."""
+    fd = -1
     try:
-        with open(path, "rb") as handle:
+        if check is not None:
+            check()
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        handle = os.fdopen(fd, "rb")
+        fd = -1
+        with handle:
             size = os.fstat(handle.fileno()).st_size
 
             def read(offset: int, length: int) -> bytes:
                 handle.seek(offset)
                 return handle.read(length)
 
-            return parse_elf_dynamic(read, size)
-    except OSError:
+            return parse_elf_dynamic(read, size, check=check)
+    except (OSError, ValueError):
         return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
-def _parse(read: Reader, file_size: int) -> ElfDynamicInfo | None:
-    probe = _Elf(read, file_size, False, "<")
+def _parse(read: Reader, file_size: int, *,
+           check: Callable[[], None] | None = None) -> ElfDynamicInfo | None:
+    probe = _Elf(read, file_size, False, "<", check)
     ident = probe.bytes_at(0, 16)
     if ident is None or ident[:4] != b"\x7fELF" or ident[4] not in (1, 2) or ident[5] not in (1, 2):
         return None
-    elf = _Elf(read, file_size, ident[4] == 2, "<" if ident[5] == 1 else ">")
+    elf = _Elf(read, file_size, ident[4] == 2, "<" if ident[5] == 1 else ">", check)
     # e_type, e_machine; e_phoff, then (past e_shoff/e_flags/e_ehsize)
     # e_phentsize and e_phnum.
     kinds = elf.unpack("HH", 0x10)
@@ -363,34 +383,64 @@ def _dynsym_section_count(elf: _Elf) -> int | None:
     return None
 
 
-def _verneed_files(elf: _Elf, tags: dict[int, int], dynstr) -> dict[int, str]:
-    """Version index -> the library file its verneed entry names."""
-    at = elf.file_offset(tags[_DT_VERNEED]) if _DT_VERNEED in tags else None
+def _verneed_files(elf: _Elf, tags: dict[int, int], dynstr) -> tuple[dict[int, str], str | None]:
+    """Read all requirements or refuse attribution; partial maps are unsafe."""
+    if _DT_VERNEED not in tags:
+        return {}, None
+    at = elf.file_offset(tags[_DT_VERNEED])
+
+    def refused(reason: str) -> tuple[dict[int, str], str]:
+        message = f"DT_VERNEED {reason}; per-import library attribution was skipped"
+        elf.notes.append(message)
+        return {}, message
+
     if at is None:
-        return {}
-    remaining = min(tags.get(_DT_VERNEEDNUM, _MAX_VERNEED), _MAX_VERNEED)
+        return refused("is outside the loaded segments")
+    remaining = tags.get(_DT_VERNEEDNUM, _MAX_VERNEED)
+    if remaining > _MAX_VERNEED:
+        return refused("exceeds the requirement limit")
     files: dict[int, str] = {}
+    seen_aux: set[int] = set()
+    total_aux = 0
     while remaining > 0:
         need = elf.unpack("HHIII", at)  # version, cnt, file, aux, next
         if need is None:
-            break
-        _version, cnt, file_index, aux, next_need = need
+            return refused("has an unreadable requirement")
+        version, cnt, file_index, aux, next_need = need
         library = dynstr(file_index)
+        if version != 1 or not library or (cnt and aux < 16):
+            return refused("has a malformed requirement")
+        total_aux += cnt
+        if total_aux > _MAX_VERNAUX:
+            return refused("exceeds the total vernaux work limit")
         aux_at = at + aux
-        for _ in range(min(cnt, _MAX_VERNEED)):
+        for index in range(cnt):
+            if aux_at in seen_aux:
+                return refused("has overlapping vernaux chains")
+            seen_aux.add(aux_at)
             entry = elf.unpack("IHHII", aux_at)  # hash, flags, other, name, next
             if entry is None:
-                break
-            if library:
-                files[entry[2] & 0x7FFF] = library
-            if not entry[4]:
-                break
+                return refused("has an unreadable vernaux entry")
+            version_index = entry[2] & 0x7FFF
+            if version_index < 2:
+                return refused("uses a reserved local/global version index")
+            if version_index in files and files[version_index] != library:
+                return refused("assigns one version to competing libraries")
+            files[version_index] = library
+            if index + 1 < cnt and entry[4] < 16:
+                return refused("has a truncated vernaux chain")
             aux_at += entry[4]
         remaining -= 1
         if not next_need:
+            if remaining and _DT_VERNEEDNUM in tags:
+                return refused("has a truncated requirement chain")
             break
+        if next_need < 16:
+            return refused("has overlapping requirements")
+        if not remaining:
+            return refused("continues beyond the requirement limit or declared count")
         at += next_need
-    return files
+    return files, None
 
 
 @dataclass
@@ -452,7 +502,9 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr,
     if _DT_SYMTAB not in tags:
         # #1037 review round 5: name the table that is actually missing.
         return {}, "the file declares symbol versions without a dynamic symbol table"
-    files = _verneed_files(elf, tags, dynstr)
+    files, unread = _verneed_files(elf, tags, dynstr)
+    if unread is not None:
+        return {}, unread
     if not files:
         if _DT_VERNEED in tags:
             return {}, "the version-requirement table (DT_VERNEED) could not be read"
@@ -470,6 +522,8 @@ def _versioned_import_libraries(elf: _Elf, tags: dict[int, int], dynstr,
     attributed: dict[str, str] = {}
     conflicted: set[str] = set()
     for index in range(1, table.count):
+        if index % 256 == 0 and elf.check is not None:
+            elf.check()
         library = files.get(table.versions[index] & 0x7FFF)
         if library is None:
             continue
@@ -523,6 +577,8 @@ def _exports(elf: _Elf, tags: dict[int, int], dynstr,
     exports: dict[str, ExportedSymbol] = {}
     hidden_version: set[str] = set()
     for index in range(1, table.count):
+        if index % 256 == 0 and elf.check is not None:
+            elf.check()
         fields = struct.unpack_from(fmt, table.data, index * table.syment)
         name_index, st_info, st_other, st_shndx = fields[0], fields[-3], fields[-2], fields[-1]
         if st_shndx == 0 or (st_info >> 4) not in (1, 2) or (st_other & 3) not in (0, 3):
