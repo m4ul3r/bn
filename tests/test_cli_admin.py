@@ -1526,6 +1526,150 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
     assert set(opened) == {"/fw/svc_a", "/fw/svc_a.bndb"}
 
 
+def _restart_project_fixture(monkeypatch, *, meta, rows):
+    """Fake registry + bridge for `session restart` with a project payload
+    (BNPR_PLAN.md §5.4/§5.7). Returns the ordered `(op, params)` call log."""
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+        "meta": meta,
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me",
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, dict(params or {})))
+        if op == "project_open":
+            return {"ok": True, "result": {"path": params["path"], "name": "fw", "opened": True}}
+        if op == "project_load":
+            return {"ok": True, "result": {
+                "path": f"/proj/fw.bnpr/data/ab/{params['selector']}",
+                "project_file_id": params["selector"],
+                "project_path": "/fw/svc_a",
+            }}
+        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": rows},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    return calls
+
+
+_PROJECT_FILE_ID = "0f3c2a1e-9b7d-4c6a-8e5f-1234567890ab"
+_PROJECT_BLOB = "/proj/fw.bnpr/data/0f/3c2a1e9b7d4c6a8e5f1234567890abcdef"
+_PROJECT_META = {
+    "project": {"path": "/proj/fw.bnpr", "id": "proj-1", "name": "fw"},
+    "project_targets": [
+        {"target_id": "500:2:7", "view_id": 2, "project_file_id": _PROJECT_FILE_ID,
+         "project_path": "/fw/svc_a"},
+    ],
+}
+_PROJECT_ROWS = [
+    {"target_id": "500:1:7", "filename": "/fw/svc_b", "analysis_state": "full",
+     "unsaved": False, "project_file_id": "", "project_path": ""},
+    {"target_id": "500:2:7", "filename": _PROJECT_BLOB, "analysis_state": "quick",
+     "unsaved": False, "project_file_id": _PROJECT_FILE_ID, "project_path": "/fw/svc_a"},
+]
+
+
+def test_session_restart_replays_project_targets_by_file_id(monkeypatch, capsys):
+    """BNPR_PLAN.md §5.7 / F2: a project target's `filename` is a blob inside the
+    `.bnpr`; reloading it by path would come back WITHOUT project linkage. The
+    restart reopens the project once and then loads each project target by its
+    exact file id, and never replays the blob as a plain binary."""
+    calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=_PROJECT_ROWS)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    ops = [op for op, _ in calls]
+    assert ops.count("project_open") == 1
+    assert ops.index("shutdown") < ops.index("project_open") < ops.index("project_load")
+    assert [p for op, p in calls if op == "project_open"] == [{"path": "/proj/fw.bnpr"}]
+    assert [p for op, p in calls if op == "project_load"] == [
+        {"selector": _PROJECT_FILE_ID, "prefer_bndb": False, "quick": True},
+    ]
+    # The plain binary replays as before; the blob does not.
+    assert [p["path"] for op, p in calls if op == "load_binary"] == ["/fw/svc_b"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"] == {"path": "/proj/fw.bnpr", "opened": True}
+    assert len(payload["loaded"]) == 2
+    assert [x.get("project_file_id") for x in payload["loaded"]] == [None, _PROJECT_FILE_ID]
+
+
+def test_session_restart_replays_project_targets_when_capture_failed(monkeypatch, capsys):
+    # The registry alone carries enough to replay the project (§5.4): an
+    # unreachable bridge's targets are still reopened by id, with full analysis.
+    from bn.transport import BridgeUnreachableError
+    calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=[])
+
+    def unreachable(instance, op, params=None, target=None, **kw):
+        raise BridgeUnreachableError("socket gone")
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", unreachable)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 1   # capture failure is still reported (#620)
+    assert [p for op, p in calls if op == "project_load"] == [
+        {"selector": _PROJECT_FILE_ID, "prefer_bndb": False, "quick": False},
+    ]
+    assert "load_binary" not in [op for op, _ in calls]
+
+
+def test_session_restart_project_open_failure_marks_each_project_target(monkeypatch, capsys):
+    from bn.transport import BridgeError
+    calls = _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=_PROJECT_ROWS)
+    inner = bn.cli.send_request
+
+    def failing(op, **kw):
+        if op == "project_open":
+            calls.append((op, dict(kw.get("params") or {})))
+            raise BridgeError("Binary Ninja could not open project /proj/fw.bnpr: boom")
+        return inner(op, **kw)
+    monkeypatch.setattr(bn.cli, "send_request", failing)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 1
+    assert "project_load" not in [op for op, _ in calls]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["project"]["opened"] is False
+    assert "could not open project" in payload["project"]["error"]
+    errors = [x for x in payload["loaded"] if x.get("error")]
+    assert len(errors) == 1
+    assert errors[0]["path"] == "/fw/svc_a"
+    assert errors[0]["project_file_id"] == _PROJECT_FILE_ID
+    assert "project not reopened" in errors[0]["error"]
+
+
+def test_session_restart_without_project_is_unchanged(monkeypatch, capsys):
+    meta = {"project": None, "project_targets": []}
+    rows = [{"target_id": "500:1:7", "filename": "/fw/svc_b", "analysis_state": "full",
+             "unsaved": False, "project_file_id": "", "project_path": ""}]
+    calls = _restart_project_fixture(monkeypatch, meta=meta, rows=rows)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    ops = [op for op, _ in calls]
+    assert "project_open" not in ops and "project_load" not in ops
+    assert [p["path"] for op, p in calls if op == "load_binary"] == ["/fw/svc_b"]
+    assert "project" not in json.loads(capsys.readouterr().out)
+
+
 def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch, capsys):
     # #620(a): a `list_targets` failure while capturing the pre-restart state
     # must not be silently swallowed. Round 2: raising BridgeError here would

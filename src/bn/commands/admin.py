@@ -1445,6 +1445,33 @@ def _session_restart(args: argparse.Namespace) -> int:
             f"{reload_capture_error}",
             file=sys.stderr,
         )
+    # BNPR_PLAN.md §5.7: project targets replay by (project path, file id), never
+    # by filename. A project target's `filename` is an opaque blob inside the
+    # `.bnpr`; loading it by path would reopen it WITHOUT project linkage (F2),
+    # so those rows are excluded from the plain reload list below.
+    project_meta = inst.meta.get("project") if isinstance(inst.meta, dict) else None
+    project_path = (
+        project_meta.get("path") if isinstance(project_meta, dict) else None
+    )
+    project_rows: list[dict[str, Any]] = []
+    if isinstance(project_path, str) and project_path:
+        raw_rows = inst.meta.get("project_targets")
+        project_rows = [
+            r for r in (raw_rows if isinstance(raw_rows, list) else [])
+            if isinstance(r, dict) and r.get("project_file_id")
+        ]
+    project_target_ids = {r.get("target_id") for r in project_rows}
+    quick_by_target_id = {
+        t.get("target_id"): t.get("analysis_state") == "quick" for t in rows
+    }
+    project_reloads: list[dict[str, Any]] = [
+        {
+            "project_file_id": str(r["project_file_id"]),
+            "project_path": r.get("project_path") or "",
+            "quick": quick_by_target_id.get(r.get("target_id"), False),
+        }
+        for r in project_rows
+    ]
     reload_targets: list[dict[str, Any]] = [
         {
             "path": t["filename"],
@@ -1453,12 +1480,14 @@ def _session_restart(args: argparse.Namespace) -> int:
             # analysis, when it is not the file `filename` names. The bridge
             # restores `bv.file.filename` to the original path after every
             # save, so for a target loaded raw and then saved the filename is
-            # the RAW file while the annotations live in the sibling/cache
+            # the RAW file while the annotations live in the sidecar/cache
             # database.
             "database_path": t.get("database_path"),
         }
         for t in rows
         if t.get("filename")
+        and not t.get("project_file_id")
+        and t.get("target_id") not in project_target_ids
     ]
 
     # Refuse to discard committed-but-unsaved work (M-01) BEFORE the old
@@ -1545,6 +1574,50 @@ def _session_restart(args: argparse.Namespace) -> int:
                 entry["attempted_path"] = attempted
             reloaded.append(entry)
 
+    # BNPR_PLAN.md §5.7: reopen the owned project once, then every project target
+    # by its exact file id. `prefer_bndb` is off for the same reason as above:
+    # the id names the file the target already IS. Reported under `loaded`
+    # alongside the plain binaries, so a failed project reload is a partial
+    # restart (rc 1) like any other failed reload.
+    project_result: dict[str, Any] | None = None
+    if project_reloads:
+        project_result = {"path": project_path, "opened": False}
+        try:
+            r = cli.send_request(
+                "project_open",
+                params={"path": project_path},
+                instance_id=instance.instance_id,
+            )
+            unwrap_result(r, "project_open")
+            project_result["opened"] = True
+        except BridgeError as exc:
+            project_result["error"] = str(exc)
+            for t in project_reloads:
+                reloaded.append({
+                    "path": t["project_path"] or t["project_file_id"],
+                    "project_file_id": t["project_file_id"],
+                    "error": f"project not reopened: {exc}",
+                })
+            project_reloads = []
+    for t in project_reloads:
+        try:
+            r = cli.send_request(
+                "project_load",
+                params={
+                    "selector": t["project_file_id"],
+                    "prefer_bndb": False,
+                    "quick": t["quick"],
+                },
+                instance_id=instance.instance_id,
+            )
+            reloaded.append(unwrap_result(r, "project_load"))
+        except BridgeError as exc:
+            reloaded.append({
+                "path": t["project_path"] or t["project_file_id"],
+                "project_file_id": t["project_file_id"],
+                "error": str(exc),
+            })
+
     project_roots, association_error = _associate_project_roots(
         instance.instance_id, inherited_roots
     )
@@ -1558,6 +1631,8 @@ def _session_restart(args: argparse.Namespace) -> int:
         # Rendered by the session-start text renderer under "loaded".
         "loaded": reloaded,
     }
+    if project_result is not None:
+        result["project"] = project_result
     if project_roots:
         result["project_roots"] = project_roots
     if association_error is not None:
@@ -1811,6 +1886,10 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
             and all(isinstance(root, str) for root in project_roots)
         ):
             entry["project_roots"] = list(project_roots)
+        # BNPR_PLAN.md §5.4: the project this bridge owns, when it publishes one.
+        project = inst.meta.get("project") if isinstance(inst.meta, dict) else None
+        if isinstance(project, dict) and project.get("path"):
+            entry["project"] = dict(project)
         if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
             entry["sticky"] = True
         source_dir = _instance_source_dir(inst)

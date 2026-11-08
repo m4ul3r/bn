@@ -35,6 +35,8 @@ EXPECTED_READ = {
     # Project associations update only the private registry payload, which
     # enumerates open targets; this remains a read of BN state.
     "associate_project_roots",
+    # BNPR_PLAN.md §5.2: project listings read BN's project metadata only.
+    "project_info", "project_files",
 }
 EXPECTED_WRITE = {
     # True short writers: gate + exclusive target lock for the whole op.
@@ -47,6 +49,11 @@ EXPECTED_WRITE = {
     # serializes writers for the whole op, while the exclusive target lock covers
     # only the BN-mutating/snapshotting phases, leaving the post-apply reanalysis
     # readable), exactly like "refresh"/"load_binary" below.
+    # BNPR_PLAN.md §5.2: project open/close and metadata mutations are
+    # exclusive -- `create_file`/`delete_file` must not race a read of the
+    # file list, and open/close swap the handle every project op reads.
+    "project_open", "project_close", "project_import", "project_export",
+    "project_delete",
 }
 # Ops that are registered lock="none" and therefore belong to NEITHER derived
 # set. This is the test-side pin for them; the registry stays the single source
@@ -64,6 +71,9 @@ EXPECTED_SELF_MANAGED = {
     # #993 item 3: holds the write gate across its read-locked plan and the
     # bridge._mutation() that applies it.
     "class_apply_types",
+    # BNPR_PLAN.md §5.2: `project_load` self-manages like `load_binary` so a
+    # multi-minute analysis never holds the dispatcher lock.
+    "project_load",
 }
 
 

@@ -1512,7 +1512,167 @@ def _render_save_text(value: Any) -> str:
             line += ("\nnote: this cache entry is restored by default only for "
                      f"{' or '.join(owners) or 'nobody'}; any other load of these "
                      "bytes opens the raw file and prints the `bn load` that restores it")
+    if value.get("project_file_id"):
+        # BNPR_PLAN.md §5.6: a project-backed target saves into the project,
+        # never to a path of the caller's choosing; say which file and whether
+        # this save created the database or snapshotted an existing one.
+        line += (f"\nproject file: {value.get('project_path', '<unknown>')} "
+                 f"({value.get('mode', '<unknown>')})")
     return line
+
+
+def _project_file_kind(row: dict[str, Any]) -> str:
+    return "bndb" if _flag_field(row, "is_database") else "raw"
+
+
+def _render_project_open_targets(value: Any) -> list[str]:
+    rows = _field_list(value, "open_targets")
+    if not rows:
+        return []
+    lines = ["", "open targets:"]
+    for row in rows:
+        if not isinstance(row, dict):
+            lines.append(f"- {_render_fallback_text(row)}")
+            continue
+        lines.append(
+            f"- {row.get('project_path', '<unknown>')}  target={row.get('target_id', '<unknown>')}"
+            f"  view={row.get('view_id', '<unknown>')}  file={str(row.get('project_file_id', ''))[:8]}"
+        )
+    return lines
+
+
+@_discloses
+def _render_project_attach_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return (f"attached to instance {value.get('instance_id', '<unknown>')}"
+            f"\n\tproject: {value.get('path', '<unknown>')}")
+
+
+@_discloses
+def _render_project_info_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    head = f"project: {value.get('name', '<unknown>')}"
+    if value.get("opened") is False:
+        head += "  [already open]"
+    lines = [head]
+    details = [
+        ("instance", value.get("instance")),
+        ("path", value.get("path")),
+        ("id", value.get("id")),
+        ("description", value.get("description")),
+        ("files", value.get("file_count")),
+        ("folders", value.get("folder_count")),
+    ]
+    for key, item in details:
+        if item not in (None, ""):
+            lines.append(f"\t{key}: {item}")
+    lines.extend(_render_project_open_targets(value))
+    return "\n".join(lines)
+
+
+def _project_file_line(row: dict[str, Any]) -> str:
+    size = row.get("size")
+    size_text = str(size) if isinstance(size, int) and not isinstance(size, bool) else "-"
+    line = (f"{str(row.get('id', ''))[:8]:<8}  {_project_file_kind(row):<4}  {size_text:>10}  "
+            f"{row.get('path', '<unknown>')}")
+    open_target = row.get("open_target_id")
+    if open_target:
+        # The selector `-t` accepts is the path-in-project without its leading
+        # slash (BNPR_PLAN.md §5.3).
+        selector = str(row.get("path", "")).lstrip("/") or str(open_target)
+        line += f"  [open as -t {selector}]"
+    sibling = row.get("sibling_database_id")
+    if sibling and not _flag_field(row, "is_database"):
+        line += f"  sibling db: {str(sibling)[:8]}"
+    if _flag_field(row, "exists_on_disk") is False:
+        line += "  [missing on disk]"
+    return line
+
+
+@_discloses
+def _render_project_file_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return "imported: " + _project_file_line(value)
+
+
+@_discloses
+def _render_project_files_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    files = _field_list(value, "files")
+    folders = _field_list(value, "folders")
+    if not files and not folders:
+        return _empty_result("project files")
+    lines = []
+    for row in files:
+        lines.append(_project_file_line(row) if isinstance(row, dict) else _render_fallback_text(row))
+    if folders:
+        if lines:
+            lines.append("")
+        lines.append("folders:")
+        for folder in folders:
+            if isinstance(folder, dict):
+                lines.append(f"- {folder.get('path', '<unknown>')}  ({str(folder.get('id', ''))[:8]})")
+            else:
+                lines.append(f"- {_render_fallback_text(folder)}")
+    return "\n".join(lines)
+
+
+@_discloses
+def _render_project_load_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    text = _render_load_text(value)
+    project_path = value.get("project_path")
+    if project_path or value.get("project_file_id"):
+        text += (f"\nProject file: {project_path or '<unknown>'} "
+                 f"({value.get('project_file_id', '<unknown>')})")
+    # `substituted_from` is already explained by the bridge's own note in
+    # `notes` (which `_render_load_text` prints); no second line for it.
+    return text
+
+
+@_discloses
+def _render_project_export_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return (f"exported: {value.get('dest', '<unknown>')}"
+            f"\n\tproject file: {value.get('project_file_id', '<unknown>')}")
+
+
+@_discloses
+def _render_project_delete_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"deleted: {value.get('project_file_id', '<unknown>')}"
+
+
+@_discloses
+def _render_project_close_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [f"closed project: {value.get('path', '<unknown>')}"]
+    closed = _field_list(value, "targets_closed")
+    if not closed:
+        lines.append(_empty_result("targets closed"))
+        return "\n".join(lines)
+    lines.append("targets closed:")
+    unsaved_any = False
+    for row in closed:
+        if not isinstance(row, dict):
+            lines.append(f"- {_render_fallback_text(row)}")
+            continue
+        unsaved = row.get("unsaved") is True
+        unsaved_any = unsaved_any or unsaved
+        marker = "  [unsaved changes discarded]" if unsaved else ""
+        lines.append(f"- {row.get('path', '<unknown>')}{marker}")
+    if unsaved_any:
+        lines.append("")
+        lines.append("warning: unsaved mutations were discarded (--force).")
+    return "\n".join(lines)
 
 
 @_discloses
@@ -1720,6 +1880,10 @@ def _render_session_list_text(value: Any) -> str:
             parts.append(f"rss={rss}MB")
         if item.get("started_at"):
             parts.append(f"started={item['started_at']}")
+        # BNPR_PLAN.md §5.6: the project this bridge owns, when it publishes one.
+        project = _field_dict(item, "project")
+        if project and project.get("name"):
+            parts.append(f"project={project['name']}")
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
@@ -1836,6 +2000,9 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         # copies exported from it -- which are never where it saves or
         # restarts from.
         ("database", value.get("database_path")),
+        # BNPR_PLAN.md §5.6: the path-in-project of a project-backed target;
+        # absent (empty) on a standalone target, so the row drops out.
+        ("project", value.get("project_path")),
         ("exported to", ", ".join(str(p) for p in _field_list(value, "exports"))),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),

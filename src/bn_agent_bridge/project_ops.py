@@ -227,25 +227,33 @@ class ProjectManager:
             rows.append(f"  ... {len(files) - _LISTING_CAP} more")
         return rows
 
-    def sibling_database(self, pf: Any) -> Any | None:
+    def sibling_index(self, files: list[Any]) -> dict[str, list[Any]]:
+        """path-in-project -> the files AT that path, over *files* (one pass).
+        `sibling_database` answers for one file; a listing of N files must not
+        ask BN for N folder listings (O(N^2) FFI under the read lock)."""
+        index: dict[str, list[Any]] = {}
+        for pf in files:
+            index.setdefault(self.path_in_project(pf), []).append(pf)
+        return index
+
+    def sibling_database(self, pf: Any, index: dict[str, list[Any]] | None = None) -> Any | None:
         """The `<name>.bndb` project file in *pf*'s folder, if any: the project
         analogue of the adjacent-`.bndb` preference (#717). None for a file that
-        is itself a `.bndb`."""
+        is itself a `.bndb`, and None when two siblings share that name (F9:
+        BN allows the duplicate; a save must not pick one at random)."""
         name = str(pf.name)
         if name.endswith(".bndb"):
             return None
-        wanted = name + ".bndb"
-        project = self.require().project
-        try:
-            siblings = project.get_files_in_folder(getattr(pf, "folder", None))
-        except Exception:  # noqa: BLE001 - fall back to the full list
-            siblings = [
-                f
-                for f in project.files
-                if self.folder_path(getattr(f, "folder", None))
-                == self.folder_path(getattr(pf, "folder", None))
-            ]
-        matches = [f for f in siblings if str(f.name) == wanted]
+        wanted_path = self.path_in_project(pf) + ".bndb"
+        if index is not None:
+            matches = index.get(wanted_path, [])
+        else:
+            project = self.require().project
+            try:
+                siblings = project.get_files_in_folder(getattr(pf, "folder", None))
+            except Exception:  # noqa: BLE001 - fall back to the full list
+                siblings = list(project.files)
+            matches = [f for f in siblings if self.path_in_project(f) == wanted_path]
         return matches[0] if len(matches) == 1 else None
 
     def ensure_folder(self, path: str | None) -> Any | None:
@@ -272,9 +280,12 @@ class ProjectManager:
     # -- rows --------------------------------------------------------------
 
     def file_row(
-        self, pf: Any, open_targets: dict[str, str] | None = None
+        self, pf: Any, open_targets: dict[str, str] | None = None,
+        index: dict[str, list[Any]] | None = None,
     ) -> dict[str, Any]:
-        """§5.2 file row. *open_targets* maps project_file_id -> target_id."""
+        """§5.2 file row. *open_targets* maps project_file_id -> target_id;
+        *index* is `sibling_index()` over the listing being built, so one row
+        costs one path lookup rather than a folder listing."""
         blob = str(getattr(pf, "path_on_disk", "") or "")
         exists = bool(getattr(pf, "exists_on_disk", False))
         size: int | None = None
@@ -286,7 +297,7 @@ class ProjectManager:
                     is_database = fh.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
             except OSError:
                 size = None
-        sibling = self.sibling_database(pf)
+        sibling = self.sibling_database(pf, index)
         return {
             "id": str(pf.id),
             "name": str(pf.name),
@@ -466,8 +477,10 @@ def project_files(
         str(row["project_file_id"]): str(row.get("target_id") or "")
         for row in _open_project_targets(bridge)
     }
+    files = list(state.project.files)
+    index = manager.sibling_index(files)
     rows: list[dict[str, Any]] = []
-    for pf in state.project.files:
+    for pf in files:
         here = manager.folder_path(getattr(pf, "folder", None))
         if wanted and not (
             here == wanted or (recursive and here.startswith(wanted + "/"))
@@ -475,7 +488,7 @@ def project_files(
             continue
         if not wanted and not recursive and here:
             continue
-        rows.append(manager.file_row(pf, open_targets))
+        rows.append(manager.file_row(pf, open_targets, index))
     rows.sort(key=lambda r: r["path"])
     folders = sorted(
         (

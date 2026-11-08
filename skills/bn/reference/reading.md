@@ -84,6 +84,32 @@ the destination set does not replace a determined instruction value or change
 assignment-source selection.
 
 
+## Project commands
+
+Manage files in a Binary Ninja project (`.bnpr`, Commercial/Ultimate only):
+
+```bash
+bn project info
+bn project files [--folder P] [--flat]
+bn project load <selector> [--no-bndb] [--quick]
+bn project import <path> [--folder P] [--name N] [--description D]
+bn project export <selector> <dest>
+bn project delete <selector>
+bn project close [--force]
+```
+
+| command | behaviour |
+|---------|-----------|
+| `bn project open <path.bnpr> [--instance-id ID]` | open or attach to a project; if running, pin that instance; else spawn a bridge and pin it |
+| `bn project attach <path.bnpr>` | pin only; error if no running bridge owns the project |
+| `bn project info` | project name, path, id, file/folder counts, open targets |
+| `bn project files [--folder P] [--flat]` | list files and folders; `--folder` filters by path, `--flat` omits subfolders |
+| `bn project load <selector> [--no-bndb] [--quick]` | load a file by path-in-project, id, id-prefix, or name; `--no-bndb` loads the raw file not its `.bndb` sidecar; `--quick` skips analysis |
+| `bn project import <path> [--folder P] [--name N] [--description D]` | import a file into the project |
+| `bn project export <selector> <dest>` | export a file to `dest` |
+| `bn project delete <selector>` | delete a file from the project |
+| `bn project close [--force]` | close the project; `--force` discards unsaved targets |
+
 Notes:
 
 - `function search` is a case-insensitive substring search over the demangled display name. Use `--exact` for a known API, `--word` for an identifier token, or an anchored `--regex` for a family. A regex-shaped zero-hit literal query may be retried as a regex; `regex_fallback` discloses that choice. Confirm a source or sink against the import and actual call target, not its name alone.

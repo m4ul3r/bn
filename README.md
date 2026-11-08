@@ -242,6 +242,9 @@ wait and retry (or resume an intentionally stopped bridge) rather than starting
 a duplicate. Neither outcome establishes that the instance is absent.
 Complete-command reconstruction is limited to the top-level, close/target-close
 and batched-decompile text paths described above.
+### Projects (.bnpr)
+
+Binary Ninja projects (`.bnpr`) let several agents share and analyze the same project's databases. Each agent routes through a single bridge instance that owns the project (opened with `bn project open`). Inside the project, select files to load with `bn project load <selector>`, view with `bn project files`, and manage with the project command group below. After loading a file, use `bn save` to create its first database; subsequent saves snapshot it. Export with `bn project export` or import new files with `bn project import`. Two bridges must never open the same `.bndb`; projects are Commercial/Ultimate only.
 
 ## Output Behavior
 
@@ -334,6 +337,24 @@ Each callsite row also includes:
 - `pre_branch_condition`: the nearest enclosing pre-call HLIL condition when it can be recovered confidently, otherwise `null`
 
 `hlil_statement` is intentionally local-or-null. If the best available HLIL mapping expands to a broad whole-function or multi-statement blob, `bn callsites` suppresses it instead of returning noisy context.
+
+## Project Commands
+
+Manage and load files from Binary Ninja projects:
+
+```bash
+bn project open /path/to/project.bnpr
+bn project attach /path/to/project.bnpr   # from another checkout: pin to the bridge that already owns it
+bn project info
+bn project files
+bn project load app.bndb
+bn project import /path/to/binary [--folder fw] [--name app]
+bn project export app.bndb /tmp/app.bndb
+bn project delete app.bndb
+bn project close
+```
+
+`bn project open` pins this checkout (the pin is per git root, like `bn instance use`) to the bridge instance that owns the project, attaching to an existing owner when one is running; another checkout joins with `bn project attach`. Inside a project, select a file with `bn project load <selector>`, which accepts the file's path-in-project, id (or an 8+ character id prefix), or unique name; once loaded it is an ordinary target, selected with `-t <path-in-project>` (leading `/` optional), its id, or its file name. `bn save -t <selector>` writes the first database as `<name>.bndb` beside the raw file inside the project; later saves snapshot it; `bn save` takes no output path for a project target. Use `bn project export` to copy files out, `bn project import` to add new files, and `bn project delete` to remove them. `bn project close` closes the project's targets and the project when none has unsaved changes (`--force` discards them).
 
 ## Bundles And Python
 

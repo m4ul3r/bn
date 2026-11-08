@@ -81,6 +81,8 @@ REQUIRED_INDEX_GROUPS = {
 # group, which is what makes the group an exemption rather than a free pass.
 INDEX_EXEMPT_STICKY = frozenset({
     "instance use", "instance clear", "target use", "target clear",
+    # BNPR_PLAN.md §5.6: both pin the bridge that owns a project.
+    "project open", "project attach",
 })
 
 # A true ALIAS: the same registered handler under a second path, so advertising
@@ -960,7 +962,7 @@ def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
 # stopped matching disappeared unnoticed. `_INDEX_LINE` refusing what it cannot
 # read covers the other half -- nothing silently leaves the sweep.
 EXPECTED_INDEX_GROUPS = frozenset({"Read", "Mutate", "Discover", "Session", "Tooling",
-                                   "Escape hatch"})
+                                   "Escape hatch", "Projects"})
 
 
 def _index_lines() -> list[str]:
