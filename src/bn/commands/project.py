@@ -178,8 +178,14 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
         project_path, exists = fallback, False
     # An explicit root that matches no detector is still usable as a project
     # root; its loader is unknown, so library sync has nothing to scan.
-    lookup = rootfs_layout.lookup_paths(info.root, info.platform)
-    candidates, notes = rootfs_layout.scan_libraries(info.root, lookup)
+    # One budget across both calls, as the sync has: loader diagnostics
+    # (`skipped loader path containing NUL`) land in its `notes`, and a per-call
+    # budget dropped them so the dry run showed `notes: []` for a root the sync
+    # flags (#1073 item 4).
+    with rootfs_layout.discovery_budget() as budget:
+        lookup = rootfs_layout.lookup_paths(info.root, info.platform)
+        candidates, notes = rootfs_layout.scan_libraries(info.root, lookup)
+        notes = [*notes, *budget.notes]
     return {
         "root": info.root,
         "platform": info.platform,

@@ -1645,12 +1645,18 @@ def _render_project_load_text(value: Any) -> str:
     # `notes` (which `_render_load_text` prints); no second line for it.
     if _field_present(value, "link"):
         link = _field_dict(value, "link")
-        text += (f"\nlinked: {_project_count_text(link, 'linked')} "
-                 f"({_project_rows_count(link, 'unresolved')} unresolved)")
         status = _text_value(link, "status")
         success = _flag_field(link, "success")
-        if status in FAILED_MUTATION_STATUSES or success is False:
+        failed = status in FAILED_MUTATION_STATUSES or success is False
+        if failed:
+            # A failed link carries no counters; `?` would claim an unreadable
+            # count where there is none to read (#1073 item 3). A SUCCESSFUL
+            # link lacking them still states `?` through the measured helpers.
+            text += "\nlinked: n/a (link failed)"
             text += f"\nauto-link FAILED: {_escape_control_chars(status or '<unknown>')}"
+        else:
+            text += (f"\nlinked: {_project_count_text(link, 'linked')} "
+                     f"({_project_rows_count(link, 'unresolved')} unresolved)")
         message = _project_link_message(link)
         if message:
             text += f"\nauto-link note: {_escape_control_chars(message)}"
