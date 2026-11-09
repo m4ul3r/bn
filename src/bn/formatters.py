@@ -1654,6 +1654,8 @@ def _render_project_load_text(value: Any) -> str:
         message = _project_link_message(link)
         if message:
             text += f"\nauto-link note: {_escape_control_chars(message)}"
+        for line in _rebind_lines(link, changed_only=True) + _refused_library_lines(link):
+            text += "\n" + line.strip()
     return text
 
 
@@ -1826,11 +1828,14 @@ def _project_link_lines(link: dict[str, Any]) -> list[str]:
         elif resolved is None:
             lines.append(f"  {name:<24} -> (resolution unknown)")
         else:
-            lines.append(f"  {name:<24} -> (not in project)")
+            reason = _text_value(row, "reason")
+            lines.append(f"  {name:<24} -> (not in project)" if not reason
+                         else f"  {name:<24} -> (unresolved: {_escape_control_chars(reason)})")
     lines.append(f"linked {_project_count_text(link, 'linked')}  "
                  f"relinked {_project_count_text(link, 'relinked')}  "
                  f"rebound {_project_count_text(link, 'rebound')}  "
                  f"unresolved {_project_rows_count(link, 'unresolved')}")
+    lines.extend(_rebind_lines(link))
     for row in _row_list(link, "unresolved"):
         lines.append(f"  {_escape_control_chars(_text_value(row, 'symbol') or '<unknown>')}  "
                      f"{_escape_control_chars(_text_value(row, 'reason') or '')}".rstrip())
@@ -1870,11 +1875,62 @@ def _render_project_export_text(value: Any) -> str:
             f"\n\tproject file: {_escape_control_chars(value.get('project_file_id', '<unknown>'))}")
 
 
+def _rebind_lines(link: Any, *, changed_only: bool = False) -> list[str]:
+    """One `rebound: <name> <old id> -> <new id>` line per provider change in a
+    link result (#1078): the count alone hid WHICH file an import was moved
+    onto. *changed_only* skips first bindings (no previous provider), which is
+    what a restart replay reports -- a replayed database that comes back bound
+    as it was saved prints nothing."""
+    lines = []
+    for row in _row_list(link, "rebinds"):
+        from_id = _text_value(row, "from_id")
+        if changed_only and not from_id:
+            continue
+        name = _escape_control_chars(_text_value(row, "name") or "<unknown>")
+        to_id = _escape_control_chars(_text_value(row, "to_id") or "<unknown>")
+        to_path = _text_value(row, "to_path")
+        where = f" ({_escape_control_chars(to_path)})" if to_path else ""
+        lines.append(
+            f"  rebound: {name} {_escape_control_chars(from_id) if from_id else '(none)'} "
+            f"-> {to_id}{where}")
+    return lines
+
+
+def _refused_library_lines(link: Any) -> list[str]:
+    """One `unresolved: <name> <reason>` line per NEEDED library the resolver
+    REFUSED to bind although an inventory row matched (#1078) -- a provider
+    gone and only a different-content alias left. Printed where the libraries
+    table is not: a load's and a restart replay's summary."""
+    lines = []
+    for row in _row_list(link, "libraries"):
+        reason = _text_value(row, "reason")
+        if _flag_field(row, "resolved") is False and reason:
+            lines.append(
+                f"  unresolved: {_escape_control_chars(_text_value(row, 'name') or '<unknown>')}"
+                f"  {_escape_control_chars(reason)}")
+    return lines
+
+
 @_discloses
 def _render_project_delete_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _escape_control_chars(_render_fallback_text(value))
-    return f"deleted: {_escape_control_chars(value.get('project_file_id', '<unknown>'))}"
+    lines = [f"deleted: {_escape_control_chars(value.get('project_file_id', '<unknown>'))}"]
+    dependents = _row_list(value, "dependents")
+    if dependents:
+        # #1078: a forced delete of a linked provider names what it orphaned.
+        lines.append(
+            f"warning: this file was the linked provider of {len(dependents)} target(s); "
+            "their imports need relinking (`bn project link -t <selector>`):")
+        for row in dependents:
+            where = (f"open as {_escape_control_chars(_text_value(row, 'selector') or '?')}"
+                     if _flag_field(row, "open") else "saved database")
+            names = ", ".join(
+                _escape_control_chars(str(n)) for n in _field_list(row, "libraries"))
+            lines.append(
+                f"  {_escape_control_chars(_text_value(row, 'project_path') or '<unknown>')}"
+                f"  ({where}; {names})")
+    return "\n".join(lines)
 
 
 @_discloses
@@ -2085,6 +2141,13 @@ def _render_session_start_text(value: Any) -> str:
                     # under later paths; an older bridge without `target` keeps
                     # the full list.
                     lines.extend(_loaded_target_lines(item))
+                    # #1078: a replayed project target whose auto-link moved
+                    # an import onto a DIFFERENT provider says which; a
+                    # count buried in `link` is not disclosure.
+                    if _field_present(item, "link"):
+                        link = _field_dict(item, "link")
+                        lines.extend(_rebind_lines(link, changed_only=True))
+                        lines.extend(_refused_library_lines(link))
                 for note in _field_list(item, "notes"):
                     lines.append(f"  note: {note}")
             else:

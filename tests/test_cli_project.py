@@ -291,6 +291,48 @@ def test_project_delete_params(fake_transport, monkeypatch, capsys):
     assert FILE_ID_A in capsys.readouterr().out
 
 
+def test_project_delete_force_forwards_and_warns_about_dependents_1078(fake_transport, monkeypatch, capsys):
+    # #1078: `--force` is the only way past the linked-provider refusal; the
+    # forced delete names what it orphaned, in text and JSON.
+    _one_instance(monkeypatch)
+    dependents = [
+        {"project_file_id": "db-1", "project_path": "/usr/bin/player.bndb",
+         "libraries": ["libcodec.so.1.2"], "open": False, "selector": None},
+        {"project_file_id": "raw-2", "project_path": "/usr/bin/viewer",
+         "libraries": ["libcodec.so.1.2"], "open": True, "selector": "viewer"},
+    ]
+    calls = fake_transport({"project_delete": {
+        "ok": True,
+        "result": {"deleted": True, "project_file_id": FILE_ID_A,
+                   "project_path": "/opt/vendor/lib/libcodec.so.1.2", "dependents": dependents}}})
+
+    assert bn.cli.main(["project", "delete", "opt/vendor/lib/libcodec.so.1.2", "--force"]) == 0
+    assert calls[0]["params"] == {"selector": "opt/vendor/lib/libcodec.so.1.2", "force": True}
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"deleted: {FILE_ID_A}"
+    assert out[1].startswith("warning: this file was the linked provider of 2 target(s)")
+    assert out[2] == "  /usr/bin/player.bndb  (saved database; libcodec.so.1.2)"
+    assert out[3] == "  /usr/bin/viewer  (open as viewer; libcodec.so.1.2)"
+
+    assert bn.cli.main(["project", "delete", FILE_ID_A, "--force", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["dependents"] == dependents
+
+
+def test_project_delete_refusal_for_a_linked_provider_is_exit_2_1078(monkeypatch, capsys):
+    _one_instance(monkeypatch)
+
+    def refuse(op, **kwargs):
+        raise bn.cli.BridgeError(
+            "project file /opt/vendor/lib/libcodec.so.1.2 (id) is the linked provider of "
+            "1 target(s): /usr/bin/player.bndb (saved database; libcodec.so.1.2). "
+            "Deleting it leaves their imports without a provider; pass --force to delete anyway")
+
+    monkeypatch.setattr(bn.cli, "send_request", refuse)
+    assert bn.cli.main(["project", "delete", "opt/vendor/lib/libcodec.so.1.2"]) == 2
+    err = capsys.readouterr().err
+    assert "linked provider of 1 target(s)" in err and "/usr/bin/player.bndb" in err
+
+
 def test_project_close_params_and_text(fake_transport, monkeypatch, capsys):
     _one_instance(monkeypatch)
     calls = fake_transport({"project_close": {"ok": True, "result": {

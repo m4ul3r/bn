@@ -37,6 +37,12 @@ _LISTING_CAP = 50
 # lookup paths, imported libraries) that `project_sync_libs` writes and
 # `project_link` reads.
 ROOTFS_METADATA_KEY = "bn.rootfs"
+# Project metadata key recording, per linked target, which project file each
+# of its NEEDED libraries is bound to (#1078). Written by `project_link` and
+# the load-time auto-link; read by `project delete` to name the targets a
+# provider serves, saved databases included.
+LINKS_METADATA_KEY = "bn.links"
+LINKS_METADATA_VERSION = 1
 # Append-only finding revisions are managed by project_findings, never through
 # ordinary file import/delete or BinaryView save operations.
 FINDINGS_FOLDER = ".bn-findings"
@@ -345,9 +351,27 @@ class ProjectManager:
     def get_rootfs(self) -> dict[str, Any] | None:
         """The `bn.rootfs` project metadata (a JSON object), or None when the
         project records no rootfs or the stored value is unreadable."""
+        return self._get_json_metadata(ROOTFS_METADATA_KEY)
+
+    def set_rootfs(self, value: dict[str, Any]) -> None:
+        """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
+        self._set_json_metadata(ROOTFS_METADATA_KEY, value, "rootfs")
+
+    def get_links(self) -> dict[str, Any]:
+        """The `bn.links` record: which project file each linked target's
+        NEEDED libraries are bound to (#1078). Empty when nothing was recorded."""
+        record = self._get_json_metadata(LINKS_METADATA_KEY)
+        if record is None or not isinstance(record.get("targets"), dict):
+            return {"version": LINKS_METADATA_VERSION, "targets": {}}
+        return record
+
+    def set_links(self, value: dict[str, Any]) -> None:
+        self._set_json_metadata(LINKS_METADATA_KEY, value, "link")
+
+    def _get_json_metadata(self, key: str) -> dict[str, Any] | None:
         project = self.require().project
         try:
-            raw = project.query_metadata(ROOTFS_METADATA_KEY)
+            raw = project.query_metadata(key)
         except Exception:  # noqa: BLE001 - BN raises for a missing key
             return None
         if isinstance(raw, (bytes, bytearray)):
@@ -359,17 +383,16 @@ class ProjectManager:
                 return None
         return raw if isinstance(raw, dict) else None
 
-    def set_rootfs(self, value: dict[str, Any]) -> None:
-        """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
+    def _set_json_metadata(self, key: str, value: dict[str, Any], what: str) -> None:
         project = self.require().project
         try:
-            if project.store_metadata(ROOTFS_METADATA_KEY, json.dumps(value, sort_keys=True)) is False:
+            if project.store_metadata(key, json.dumps(value, sort_keys=True)) is False:
                 raise RuntimeError("Binary Ninja returned False")
-            if self.get_rootfs() != value:
+            if self._get_json_metadata(key) != value:
                 raise RuntimeError("stored metadata did not match the requested value")
         except Exception as exc:  # noqa: BLE001 - ProjectException
             raise RuntimeError(
-                f"Binary Ninja could not store the rootfs metadata in the project: {exc}"
+                f"Binary Ninja could not store the {what} metadata in the project: {exc}"
             ) from exc
 
     # -- file lookups ------------------------------------------------------
@@ -838,15 +861,14 @@ def project_export(bridge: Any, selector: Any, dest: Any) -> dict[str, Any]:
     }
 
 
-def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
+def project_delete(bridge: Any, selector: Any, force: Any = False) -> dict[str, Any]:
     manager = bridge.projects
     state = manager.require()
     pf = manager.resolve_file(selector)
     _refuse_finding_path(manager.path_in_project(pf))
+    open_targets = _open_project_targets(bridge)
     open_rows = [
-        row
-        for row in _open_project_targets(bridge)
-        if row.get("project_file_id") == str(pf.id)
+        row for row in open_targets if row.get("project_file_id") == str(pf.id)
     ]
     if open_rows:
         sel = open_rows[0].get("selector") or open_rows[0].get("target_id")
@@ -856,14 +878,78 @@ def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
         )
     path = manager.path_in_project(pf)
     file_id = str(pf.id)
+    # #1078: a file some target's imports are bound to. Deleting it silently
+    # left those links dangling and the next link (or restart replay) free to
+    # rebind the name onto whatever alias matched. Refuse unless forced; the
+    # targets are named either way.
+    dependents = linked_dependents(manager, file_id, open_targets)
+    if dependents and not bool(force):
+        raise RuntimeError(
+            f"project file {path} ({file_id}) is the linked provider of "
+            f"{len(dependents)} target(s): {_dependents_text(dependents)}. "
+            "Deleting it leaves their imports without a provider; pass --force to "
+            "delete anyway, then import the right file and `bn project link -t <selector>`."
+        )
     try:
         ok = state.project.delete_file(pf)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Binary Ninja could not delete {path}: {exc}") from exc
     if ok is False:
         raise RuntimeError(f"Binary Ninja refused to delete {path}")
+    # The deleted file's own link record (when it was a linked target) is
+    # stale; records that POINT at it stay, since the dangling binding they
+    # describe is still what those databases hold.
+    record = manager.get_links()
+    if file_id in record.get("targets", {}):
+        try:
+            del record["targets"][file_id]
+            manager.set_links(record)
+        except Exception:  # noqa: BLE001 - a stale record never fails a delete
+            pass
     bridge._write_registry()
-    return {"deleted": True, "project_file_id": file_id, "project_path": path}
+    result: dict[str, Any] = {"deleted": True, "project_file_id": file_id, "project_path": path}
+    if dependents:
+        result["dependents"] = dependents
+    return result
+
+
+def linked_dependents(
+    manager: Any, file_id: str, open_targets: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """The targets whose recorded links name *file_id* as a provider: one row
+    per target with its project path, the NEEDED names it provides, and whether
+    that target is open now or a saved database (#1078). Ordered by path."""
+    open_ids = {
+        str(row.get("project_file_id")): row for row in (open_targets or [])
+        if row.get("project_file_id")
+    }
+    out: list[dict[str, Any]] = []
+    for target_id, entry in manager.get_links().get("targets", {}).items():
+        providers = entry.get("providers") if isinstance(entry, dict) else None
+        if not isinstance(providers, dict):
+            continue
+        names = sorted(name for name, provider in providers.items() if str(provider) == file_id)
+        if not names:
+            continue
+        open_row = open_ids.get(str(target_id))
+        out.append({
+            "project_file_id": str(target_id),
+            "project_path": str(entry.get("project_path") or ""),
+            "libraries": names,
+            "open": open_row is not None,
+            "selector": (open_row.get("selector") or open_row.get("target_id")) if open_row else None,
+        })
+    out.sort(key=lambda row: (row["project_path"], row["project_file_id"]))
+    return out
+
+
+def _dependents_text(dependents: list[dict[str, Any]]) -> str:
+    parts = []
+    for row in dependents:
+        where = f"open as {row['selector']}" if row["open"] else "saved database"
+        parts.append(f"{row['project_path'] or row['project_file_id']} ({where}; "
+                     f"{', '.join(row['libraries'])})")
+    return "; ".join(parts)
 
 
 def _other_database_writers(bridge: Any, bv: Any, blob: str) -> list[str]:
@@ -946,6 +1032,18 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     bridge.targets.clear_dirty(bv)
     bridge.targets.note_database(bv, blob)
     bridge.targets.note_project_database(bv, new_id, new_path)
+    # #1078: the target's link record moves with its identity -- the links
+    # now live in the database file, and `project delete` reports dependents
+    # by that file. Best-effort: a metadata hiccup never fails a save.
+    try:
+        record = bridge.projects.get_links()
+        entry = record.get("targets", {}).pop(str(pf.id), None)
+        if entry is not None:
+            entry["project_path"] = new_path
+            record["targets"][new_id] = entry
+            bridge.projects.set_links(record)
+    except Exception:  # noqa: BLE001
+        pass
     bridge._write_registry()
     return {
         "ok": True,

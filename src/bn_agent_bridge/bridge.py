@@ -5952,7 +5952,7 @@ def _bind_project_export(bridge, params, target):
 
 @op("project_delete", lock="write")
 def _bind_project_delete(bridge, params, target):
-    return project_ops.project_delete(bridge, params.get("selector"))
+    return project_ops.project_delete(bridge, params.get("selector"), params.get("force", False))
 
 
 # Findings live in the project, not a selected BinaryView. The write gate is

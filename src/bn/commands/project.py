@@ -444,16 +444,23 @@ def _project_export(args: argparse.Namespace) -> int:
     )
 
 
-@command("project", "delete", help="Delete a file from the open project (refused while it is an open target)",
+@command("project", "delete", help="Delete a file from the open project (refused while it is an open target, "
+                                   "or the linked provider of a target unless --force)",
          args=[arg("selector", help="Project file: id, >=8-char id prefix, path-in-project, or "
-                                    "unique file name")])
+                                    "unique file name"),
+               arg("--force", action="store_true",
+                   help="Delete even when open or saved targets have imports linked to this "
+                        "file (they are named in the output and will need relinking)")])
 def _project_delete(args: argparse.Namespace) -> int:
     if not str(args.selector).strip():
         raise BridgeError("selector is empty: pass the project file to delete")
+    params: dict[str, Any] = {"selector": args.selector}
+    if getattr(args, "force", False):
+        params["force"] = True
     return _call(
         args,
         "project_delete",
-        {"selector": args.selector},
+        params,
         require_target=False,
         text_renderer=_render_project_delete_text,
         stem="project-delete",
