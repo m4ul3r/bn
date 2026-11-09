@@ -31,8 +31,13 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 # enough that 8 characters are unique in any realistic project, and a shorter
 # prefix invites `-t 7` style accidents).
 MIN_ID_PREFIX = 8
-# Cap on the "did you mean" listing appended to selector errors.
+# Cap on the listing appended to an AMBIGUOUS selector error (the matches
+# themselves) ...
 _LISTING_CAP = 50
+# ... and on the "nearest by file name" suggestions a MISS gets (#1077): a
+# miss used to dump up to _LISTING_CAP rows in storage order, findings ledger
+# records included, which told the reader nothing about what they mistyped.
+_SUGGESTION_CAP = 5
 # Project metadata key holding the firmware rootfs inventory (root, platform,
 # lookup paths, imported libraries) that `project_sync_libs` writes and
 # `project_link` reads.
@@ -433,14 +438,56 @@ class ProjectManager:
                 return by_prefix[0]
             if len(by_prefix) > 1:
                 raise RuntimeError(self._ambiguous(wanted, by_prefix))
-        raise RuntimeError(
-            "\n".join(
-                [
-                    f"No project file matches {wanted!r}. Project files:",
-                    *self._listing(files),
-                ]
+        raise RuntimeError(self._miss(wanted, files))
+
+    def _miss(self, wanted: str, files: list[Any]) -> str:
+        """The error for a selector naming no file: the files whose NAMES are
+        nearest the selector's last component, at most `_SUGGESTION_CAP`, in a
+        fixed order, and never a findings-ledger record (#1077)."""
+        suggestions = self._nearest_by_name(wanted, files)
+        if not suggestions:
+            return (
+                f"No project file matches {wanted!r}; no project file has a similar "
+                "name. Full listing: `bn project files`."
             )
-        )
+        return "\n".join([
+            f"No project file matches {wanted!r}. Nearest by file name:",
+            *self._listing(suggestions),
+            "Full listing: `bn project files`.",
+        ])
+
+    def _nearest_by_name(self, wanted: str, files: list[Any]) -> list[Any]:
+        """*files* ranked by how closely their name matches the last component
+        of *wanted*, ties by path: the same name (or its `.bndb`-stripped
+        stem), then one a prefix of the other, then a substring, then a
+        `difflib` ratio of 0.6 or better. Ledger records are never offered."""
+        import difflib
+
+        base = wanted.strip().rstrip("/").rsplit("/", 1)[-1].lower()
+        if base.endswith(".bndb"):
+            base = base[: -len(".bndb")]
+        if not base:
+            return []
+        ranked: list[tuple[int, str, Any]] = []
+        for pf in files:
+            path = self.path_in_project(pf)
+            if is_finding_path(path):
+                continue
+            name = str(pf.name).lower()
+            stem = name[: -len(".bndb")] if name.endswith(".bndb") else name
+            if base in (name, stem):
+                rank = 0
+            elif stem.startswith(base) or base.startswith(stem):
+                rank = 1
+            elif base in stem or stem in base:
+                rank = 2
+            elif difflib.SequenceMatcher(None, base, stem).ratio() >= 0.6:
+                rank = 3
+            else:
+                continue
+            ranked.append((rank, path, pf))
+        ranked.sort(key=lambda item: (item[0], item[1], str(item[2].id)))
+        return [pf for _, _, pf in ranked[:_SUGGESTION_CAP]]
 
     def _ambiguous(self, selector: str, matches: list[Any]) -> str:
         return "\n".join(
@@ -766,9 +813,14 @@ def project_files(
     return {"files": rows, "folders": folders}
 
 
-def _refuse_finding_path(path: str) -> None:
+def is_finding_path(path: str) -> bool:
+    """Whether *path* (a path in the project) lies in the findings ledger."""
     components = [part for part in path.split("/") if part]
-    if components and components[0] == FINDINGS_FOLDER:
+    return bool(components) and components[0] == FINDINGS_FOLDER
+
+
+def _refuse_finding_path(path: str) -> None:
+    if is_finding_path(path):
         raise RuntimeError(
             "reserved findings history: use `bn project finding` to append a "
             "revision or review; existing finding records cannot be overwritten or deleted"

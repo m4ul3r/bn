@@ -255,6 +255,140 @@ def test_compute_selectors_disambiguates_two_project_files_with_one_name(world):
         world.targets.resolve("app")
 
 
+# --- #1077: exact project selectors beat weak aliases; no blob-suffix selectors
+
+
+def _blob_named_by_id(world, pf, data=b"\x7fELF"):
+    """Give *pf* the blob path a real `.bnpr` uses: `data/<id[:2]>/<id[2:]>`,
+    so a selector computed from blob path parts would be the id minus its
+    first two characters -- the defect #1077 reports."""
+    file_id = pf.id.replace("-", "")
+    blob = world.root / "data" / file_id[:2] / file_id[2:]
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_bytes(data)
+    pf.path_on_disk = str(blob)
+    return pf
+
+
+def _raw_and_database_open(world):
+    """`/fw/app` (raw, `--no-bndb`) and `/fw/app.bndb` (its database) both
+    open with NO save ledger tying them -- the state after a restart replays
+    the database and the raw file is loaded beside it."""
+    f = world.files
+    _blob_named_by_id(world, f.app)
+    _blob_named_by_id(world, f.app_db, SQLITE_MAGIC + b"\x00" * 8)
+    raw = FakeView(f.app.path_on_disk, f.app)
+    db = FakeView(f.app_db.path_on_disk, f.app_db, has_database=True)
+    rows = _rows(world, raw, db)
+    return raw, db, rows
+
+
+@pytest.mark.parametrize("selector_of", [
+    lambda f: "fw/app",
+    lambda f: "/fw/app",
+    lambda f: f.app.id,
+])
+def test_exact_project_selector_resolves_the_raw_view_beside_its_database_1077(world, selector_of):
+    # Before: the database's `.bndb`-stripped alias (`fw/app`) collided with
+    # the raw file's EXACT path in the project, and `-t fw/app` -- the one
+    # selector that names exactly that file -- was refused as ambiguous.
+    raw, db, _ = _raw_and_database_open(world)
+    assert world.targets.resolve(selector_of(world.files)) is raw
+
+
+@pytest.mark.parametrize("selector", ["app.bndb", "fw/app.bndb", "/fw/app.bndb"])
+def test_database_selectors_still_resolve_the_database_beside_its_raw_file_1077(world, selector):
+    raw, db, _ = _raw_and_database_open(world)
+    assert world.targets.resolve(selector) is db
+
+
+def test_bare_name_stays_ambiguous_between_a_raw_file_and_its_database_1077(world):
+    # `app` is a NAME for the raw file and a stripped alias for the database:
+    # neither is exact, and without a save ledger nothing ranks them.
+    _raw_and_database_open(world)
+    with pytest.raises(RuntimeError, match="Ambiguous target selector: 'app'"):
+        world.targets.resolve("app")
+
+
+def test_two_exact_matches_are_still_ambiguous_1077(world):
+    f = world.files
+    twin = world.project.add_file("app", f.app.folder)
+    first = FakeView(f.app.path_on_disk, f.app)
+    second = FakeView(twin.path_on_disk, twin)
+    _rows(world, first, second)
+    with pytest.raises(RuntimeError, match="Ambiguous target selector: 'fw/app'"):
+        world.targets.resolve("fw/app")
+    assert world.targets.resolve(twin.id) is second
+
+
+def _is_path_suffix_or_full_id(selector: str, row: dict) -> bool:
+    parts = row["project_path"].strip("/").split("/")
+    suffixes = {"/".join(parts[-depth:]) for depth in range(1, len(parts) + 1)}
+    return selector in suffixes or selector == row["project_file_id"] or selector == row["target_id"]
+
+
+def test_target_list_never_advertises_a_blob_suffix_1077(world):
+    # Before: the raw view beside its database fell through every path-in-
+    # project candidate (all "ambiguous" with the database's stripped alias)
+    # to the blob filename -- the project file id minus its first two hex
+    # characters, which is the `data/<xx>/` directory.
+    raw, db, rows = _raw_and_database_open(world)
+    by_file = {r["filename"]: r for r in rows}
+    assert by_file[raw.file.filename]["selector"] == "fw/app"
+    assert by_file[db.file.filename]["selector"] == "app.bndb"
+    for row in rows:
+        assert _is_path_suffix_or_full_id(row["selector"], row), row["selector"]
+        assert world.targets.resolve(row["selector"]) is {
+            raw.file.filename: raw, db.file.filename: db}[row["filename"]]
+
+
+def test_project_target_falls_back_to_the_full_file_id_not_a_blob_part_1077(world):
+    # Two project files at ONE path in the project (BN allows it; ids stay
+    # unique): no path suffix is unique, so the advertised selector is the
+    # full file id, never a suffix of the blob filename.
+    f = world.files
+    twin = world.project.add_file("app", f.app.folder)
+    _blob_named_by_id(world, f.app)
+    _blob_named_by_id(world, twin)
+    first = FakeView(f.app.path_on_disk, f.app)
+    second = FakeView(twin.path_on_disk, twin)
+    rows = _rows(world, first, second)
+    selectors = {r["project_file_id"]: r["selector"] for r in rows}
+    assert selectors == {f.app.id: f.app.id, twin.id: twin.id}
+    for row in rows:
+        assert _is_path_suffix_or_full_id(row["selector"], row)
+        assert world.module._path_components(row["selector"]) != \
+            world.module._path_components(row["filename"])[-1:]
+
+
+def test_pre_save_selector_keeps_resolving_the_database_after_save_and_restart_1077(world):
+    # `loader` before the first save; `loader.bndb` is the database's own
+    # selector after it -- and `loader` / `/loader` stay valid aliases for the
+    # database view, both in the bridge that saved and in the one a restart
+    # replays the database into (no save ledger there).
+    f = world.files
+    bv = FakeView(f.loader.path_on_disk, f.loader)
+    assert _rows(world, bv)[0]["selector"] == "loader"
+    world.targets.mark_dirty(bv)
+    saved = world.instance._save_database("loader")
+    row = world.targets.refresh()[0]
+    assert row["selector"] == "loader.bndb"
+    for alias in ("loader", "/loader", "loader.bndb", saved["project_file_id"]):
+        assert world.targets.resolve(alias) is bv
+
+    # The restart: a fresh manager, the database project file opened as its
+    # own view.
+    db_pf = world.instance.projects.resolve_file(saved["project_file_id"])
+    replayed = FakeView(db_pf.path_on_disk, db_pf, has_database=True)
+    fresh = world.module.TargetManager()
+    world.module._headless_views[:] = []
+    _register_views(world.module, replayed)
+    rows = fresh.refresh()
+    assert rows[0]["selector"] == "loader.bndb"
+    for alias in ("loader", "/loader", "loader.bndb", saved["project_file_id"]):
+        assert fresh.resolve(alias) is replayed
+
+
 # --- save_database dispatch --------------------------------------------------
 
 
