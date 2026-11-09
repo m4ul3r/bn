@@ -730,40 +730,75 @@ def project_open(bridge: Any, path: Any) -> dict[str, Any]:
 
 
 def project_files(
-    bridge: Any, folder: Any = None, recursive: Any = True
+    bridge: Any, folder: Any = None, recursive: Any = True, *,
+    offset: int = 0, limit: int | None = None,
 ) -> dict[str, Any]:
+    """The files under *folder* (the root when None) as a paged `items` list,
+    plus the UNPAGED `folders` side list covering the same scope: the
+    requested folder and, when *recursive*, every folder below it; at the root,
+    every folder, or none when flat. Each folder row counts its direct files
+    (`files`) and, when recursive, its whole subtree (`files_recursive`).
+    Before #1080 `folders` was every folder in the project whatever the
+    filter said, so one requested row came with hundreds of unrelated folders."""
     manager = bridge.projects
     state = manager.require()
     if folder is not None and not isinstance(folder, str):
         raise RuntimeError(
             "project_files: folder must be a path in the project or null"
         )
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise RuntimeError("project_files: offset must be a non-negative integer")
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+        raise RuntimeError("project_files: limit must be a positive integer or null")
     wanted = ("/" + folder.strip("/")) if folder and folder.strip("/") else ""
+
+    def in_scope(path: str) -> bool:
+        if wanted:
+            return path == wanted or (bool(recursive) and path.startswith(wanted + "/"))
+        return bool(recursive) or not path
+
     open_targets = {
         str(row["project_file_id"]): str(row.get("target_id") or "")
         for row in _open_project_targets(bridge)
     }
     files = list(state.project.files)
     index = manager.sibling_index(files)
-    rows: list[dict[str, Any]] = []
+    direct: dict[str, int] = {}
+    selected: list[tuple[str, Any]] = []
     for pf in files:
         here = manager.folder_path(getattr(pf, "folder", None))
-        if wanted and not (
-            here == wanted or (recursive and here.startswith(wanted + "/"))
-        ):
+        direct[here] = direct.get(here, 0) + 1
+        if in_scope(here):
+            selected.append((manager.path_in_project(pf), pf))
+    selected.sort(key=lambda item: item[0])
+    total = len(selected)
+    start = min(offset, total)
+    stop = total if limit is None else min(start + limit, total)
+    # Rows are built for the requested window only: `file_row` stats the blob
+    # and reads its magic, which a 450-file project must not pay per page.
+    rows = [manager.file_row(pf, open_targets, index) for _path, pf in selected[start:stop]]
+    folders: list[dict[str, Any]] = []
+    for f in state.project.folders:
+        path = manager.folder_path(f)
+        if not path or not in_scope(path):
             continue
-        if not wanted and not recursive and here:
-            continue
-        rows.append(manager.file_row(pf, open_targets, index))
-    rows.sort(key=lambda r: r["path"])
-    folders = sorted(
-        (
-            {"id": str(f.id), "path": manager.folder_path(f)}
-            for f in state.project.folders
-        ),
-        key=lambda r: r["path"],
-    )
-    return {"files": rows, "folders": folders}
+        row: dict[str, Any] = {"id": str(f.id), "path": path, "files": direct.get(path, 0)}
+        if recursive:
+            row["files_recursive"] = sum(
+                count for here, count in direct.items()
+                if here == path or here.startswith(path + "/"))
+        folders.append(row)
+    folders.sort(key=lambda r: r["path"])
+    return {
+        "kind": "project_files",
+        "items": rows,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(rows),
+        "has_more": offset + len(rows) < total,
+        "folders": folders,
+    }
 
 
 def _refuse_finding_path(path: str) -> None:

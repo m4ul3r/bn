@@ -26,7 +26,7 @@ For cross-user collaboration, the project and its stable `.bn-bridge.lock` must 
 bn project open /path/to/work.bnpr --instance-id requested-name
 bn project attach /path/to/work.bnpr
 bn project info
-bn project files --folder usr/bin --flat
+bn project files --folder usr/bin --flat [--limit N --offset M]
 bn project load usr/bin/app
 bn -i <owner-instance-id> target list
 bn -i <owner-instance-id> -t <selector-from-target-list> save
@@ -34,7 +34,7 @@ bn -i <owner-instance-id> -t <selector-from-target-list> save
 
 The unqualified project examples assume the owner pin established above; concurrent workers must add `-i <owner-instance-id>`.
 
-- `project info` reports project name, path, ID, file/folder counts, and open targets. `project files` lists project entries; `--folder` filters a path and `--flat` omits subfolders.
+- `project info` reports project name, path, ID, file/folder counts, and open targets. `project files` lists project entries as a paged `items` list (`--limit`/`--offset`, default page 100, the `// showing N of TOTAL` footer when cut); `--folder` limits files and `folders[]` to that folder and its subtree, and `--flat` keeps only the folder's direct files and the folder itself in `folders[]` (none at the root). Each folder row carries `files` (direct) and, unless `--flat`, `files_recursive`; folders are a small side list and are never paged. Text output ends with `N files, M folders`, where N is the whole scope, not the page.
 - `project load`, `project export`, and `project delete` select a project file by full file ID, unique ID prefix of at least eight characters, path-in-project, or unique bare name. These are **project-file selectors**, not `-t` selectors.
 - Loaded target selectors come from `target list`: the shortest unique path-in-project suffix, a full project file ID, path-in-project (with or without leading `/`), or file name. A `.bndb`-stripped name is a weak alias. ID prefixes are **not** a `-t` form. The view's `filename` can be an opaque blob path. Raw `bn load` refuses paths inside a directory containing native `project.bnpm`, including resolved symlinks; use the owner bridge's `project load`, not direct blob paths.
 - `project load` prefers the saved database; `--no-bndb` chooses raw bytes, `--quick` skips analysis, and `--no-link` skips automatic linking. Check `analysis_state` and run `bn refresh` before relying on complete function discovery from a quick load. An auto-link failure retains the loaded target but returns exit 3 and exposes its status/notes in `link` and text output; inspect that target and the linking error rather than assuming the file was not loaded.

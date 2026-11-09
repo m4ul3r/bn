@@ -12,6 +12,8 @@ import pytest
 from _cli_helpers import _fake_bridge_instance  # noqa: F401
 from bn.mutation_statuses import FAILED_MUTATION_STATUSES
 from bn.transport import BridgeError
+# The real project handlers' fixtures, for CLI tests that drive them (#1080).
+from test_project_ops import bnpr, opened, po  # noqa: F401
 
 
 FILE_ID_A = "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b"
@@ -221,13 +223,50 @@ def test_project_info_sends_op(fake_transport, monkeypatch, capsys):
 
 def test_project_files_params_default_and_flat(fake_transport, monkeypatch):
     _one_instance(monkeypatch)
-    calls = fake_transport({"project_files": {"ok": True, "result": {"files": [], "folders": []}}})
+    calls = fake_transport({"project_files": {"ok": True, "result": _page([], folders=[])}})
 
     assert bn.cli.main(["project", "files"]) == 0
-    assert bn.cli.main(["project", "files", "--folder", "fw", "--flat"]) == 0
+    assert bn.cli.main(["project", "files", "--folder", "fw", "--flat",
+                        "--limit", "5", "--offset", "10"]) == 0
 
-    assert calls[0]["params"] == {"folder": None, "recursive": True}
-    assert calls[1]["params"] == {"folder": "fw", "recursive": False}
+    # #1080: files page like every other list (default page 100, like
+    # `function list`); folders are a side list the bridge never pages.
+    assert calls[0]["params"] == {"folder": None, "recursive": True, "offset": 0, "limit": 100}
+    assert calls[1]["params"] == {"folder": "fw", "recursive": False, "offset": 10, "limit": 5}
+
+
+def test_project_files_folder_filter_and_flat_reach_the_text_1080(
+    po, opened, monkeypatch, capsys
+):
+    """The real handler behind the CLI (#1080): `--folder usr/bin --flat` prints
+    no unrelated folder, each folder carries its count, and a summary closes."""
+    from test_project_ops import _bridge_with_rows, _firmware_tree
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        assert op == "project_files"
+        return {"ok": True, "result": po.project_files(bridge, **params)}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    assert bn.cli.main(["project", "files", "--folder", "usr/bin", "--flat"]) == 0
+    out = capsys.readouterr().out
+    assert "/opt" not in out and "/usr/lib" not in out
+    assert "- /usr/bin  (3 files)" in out
+    assert out.rstrip().endswith("3 files, 1 folder")
+
+    assert bn.cli.main(["project", "files", "--folder", "usr", "--limit", "2"]) == 0
+    out = capsys.readouterr()
+    lines = out.out.rstrip().splitlines()
+    assert "- /usr  (1 file, 5 recursive)" in lines
+    assert "- /usr/bin  (3 files)" in lines
+    assert lines[-2] == "5 files, 3 folders"
+    assert lines[-1] == "// showing 2 of 5 (3 more); rerun with --offset 2 or a larger --limit"
 
 
 def test_project_load_params(fake_transport, monkeypatch):
@@ -329,18 +368,24 @@ def test_project_refusal_is_exit_2(monkeypatch, capsys):
 # --- renderers ------------------------------------------------------------------
 
 
+def _page(items, *, folders, total=None, offset=0, limit=None):
+    """The `project_files` envelope: a paged `items` list plus the unpaged
+    `folders` side list (#1080)."""
+    total = len(items) if total is None else total
+    return {"kind": "project_files", "items": items, "total": total, "offset": offset,
+            "limit": limit, "returned": len(items), "has_more": offset + len(items) < total,
+            "folders": folders}
+
+
 def _files_result():
-    return {
-        "files": [
-            {"id": FILE_ID_A, "name": "app", "path": "/fw/app", "folder": "/fw",
-             "description": "", "size": 4096, "exists_on_disk": True, "is_database": False,
-             "open_target_id": None, "sibling_database_id": FILE_ID_B},
-            {"id": FILE_ID_B, "name": "app.bndb", "path": "/fw/app.bndb", "folder": "/fw",
-             "description": "", "size": 123456, "exists_on_disk": True, "is_database": True,
-             "open_target_id": "123:4:1", "sibling_database_id": None},
-        ],
-        "folders": [{"id": "f-1", "path": "/fw"}],
-    }
+    return _page([
+        {"id": FILE_ID_A, "name": "app", "path": "/fw/app", "folder": "/fw",
+         "description": "", "size": 4096, "exists_on_disk": True, "is_database": False,
+         "open_target_id": None, "sibling_database_id": FILE_ID_B},
+        {"id": FILE_ID_B, "name": "app.bndb", "path": "/fw/app.bndb", "folder": "/fw",
+         "description": "", "size": 123456, "exists_on_disk": True, "is_database": True,
+         "open_target_id": "123:4:1", "sibling_database_id": None},
+    ], folders=[{"id": "f-1", "path": "/fw", "files": 2, "files_recursive": 2}])
 
 
 def test_project_files_text_rows(fake_transport, monkeypatch, capsys):
@@ -362,7 +407,8 @@ def test_project_files_text_rows(fake_transport, monkeypatch, capsys):
     assert "123456" in db_line
     assert "[open as -t fw/app.bndb]" in db_line
     assert out.index("folders:") > out.index("/fw/app.bndb")
-    assert "- /fw" in out
+    assert "- /fw  (2 files)" in out
+    assert out.rstrip().endswith("2 files, 1 folder")
 
 
 def test_project_files_json_is_raw(fake_transport, monkeypatch, capsys):

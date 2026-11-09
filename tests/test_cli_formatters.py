@@ -9013,3 +9013,36 @@ def test_proto_text_prints_entry_value_and_undefined_type_notes_1013():
     })
     assert "\n\nnote: At 2 of 2 direct call sites ..." in text
     assert "\n\nnote: run `bn types declare 'struct `ns::Cls`;'` first." in text
+
+
+def test_project_files_text_states_folder_counts_and_a_summary_1080():
+    """#1080: each folder row carries its direct count (and the recursive one
+    when it differs); the listing closes with `N files, M folders` and, on a
+    cut page, the shared paging footer. An unreadable count is stated as `?`
+    and disclosed, never printed as 0."""
+    from bn.formatters import _render_project_files_text
+
+    row = {"id": "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b", "path": "/usr/bin/play", "size": 4,
+           "is_database": False, "exists_on_disk": True}
+    page = {"kind": "project_files", "items": [row], "total": 5, "offset": 0, "limit": 1,
+            "returned": 1, "has_more": True,
+            "folders": [{"id": "f-1", "path": "/usr", "files": 1, "files_recursive": 5},
+                        {"id": "f-2", "path": "/usr/bin", "files": 3, "files_recursive": 3}]}
+    lines = _render_project_files_text(page).splitlines()
+    assert "- /usr  (1 file, 5 recursive)" in lines
+    assert "- /usr/bin  (3 files)" in lines
+    assert lines[-2:] == ["5 files, 2 folders",
+                          "// showing 1 of 5 (4 more); rerun with --offset 1 or a larger --limit"]
+
+    flat = {**page, "total": 1, "limit": None, "has_more": False,
+            "folders": [{"id": "f-2", "path": "/usr/bin", "files": 3}]}
+    text = _render_project_files_text(flat)
+    assert text.endswith("- /usr/bin  (3 files)\n\n1 file, 1 folder")
+    assert "// showing" not in text
+
+    skewed = {**flat, "total": "many",
+              "folders": [{"id": "f-2", "path": "/usr/bin", "files": "lots"}]}
+    text = _render_project_files_text(skewed)
+    assert "- /usr/bin  (? files)" in text and "\n? files, 1 folder" in text
+    assert "! malformed files, total fields" in text
+    assert "0 files" not in text and "(0 " not in text

@@ -1607,13 +1607,29 @@ def _render_project_file_text(value: Any) -> str:
     return "imported: " + _project_file_line(value)
 
 
+def _project_folder_count_text(folder: dict[str, Any]) -> str:
+    """`3 files`, or `1 file, 5 recursive` when the subtree count differs from
+    the direct one (#1080). Both counts are stated through the choke point, so
+    an unreadable one prints `?` and is disclosed, never a 0."""
+    direct = _stated_count(folder, "files")
+    text = f"{direct} file{'' if direct == '1' else 's'}"
+    if _field_present(folder, "files_recursive"):
+        recursive = _stated_count(folder, "files_recursive")
+        if recursive != direct:
+            text += f", {recursive} recursive"
+    return text
+
+
 @_discloses
 def _render_project_files_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _escape_control_chars(_render_fallback_text(value))
-    files = _field_list(value, "files")
+    files = _field_list(value, "items")
+    page_unreadable = _field_skewed("items")
     folders = _field_list(value, "folders")
-    if not files and not folders:
+    # An empty page past the end of a non-empty scope is not an empty project:
+    # it still gets the summary and the footer that say where the rows are.
+    if not files and not folders and not _count_field(value, "total"):
         return _empty_result("project files")
     lines = []
     for row in files:
@@ -1626,9 +1642,20 @@ def _render_project_files_text(value: Any) -> str:
         for folder in folders:
             if isinstance(folder, dict):
                 lines.append(f"- {_escape_control_chars(folder.get('path', '<unknown>'))}"
-                             f"  ({_escape_control_chars(str(folder.get('id', ''))[:8])})")
+                             f"  ({_project_folder_count_text(folder)})")
             else:
                 lines.append(f"- {_escape_control_chars(_render_fallback_text(folder))}")
+    # The summary counts the whole scope (`total`), not the page; the shared
+    # footer says how much of it this page shows (#1080).
+    total = (_project_count_text(value, "total") if _field_present(value, "total")
+             else _project_rows_count(value, "items"))
+    folder_count = _project_rows_count(value, "folders")
+    lines.append("")
+    lines.append(f"{total} file{'' if total == '1' else 's'}, "
+                 f"{folder_count} folder{'' if folder_count == '1' else 's'}")
+    footer = _paging_footer(value, files, page_unreadable)
+    if footer is not None:
+        lines.append(footer)
     return "\n".join(lines)
 
 
