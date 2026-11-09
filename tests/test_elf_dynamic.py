@@ -11,6 +11,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import struct
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -794,6 +795,14 @@ def _parse_fifo_in_worker(path, connection):
         connection.close()
 
 
+# Readiness is a fresh `spawn` interpreter importing this module: measured ~0.5s
+# alone, but under two `-n 8` suites it has exceeded 10s. The deadline is
+# generous because it proves nothing about `parse_elf_file`; the SHORT timeout
+# below, which starts only once the worker is running, is the proof.
+_FIFO_WORKER_START_DEADLINE = 120.0
+_FIFO_PARSE_TIMEOUT = 5.0
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
 def test_parse_elf_file_rejects_fifo_without_waiting_for_a_writer(tmp_path):
     path = tmp_path / "library.fifo"
@@ -806,13 +815,24 @@ def test_parse_elf_file_rejects_fifo_without_waiting_for_a_writer(tmp_path):
         process.start()
         started = True
         sender.close()
-        assert receiver.poll(10), "FIFO worker did not start"
+        # Deadline-based readiness: wait for "ready", but stop as soon as the
+        # worker is gone (an import error must not cost the whole deadline).
+        deadline = time.monotonic() + _FIFO_WORKER_START_DEADLINE
+        while not receiver.poll(0.5):
+            assert process.is_alive(), (
+                f"FIFO worker exited before reporting ready (exit code {process.exitcode})")
+            assert time.monotonic() < deadline, (
+                f"FIFO worker did not start within {_FIFO_WORKER_START_DEADLINE:.0f}s")
         assert receiver.recv() == "ready"
-        process.join(timeout=2)
-        assert not process.is_alive(), "parse_elf_file blocked opening a FIFO"
-        assert process.exitcode == 0
-        assert receiver.poll(1), "FIFO worker returned no result"
+        # The property under test: a running worker that calls `parse_elf_file`
+        # on a FIFO nobody writes to gets its answer (None) within a short,
+        # fixed time instead of blocking in `open()`.
+        assert receiver.poll(_FIFO_PARSE_TIMEOUT), (
+            f"parse_elf_file blocked opening a FIFO for {_FIFO_PARSE_TIMEOUT:.0f}s")
         assert receiver.recv() is None
+        process.join(timeout=_FIFO_PARSE_TIMEOUT)
+        assert not process.is_alive(), "FIFO worker did not exit after answering"
+        assert process.exitcode == 0
     finally:
         if started:
             if process.is_alive():

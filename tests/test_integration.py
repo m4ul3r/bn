@@ -5817,7 +5817,11 @@ class TestStringScanSeesCodeOnly1045:
             '{ return strcmp("<a href=\\"http://x\\">", "abc") + strcmp(s, "x"); }\n'
             "int main(int c, char **v) { return probe(v[0]); }\n"))
         [line] = [line for line in result["text"].splitlines() if "http://x" in line]
-        assert '"<a href="http://x">", 0x' in line, line  # the literal is intact
+        # The literal is intact and the second operand stays a raw address. BN
+        # has rendered the literal's inner quotes both bare and as `\"` across
+        # builds; either spelling is the same intact literal.
+        literal = re.search(r'"<a href=\\?"http://x\\?">", (0x[0-9a-f]+)\)', line)
+        assert literal, line
         assert line.index("/* bn:") > line.index("http://x"), line
         [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
         assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row
