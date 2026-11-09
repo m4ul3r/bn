@@ -721,6 +721,76 @@ def test_project_init_falls_back_to_cache_when_parent_unwritable(
     assert calls[0]["params"]["path"] == fallback
 
 
+def test_project_init_creates_the_cache_projects_dir_before_the_bridge_creates_1075(
+    monkeypatch, tmp_path, capsys
+):
+    """#1075 item 1: the fallback parent `<cache>/projects` did not exist on a
+    fresh machine, so the bridge's `os.open(parent)` died with FileNotFoundError."""
+    import stat
+    import bn.commands.project
+    from bn import rootfs_layout
+    root = _rootfs(tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    preferred, fallback = rootfs_layout.project_location(root, str(cache))
+    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: False)
+    _one_instance(monkeypatch)
+    _capture_pins(monkeypatch)
+    assert not cache.exists()
+    seen = []
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        if op == "project_create":
+            # The bridge opens the parent BEFORE it creates the project.
+            seen.append((os.path.isdir(os.path.dirname(params["path"])),
+                         stat.S_IMODE(os.stat(cache).st_mode)))
+            return {"ok": True, "result": _project_info(fallback, created=True)}
+        return {"ok": True, "result": {"associated": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    assert bn.cli.main(["project", "init", root, "--no-libs"]) == 0
+
+    assert seen == [(True, 0o700)]
+    out = capsys.readouterr().out
+    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable "
+            f"\u2192 cache fallback {fallback}") in out
+
+
+def test_project_init_dry_run_explains_the_cache_fallback_and_creates_nothing_1075(
+    monkeypatch, tmp_path, capsys
+):
+    import bn.commands.project
+    from bn import rootfs_layout
+    root = _rootfs(tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    preferred, fallback = rootfs_layout.project_location(root, str(cache))
+    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: False)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("dry-run must not send"))
+
+    assert bn.cli.main(["project", "init", root, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert f"project: {fallback}  [new]" in out
+    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable "
+            f"\u2192 cache fallback {fallback}") in out
+    assert not cache.exists(), "--dry-run must not create the cache projects dir"
+
+    assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["project_path"] == fallback
+    assert data["fallback_from"] == os.path.dirname(preferred)
+
+    # A writable parent is the preferred location: no fallback, no note.
+    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: True)
+    assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["project_path"] == preferred and data["fallback_from"] is None
+
+
 def test_project_init_attaches_to_the_owner_then_syncs(
     fake_transport, monkeypatch, tmp_path, capsys
 ):
@@ -827,6 +897,10 @@ def test_project_init_sync_failure_after_open_is_exit_1(
     assert "error: project_sync_libs: Binary Ninja could not import" in captured.err
     assert f"project: {project_path}  [created]" in captured.out
     assert "libraries: sync FAILED -- Binary Ninja could not import" in captured.out
+    # #1075 item 3: the project exists but is empty, so `next: bn project
+    # files` would point at nothing; the retry is the sync itself.
+    assert "next:" not in captured.out
+    assert "`bn project libs --sync`" in captured.out
 
 
 def test_project_init_json_summary(fake_transport, monkeypatch, tmp_path, capsys):

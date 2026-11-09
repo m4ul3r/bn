@@ -33,6 +33,7 @@ from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic, parse_elf_file
 from .rootfs_layout import (
     DiscoveryBudget, detect_root, discovery_budget, lookup_paths, scan_libraries,
 )
+from .target_hint import positional_selector
 
 METADATA_VERSION = 1
 # ld.so builds the global scope breadth-first over NEEDED; a firmware tree
@@ -105,7 +106,7 @@ def project_sync_libs(
         state = manager.require()
         meta = manager.get_rootfs() or {}
         live_ids = {str(pf.id) for pf in state.project.files}
-    budget = DiscoveryBudget(cancelled=cancelled)
+    budget = DiscoveryBudget(cancelled=cancelled, restart=_restart_command(bridge))
     with discovery_budget(budget):
         if root is not None and (not isinstance(root, str) or not root.strip() or "\0" in root):
             raise RuntimeError("project_sync_libs: root must be a directory path when given")
@@ -143,6 +144,10 @@ def project_sync_libs(
             project_ops._refuse_finding_path(
                 cand.dir_in_root.rstrip("/") + "/" + cand.names[0])
             if cand.rel_realpath not in existing:
+                # One unit per file parsed; its bytes were charged per MiB by
+                # the hash. `check` is the parser's cancellation/deadline probe
+                # (called per symbol name read), not a per-symbol charge (#1075).
+                budget.charge(files=1)
                 parsed[cand.rel_realpath] = parse_elf_file(cand.realpath, check=budget.check)
         notes.extend(budget.notes)
         with bridge._write_operation_lock():
@@ -155,6 +160,15 @@ def project_sync_libs(
                 manager, state, meta, chosen_root, str(chosen_platform),
                 paths, candidates, parsed, notes, bool(dry_run), budget,
             )
+
+
+def _restart_command(bridge: Any) -> str | None:
+    """`bn session restart <id>` for the headless bridge that read the discovery
+    limits at start; None for the GUI plugin, which has no instance id."""
+    instance_id = getattr(bridge, "instance_id", None)
+    if not isinstance(instance_id, str) or not instance_id:
+        return None
+    return f"bn session restart {positional_selector(instance_id)}"
 
 
 def _apply_sync(

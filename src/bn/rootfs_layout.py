@@ -46,24 +46,41 @@ def _positive_limit(name: str, default: int | float) -> int | float:
         raise RuntimeError(f"{name} must be a positive finite {kind}") from exc
 
 
+_MIB = 1 << 20
+
+
 @dataclass
 class DiscoveryBudget:
-    """One aggregate limit for lookup, hashing and ELF discovery."""
+    """One aggregate limit for lookup, hashing and ELF discovery.
 
-    max_steps: int = field(default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_WORK", 100_000))
+    ``max_work`` (``BN_ROOTFS_MAX_WORK``) is spent in units of one per file
+    opened -- a loader config read, a directory listed, a library hashed or
+    parsed -- plus one per MiB read from the root. What is *inside* a file
+    (directory entries, config lines, dynamic symbols) costs nothing: the old
+    per-symbol charge spent ~460k units on a ~450-library firmware for three
+    seconds of work (#1075), while the same tree is ~1k units here and the
+    deadline bounds pathological trees. ``check()`` only probes -- cancellation,
+    the deadline, and the limits as charged so far -- so it is cheap to call
+    per entry or per symbol; ``charge()`` is what spends.
+    """
+
+    max_work: int = field(default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_WORK", 100_000))
     max_bytes: int = field(default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_BYTES", 1 << 30))
     timeout: float = field(default_factory=lambda: _positive_limit("BN_ROOTFS_TIMEOUT", 30.0))
     max_text_bytes: int = field(
         default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_CONFIG_BYTES", 1 << 20))
     cancelled: Callable[[], bool] | None = None
+    # The command that restarts the process which read these limits from its
+    # environment (`bn session restart <id>`); None when there is none to name.
+    restart: str | None = None
     notes: list[str] = field(default_factory=list)
-    _steps: int = 0
+    _files: int = 0
     _bytes: int = 0
     _started: float = field(default_factory=lambda: time.monotonic())
 
     def __post_init__(self) -> None:
-        if type(self.max_steps) is not int or self.max_steps <= 0:
-            raise ValueError("rootfs max_steps must be a positive integer")
+        if type(self.max_work) is not int or self.max_work <= 0:
+            raise ValueError("rootfs max_work must be a positive integer")
         if type(self.max_bytes) is not int or self.max_bytes <= 0:
             raise ValueError("rootfs max_bytes must be a positive integer")
         if type(self.max_text_bytes) is not int or self.max_text_bytes <= 0:
@@ -71,20 +88,40 @@ class DiscoveryBudget:
         if not math.isfinite(self.timeout) or self.timeout <= 0:
             raise ValueError("rootfs timeout must be positive and finite")
 
-    def check(self, *, bytes_read: int = 0) -> None:
-        self._steps += 1
+    @property
+    def work_used(self) -> int:
+        return self._files + self._bytes // _MIB
+
+    def charge(self, *, files: int = 0, bytes_read: int = 0) -> None:
+        """Spend *files* file units and *bytes_read* bytes, then refuse if a
+        limit is now exceeded."""
+        self._files += files
         self._bytes += bytes_read
+        self.check()
+
+    def check(self) -> None:
+        """Refuse on cancellation, the deadline, or a limit the work charged so
+        far exceeds. Charges nothing."""
         reason = None
         if self.cancelled is not None and self.cancelled():
             reason = "request cancelled"
         elif time.monotonic() - self._started >= self.timeout:
             reason = "discovery deadline exceeded"
-        elif self._steps > self.max_steps:
-            reason = "filesystem/ELF work limit exceeded"
+        elif self.work_used > self.max_work:
+            reason = (f"work limit exceeded (used {self.work_used} units, "
+                      f"BN_ROOTFS_MAX_WORK={self.max_work}, charged per file opened "
+                      "and per MiB read)")
         elif self._bytes > self.max_bytes:
             reason = "discovery byte limit exceeded"
-        if reason is not None:
-            raise RuntimeError(f"rootfs discovery refused: {reason}; no inventory committed")
+        if reason is None:
+            return
+        message = f"rootfs discovery refused: {reason}; no inventory committed"
+        if reason.startswith("work limit") and self.restart:
+            # The CLI's environment never reaches the bridge that does the
+            # work; the knob only applies to a process started with it.
+            message += (". The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set "
+                        f"it and restart: BN_ROOTFS_MAX_WORK={2 * self.max_work} {self.restart}")
+        raise RuntimeError(message)
 
 
 _discovery: ContextVar[DiscoveryBudget | None] = ContextVar("rootfs_discovery", default=None)
@@ -114,10 +151,18 @@ def _bounded(function):
     return bounded
 
 
-def _check_work(*, bytes_read: int = 0) -> None:
+def _check_work() -> None:
+    """Probe the shared budget (cancellation, deadline, limits); free."""
     budget = _discovery.get()
     if budget is not None:
-        budget.check(bytes_read=bytes_read)
+        budget.check()
+
+
+def _charge_work(*, files: int = 0, bytes_read: int = 0) -> None:
+    """Spend file / byte units against the shared budget, then probe it."""
+    budget = _discovery.get()
+    if budget is not None:
+        budget.charge(files=files, bytes_read=bytes_read)
 
 
 def _invalid_path(rel: str) -> bool:
@@ -271,6 +316,7 @@ def _glob_in_root(root: str, pattern: str, *, recursive: bool = False) -> list[s
         names: list[str] = []
         try:
             with os.scandir(full) as entries:
+                _charge_work(files=1)
                 for entry in entries:
                     _check_work()
                     if (not entry.name.startswith(".") or part.startswith(".")) and (
@@ -388,7 +434,7 @@ def _read_text(root: str, rel: str) -> str:
                 # Bound even the allocation by the remaining aggregate allowance.
                 limit = min(limit, max(0, budget.max_bytes - budget._bytes))
             data = fh.read(limit + 1)
-            _check_work(bytes_read=len(data))
+            _charge_work(files=1, bytes_read=len(data))
             if len(data) > limit:
                 raise RuntimeError(
                     f"rootfs discovery refused: loader config {rel} exceeds the text limit; "
@@ -546,14 +592,13 @@ def _library_digest(path: str) -> tuple[os.stat_result, str] | None:
     with _open_regular(path) as fh:
         st = os.fstat(fh.fileno())
         magic = fh.read(4)
-        _check_work(bytes_read=len(magic))
+        _charge_work(files=1, bytes_read=len(magic))
         if magic != _ELF_MAGIC:
             return None
         h = hashlib.sha256(magic)
-        while chunk := fh.read(1 << 20):
-            _check_work(bytes_read=len(chunk))
+        while chunk := fh.read(_MIB):
+            _charge_work(bytes_read=len(chunk))
             h.update(chunk)
-        _check_work()
         return st, h.hexdigest()
 
 
@@ -579,6 +624,7 @@ def scan_libraries(root: str, paths: list[LookupPath]) -> tuple[list[LibraryCand
         try:
             dir_full = _resolve_in_root(root, lp.path_in_root)
             with os.scandir(dir_full) as directory:
+                _charge_work(files=1)
                 entries = []
                 for entry in directory:
                     _check_work()

@@ -168,6 +168,9 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
             f"not inside a firmware root filesystem (looked from {start} up to /); "
             "pass an explicit firmware root: bn project init ROOT")
     preferred, fallback = rootfs_layout.project_location(info.root, str(paths.projects_dir()))
+    # `fallback_from` names the unwritable parent when the cache fallback is
+    # chosen over the preferred location, so the reason is visible (#1075).
+    fallback_from = None
     if os.path.isdir(preferred):
         project_path, exists = preferred, True
     elif os.path.isdir(fallback):
@@ -176,6 +179,7 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
         project_path, exists = preferred, False
     else:
         project_path, exists = fallback, False
+        fallback_from = os.path.dirname(preferred) or os.sep
     # An explicit root that matches no detector is still usable as a project
     # root; its loader is unknown, so library sync has nothing to scan.
     lookup = rootfs_layout.lookup_paths(info.root, info.platform)
@@ -186,6 +190,7 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
         "markers": list(info.markers),
         "project_path": project_path,
         "project_exists": exists,
+        "fallback_from": fallback_from,
         "name": args.name or os.path.basename(info.root.rstrip(os.sep)) or "rootfs",
         "lookup_paths": _lookup_rows(lookup),
         "candidate_libraries": len(candidates),
@@ -218,6 +223,12 @@ def _project_init(args: argparse.Namespace) -> int:
     if plan["project_exists"]:
         op, params = "project_open", {"path": path}
     else:
+        # The cache fallback parent does not exist on a fresh machine, and the
+        # bridge opens it (its creation gate) before creating the project, so
+        # it died with FileNotFoundError (#1075). Create it here, owner-private
+        # like every other cache directory.
+        if plan["fallback_from"] is not None:
+            paths.ensure_private_dir(Path(os.path.dirname(path)))
         op, params = "project_create", {
             "path": path, "name": plan["name"],
             "rootfs": {"root": plan["root"], "platform": plan["platform"]},

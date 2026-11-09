@@ -633,7 +633,7 @@ def test_recursive_startup_alias_dag_shares_work_and_deduplicates_files(
     _link(root, "etc/init.d/duplicate", "/startup/18/start")
 
     # There are exponentially many spellings, but only nineteen real nodes.
-    with rl.discovery_budget(rl.DiscoveryBudget(max_steps=30_000, timeout=5)):
+    with rl.discovery_budget(rl.DiscoveryBudget(max_work=30_000, timeout=5)):
         assert rl.env_hint(str(root)) == [
             ("/etc/profile", "/opt/extra/lib:$LD_LIBRARY_PATH"),
             ("/etc/environment", "/opt/vendor/lib"),
@@ -703,12 +703,12 @@ def test_scan_byte_refusal_does_not_return_an_already_discovered_subset(
             rl.scan_libraries(str(root), [rl.LookupPath("/lib", "default")])
 
 
-def test_discovery_step_budget_is_shared_between_calls(tmp_path: Path) -> None:
+def test_discovery_work_budget_is_shared_between_calls(tmp_path: Path) -> None:
     root = tmp_path / "rootfs"
     _elf(root, "lib/libgood.so")
     paths = [rl.LookupPath("/lib", "default")]
 
-    with rl.discovery_budget(rl.DiscoveryBudget(max_steps=500, timeout=30)):
+    with rl.discovery_budget(rl.DiscoveryBudget(max_work=500, timeout=30)):
         candidates, notes = rl.scan_libraries(str(root), paths)
         assert [candidate.rel_realpath for candidate in candidates] == ["/lib/libgood.so"]
         assert notes == []
@@ -716,6 +716,58 @@ def test_discovery_step_budget_is_shared_between_calls(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="rootfs discovery refused"):
             for _ in range(501):
                 rl.scan_libraries(str(root), paths)
+
+
+def test_work_is_charged_per_file_and_per_mib_never_per_check_1075(tmp_path: Path) -> None:
+    """#1075 item 2: `check()` is a probe (cancellation, deadline, the limits
+    as charged so far); only `charge()` spends units, one per file opened and
+    one per MiB read, so a file's entry/line/symbol count costs nothing."""
+    budget = rl.DiscoveryBudget(max_work=3, timeout=30)
+    for _ in range(10_000):
+        budget.check()
+    assert budget.work_used == 0
+    budget.charge(files=1)
+    budget.charge(bytes_read=(2 << 20) - 1)  # 1.99 MiB rounds down
+    assert budget.work_used == 2
+    budget.charge(bytes_read=1)  # ... and the next byte completes the MiB
+    assert budget.work_used == 3
+    with pytest.raises(RuntimeError) as raised:
+        budget.charge(files=1)
+    message = str(raised.value)
+    assert message.startswith("rootfs discovery refused: work limit exceeded")
+    assert "used 4 units" in message and "BN_ROOTFS_MAX_WORK=3" in message
+    assert "charged per file opened and per MiB read" in message
+    assert "no inventory committed" in message
+    assert "session restart" not in message, "no restart advice without a restart command"
+
+    with_restart = rl.DiscoveryBudget(max_work=3, timeout=30, restart="bn session restart w1")
+    with pytest.raises(RuntimeError) as raised:
+        with_restart.charge(files=4)
+    assert ("The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart: "
+            "BN_ROOTFS_MAX_WORK=6 bn session restart w1") in str(raised.value)
+
+
+def test_scan_charges_one_unit_per_file_plus_its_mib_regardless_of_entry_count_1075(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "rootfs"
+    for index in range(40):
+        _elf(root, f"lib/lib{index:02}.so")
+    big = _elf(root, "lib/libbig.so", ELF_STUB + b"\0" * (3 << 20))
+    paths = [rl.LookupPath("/lib", "default")]
+
+    budget = rl.DiscoveryBudget(max_work=100, timeout=30)
+    with rl.discovery_budget(budget):
+        candidates, _notes = rl.scan_libraries(str(root), paths)
+    assert len(candidates) == 41
+    # One directory listed, 41 libraries hashed, 3 whole MiB read from `big`.
+    assert budget.work_used == 1 + 41 + (big.stat().st_size >> 20)
+
+    # Forty small libraries cost forty units however many entries the
+    # directory holds; the default budget (100k) is nowhere near.
+    with rl.discovery_budget(rl.DiscoveryBudget(max_work=1 + 41 + 2, timeout=30)):
+        with pytest.raises(RuntimeError, match="work limit exceeded"):
+            rl.scan_libraries(str(root), paths)
 
 
 @pytest.mark.parametrize("operation", ["env_hint", "lookup_paths", "scan_libraries"])
@@ -854,13 +906,15 @@ def test_scan_propagates_mid_inventory_cancellation_and_deadline(
     assert reached_later.is_set(), "refusal must interrupt an in-progress inventory"
 
 
-def test_lookup_step_refusal_does_not_return_partial_or_default_paths(
+def test_lookup_work_refusal_does_not_return_partial_or_default_paths(
     tmp_path: Path,
 ) -> None:
     root = _linux_rootfs(tmp_path)
-    _touch(root, "etc/ld.so.conf", b"/opt/vendor/lib\n" * 1_000)
+    _touch(root, "etc/ld.so.conf", b"include /etc/ld.so.conf.d/*.conf\n")
+    for index in range(1_000):
+        _touch(root, f"etc/ld.so.conf.d/{index:04}.conf", b"/opt/vendor/lib\n")
 
-    with rl.discovery_budget(rl.DiscoveryBudget(max_steps=500, timeout=30)):
+    with rl.discovery_budget(rl.DiscoveryBudget(max_work=500, timeout=30)):
         with pytest.raises(RuntimeError, match="rootfs discovery refused"):
             rl.lookup_paths(str(root), "linux")
 
@@ -927,7 +981,7 @@ def test_invalid_environment_limits_refuse_discovery(
         rl.scan_libraries(str(root), [rl.LookupPath("/lib", "default")])
 
 
-@pytest.mark.parametrize("limit", ["max_steps", "max_bytes", "timeout", "max_text_bytes"])
+@pytest.mark.parametrize("limit", ["max_work", "max_bytes", "timeout", "max_text_bytes"])
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), -float("inf")])
 def test_invalid_explicit_discovery_limits_are_rejected(limit: str, value: float) -> None:
     with pytest.raises(ValueError, match="rootfs"):
