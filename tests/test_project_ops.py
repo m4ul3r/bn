@@ -972,6 +972,74 @@ def test_project_import_creates_the_folder_and_returns_a_row(po, populated, tmp_
     assert bridge.registry_writes == 1
 
 
+def _applet_pair(tmp_path):
+    """A busybox-style applet: `usr/bin/record -> play` beside the real `play`."""
+    usr_bin = tmp_path / "image/usr/bin"
+    usr_bin.mkdir(parents=True)
+    play = usr_bin / "play"
+    play.write_bytes(b"\x7fELF-player")
+    (usr_bin / "record").symlink_to("play")
+    return usr_bin / "record", play
+
+
+def test_project_import_of_a_symlink_keeps_the_requested_name_1079(po, populated, tmp_path):
+    """#1079: the default name was the RESOLVED basename, so importing the
+    applet link `record -> play` stored a second `play`."""
+    manager, project, _ = populated
+    record, play = _applet_pair(tmp_path)
+    bridge = _bridge_with_rows(manager, [])
+
+    row = po.project_import(bridge, str(record), folder="usr/bin")
+
+    assert row["name"] == "record" and row["path"] == "/usr/bin/record"
+    assert row["source_symlink"] == f"{record} -> {play}"
+    assert Path(manager.resolve_file("/usr/bin/record").path_on_disk).read_bytes() == play.read_bytes()
+
+
+def test_project_import_of_a_regular_file_reports_no_symlink_1079(po, populated, tmp_path):
+    manager, _, _ = populated
+    _record, play = _applet_pair(tmp_path)
+    row = po.project_import(_bridge_with_rows(manager, []), str(play), folder="usr/bin")
+    assert row["name"] == "play" and "source_symlink" not in row
+
+
+@pytest.mark.parametrize("explicit_name", [False, True])
+def test_project_import_refuses_an_existing_path_in_project_1079(
+    po, populated, tmp_path, explicit_name,
+):
+    manager, project, _ = populated
+    record, play = _applet_pair(tmp_path)
+    bridge = _bridge_with_rows(manager, [])
+    first = po.project_import(bridge, str(play), folder="usr/bin")
+    before = list(project.files)
+    # The same path-in-project again: through the link with the colliding
+    # explicit `--name`, or the file itself a second time.
+    path, kwargs = (record, {"name": "play"}) if explicit_name else (play, {})
+
+    with pytest.raises(RuntimeError) as raised:
+        po.project_import(bridge, str(path), folder="usr/bin", **kwargs)
+
+    message = str(raised.value)
+    assert message.startswith("project_import: /usr/bin/play already exists in the project "
+                              f"(file {first['id']})")
+    assert "--name <other>" in message and f"bn project delete {first['id']}" in message
+    assert project.files == before
+    assert po.project_files(bridge, folder="usr/bin")["files"] == [
+        manager.file_row(manager.resolve_file(first["id"]))]
+
+
+def test_project_import_duplicate_check_is_scoped_to_the_folder_1079(po, populated, tmp_path):
+    manager, _, f = populated
+    source = tmp_path / "app"
+    source.write_bytes(b"\x7fELF-other-app")
+    # `/fw/app` exists; `/other/app` and the root `/app` do not collide with it.
+    bridge = _bridge_with_rows(manager, [])
+    assert po.project_import(bridge, str(source), folder="other")["path"] == "/other/app"
+    assert po.project_import(bridge, str(source))["path"] == "/app"
+    with pytest.raises(RuntimeError, match="already exists"):
+        po.project_import(bridge, str(source), folder="fw")
+
+
 def test_project_import_refuses_a_missing_source(po, populated, tmp_path):
     manager, _, _ = populated
     with pytest.raises(RuntimeError, match="not a file"):
