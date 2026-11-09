@@ -37,6 +37,15 @@ _LISTING_CAP = 50
 # lookup paths, imported libraries) that `project_sync_libs` writes and
 # `project_link` reads.
 ROOTFS_METADATA_KEY = "bn.rootfs"
+# The format of that blob. It is project-level data any tool or any other bn
+# version can write, so it is untrusted input: `validate_rootfs_metadata` is
+# the one gate every reader goes through (#1071).
+ROOTFS_METADATA_VERSION = 1
+# A document this bn cannot read cannot be rebuilt in place either: the `libs`
+# map is what says which project files are the inventory, so a sync over a
+# fresh document would import every library again beside the old copies.
+_ROOTFS_REINIT = ("this bn cannot rebuild an inventory it cannot read: upgrade bn, or move "
+                  "the project aside and re-run `bn project init <root>`")
 # Append-only finding revisions are managed by project_findings, never through
 # ordinary file import/delete or BinaryView save operations.
 FINDINGS_FOLDER = ".bn-findings"
@@ -50,6 +59,107 @@ _LEASE_LOCK = threading.RLock()
 _LEASE_OWNERS: dict[int, ProjectManager] = {}
 # Do not invoke native handle destructors from a post-fork child callback.
 _FORKED_OWNERS: list[ProjectManager] = []
+
+
+def _shape_name(value: Any) -> str:
+    return type(value).__name__
+
+
+def _refuse_shape(path: str, expected: str, value: Any) -> None:
+    raise RuntimeError(
+        f"rootfs metadata key '{path}' must be {expected}, got {_shape_name(value)}; "
+        f"{_ROOTFS_REINIT}"
+    )
+
+
+def _require_str(document: dict[str, Any], key: str, path: str, *, nullable: bool = False,
+                 required: bool = True) -> None:
+    if key not in document:
+        if required:
+            raise RuntimeError(f"rootfs metadata key '{path}' is missing; {_ROOTFS_REINIT}")
+        return
+    value = document[key]
+    if isinstance(value, str) or (nullable and value is None):
+        return
+    _refuse_shape(path, "a string or null" if nullable else "a string", value)
+
+
+def _require_str_list(document: dict[str, Any], key: str, path: str) -> None:
+    if key not in document:
+        return
+    value = document[key]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        _refuse_shape(path, "an array of strings", value)
+
+
+def _require_int_or_null(document: dict[str, Any], key: str, path: str) -> None:
+    if key not in document:
+        return
+    value = document[key]
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return
+    _refuse_shape(path, "an integer or null", value)
+
+
+def validate_rootfs_metadata(raw: Any) -> dict[str, Any]:
+    """*raw* (the decoded `bn.rootfs` blob) as the version-1 document the
+    consumers in `project_rootfs` index into, or a user-facing refusal naming
+    the offending key path and the way back.
+
+    Every shape checked here is one a consumer relies on: `libs` is iterated
+    with `.items()` and each entry read for `rel_realpath`/`names`/`paths`/
+    `soname`/`sha256`/`e_machine`/`elf_class`; `lookup_paths` rows are read
+    for `path`/`source`; `root`/`platform`/`synced_at` are reported. Before
+    this gate `{"libs": ["bad"]}` reached `.items()` as an `internal error:
+    AttributeError`, and `version: 999` was read as version 1 (#1071).
+    Unknown extra keys are left alone: they are the current version's
+    forward-compatible room, not a different format. Only `libs` must be
+    present; the rest are checked when they are."""
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"rootfs metadata must be a JSON object, got {_shape_name(raw)}; {_ROOTFS_REINIT}")
+    version = raw.get("version")
+    if version is None:
+        raise RuntimeError(
+            "this project's rootfs metadata has no version; this bn understands version "
+            f"{ROOTFS_METADATA_VERSION} \u2014 upgrade bn or re-run project init")
+    if isinstance(version, bool) or version != ROOTFS_METADATA_VERSION:
+        raise RuntimeError(
+            f"this project's rootfs metadata is version {version}; this bn understands "
+            f"version {ROOTFS_METADATA_VERSION} \u2014 upgrade bn or re-run project init")
+    # Only `libs` is required: every other key is read with a tolerant
+    # `.get(...)` by its consumers, and the issue's own repro document carries
+    # just `version`/`platform`/`libs` (#1071). Present keys must have the shape
+    # the consumer indexes.
+    _require_str(raw, "root", "root", nullable=True, required=False)
+    _require_str(raw, "platform", "platform", nullable=True, required=False)
+    _require_str(raw, "synced_at", "synced_at", nullable=True, required=False)
+    lookup_paths = raw.get("lookup_paths", [])
+    if not isinstance(lookup_paths, list):
+        _refuse_shape("lookup_paths", "an array", lookup_paths)
+    for index, row in enumerate(lookup_paths):
+        path = f"lookup_paths[{index}]"
+        if not isinstance(row, dict):
+            _refuse_shape(path, "an object", row)
+        _require_str({"path": row.get("path")}, "path", f"{path}.path")
+        _require_str({"source": row.get("source")}, "source", f"{path}.source")
+    if "libs" not in raw:
+        raise RuntimeError(f"rootfs metadata key 'libs' is missing; {_ROOTFS_REINIT}")
+    libs = raw["libs"]
+    if not isinstance(libs, dict):
+        _refuse_shape("libs", "an object", libs)
+    for file_id, entry in libs.items():
+        path = f"libs[{file_id!r}]"
+        if not isinstance(entry, dict):
+            _refuse_shape(path, "an object", entry)
+        _require_str(entry, "rel_realpath", f"{path}.rel_realpath")
+        _require_str(entry, "soname", f"{path}.soname", nullable=True, required=False)
+        _require_str(entry, "sha256", f"{path}.sha256", required=False)
+        _require_str_list(entry, "names", f"{path}.names")
+        _require_str_list(entry, "paths", f"{path}.paths")
+        _require_int_or_null(entry, "e_machine", f"{path}.e_machine")
+        _require_int_or_null(entry, "elf_class", f"{path}.elf_class")
+    return raw
 
 
 def _after_fork_child() -> None:
@@ -342,9 +452,10 @@ class ProjectManager:
 
     # -- rootfs metadata ----------------------------------------------------
 
-    def get_rootfs(self) -> dict[str, Any] | None:
-        """The `bn.rootfs` project metadata (a JSON object), or None when the
-        project records no rootfs or the stored value is unreadable."""
+    def _rootfs_raw(self) -> Any:
+        """The decoded `bn.rootfs` blob as stored, or None when the project
+        records none. Text that is not JSON is a refusal, not "none": it is
+        metadata somebody wrote, which this bn cannot read (#1071)."""
         project = self.require().project
         try:
             raw = project.query_metadata(ROOTFS_METADATA_KEY)
@@ -352,12 +463,25 @@ class ProjectManager:
             return None
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", "replace")
+        if raw is None or raw == "":
+            return None
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
-            except ValueError:
-                return None
-        return raw if isinstance(raw, dict) else None
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"rootfs metadata is not valid JSON ({exc}); {_ROOTFS_REINIT}") from exc
+        return raw
+
+    def get_rootfs(self) -> dict[str, Any] | None:
+        """The `bn.rootfs` project metadata, validated (`validate_rootfs_metadata`),
+        or None when the project records no rootfs. The ONE gate: every reader
+        -- `project_libs`, `project_sync_libs`, `link_view`, the load-time
+        auto-link -- reads through here, so a future version or a malformed
+        shape is a user-facing refusal everywhere and an `internal error:`
+        nowhere (#1071)."""
+        raw = self._rootfs_raw()
+        return None if raw is None else validate_rootfs_metadata(raw)
 
     def set_rootfs(self, value: dict[str, Any]) -> None:
         """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
@@ -365,11 +489,23 @@ class ProjectManager:
         try:
             if project.store_metadata(ROOTFS_METADATA_KEY, json.dumps(value, sort_keys=True)) is False:
                 raise RuntimeError("Binary Ninja returned False")
-            if self.get_rootfs() != value:
+            if self._rootfs_raw() != value:
                 raise RuntimeError("stored metadata did not match the requested value")
         except Exception as exc:  # noqa: BLE001 - ProjectException
             raise RuntimeError(
                 f"Binary Ninja could not store the rootfs metadata in the project: {exc}"
+            ) from exc
+
+    def clear_rootfs(self) -> None:
+        """Remove the `bn.rootfs` metadata: the rollback for a sync that found
+        none to restore (storing `{}` instead would leave a blob the gate above
+        refuses as versionless)."""
+        project = self.require().project
+        try:
+            project.remove_metadata(ROOTFS_METADATA_KEY)
+        except Exception as exc:  # noqa: BLE001 - ProjectException
+            raise RuntimeError(
+                f"Binary Ninja could not remove the rootfs metadata from the project: {exc}"
             ) from exc
 
     # -- file lookups ------------------------------------------------------

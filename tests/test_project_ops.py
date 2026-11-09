@@ -396,7 +396,7 @@ def test_lifetime_owner_retains_handle_when_bridge_reference_is_dropped(
     assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
 
 
-def test_set_rootfs_checks_native_result_and_readback(opened):
+def test_set_rootfs_checks_native_result_and_readback(po, opened):
     manager, project = opened
     metadata = {}
 
@@ -406,7 +406,7 @@ def test_set_rootfs_checks_native_result_and_readback(opened):
 
     project.store_metadata = store
     project.query_metadata = metadata.__getitem__
-    value = {"root": "/firmware", "libs": {}}
+    value = {"version": po.ROOTFS_METADATA_VERSION, "root": "/firmware", "libs": {}}
     manager.set_rootfs(value)
     assert manager.get_rootfs() == value
     project.store_metadata = lambda key, value: False
@@ -414,7 +414,7 @@ def test_set_rootfs_checks_native_result_and_readback(opened):
         manager.set_rootfs(value)
     project.store_metadata = lambda key, value: True
     with pytest.raises(RuntimeError, match="did not match"):
-        manager.set_rootfs({"root": "/different"})
+        manager.set_rootfs({**value, "root": "/different"})
 
 
 def test_create_handoff_excludes_process_and_adopts_without_reopening(po, tmp_path):

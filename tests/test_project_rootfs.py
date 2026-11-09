@@ -227,8 +227,103 @@ def test_metadata_missing_and_json_roundtrip(world):
     assert manager.get_rootfs() is None
     manager.set_rootfs(world.meta)
     assert manager.get_rootfs() == world.meta
+    # #1071: present-but-unreadable is the third state, not "no metadata".
     world.project.metadata["bn.rootfs"] = "broken json"
-    assert manager.get_rootfs() is None
+    with pytest.raises(RuntimeError, match="rootfs metadata is not valid JSON"):
+        manager.get_rootfs()
+
+
+def _store_raw_metadata(w, document):
+    """Write the `bn.rootfs` blob the way a foreign tool or another bn would:
+    straight into the project, past `set_rootfs`'s readback."""
+    w.project.metadata["bn.rootfs"] = json.dumps(document)
+
+
+_VERSION_REFUSAL = ("this project's rootfs metadata is version 999; this bn understands "
+                    "version 1 \u2014 upgrade bn or re-run project init")
+
+
+def test_malformed_libs_metadata_is_refused_by_key_1071(world):
+    """#1071: `{"libs": ["bad"]}` crashed `project libs` with
+    `AttributeError: 'list' object has no attribute 'items'` (an `internal
+    error:` at exit 2). It is untrusted project-level input and is refused
+    naming the key, with the way back."""
+    w = world
+    _store_raw_metadata(w, {"version": 1, "root": str(w.tmp), "platform": "linux",
+                            "lookup_paths": [], "libs": ["bad"]})
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_libs(w.instance)
+    message = str(raised.value)
+    assert message.startswith("rootfs metadata key 'libs' must be an object, got list")
+    assert "bn project init <root>" in message and "AttributeError" not in message
+
+
+@pytest.mark.parametrize(("patch", "expected"), [
+    ({"libs": {"11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa": "x"}},
+     "rootfs metadata key 'libs['11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa']' must be an object, got str"),
+    ({"libs": {"id": {"rel_realpath": 7}}},
+     "rootfs metadata key 'libs['id'].rel_realpath' must be a string, got int"),
+    ({"libs": {"id": {"rel_realpath": "/lib/a.so", "names": "a.so"}}},
+     "rootfs metadata key 'libs['id'].names' must be an array of strings, got str"),
+    ({"libs": {"id": {"rel_realpath": "/lib/a.so", "e_machine": "arm"}}},
+     "rootfs metadata key 'libs['id'].e_machine' must be an integer or null, got str"),
+    ({"lookup_paths": "/lib"},
+     "rootfs metadata key 'lookup_paths' must be an array, got str"),
+    ({"lookup_paths": [{"path": "/lib"}]},
+     "rootfs metadata key 'lookup_paths[0].source' must be a string, got NoneType"),
+    ({"root": 5}, "rootfs metadata key 'root' must be a string or null, got int"),
+    ({"platform": 1}, "rootfs metadata key 'platform' must be a string or null, got int"),
+    ({"synced_at": 5}, "rootfs metadata key 'synced_at' must be a string or null, got int"),
+])
+def test_every_shape_a_consumer_relies_on_is_checked_1071(world, patch, expected):
+    w = world
+    _store_raw_metadata(w, {**w.meta, **patch})
+    for entry in (
+        lambda: w.ops.project_libs(w.instance),
+        lambda: w.ops.project_sync_libs(w.instance, root=str(w.tmp), dry_run=True),
+        lambda: w.instance.projects.get_rootfs(),
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            entry()
+        assert str(raised.value).startswith(expected), str(raised.value)
+
+
+def test_missing_required_metadata_key_is_named_1071(world):
+    w = world
+    _store_raw_metadata(w, {"version": 1, "root": str(w.tmp), "platform": "linux"})
+    with pytest.raises(RuntimeError, match=r"rootfs metadata key 'libs' is missing"):
+        w.ops.project_libs(w.instance)
+    _store_raw_metadata(w, ["not", "an", "object"])
+    with pytest.raises(RuntimeError, match=r"rootfs metadata must be a JSON object, got list"):
+        w.ops.project_libs(w.instance)
+
+
+def test_future_metadata_version_is_refused_by_every_consumer_1071(world, monkeypatch):
+    """#1071: `version: 999` was read as version 1. Every reader refuses it, and
+    a sync must not merge into (or overwrite) a format it does not understand."""
+    w = world
+    target(w, needed=["libz.so"], symbols=["inflate"])
+    future = {"version": 999, "root": str(w.tmp), "platform": "linux", "libs": {}}
+    _store_raw_metadata(w, future)
+    stored_before = w.project.metadata["bn.rootfs"]
+    writes_before = list(w.project.writes)
+    monkeypatch.setattr(w.ops, "lookup_paths", lambda *a: [NS(path_in_root="/lib", source="default")])
+
+    for entry in (
+        lambda: w.ops.project_libs(w.instance),
+        lambda: w.ops.project_sync_libs(w.instance, root=str(w.tmp)),
+        lambda: w.ops.project_sync_libs(w.instance, root=str(w.tmp), dry_run=True),
+        lambda: link(w),
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            entry()
+        assert str(raised.value) == _VERSION_REFUSAL, str(raised.value)
+
+    assert w.project.metadata["bn.rootfs"] == stored_before
+    assert w.project.writes == writes_before and w.project.files[1:] == []
+    with pytest.raises(RuntimeError, match=r"rootfs metadata has no version"):
+        _store_raw_metadata(w, {"root": str(w.tmp), "platform": "linux", "libs": {}})
+        w.ops.project_libs(w.instance)
 
 
 def test_sync_group_skip_changed_bulk_and_metadata(world, monkeypatch):

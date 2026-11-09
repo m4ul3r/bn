@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import types
 
 import bn.cli
@@ -12,6 +13,7 @@ import pytest
 from _cli_helpers import _fake_bridge_instance  # noqa: F401
 from bn.mutation_statuses import FAILED_MUTATION_STATUSES
 from bn.transport import BridgeError
+import test_project_rootfs
 
 
 FILE_ID_A = "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b"
@@ -1216,3 +1218,46 @@ def test_project_link_internal_error_preserves_bridge_notes(fake_transport, monk
     out = capsys.readouterr().out
     assert "provider assignment raised before readback" in out
     assert "unknown status" not in out
+
+
+# The real handlers behind the CLI, for refusals that must reach the terminal as
+# the bridge's own text and not as an `internal error:` (#1071).
+world = test_project_rootfs.world
+
+
+@pytest.mark.parametrize("document,expected", [
+    ({"version": 1, "platform": "linux", "libs": ["bad"]},
+     "rootfs metadata key 'libs' must be an object, got list"),
+    ({"version": 999, "platform": "linux", "libs": {}},
+     "this project's rootfs metadata is version 999; this bn understands version 1"),
+])
+def test_project_libs_on_bad_metadata_is_exit_2_without_internal_error_1071(
+    world, monkeypatch, capsys, document, expected,
+):
+    """#1071: `{"libs": ["bad"]}` surfaced as `internal error: AttributeError`
+    (exit 2) and `version: 999` as a clean exit 0 over an empty inventory."""
+    w = world
+    w.project.metadata["bn.rootfs"] = json.dumps(document)
+    _one_instance(monkeypatch)
+    bridge_shared = sys.modules[w.ops.__package__ + "._shared"]
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        assert op == "project_libs"
+        try:
+            return {"ok": True, "result": w.ops.project_libs(w.instance)}
+        except Exception as exc:  # the dispatcher's `ok: false` envelope
+            raise BridgeError(bridge_shared._serialize_error(exc)) from exc
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    assert bn.cli.main(["project", "libs", "--format", "json"]) == 2
+
+    captured = capsys.readouterr()
+    assert expected in captured.err
+    assert "internal error" not in captured.err and "AttributeError" not in captured.err
+    # `--format json` also carries the refusal as the `ok: false` envelope.
+    envelope = json.loads(captured.out)
+    assert envelope["ok"] is False and expected in envelope["error"]
+    assert "internal error" not in envelope["error"]
