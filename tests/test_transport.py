@@ -3854,6 +3854,46 @@ def test_wait_for_teardown_treats_a_reused_pid_as_gone(tmp_path, monkeypatch):
     assert wait_for_teardown(instance, timeout=0.05) is True
 
 
+def test_wait_for_teardown_treats_an_exited_unreaped_child_as_gone(tmp_path, monkeypatch):
+    """#1058 item 7: `session start` spawns the bridge and is its PARENT; after
+    hand-back nothing in the CLI waits on it, so when that same CLI shuts the
+    bridge down (a preload that failed) the exited child is a zombie. Its pid,
+    pidfd and start ticks all still resolve, so a liveness check that stops at
+    identity reads it as running and `wait_for_teardown` burns its whole budget
+    while the registry has been gone for milliseconds -- the `cleanup error:
+    ... timed out waiting for teardown` that `session stop` then contradicts."""
+    import subprocess
+
+    import bn.transport as transport
+    from bn.proc_identity import boot_id, process_start_ticks
+    from bn.transport import BridgeInstance
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        meta = {"pid_start_ticks": process_start_ticks(child.pid), "boot_id": boot_id()}
+        deadline = time.monotonic() + 10
+        while transport._process_state(child.pid) not in transport._EXITED_STATES:
+            assert time.monotonic() < deadline, "child did not exit"
+            time.sleep(0.01)
+        # Exited, deliberately NOT waited on (poll() would reap it): the pid is
+        # still ours, exactly as the CLI leaves its bridge after hand-back.
+        instance = BridgeInstance(
+            pid=child.pid,
+            socket_path=tmp_path / "z.sock",
+            registry_path=tmp_path / "z.json",   # never written: registry already gone
+            plugin_name="bn_agent_bridge",
+            plugin_version="0.1.0",
+            started_at=None,
+            meta=meta,
+            instance_id="zombie1",
+            instance_token="t",
+        )
+        assert transport.bridge_process_alive(instance) is False
+        assert wait_for_teardown(instance, timeout=0.5) is True
+    finally:
+        child.wait()
+
+
 # --------------------------------------------------------------------------
 # #694 finding 10: a socket-less registry never reaches normal discovery
 # --------------------------------------------------------------------------
