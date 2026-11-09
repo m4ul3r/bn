@@ -8,8 +8,9 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from _project_fakes import FakeProject
 from test_project_findings import claim
-from test_project_rootfs import elf, exports, library, target, world
+from test_project_rootfs import RootfsProject, elf, exports, library, target, world
 
 
 @pytest.fixture
@@ -74,30 +75,72 @@ def _state(w, view):
          for pf in w.project.files],
         copy.deepcopy(w.project.metadata),
         list(view.writes) if view is not None else [],
+        # Everything on disk under the scratch root: project blobs, a created
+        # `.bnpr`, an exported file. A mutation that slipped past the reader
+        # shows up here even when it leaves the project object alone.
+        sorted(str(p.relative_to(w.tmp)) for p in w.tmp.rglob("*")),
     )
 
 
-@pytest.mark.parametrize("mutation", ["add", "update", "delete", "open", "link", "sync"])
+@pytest.mark.parametrize("mutation", [
+    "add", "update", "review", "delete", "import", "export", "open", "close", "create",
+    "link", "sync",
+])
 def test_project_mutation_waits_for_existing_reader(dispatch_world, monkeypatch, mutation):
     """Downgrading any mutation to shared/no locking lets it change reader state."""
     w = dispatch_world
     view = None
-    if mutation in {"add", "update"}:
+    if mutation in {"add", "update", "review"}:
         document = _document(w)
         op = "project_finding_add"
         params = {"document": document, "author": "analyst"}
-        if mutation == "update":
+        if mutation != "add":
             initial = _dispatch(w, op, params)
             assert initial["ok"], initial
-            op = "project_finding_update"
-            params = {**params, "id": initial["result"]["id"], "expected_revision": 1,
-                      "document": {**document, "claim": "Serialized correction"}}
+            params = {"id": initial["result"]["id"], "expected_revision": 1}
+            if mutation == "update":
+                op = "project_finding_update"
+                params.update(author="analyst",
+                              document={**document, "claim": "Serialized correction"})
+            else:
+                op = "project_finding_review"
+                trace = w.project.add_file("trace", data=b"independent reproduction")
+                params.update(reviewer="peer", document={
+                    "verdict": "accept", "rationale": "Checked independently",
+                    "evidence": [{"check": "file", "file": trace.id}]})
     elif mutation == "delete":
         source = w.project.add_file("obsolete")
         op, params = "project_delete", {"selector": source.id}
+    elif mutation == "import":
+        # A single import is not a bulk operation; drop the rootfs fake's
+        # sync-only bulk assertion for this op.
+        monkeypatch.setattr(w.project, "create_file_from_path",
+                            FakeProject.create_file_from_path.__get__(w.project))
+        blob = w.tmp / "blob.bin"
+        blob.write_bytes(b"\x7fELF-imported")
+        op, params = "project_import", {"path": str(blob), "folder": "fw/new"}
+    elif mutation == "export":
+        source = w.project.add_file("app")
+        dest = w.tmp / "exported.bin"
+        op, params = "project_export", {"selector": source.id, "dest": str(dest)}
     elif mutation == "open":
         w.instance.projects.close()
         op, params = "project_open", {"path": str(w.root)}
+    elif mutation == "close":
+        op, params = "project_close", {}
+    elif mutation == "create":
+        w.instance.projects.close()
+        dest = w.tmp / "new.bnpr"
+        created = RootfsProject(dest, "new")
+
+        def create_project(path, name):
+            dest.mkdir()
+            (dest / "project.bnpm").write_bytes(b"SQLite format 3\x00")
+            return created
+
+        w.bn.Project = NS(create_project=create_project, open_project=lambda path: created)
+        op, params = "project_create", {"path": str(dest), "name": "new",
+                                        "rootfs": {"root": str(w.tmp), "platform": "linux"}}
     elif mutation == "link":
         backing = library(w, "/lib/libdemo.so", info=elf(w, exports=exports("parse")))
         view = target(w, needed=["libdemo.so"], symbols=["parse"])
@@ -131,9 +174,11 @@ def test_project_mutation_waits_for_existing_reader(dispatch_world, monkeypatch,
             response = _finish(job)
     assert response["ok"], response
 
-    if mutation in {"add", "update"}:
+    if mutation in {"add", "update", "review"}:
         finding = response["result"]
-        assert finding["revision"] == (2 if mutation == "update" else 1)
+        assert finding["revision"] == (1 if mutation == "add" else 2)
+        if mutation == "review":
+            assert finding["review_state"] == "accepted"
         history = _dispatch(w, "project_finding_history", {"id": finding["id"]})
         assert history["ok"], history
         assert [item["revision"] for item in history["result"]["items"]] == list(
@@ -141,8 +186,21 @@ def test_project_mutation_waits_for_existing_reader(dispatch_world, monkeypatch,
     elif mutation == "delete":
         assert source not in w.project.files
         assert source in w.project.deleted
+    elif mutation == "import":
+        assert response["result"]["path"] == "/fw/new/blob.bin"
+        assert w.instance.projects.resolve_file(response["result"]["id"]) in w.project.files
+    elif mutation == "export":
+        assert response["result"]["exported"] is True
+        assert dest.read_bytes() == b"\x7fELF"
     elif mutation == "open":
         assert w.instance.projects.current.project is w.project
+    elif mutation == "close":
+        assert response["result"]["closed"] is True
+        assert w.project.closed and w.instance.projects.current is None
+    elif mutation == "create":
+        assert response["result"]["created"] is True
+        assert w.instance.projects.current.project is created
+        assert w.instance.projects.get_rootfs()["libs"] == {}
     elif mutation == "link":
         assert view.externals["libdemo.so"].backing_file is backing
         assert view.locations[0].library is view.externals["libdemo.so"]
