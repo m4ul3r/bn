@@ -482,6 +482,71 @@ def test_standalone_load_refuses_project_storage_across_cache_owners(
         assert world.instance.projects.current is not None
 
 
+def _storage_destination(world, tmp_path, alias_kind: str) -> Path:
+    """A destination inside the project's `data/` tree, spelled directly, via
+    a file symlink into it, or via a directory symlink onto it."""
+    inside = world.root / "data" / "6e"
+    inside.mkdir(parents=True, exist_ok=True)
+    if alias_kind == "file_symlink":
+        path = tmp_path / "alias.bndb"
+        path.symlink_to(inside / "stray.bndb")
+        return path
+    if alias_kind == "directory_symlink":
+        alias = tmp_path / "alias-directory"
+        alias.symlink_to(inside, target_is_directory=True)
+        return alias / "stray.bndb"
+    return inside / "stray.bndb"
+
+
+@pytest.mark.parametrize("alias_kind", ["direct", "file_symlink", "directory_symlink"])
+def test_standalone_save_refuses_project_storage_1072(world, tmp_path, alias_kind):
+    # #1072: the load refusal had no save-side mirror, so a standalone target
+    # could write an unregistered `.bndb` into a project's `data/`.
+    raw = tmp_path / "plain_bin"
+    raw.write_bytes(b"\x7fELF")
+    bv = _SaveBV(str(raw), result=True, write=True)
+    _rows(world, bv)
+    dest = _storage_destination(world, tmp_path, alias_kind)
+
+    with pytest.raises(world.module.OperationFailure) as error:
+        world.instance._save_database("plain_bin", str(dest))
+    failure = error.value
+    assert failure.status == "invalid_request"
+    assert "Cannot save into project storage" in str(failure)
+    assert str(world.root) in str(failure) and "bn project import" in str(failure)
+    assert failure.observed == {"request_sent": True, "written": False}
+    assert failure.requested == {"path": str(dest.resolve())}
+    assert bv.created_with is None
+    assert not (world.root / "data" / "6e" / "stray.bndb").exists()
+    assert not dest.exists()
+    assert len(world.project.files) == 4, "no project row either"
+
+
+def test_project_export_refuses_a_destination_in_project_storage_1072(world, tmp_path):
+    other = tmp_path / "other.bnpr"
+    (other / "data" / "ab").mkdir(parents=True)
+    (other / "project.bnpm").write_bytes(SQLITE_MAGIC)
+    dest = other / "data" / "ab" / "copy"
+    with pytest.raises(RuntimeError, match="Cannot export into project storage") as error:
+        world.module.project_ops.project_export(world.instance, "fw/app", str(dest))
+    assert str(other) in str(error.value)
+    assert not dest.exists()
+
+
+def test_project_import_refuses_a_source_in_project_storage_1072(world, tmp_path):
+    other = tmp_path / "other.bnpr"
+    blob = other / "data" / "ab" / "cdef"
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"\x7fELF")
+    (other / "project.bnpm").write_bytes(SQLITE_MAGIC)
+    before = list(world.project.files)
+    for source in (blob, world.files.app.path_on_disk):
+        with pytest.raises(RuntimeError, match="Cannot import project storage") as error:
+            world.module.project_ops.project_import(world.instance, str(source))
+        assert "bn project export" in str(error.value)
+    assert list(world.project.files) == before
+
+
 def test_project_load_closes_an_unpublished_view_on_failure(world):
     # #609 parity: a view BN opened but the bridge never published would leak.
     f = world.files
