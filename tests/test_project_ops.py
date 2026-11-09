@@ -919,15 +919,55 @@ def test_project_delete_removes_a_closed_file(po, populated):
 
 
 
-@pytest.mark.parametrize("folder", [".bn-findings", "/.bn-findings/F-example", "//.bn-findings//"])
+@pytest.mark.parametrize("folder", [
+    ".bn-findings", "/.bn-findings/F-example", "//.bn-findings//",
+    # #1074 item 2: `.` and empty components carry no meaning in a
+    # path-in-project, so these spell the same reserved first component and
+    # must not create a literal `/./.bn-findings/...` folder instead.
+    "./.bn-findings/lookalike", "././.bn-findings", ".//.bn-findings/",
+])
 def test_project_import_cannot_inject_finding_history(po, populated, tmp_path, folder):
     manager, project, _ = populated
     source = tmp_path / "record.json"
     source.write_bytes(b'{"claim":"forged"}')
     before = list(project.files)
-    with pytest.raises(RuntimeError, match="reserved findings history"):
+    before_folders = list(project.folders)
+    with pytest.raises(RuntimeError, match=r"reserved findings history `/\.bn-findings`"):
         po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder)
     assert project.files == before
+    assert project.folders == before_folders
+
+
+def test_project_import_allows_the_reserved_name_below_the_root(po, populated, tmp_path):
+    """Only the FIRST normalised component is the ledger namespace."""
+    manager, _, _ = populated
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x7fELF")
+    row = po.project_import(_bridge_with_rows(manager, []), str(src), folder="usr/.bn-findings")
+    assert row["folder"] == "/usr/.bn-findings" and row["path"] == "/usr/.bn-findings/blob.bin"
+
+
+@pytest.mark.parametrize("folder", ["./usr//bin/", "usr/./bin", "/usr/bin/", "usr/bin"])
+def test_project_import_normalises_the_folder_spelling(po, populated, tmp_path, folder):
+    """#1074 item 2: `./`, `//`, a leading and a trailing `/` are spellings of
+    one path-in-project, not distinct native folders."""
+    manager, project, _ = populated
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x7fELF")
+    row = po.project_import(_bridge_with_rows(manager, []), str(src), folder=folder)
+    assert row["folder"] == "/usr/bin" and row["path"] == "/usr/bin/blob.bin"
+    assert [f.name for f in project.folders if f.name in {".", ""}] == []
+    assert manager.folder_path(manager.ensure_folder("./usr/bin/")) == "/usr/bin"
+    assert len([f for f in project.folders if f.name == "bin"]) == 1
+
+
+def test_project_files_normalises_the_folder_filter(po, populated):
+    manager, _, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    plain = po.project_files(bridge, folder="fw")
+    for spelling in ("./fw//", "/fw/", "fw/./"):
+        assert po.project_files(bridge, folder=spelling) == plain, spelling
+    assert [r["path"] for r in plain["files"]]
 
 
 def test_project_delete_cannot_erase_finding_history(po, populated):

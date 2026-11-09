@@ -133,6 +133,28 @@ def test_no_self_accept_and_manual_evidence_cannot_establish_acceptance(ledger):
     assert rejected["reviews"][0]["evidence"][0]["text"] == "Unsupported interpretation"
 
 
+@pytest.mark.parametrize("author, reviewer", [
+    ("analyst", "Analyst"),
+    ("analyst", " analyst "),
+    ("analyst", "ANALYST"),
+    ("analyst", "\uff41\uff4e\uff41\uff4c\uff59\uff53\uff54"),   # fullwidth: NFKC-equal
+    ("lead analyst", "lead \t  analyst"),                         # whitespace run
+])
+def test_self_accept_refusal_is_a_typo_guard_over_the_declared_label(ledger, author, reviewer):
+    """#1074 item 1: the self-accept check compares labels after NFKC, case
+    folding, trimming and whitespace collapse. It is a typo guard, not
+    authentication -- a genuinely different label still accepts."""
+    first = ledger.api.project_finding_add(ledger.bridge, claim(ledger), author)
+    assert first["author"] == author
+    with pytest.raises(RuntimeError, match="Self acceptance"):
+        review(ledger, first, reviewer=reviewer)
+    assert len(snapshots(ledger)) == 1
+    accepted = review(ledger, first, reviewer="analyst-2")
+    assert accepted["review_state"] == "accepted"
+    assert accepted["reviews"][-1]["reviewer"] == "analyst-2"
+    assert accepted["author"] == author
+
+
 def test_acceptance_uses_declared_author_of_current_claim_revision(ledger):
     first = add(ledger)
     changed = ledger.api.project_finding_update(

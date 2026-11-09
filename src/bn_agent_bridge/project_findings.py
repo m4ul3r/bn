@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -91,6 +92,20 @@ def _text(value: Any, label: str, maximum: int = 32768) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise RuntimeError(f"{label} must be a nonempty string of at most {maximum} characters")
     return value.strip()
+
+
+def _same_label(a: str, b: str) -> bool:
+    """Do two declared identity labels spell the same name?
+
+    A typo guard for the self-accept refusal, NOT authentication (#1074 item
+    1): `Analyst`, ` analyst ` and a fullwidth spelling are one label for the
+    purpose of "the reviewer must differ from the author", because a declared
+    label proves nothing about who typed it either way. Compared after NFKC
+    normalisation, case folding, trimming and collapsing internal whitespace;
+    the labels themselves are stored exactly as declared."""
+    def fold(label: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", label).casefold().split())
+    return fold(a) == fold(b)
 
 
 def _integer(value: Any, label: str, minimum: int = 1) -> int:
@@ -226,6 +241,10 @@ def _record_schema(record: Any, project_id: str, finding_id: str, revision: int)
         if _integer(review["reviewed_revision"], "reviewed_revision") >= revision or review["claim_revision"] != record["claim_revision"]:
             raise RuntimeError("Invalid review revision")
         _captured_schema(review["evidence"], nonempty=verdict != "supersede")
+        # Exact, not `_same_label`: this validates records already on disk, and
+        # a ledger written before the typo guard may hold an accept whose
+        # labels differ only in case. Tightening here would turn such history
+        # into an integrity failure; the guard belongs at the write.
         if verdict == "accept" and reviewer == record["author"]:
             raise RuntimeError("Self acceptance is forbidden")
         if verdict == "supersede":
@@ -624,7 +643,7 @@ def project_finding_review(bridge: Any, id: Any, document: Any, expected_revisio
         raise RuntimeError("verdict must be accept, reject, dispute, or supersede")
     rationale = _text(document["rationale"], "rationale")
     inputs = _array(document["evidence"], "review evidence", nonempty=verdict != "supersede")
-    if verdict == "accept" and reviewer == previous["author"]:
+    if verdict == "accept" and _same_label(reviewer, previous["author"]):
         raise RuntimeError("Self acceptance is forbidden: reviewer must differ from claim author")
     replacement = None
     if verdict == "supersede":

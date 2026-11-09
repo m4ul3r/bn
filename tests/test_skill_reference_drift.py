@@ -1064,6 +1064,30 @@ def test_the_command_index_is_readable(skill):
     )
 
 
+# #1074 item 4: the category names each Command index carries, pinned as a SET
+# (order is layout, not contract), mirroring `EXPECTED_DESTRUCTIVE` in
+# `tests/test_op_registry.py`. The population guard above proves every command
+# is advertised SOMEWHERE; this one makes the category vocabulary a deliberate
+# change, because skill prose refers to categories by name ("see Mutate") and a
+# rename that leaves such a reference dangling regresses agent discovery with
+# no test noticing. A rename must update this pin AND every skill sentence that
+# names the category, in the same commit.
+EXPECTED_INDEX_CATEGORIES = {
+    SKILL: frozenset({"Read", "Mutate", "Discover", "Session", "Tooling", "Escape hatch"}),
+    PROJECT_SKILL: frozenset({"Projects", "Findings"}),
+}
+
+
+@pytest.mark.parametrize("skill", INDEX_SKILLS, ids=lambda path: path.parent.name)
+def test_the_command_index_categories_are_exactly_these(skill):
+    categories = {match.group("group").strip()
+                  for match in map(_INDEX_LINE.match, _index_lines(skill)) if match}
+    assert categories == EXPECTED_INDEX_CATEGORIES[skill], (
+        f"the Command index categories in {skill.parent.name} changed: expected "
+        f"{sorted(EXPECTED_INDEX_CATEGORIES[skill])}, parsed {sorted(categories)}. "
+        "A rename must update this pin and every skill sentence naming the category.")
+
+
 @pytest.mark.parametrize("skill,line",
                          [(skill, line) for skill in INDEX_SKILLS for line in _index_lines(skill)],
                          ids=lambda value: value.parent.name if isinstance(value, Path) else value.strip()[:24])

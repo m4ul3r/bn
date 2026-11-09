@@ -493,12 +493,13 @@ class ProjectManager:
 
     def ensure_folder(self, path: str | None) -> Any | None:
         """The folder at path-in-project *path*, created level by level when
-        missing. None (the root) for empty/`/`."""
-        if not path or path.strip("/") == "":
+        missing. None (the root) for empty/`/`/`./`."""
+        components = folder_components(path)
+        if not components:
             return None
         project = self.require().project
         parent = None
-        for component in [c for c in path.split("/") if c]:
+        for component in components:
             existing = [
                 f
                 for f in project.folders
@@ -738,7 +739,8 @@ def project_files(
         raise RuntimeError(
             "project_files: folder must be a path in the project or null"
         )
-    wanted = ("/" + folder.strip("/")) if folder and folder.strip("/") else ""
+    components = folder_components(folder)
+    wanted = "/" + "/".join(components) if components else ""
     open_targets = {
         str(row["project_file_id"]): str(row.get("target_id") or "")
         for row in _open_project_targets(bridge)
@@ -766,12 +768,30 @@ def project_files(
     return {"files": rows, "folders": folders}
 
 
+def folder_components(path: Any) -> list[str]:
+    """`./usr//bin/` -> `["usr", "bin"]`: the components of a path-in-project
+    that NAME a folder. Empty and `.` components are spellings of "here", not
+    folders, so `./.bn-findings/x` is the reserved namespace rather than a
+    literal `.` folder beside it (#1074 item 2). Nothing else is rewritten:
+    `..` is a legal native folder name and is kept as one."""
+    if not isinstance(path, str):
+        return []
+    return [part for part in path.split("/") if part and part != "."]
+
+
 def _refuse_finding_path(path: str) -> None:
+    """Refuse a path whose first component is the ledger namespace. Literal on
+    purpose: an existing file's `path_in_project` has no `.`/empty components,
+    and a file in a literal `/./.bn-findings/...` folder (which earlier
+    versions let `--folder ./.bn-findings/...` create) is NOT ledger history,
+    so it stays deletable. User-supplied folder input is normalised by
+    `folder_components` BEFORE it reaches this check."""
     components = [part for part in path.split("/") if part]
     if components and components[0] == FINDINGS_FOLDER:
         raise RuntimeError(
-            "reserved findings history: use `bn project finding` to append a "
-            "revision or review; existing finding records cannot be overwritten or deleted"
+            f"reserved findings history `/{FINDINGS_FOLDER}`: use `bn project finding` "
+            "to append a revision or review; existing finding records cannot be "
+            "overwritten or deleted"
         )
 
 
@@ -791,10 +811,9 @@ def project_import(
         raise RuntimeError(f"project_import: not a file: {source}")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise RuntimeError("project_import: name must be a non-empty string when given")
-    _refuse_finding_path(
-        (folder if isinstance(folder, str) else "") + "/" + (name or source.name).strip()
-    )
-    target_folder = manager.ensure_folder(folder if isinstance(folder, str) else None)
+    components = folder_components(folder)
+    _refuse_finding_path("/".join(components + [(name or source.name).strip()]))
+    target_folder = manager.ensure_folder("/".join(components))
     try:
         pf = state.project.create_file_from_path(
             str(source),

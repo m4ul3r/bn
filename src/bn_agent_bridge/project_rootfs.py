@@ -140,8 +140,8 @@ def project_sync_libs(
         # Validate every candidate and parse new blobs before entering bulk mode.
         for cand in candidates:
             budget.check()
-            project_ops._refuse_finding_path(
-                cand.dir_in_root.rstrip("/") + "/" + cand.names[0])
+            project_ops._refuse_finding_path("/".join(
+                project_ops.folder_components(cand.dir_in_root) + [cand.names[0]]))
             if cand.rel_realpath not in existing:
                 parsed[cand.rel_realpath] = parse_elf_file(cand.realpath, check=budget.check)
         notes.extend(budget.notes)
