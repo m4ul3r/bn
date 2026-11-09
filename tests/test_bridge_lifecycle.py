@@ -47,6 +47,28 @@ def test_registry_records_boot_id_and_process_start_time(instance):
     assert payload["boot_id"] == boot_id()
 
 
+def test_registry_publishes_the_bridge_bn_environment_1076(monkeypatch, tmp_path):
+    # #1076: `session restart` replays the BN_* settings the OLD bridge ran
+    # with, so the bridge publishes what it actually sees -- BN_* keys only,
+    # never the rest of its environment -- as recorded at construction.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2000000")
+    monkeypatch.setenv("BN_ROOTFS_TIMEOUT", "")
+    monkeypatch.setenv("HOME_SECRET", "not-bn")
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="env1")
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "mutated-after-start")
+
+    inst._write_registry()
+
+    env = json.loads(inst.registry_path.read_text(encoding="utf-8"))["env"]
+    assert env["BN_ROOTFS_MAX_WORK"] == "2000000"
+    assert env["BN_ROOTFS_TIMEOUT"] == ""
+    assert env["BN_CACHE_DIR"] == str(tmp_path)
+    assert "HOME_SECRET" not in env
+    assert all(key.startswith("BN_") for key in env)
+
+
 def test_registry_updates_preserve_bridge_start_time(instance, monkeypatch, tmp_path):
     module = __import__(type(instance).__module__, fromlist=["datetime"])
     instance._write_registry()

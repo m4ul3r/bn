@@ -2143,6 +2143,14 @@ class BinaryNinjaBridge:
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
         self._started_at = datetime.now(timezone.utc).isoformat()
+        # #1076: the BN_* settings this bridge runs under, taken once here so the
+        # registry publishes what the process actually started with rather than
+        # whatever a plugin later wrote into os.environ. `session restart`
+        # replays them, because the restart's caller is often another shell or
+        # agent whose environment never had them.
+        self._bn_environment: dict[str, str] = {
+            key: value for key, value in os.environ.items() if key.startswith("BN_")
+        }
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
@@ -2620,6 +2628,10 @@ class BinaryNinjaBridge:
             "started_at": self._started_at,
             "gui": ui is not None,
             "capabilities": {"refresh_target_gate": True},
+            # BN_* keys only (#1076): the record `session restart` replays. The
+            # bridge writes it, not the spawning CLI, so it is what this process
+            # SAW -- which covers a GUI-plugin bridge nothing spawned.
+            "env": dict(self._bn_environment),
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,

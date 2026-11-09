@@ -1255,6 +1255,65 @@ def _session_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lifecycle_instance_id(verb: str, args: argparse.Namespace) -> str:
+    """The instance a lifecycle command (`session stop`/`restart`) acts on.
+
+    #456: accept the id positionally OR via -i/--instance (every other command
+    is driven with -i/--instance, so `session stop -i <id>` is the natural
+    cleanup shape). The positional wins when both are given. Presence, not
+    truthiness (#690 r4): `bn session stop "$ID"` with $ID unset must error, not
+    fall through to the sticky-pin-filled -i and shut down the PINNED bridge.
+
+    #588: the final fallback must NOT pick up a sticky-pinned -i -- only a
+    non-sticky args.instance (an explicit -i/--instance OR the BN_INSTANCE env
+    default; see _instance_option/_apply_sticky_defaults in cli.py) may supply
+    the target for a bare command. Otherwise target_id stays unset and the
+    "requires an instance id" branch fires instead of silently acting on
+    whatever instance the project happens to be pinned to.
+
+    `session restart` additionally refuses two DIFFERENT explicit ids (#1076):
+    `bn -i a session restart b` names two bridges, and silently restarting one
+    of them is not what either name asked for. `BN_INSTANCE` is ambient, so
+    the positional wins over it as it always has.
+    """
+    positional = getattr(args, "instance_id", None)
+    alias = getattr(args, "instance_id_flag", None)
+    flag = (
+        getattr(args, "instance", None)
+        if not getattr(args, "_sticky_instance", False)
+        else None
+    )
+    target_id = (
+        positional
+        if positional is not None
+        else alias
+        if alias is not None
+        else flag
+    )
+    if target_id is not None and not str(target_id).strip():
+        raise BridgeError(
+            f"session {verb}: instance id is empty; pass an id from `bn session list`"
+        )
+    if not target_id:
+        raise BridgeError(
+            f"session {verb} requires an instance id: `bn session {verb} <id>` "
+            f"(or `bn session {verb} -i/--instance <id>`). See `bn session list`."
+        )
+    if verb == "restart" and positional is not None:
+        explicit = [
+            other for other in (alias, flag)
+            if other is not None
+            and other != positional
+            and other != os.environ.get("BN_INSTANCE")
+        ]
+        if explicit:
+            raise BridgeError(
+                f"session restart: two different instance ids were given, "
+                f"{positional!r} and {explicit[0]!r}; pass one. See `bn session list`."
+            )
+    return str(target_id)
+
+
 @command(
     "session",
     "stop",
@@ -1281,38 +1340,7 @@ def _session_status(args: argparse.Namespace) -> int:
     ],
 )
 def _session_stop(args: argparse.Namespace) -> int:
-    # #456: accept the id positionally OR via -i/--instance (every other command is
-    # driven with -i/--instance, so `session stop -i <id>` is the natural
-    # cleanup shape). The positional wins when both are given.
-    # Presence, not truthiness (#690 r4): `bn session stop "$ID"` with $ID
-    # unset must error, not fall through to the sticky-pin-filled -i and shut
-    # down the PINNED bridge.
-    positional = getattr(args, "instance_id", None)
-    alias = getattr(args, "instance_id_flag", None)
-    # #588: the final fallback must NOT pick up a sticky-pinned -i -- only a
-    # non-sticky args.instance (an explicit -i/--instance OR the BN_INSTANCE
-    # env default; see _instance_option/_apply_sticky_defaults in cli.py) may
-    # supply the target for a bare `session stop`. Otherwise target_id stays
-    # unset and the "requires an instance id" branch below fires instead of
-    # silently stopping whatever instance the project happens to be pinned to.
-    target_id = (
-        positional
-        if positional is not None
-        else alias
-        if alias is not None
-        else getattr(args, "instance", None)
-        if not getattr(args, "_sticky_instance", False)
-        else None
-    )
-    if target_id is not None and not str(target_id).strip():
-        raise BridgeError(
-            "session stop: instance id is empty; pass an id from `bn session list`"
-        )
-    if not target_id:
-        raise BridgeError(
-            "session stop requires an instance id: `bn session stop <id>` "
-            "(or `bn session stop -i/--instance <id>`). See `bn session list`."
-        )
+    target_id = _lifecycle_instance_id("stop", args)
     # Resolve the instance up front so we can confirm teardown by pid + files
     # after the shutdown, and SIGTERM it if the socket request fails.
     # Lifecycle lookup, not normal discovery: a bridge whose socket file is gone
@@ -1411,7 +1439,18 @@ def _session_stop(args: argparse.Namespace) -> int:
 
 @command("session", "restart", help="Stop a bridge session and respawn it (same id), reloading its targets",
          args=[
-             arg("instance", help="Instance ID to restart"),
+             arg(
+                 "instance_id",
+                 nargs="?",
+                 metavar="instance",
+                 help="Instance ID to restart (positional, or pass -i/--instance <id>)",
+             ),
+             arg(
+                 "--instance-id",
+                 dest="instance_id_flag",
+                 default=None,
+                 help="Instance ID to restart (alias for the positional or -i/--instance)",
+             ),
              arg(
                  "--discard-unsaved",
                  action="store_true",
@@ -1425,7 +1464,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     targets, stop the process, respawn under the same instance id, and reload the
     same binaries -- so the new bridge serves current code without the caller
     hunting for the right paths."""
-    target_id = args.instance
+    target_id = _lifecycle_instance_id("restart", args)
     # Lifecycle lookup (#694): a socket-less bridge is hidden from normal
     # discovery, but restarting it is a legitimate way to recover it.
     inst = cli.find_lifecycle_instance(target_id)
@@ -1548,7 +1587,17 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    instance = cli.spawn_instance(resolved_id)
+    # #1076: the new bridge starts with the BN_* settings the OLD one ran under
+    # (its registry records what it saw), and the caller's own BN_* exports win
+    # over them. Without this a restart from another shell or agent silently
+    # dropped BN_ROOTFS_MAX_WORK and friends and the refusal they fixed came
+    # back. Read from the record captured before teardown: the registry file is
+    # gone by now.
+    recorded_env = inst.meta.get("env") if isinstance(inst.meta, dict) else None
+    env, env_report = cli.restart_environment(
+        recorded_env if isinstance(recorded_env, dict) else None, os.environ
+    )
+    instance = cli.spawn_instance(resolved_id, env=env)
     # Reload targets without associating the restart command's cwd.
     #
     # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
@@ -1658,6 +1707,7 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["reload_capture_error"] = reload_capture_error
     if discarded:
         result["discarded_unsaved"] = discarded
+    result["env"] = env_report
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     project_reopen_failed = project_result is not None and not project_result["opened"]
     return 1 if failures or project_reopen_failed or association_error or reload_capture_failed else 0

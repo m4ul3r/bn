@@ -1565,7 +1565,7 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
-    def fake_spawn(instance_id=None):
+    def fake_spawn(instance_id=None, **kw):
         spawned["id"] = instance_id
         return new
     monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
@@ -1637,7 +1637,7 @@ def test_session_restart_reloads_each_target_as_the_file_it_is_753(monkeypatch, 
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: new)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
     rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
@@ -1693,7 +1693,7 @@ def _restart_project_fixture(monkeypatch, *, meta, rows):
         lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": rows},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: new)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     return calls
 
@@ -1879,7 +1879,7 @@ def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch,
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", failing_send_to_instance)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
-    def fake_spawn(instance_id=None):
+    def fake_spawn(instance_id=None, **kw):
         spawned["id"] = instance_id
         return new
     monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
@@ -1929,7 +1929,7 @@ def test_session_restart_with_zero_open_targets_still_restarts(monkeypatch, caps
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
     spawned = {}
-    def fake_spawn(instance_id=None):
+    def fake_spawn(instance_id=None, **kw):
         spawned["id"] = instance_id
         return new
     monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
@@ -4126,7 +4126,7 @@ def test_session_restart_escalates_through_one_pin(monkeypatch, capsys):
     )
     converged = iter([False, True])
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: next(converged))
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new_instance)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: new_instance)
     signallers = _fake_signaller(monkeypatch)
 
     assert bn.cli.main(["session", "restart", "res1", "--format", "json"]) == 0
@@ -4165,7 +4165,7 @@ def test_session_start_cleanup_signals_through_the_verified_pin(monkeypatch, cap
 
     binary = tmp_path / "app.bin"
     binary.write_bytes(b"\x7fELF")
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance())
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: _failing_start_instance())
     monkeypatch.setattr(bn.cli, "send_request", _failing_start_send_request)
     converged = iter([False, True])
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: next(converged))
@@ -4184,7 +4184,7 @@ def test_session_start_cleanup_signals_through_the_verified_pin(monkeypatch, cap
 def test_session_start_cleanup_reports_a_refused_signal(monkeypatch, capsys, tmp_path):
     binary = tmp_path / "app.bin"
     binary.write_bytes(b"\x7fELF")
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance())
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: _failing_start_instance())
     monkeypatch.setattr(bn.cli, "send_request", _failing_start_send_request)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
     signallers = _fake_signaller(
@@ -4208,7 +4208,7 @@ def test_session_start_default_text_discloses_cleanup_timeout(
     from bn.transport import BridgeError
 
     monkeypatch.setattr(
-        bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance()
+        bn.cli, "spawn_instance", lambda instance_id=None, **kw: _failing_start_instance()
     )
 
     def send_request(op, **kwargs):
@@ -4301,7 +4301,7 @@ def _restart_bridge_stubs(
         },
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: new)
     return calls
 
 
@@ -4401,7 +4401,7 @@ def test_failed_start_cleanup_gives_acknowledged_shutdown_its_grace_period(
 
     binary = tmp_path / "app.bin"
     binary.write_bytes(b"\x7fELF")
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance())
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: _failing_start_instance())
 
     def request(op, **kwargs):
         if op == "shutdown":
@@ -4610,7 +4610,7 @@ def test_session_restart_reopens_the_saved_database_not_the_raw_file_857(monkeyp
         ]},
     )
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: new)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
     rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
@@ -5511,7 +5511,7 @@ def _unsaved_guard_fixture(monkeypatch, rows, *, instance_id="fix-1", listing=No
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", fake_to_instance)
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: new)
     _fake_signaller(monkeypatch)
     return calls
 
@@ -6558,3 +6558,196 @@ def test_skill_install_and_doctor_report_the_bn_kernel_skill_dir(
     assert bn.cli.main(["doctor"]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert [line for line in lines if line.startswith("bn-kernel skill_dir:")] == expected
+
+
+# --------------------------------------------------------------------------
+# #1076: `session restart` replays the bridge's recorded BN_* environment
+# --------------------------------------------------------------------------
+
+
+def _restart_env_fixture(monkeypatch, tmp_path, meta):
+    """A restart that drives the REAL spawn path up to `subprocess.Popen`, so the
+    `env=` the new bridge would start with is what is asserted -- not a stub's
+    argument. Returns the list of Popen keyword arguments."""
+    import pathlib
+    from bn.transport import BridgeInstance, bridge_registry_path
+
+    # The caller's BN_* set is exactly what each test exports below; the
+    # registry location is the fixture's own.
+    for key in [k for k in os.environ if k.startswith("BN_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
+    old = type("FakeInstance", (), {
+        "instance_id": "env-1", "pid": 500,
+        "socket_path": pathlib.Path("/tmp/old.sock"),
+        "meta": meta,
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=tmp_path / "new.sock",
+        registry_path=bridge_registry_path("env-1"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="env-1",
+    )
+    bridge_registry_path("env-1").parent.mkdir(parents=True, exist_ok=True)
+    bridge_registry_path("env-1").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None, **kw: {"ok": True, "result": []},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, *, params=None, target=None, timeout=30.0, instance_id=None, **kw:
+            {"ok": True, "result": {}},
+    )
+    monkeypatch.setattr("bn.transport.list_instances", lambda **kwargs: [])
+    monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
+    monkeypatch.setattr("bn.transport._load_instance", lambda path, **kwargs: new)
+
+    popen_calls = []
+
+    class _FakePopen:
+        pid = 999
+
+        def __init__(self, cmd, **kwargs):
+            popen_calls.append({"cmd": cmd, **kwargs})
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr("bn.transport.subprocess.Popen", _FakePopen)
+    return popen_calls
+
+
+def test_session_restart_replays_the_recorded_bn_env_1076(monkeypatch, tmp_path, capsys):
+    """#1076: the bridge was started with BN_ROOTFS_MAX_WORK; a restart from a
+    shell that does not have it must spawn the new bridge WITH it, and say so."""
+    popen_calls = _restart_env_fixture(
+        monkeypatch, tmp_path, {"env": {"BN_ROOTFS_MAX_WORK": "2000000"}}
+    )
+    monkeypatch.delenv("BN_ROOTFS_MAX_WORK", raising=False)
+
+    rc = bn.cli.main(["session", "restart", "env-1"])
+    assert rc == 0
+    assert popen_calls[0]["env"]["BN_ROOTFS_MAX_WORK"] == "2000000"
+    out = capsys.readouterr().out
+    assert "env: replayed BN_ROOTFS_MAX_WORK" in out
+
+
+@pytest.mark.parametrize("override", ["5", ""])
+def test_session_restart_caller_bn_env_overrides_the_record_1076(
+    monkeypatch, tmp_path, capsys, override
+):
+    # A key the caller sets explicitly -- even to empty -- wins over the record.
+    popen_calls = _restart_env_fixture(
+        monkeypatch, tmp_path,
+        {"env": {"BN_ROOTFS_MAX_WORK": "2000000", "BN_ROOTFS_TIMEOUT": "90"}},
+    )
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", override)
+    monkeypatch.delenv("BN_ROOTFS_TIMEOUT", raising=False)
+    monkeypatch.setenv("BN_IDLE_TIMEOUT", "600")
+
+    rc = bn.cli.main(["session", "restart", "env-1", "--format", "json"])
+    assert rc == 0
+    env = popen_calls[0]["env"]
+    assert env["BN_ROOTFS_MAX_WORK"] == override
+    assert env["BN_ROOTFS_TIMEOUT"] == "90"
+    assert env["BN_IDLE_TIMEOUT"] == "600"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["env"] == {
+        "recorded": True,
+        "replayed": ["BN_ROOTFS_TIMEOUT"],
+        "overridden": ["BN_ROOTFS_MAX_WORK"],
+        "added": ["BN_IDLE_TIMEOUT"],
+    }
+
+
+def test_session_restart_env_line_names_every_kind_of_change_1076(monkeypatch, tmp_path, capsys):
+    popen_calls = _restart_env_fixture(
+        monkeypatch, tmp_path,
+        {"env": {"BN_ROOTFS_MAX_WORK": "2000000", "BN_ROOTFS_TIMEOUT": "90",
+                 "BN_DISABLE_USER_PLUGINS": "1"}},
+    )
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "5")
+    monkeypatch.delenv("BN_ROOTFS_TIMEOUT", raising=False)
+    monkeypatch.setenv("BN_DISABLE_USER_PLUGINS", "1")      # unchanged: not mentioned
+    monkeypatch.setenv("BN_IDLE_TIMEOUT", "600")
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    assert popen_calls[0]["env"]["BN_DISABLE_USER_PLUGINS"] == "1"
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == (
+        "env: replayed BN_ROOTFS_TIMEOUT; overridden BN_ROOTFS_MAX_WORK; "
+        "added BN_IDLE_TIMEOUT"
+    )
+
+
+def test_session_restart_env_line_is_silent_when_nothing_differs_1076(monkeypatch, tmp_path, capsys):
+    _restart_env_fixture(monkeypatch, tmp_path, {"env": {"BN_ROOTFS_MAX_WORK": "2000000"}})
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2000000")
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    assert "env:" not in capsys.readouterr().out
+
+
+def test_session_restart_never_replays_the_registry_location_1076(monkeypatch, tmp_path, capsys):
+    # BN_CACHE_DIR names the registry the SPAWNING cli waits on; a recorded value
+    # from another shell would send the new bridge's registration elsewhere and
+    # time the spawn out. The caller's value is the only one that can be right.
+    popen_calls = _restart_env_fixture(
+        monkeypatch, tmp_path, {"env": {"BN_CACHE_DIR": "/elsewhere/cache"}}
+    )
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    assert popen_calls[0]["env"]["BN_CACHE_DIR"] == str(tmp_path / "cache")
+    assert "env:" not in capsys.readouterr().out
+
+
+def test_session_restart_without_a_recorded_env_uses_the_caller_env_1076(monkeypatch, tmp_path, capsys):
+    # A registry written before #1076 has no `env`: restart exactly as before,
+    # and say that nothing could be replayed.
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {})
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "7")
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    assert popen_calls[0]["env"] == {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    out = capsys.readouterr().out
+    assert "env: no recorded environment" in out
+
+
+def test_session_restart_accepts_the_instance_flag_1076(monkeypatch, tmp_path, capsys):
+    # The related nit: every other command is driven with -i, and restart
+    # refused it because the id was positional-only.
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {"env": {}})
+    seen = {}
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance",
+        lambda target: seen.setdefault("target", target) and None,
+    )
+    rc = bn.cli.main(["-i", "env-1", "session", "restart"])
+    assert seen["target"] == "env-1"
+    assert rc == 2                       # the stub returned None: not found
+    assert not popen_calls
+
+
+def test_session_restart_flag_and_positional_must_agree_1076(monkeypatch, tmp_path, capsys):
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {"env": {}})
+    rc = bn.cli.main(["-i", "env-1", "session", "restart", "other-2"])
+    assert rc == 2
+    assert "env-1" in capsys.readouterr().err
+    assert not popen_calls
+    # The same id both ways is not a conflict.
+    assert bn.cli.main(["-i", "env-1", "session", "restart", "env-1"]) == 0
+    assert len(popen_calls) == 1
+
+
+def test_session_restart_requires_an_instance_id_1076(monkeypatch, tmp_path, capsys):
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {"env": {}})
+    monkeypatch.delenv("BN_INSTANCE", raising=False)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "pinned"})
+    rc = bn.cli.main(["session", "restart"])
+    assert rc == 2
+    assert "instance id" in capsys.readouterr().err.lower()
+    assert not popen_calls                 # the sticky pin never names the victim

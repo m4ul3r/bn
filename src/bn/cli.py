@@ -59,6 +59,7 @@ from .transport import (  # noqa: F401
     instance_selector,
     implicit_target_selector,
     list_instances,
+    restart_environment,
     send_request,
     spawn_instance,
     unwrap_result,
