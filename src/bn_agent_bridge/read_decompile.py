@@ -388,16 +388,20 @@ def _flattened_guard_warning(bv, func) -> dict[str, Any] | None:
     sites.sort()
     where = ", ".join(hex(a) for a in sites[:3]) + (
         f" +{len(sites) - 3} more" if len(sites) > 3 else "")
+    # #1058 item 12: a printed command runs as printed. The summary names the
+    # first site; the detail carries them all in `addresses`, so it says which
+    # placeholder to fill rather than printing a `bn disasm` with no address.
     return _warning_row(
         "select",
         f"branch-free {names} at {where}: a guard there may read as a ternary or "
-        "flag math; confirm it in `bn disasm`",
+        f"flag math; confirm it in `bn disasm {hex(sites[0])}`",
         f"branch-free conditional(s) in this function ({names}): Pseudo-C "
         f"renders these as ternaries, folds them into one compound condition, "
         f"or decomposes them into raw flag arithmetic (`v`/`z`/`n` locals) -- "
         f"a two-sided range guard can come out as none of the three shapes a "
         f"reader is looking for, so a bound that IS enforced can read as one "
-        f"that never fires. Confirm it in `bn disasm` before concluding on an "
+        f"that never fires. Confirm each site in `bn disasm <address>` (the "
+        f"addresses listed with this warning) before concluding on an "
         f"off-by-one, truncation or missing check.",
         addresses=[hex(a) for a in sites],
     )
@@ -1030,7 +1034,8 @@ def _split_body_notes(bv, func) -> list[dict[str, Any]]:
             f"split body: the block ending at {hex(source)} runs straight into "
             f"{_function_label(other)} without a branch or return -- BN likely split "
             "this function at a shared tail, so part of its code is listed under that "
-            "one. Read both (`bn disasm`) before trusting either decompile. "
+            f"one. Read both (`bn disasm {hex(int(func.start))}` and "
+            f"`bn disasm {hex(int(other.start))}`) before trusting either decompile. "
             f"If this is an erroneous tail entry, repair with `bn function delete {hex(int(other.start))}`. "
             "There is no clean undo; --preview refuses without changes. Inspect the "
             "reported containing bodies and decompile again; deletion does not guarantee a full merge.",
@@ -1052,12 +1057,13 @@ def _split_body_notes(bv, func) -> list[dict[str, Any]]:
         notes.append(_warning_row(
             "split",
             f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}); "
-            "drop them with `bn proto set`",
+            f"drop them with `bn proto set {hex(int(func.start))} '<prototype without them>'`",
             f"prototype takes parameters in callee-saved/link registers ({', '.join(params)}): "
             "no calling convention passes arguments there, so BN is reading a value the "
             "body only saves or restores -- typically because it split the body at a "
             "shared tail, or a path reads the register before setting it. Callers render "
-            "stray arguments for them; drop them with `bn proto set`.",
+            f"stray arguments for them; drop them with `bn proto set {hex(int(func.start))} "
+            "'<prototype without them>'`.",
         ))
     elif params:
         notes.append(_warning_row(
@@ -1536,7 +1542,7 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
         "which. A tail call through a pointer, leaving the function: the callee's "
         f"arguments are then in the argument registers{regs} at the jump and are not "
         f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
-        "set`) or the object the pointer is loaded from so BN can render the call. Or a "
+        "set <callee> '<prototype>'`) or the object the pointer is loaded from so BN can render the call. Or a "
         "computed goto or jump table BN did not resolve, staying in this function: the "
         "code it reaches may not be part of this function's decompile or disassembly. None "
         "of these steps is sure to find the targets: " + "; ".join(steps) + ". Read a "
@@ -1691,8 +1697,8 @@ def _offset_warning(bv, func, text: str) -> dict[str, Any] | None:
             f"No definition: {', '.join(plain)} -- "
             + ("each is a named reference" if len(plain) > 1 else "a named reference")
             + " BN created (from a symbol or a demangled signature) with no layout, so "
-            "`bn types show` reports it as not found. Declare one with "
-            "`bn types declare` (a `::` name goes in backticks: struct `ns::T` { ... };)."
+            "`bn types show <name>` reports it as not found. Declare one with "
+            "`bn types declare '<declaration>'` (a `::` name goes in backticks: struct `ns::T` { ... };)."
             + (f" {', '.join(with_vtable)} already has a `::VTable` type, and `bn struct "
                f"show {shlex.quote(with_vtable[0])}` prints the declaration to start from."
                if with_vtable else ""))
@@ -2043,6 +2049,10 @@ def _function_info_batch(ctx, selector: str | None, identifiers, *, blocks: bool
     order, and a miss is a failed row rather than an abort -- an agent asking
     about five functions used to run five calls in a shell loop.
     """
+    # As in `_decompile_batch`: the target is not per identifier, so a refusal
+    # (several targets open, an unknown selector) fails the request once with
+    # its listing instead of repeating it in every row (#1058 item 14).
+    ctx._resolve_view(selector)
     rows: list[dict[str, Any]] = []
     for identifier in identifiers:
         try:
@@ -2247,15 +2257,15 @@ def _undefined_type_advice(bv, func, params) -> list[dict[str, Any]]:
 def _undefined_type_note(rows, params) -> str:
     names = ", ".join(f"`{r['name']}`" for r in rows)
     text = (f"This prototype names type(s) the view does not define: {names}. "
-            "`bn proto set` refuses a prototype naming an undefined type until it is declared")
+            "proto set refuses a prototype naming an undefined type until it is declared")
     cmds = [r["declare_command"] for r in rows if r.get("declare_command")]
     text += (": run " + "; ".join(f"`{c}`" for c in cmds) + " first.") if cmds else \
-        " (declare it first with `bn types declare`)."
+        " (declare it first with `bn types declare '<declaration>'`)."
     if any("::" in r["name"] for r in rows):
         text += " In a type string, spell a `::`-qualified name in backticks (struct `ns::Foo`*)."
     if any(str(getattr(p, "name", "")) == "this" for p in params):
         text += (" `this` is a keyword the parser rejects as a parameter name: rename it "
-                 "(`self`) in the prototype you pass to `bn proto set`.")
+                 "(`self`) in the prototype you pass to proto set.")
     return text
 
 

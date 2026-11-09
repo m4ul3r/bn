@@ -3770,3 +3770,18 @@ def test_function_search_count_still_accepts_an_explicit_address_sort_1048(fake_
                                                     "total": 1}},
     })
     assert bn.cli.main(["function", "search", "main", "--count", "--sort", "address"]) == 0
+
+
+def test_evidence_surface_table_min_run_refuses_one_and_says_why_1058(capsys):
+    """#1058 item 11: the bridge refuses `table-min-run 1` (a run of one pointer
+    is not a table) but the CLI accepted it as a positive int and the help text
+    did not say so. Both now name the minimum."""
+    with pytest.raises(SystemExit) as exit_info:
+        bn.cli.main(["evidence", "surface", "--table-min-run", "1"])
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--table-min-run must be an integer >= 2, got 1" in err
+
+    with pytest.raises(SystemExit):
+        bn.cli.main(["evidence", "surface", "--help"])
+    assert "must be at least 2" in capsys.readouterr().out

@@ -1208,8 +1208,13 @@ def _evidence_virtual_call(args: argparse.Namespace) -> int:
                      "create functions",
          see_also=("evidence init", "evidence table", "function create"),
          args=[
-             arg("--table-min-run", dest="table_min_run", type=_positive_int, default=3, metavar="N",
-                 help="Minimum consecutive pointers-to-code to report as a candidate table (default 3)"),
+             # #1058 item 11: a run of one pointer is not a table; the bridge refuses
+             # 1 (`read_evidence._hidden_surface`), so refuse it here with the minimum
+             # named instead of round-tripping to that error.
+             arg("--table-min-run", dest="table_min_run", type=cli._int_at_least(2, "--table-min-run"),
+                 default=3, metavar="N",
+                 help="Minimum consecutive pointers-to-code to report as a candidate table "
+                      "(default 3; must be at least 2)"),
              arg("--max-tables", dest="max_tables", type=_positive_int, default=64,
                  help="Cap on reported candidate tables (disclosed when hit)"),
              arg("--max-candidates", dest="max_candidates", type=_positive_int, default=128,
