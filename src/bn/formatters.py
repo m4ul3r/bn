@@ -1891,7 +1891,7 @@ def _rebind_lines(link: Any, *, changed_only: bool = False) -> list[str]:
         to_path = _text_value(row, "to_path")
         where = f" ({_escape_control_chars(to_path)})" if to_path else ""
         lines.append(
-            f"  rebound: {name} {_escape_control_chars(from_id) if from_id else '(none)'} "
+            f"  rebound: {name} {_escape_control_chars(from_id) if from_id else _empty_result()} "
             f"-> {to_id}{where}")
     return lines
 
