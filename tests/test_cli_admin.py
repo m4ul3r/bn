@@ -6705,6 +6705,31 @@ def test_session_restart_never_replays_the_registry_location_1076(monkeypatch, t
     assert "env:" not in capsys.readouterr().out
 
 
+def test_session_restart_neither_replays_nor_reports_cli_only_keys_1076(monkeypatch, tmp_path, capsys):
+    # BN_INSTANCE, BN_TARGET, the request/spawn budgets, the spill knobs and the
+    # local batch limits are read by the CLI process only. Even when a record
+    # carries them, replaying them says nothing about the bridge, and the
+    # caller's own copies are not "added" to it either: the env: line names
+    # bridge settings and nothing else.
+    popen_calls = _restart_env_fixture(
+        monkeypatch, tmp_path,
+        {"env": {"BN_INSTANCE": "old-shell", "BN_TARGET": "old-bin",
+                 "BN_REQUEST_TIMEOUT": "9", "BN_SPILL_TOKENS": "5000",
+                 "BN_ROOTFS_MAX_WORK": "2000000"}},
+    )
+    monkeypatch.setenv("BN_INSTANCE", "env-1")
+    monkeypatch.setenv("BN_NO_WAIT", "1")
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    env = popen_calls[0]["env"]
+    assert env["BN_INSTANCE"] == "env-1"              # the caller's, untouched
+    assert env["BN_NO_WAIT"] == "1"
+    assert "BN_TARGET" not in env and "BN_REQUEST_TIMEOUT" not in env
+    assert "BN_SPILL_TOKENS" not in env
+    assert env["BN_ROOTFS_MAX_WORK"] == "2000000"
+    assert capsys.readouterr().out.splitlines()[-1] == "env: replayed BN_ROOTFS_MAX_WORK"
+
+
 def test_session_restart_without_a_recorded_env_uses_the_caller_env_1076(monkeypatch, tmp_path, capsys):
     # A registry written before #1076 has no `env`: restart exactly as before,
     # and say that nothing could be replayed.

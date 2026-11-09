@@ -42,6 +42,7 @@ from . import read_taint_slice
 from . import read_types
 from . import read_xrefs
 from . import vars as vars_mod
+from .bridge_env import recorded_environment
 from ._shared import (
     IMPORT_SYMBOL_TYPE_NAMES,
     OperationFailure,
@@ -2147,10 +2148,9 @@ class BinaryNinjaBridge:
         # registry publishes what the process actually started with rather than
         # whatever a plugin later wrote into os.environ. `session restart`
         # replays them, because the restart's caller is often another shell or
-        # agent whose environment never had them.
-        self._bn_environment: dict[str, str] = {
-            key: value for key, value in os.environ.items() if key.startswith("BN_")
-        }
+        # agent whose environment never had them. CLI-only keys are left out
+        # by the shared rule (bridge_env).
+        self._bn_environment: dict[str, str] = recorded_environment(os.environ)
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}

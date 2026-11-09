@@ -33,6 +33,7 @@ from .output import (estimate_output_result, render_envelope, render_error, rend
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
 # can monkeypatch a single well-known location, `bn.cli`.
+from .bridge_env import restart_environment  # noqa: F401
 from .paths import (  # noqa: F401
     cache_home,
     claude_skills_dir,
@@ -59,7 +60,6 @@ from .transport import (  # noqa: F401
     instance_selector,
     implicit_target_selector,
     list_instances,
-    restart_environment,
     send_request,
     spawn_instance,
     unwrap_result,
