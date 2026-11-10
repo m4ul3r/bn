@@ -1975,6 +1975,35 @@ def _reap_child(proc: subprocess.Popen) -> None:
             proc.wait(timeout=2.0)
 
 
+def reap_if_exited(pid: int) -> bool:
+    """Best-effort, NEVER-BLOCKING reap of *pid* if it has already exited (#1096
+    A2).
+
+    `spawn_instance` hands back a `BridgeInstance`, not the `Popen` it created:
+    once that `Popen` object is garbage collected, nothing in this process ever
+    calls `wait()`/`waitpid()` on the child again. A bridge that then exits
+    (a crash, or this process's own cleanup-path shutdown) stays a zombie for
+    as long as the CLI keeps running -- it is reparented to init and reaped
+    only once the CLI itself exits. `os.waitpid(pid, os.WNOHANG)` is correct
+    here without the `Popen` object: a child's PPID is unaffected by
+    `start_new_session=True` (that only detaches the controlling terminal and
+    makes it its own session leader), so this process is still its real
+    parent and the only one allowed to reap it.
+
+    `WNOHANG` never blocks: a still-running bridge returns `(0, 0)` and is
+    left exactly as it was (no signal, no wait) -- the live, possibly
+    detached, case this must never disturb. Returns whether *pid* was reaped;
+    `False` covers both "still running" and "not our child" (already reaped,
+    or never spawned by this process), the latter via `ChildProcessError`,
+    which every platform this ships on raises instead of blocking or hanging.
+    """
+    try:
+        reaped_pid, _status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False
+    return reaped_pid == pid
+
+
 def spawn_instance(
     instance_id: str | None = None,
     *,

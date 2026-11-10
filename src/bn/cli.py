@@ -60,13 +60,14 @@ from .transport import (  # noqa: F401
     instance_selector,
     implicit_target_selector,
     list_instances,
+    reap_if_exited,
     send_request,
     spawn_instance,
     unwrap_result,
     validate_instance_id,
     wait_for_teardown,
 )
-from .target_hint import instance_option, respell_for_option
+from .target_hint import instance_option, respell_for_option, target_option
 from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
 
 
@@ -2315,8 +2316,7 @@ def _contextualize_diagnostic_hints(
         if instance and not routed("instance"):
             flags.append(instance_option(instance))
         if target and not routed("target"):
-            flags.append(f"-t {shlex.quote(target)}" if not target.startswith("-")
-                         else shlex.quote(f"--target={target}"))
+            flags.append(target_option(target))
         if not flags:
             return match.group(0)
         return "`bn " + " ".join(flags) + " " + command_text + "`"
