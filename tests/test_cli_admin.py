@@ -147,6 +147,68 @@ def test_plugin_install_accepts_its_own_install_and_names_a_stale_one(tmp_path, 
     assert os.readlink(destination) == str(tmp_path / "old-checkout")
 
 
+def test_plugin_install_refusal_prints_the_force_rerun_template_1058(tmp_path, capsys):
+    """#1058 item 10: a refused `plugin install` that `--force` would accept
+    prints the same rerun template a refused `skill install` prints, through
+    the same helper: the refused arguments plus `--force`, no program name."""
+    destination = tmp_path / "bn_agent_bridge"
+    destination.symlink_to(tmp_path / "old-checkout")
+
+    assert bn.cli.main(["plugin", "install", "--mode", "copy", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert "--force preflight accepts this destination" in err
+    assert ("rerun with the same bn invocation you just used, adding --force: "
+            f"bn plugin install --dest {destination} --mode copy --force") in err
+    assert os.readlink(destination) == str(tmp_path / "old-checkout")
+
+    # A refusal --force would NOT change prints no template to a dead end.
+    destination.unlink()
+    destination.write_text("not a directory")
+    assert bn.cli.main(["plugin", "install", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert "--force preflight refuses" in err
+    assert "rerun with the same bn invocation" not in err
+
+
+def test_unforced_successful_skill_install_prints_no_force_preflight_1058(tmp_path, capsys):
+    """#1058 item 10: a successful unforced install ended with `--force
+    preflight: ready. Checked without writes` -- a dry-run verdict about a run
+    that had just written. That line belongs only to a run `--force` would
+    change."""
+    destination = tmp_path / "skills"
+    assert bn.cli.main(["skill", "install", "--dest", str(destination)]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Installed skills (symlink):")
+    assert "--force preflight:" not in out
+    assert "rerun with the same bn invocation" not in out
+    assert f"bn-kernel skill_dir: {destination / 'bn-kernel'}" in out
+
+    # The same destination again is a no-op, and still no preflight talk.
+    assert bn.cli.main(["skill", "install", "--dest", str(destination)]) == 0
+    out = capsys.readouterr().out
+    assert "Already up to date:" in out and "--force preflight:" not in out
+
+    # A refusal --force WOULD fix (a link into another checkout) keeps the
+    # `ready` verdict and prints the rerun template.
+    (destination / "bn").unlink()
+    (destination / "bn").symlink_to(tmp_path / "old-checkout" / "bn")
+    assert bn.cli.main(["skill", "install", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert "--force preflight: ready." in err
+    assert ("rerun with the same bn invocation you just used, adding --force: "
+            f"bn skill install --dest {destination} --force") in err
+
+    # A refusal --force would NOT fix (an unmarked directory with local edits)
+    # says so, and prints no template to a dead end.
+    (destination / "bn").unlink()
+    (destination / "bn").mkdir()
+    (destination / "bn" / "SKILL.md").write_text("local edits")
+    assert bn.cli.main(["skill", "install", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert "--force preflight: refused; fix every blocker first." in err
+    assert "rerun with the same bn invocation" not in err
+
+
 def test_skill_install_copy_mode(tmp_path):
     destination = tmp_path / "skill-copy"
     rc = bn.cli.main(
@@ -2337,6 +2399,69 @@ def test_session_status_wait_refuses_what_it_cannot_wait_for(monkeypatch, capsys
     assert message in capsys.readouterr().err
 
 
+class _FakeClock:
+    """A `time` stand-in for `admin.time`: `sleep` advances `monotonic`."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+@pytest.mark.parametrize("polls_before_done,expected_lines,status_command", [
+    # 2 s polls, 30 s notice cadence: 40 polls span two intervals, 5 span none.
+    (40, 2, "bn -i worker session status job123"), (5, 0, "bn -i worker session status job123"),
+    # A bridge that cannot name itself sends no command; the CLI spells it
+    # with the instance this call was routed to.
+    (40, 2, None),
+])
+def test_session_status_wait_reports_progress_on_stderr_1058(
+        monkeypatch, capsys, polls_before_done, expected_lines, status_command):
+    """#1058 item 6: a 54-second `--wait` left stderr empty. It now prints the
+    same `bn: still loading …` line a foreground start prints, on the same
+    cadence, and nothing at all when the wait ends inside the first interval.
+    The hint in it is a command that runs as printed: `session status` needs
+    `-i`, so a bare `session status <job>` exited 2 when pasted."""
+    import re
+    import shlex
+
+    import bn.commands.admin as admin
+
+    clock = _FakeClock()
+    monkeypatch.setattr(admin, "time", clock)
+    polls = []
+
+    def fake_send_request(op, **kwargs):
+        polls.append(clock.now)
+        done = len(polls) > polls_before_done
+        reply = _job_status("complete" if done else "running", succeeded=True if done else None)
+        reply["result"]["status_command"] = status_command
+        return reply
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "status", "job123", "-i", "worker", "--wait"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    lines = [line for line in captured.err.splitlines() if line.startswith("bn: still loading")]
+    assert len(lines) == expected_lines, captured.err
+    for line in lines:
+        assert line.startswith("bn: still loading /tmp/s.bndb (")
+        [command] = re.findall(r"`(bn [^`]+)`", line)
+        parsed = bn.cli.build_parser().parse_args(shlex.split(command)[1:])
+        assert (parsed.instance, parsed.job_id, parsed.wait) == ("worker", "job123", False)
+    assert "still loading" not in captured.out
+    if lines:
+        # Elapsed stamps are the real cadence, not a count of polls.
+        stamps = [int(line.split("(")[1].split("s")[0]) for line in lines]
+        assert stamps[0] >= 30 and stamps[1] >= 60 and stamps[1] - stamps[0] >= 30
+
+
 def test_foreground_session_start_reports_a_long_load_on_stderr_1036(monkeypatch, capsys):
     """#1036 item 6: a foreground start of a large binary printed nothing for
     four minutes. A stderr line every interval says it is still working;
@@ -4231,6 +4356,64 @@ def test_session_start_default_text_discloses_cleanup_timeout(
     assert "timed out waiting for teardown" in out
     assert "process may still be running" in out
     assert "session stopped:" not in out
+
+
+def test_detached_start_of_a_missing_path_reports_one_error_and_no_cleanup_error_1058(
+    monkeypatch, capsys, tmp_path
+):
+    """#1058 item 7: the CLI is the bridge's parent and never waits on it, so
+    after the bridge honours `shutdown` it is an exited-but-unreaped child.
+    `wait_for_teardown` used to read that zombie as alive and time out, so a
+    detached start of a missing path printed the load error AND a bogus
+    `cleanup error: … timed out waiting for teardown` -- while the registry
+    was already gone, which is why the next `session stop` exited 2.
+
+    Real `wait_for_teardown`, real exited child; only the wire is faked."""
+    import subprocess
+    import sys
+    import time
+
+    import bn.commands.admin as admin
+    import bn.transport as transport
+    from bn.proc_identity import boot_id, process_start_ticks
+    from bn.transport import BridgeError, BridgeInstance
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        meta = {"pid_start_ticks": process_start_ticks(child.pid), "boot_id": boot_id()}
+        deadline = time.monotonic() + 10
+        while transport._process_state(child.pid) not in transport._EXITED_STATES:
+            assert time.monotonic() < deadline, "child did not exit"
+            time.sleep(0.01)
+        instance = BridgeInstance(
+            pid=child.pid, socket_path=tmp_path / "w.sock", registry_path=tmp_path / "w.json",
+            plugin_name="bn_agent_bridge", plugin_version="0.1.0", started_at=None,
+            meta=meta, instance_id="w1058a", instance_token="t")
+        monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: instance)
+
+        def send_request(op, **kwargs):
+            if op == "associate_project_roots":
+                return {"ok": True, "result": {"associated": [str(tmp_path)]}}
+            if op == "shutdown":
+                return {"ok": True, "result": {"shutting_down": True}}
+            raise BridgeError("File not found: /nonexistent")
+
+        monkeypatch.setattr(bn.cli, "send_request", send_request)
+        monkeypatch.setattr(bn.cli, "wait_for_teardown", transport.wait_for_teardown)
+        monkeypatch.setattr(admin, "_SHUTDOWN_TEARDOWN_TIMEOUT", 0.5)
+        _fake_signaller(monkeypatch)
+
+        rc = bn.cli.main(["session", "start", "/nonexistent", "--detach",
+                          "--instance-id", "w1058a"])
+    finally:
+        child.wait()
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out.count("error") == 1, captured.out
+    assert "File not found: /nonexistent" in captured.out
+    assert "cleanup error:" not in captured.out
+    assert "session stopped:" in captured.out
 
 
 # --------------------------------------------------------------------------

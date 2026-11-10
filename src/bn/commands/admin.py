@@ -27,6 +27,7 @@ from typing import Any, NoReturn
 from .. import cli
 from ..cli import arg, command
 from ..formatters import (
+    _force_rerun_line,
     _render_capabilities_text,
     _render_doctor_text,
     _render_instance_find_text,
@@ -51,10 +52,17 @@ from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, u
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
 # #1036 item 6: a foreground `session start` of a large binary can block for
-# minutes; one stderr line this often says it is still working.
+# minutes; one stderr line this often says it is still working. #1058 item 6:
+# `session status --wait` reports on the same cadence.
 _START_PROGRESS_INTERVAL = 30.0
 # How often `session status <job> --wait` polls the bridge.
 _STATUS_WAIT_INTERVAL = 2.0
+_START_DETACH_HINT = "`session start --detach` returns at once instead"
+
+
+def _still_loading_line(path: str, elapsed: float, hint: str) -> str:
+    """The one spelling of the progress line both long waits print."""
+    return f"bn: still loading {path} ({int(elapsed)}s); {hint}"
 
 
 @contextlib.contextmanager
@@ -67,10 +75,8 @@ def _still_loading_notice(path: str, interval: float):
 
     def tick() -> None:
         while not done.wait(interval):
-            print(
-                f"bn: still loading {path} ({int(time.monotonic() - started)}s); "
-                "`session start --detach` returns at once instead",
-                file=sys.stderr, flush=True)
+            print(_still_loading_line(path, time.monotonic() - started, _START_DETACH_HINT),
+                  file=sys.stderr, flush=True)
 
     thread = threading.Thread(target=tick, name="bn-start-progress", daemon=True)
     thread.start()
@@ -359,7 +365,17 @@ def _plugin_install(args: argparse.Namespace) -> int:
     # names what is there.
     up_to_date = state is not None and state[0] == "up_to_date"
     if not up_to_date:
-        _install_tree(source, dest, mode=args.mode, force=args.force)
+        try:
+            _install_tree(source, dest, mode=args.mode, force=args.force)
+        except ExistingDestinationRefused as exc:
+            # #1058 item 10: the same rerun template a refused `skill install`
+            # prints, and only when the forced preflight said it would help.
+            if not exc.force_ready:
+                raise
+            raise BridgeError(
+                f"{exc}\n"
+                + _force_rerun_line(_forced_install_args(args, "plugin", "install"), what="it")
+            ) from None
 
     result: dict[str, Any] = {
         "installed": not up_to_date,
@@ -560,6 +576,18 @@ FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
               "and then changes no destination.")
 
 
+class ExistingDestinationRefused(BridgeError):
+    """An unforced install refused because something is already at the
+    destination. `force_ready` says whether the forced preflight accepted it,
+    so the caller can print the rerun template only when `--force` would
+    actually change the outcome (#1058 item 10) -- and never by matching the
+    message text."""
+
+    def __init__(self, message: str, *, force_ready: bool):
+        super().__init__(message)
+        self.force_ready = force_ready
+
+
 def _install_path(dest: Path) -> Path:
     """The path an install at `dest` works on, decided before anything is written.
 
@@ -758,12 +786,15 @@ def _plan_install(
                     source, requested_dest, mode=mode, force=True, skill_root=skill_root
                 )
             except BridgeError as exc:
+                force_ready = False
                 force_detail = f"--force preflight refuses: {exc}"
             else:
+                force_ready = True
                 force_detail = "--force preflight accepts this destination"
-            raise BridgeError(
+            raise ExistingDestinationRefused(
                 f"Destination already exists: {dest} ({state[1]}).\n"
-                f"{force_detail}\n{FORCE_NOTE}"
+                f"{force_detail}\n{FORCE_NOTE}",
+                force_ready=force_ready,
             )
         return dest
     reason = _force_refusal_reason(dest, source)
@@ -938,7 +969,7 @@ def _skill_install(args: argparse.Namespace) -> int:
         # 3): the refused run's arguments plus `--force`, never a claim about
         # which executable to run them with.
         "force_args": (
-            _forced_skill_install_args(args)
+            _forced_install_args(args, "skill", "install")
             if not args.force and not_updated_destinations
             and all(row["allowed"] for row in force_plan)
             else None
@@ -967,8 +998,9 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 1 if not_updated_destinations else 0
 
 
-def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
-    """The refused run's own arguments plus `--force`, after the program name.
+def _forced_install_args(args: argparse.Namespace, *command: str) -> list[str]:
+    """The refused run's own arguments plus `--force`, after the program name,
+    for `skill install` or `plugin install` (#1058 item 10 shares it).
 
     Rebuilt from the parsed arguments: `--dest` keeps the caller's spelling (a
     relative path reruns from the same directory; normalising it could change
@@ -980,8 +1012,8 @@ def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
     something this process can prove -- three review rounds of provenance
     checks each printed a command that installed another checkout (#1043).
     The caller reruns its own invocation with these arguments."""
-    argv = ["skill", "install"]
-    if args.selection is not None:
+    argv = list(command)
+    if getattr(args, "selection", None) is not None:
         argv.append(args.selection)
     if args.dest is not None:
         dest = str(args.dest)
@@ -1220,6 +1252,7 @@ def _session_status(args: argparse.Namespace) -> int:
             "printed, or one listed by `session status` without --wait"
         )
     started = time.monotonic()
+    intervals_reported = 0
     while True:
         response = cli.send_request(
             "load_status",
@@ -1237,6 +1270,26 @@ def _session_status(args: argparse.Namespace) -> int:
         if timeout is not None and elapsed >= timeout:
             result["waited"] = {"seconds": round(elapsed, 1), "timed_out": True}
             break
+        # #1058 item 6: the same stderr line a foreground start prints, on the
+        # same cadence -- a 54 s wait used to print nothing. Driven by elapsed
+        # time, not by poll count, so a slow poll does not skew the cadence,
+        # and nothing is printed when the wait ends inside the first interval.
+        due = int(elapsed // _START_PROGRESS_INTERVAL)
+        if due > intervals_reported:
+            intervals_reported = due
+            job = result.get("job")
+            path = job.get("path") if isinstance(job, dict) else None
+            # A printed command runs as printed: `session status` needs `-i`,
+            # so the hint is the bridge's own `status_command` (the `poll:`
+            # line), or the same command spelled with this call's instance.
+            poll = result.get("status_command")
+            if not isinstance(poll, str) or not poll:
+                poll = (f"bn {cli.instance_option(instance_id)} session status "
+                        f"{shlex.quote(str(job_id))}")
+            print(_still_loading_line(
+                path if isinstance(path, str) and path else f"job {job_id}", elapsed,
+                f"`{poll}` (without --wait) returns at once"),
+                file=sys.stderr, flush=True)
         pause = _STATUS_WAIT_INTERVAL
         if timeout is not None:
             pause = min(pause, max(timeout - elapsed, 0.0))

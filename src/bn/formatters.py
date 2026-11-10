@@ -8787,6 +8787,17 @@ def _render_plugin_install_text(value: Any) -> str:
     return f"Plugin {value.get('note', 'already installed')}.\n"
 
 
+def _force_rerun_line(force_args: list[Any], *, what: str = "them") -> str:
+    """The rerun template a refused install prints (#1035 install comment 2,
+    narrowed under the split rule in #1043 review 3; shared with `plugin
+    install` by #1058 item 10): the refused arguments plus `--force`, spelled
+    with `bn` as a TEMPLATE. Which executable ran (and so which checkout gets
+    installed) cannot be proven, so the note says to reuse the caller's own
+    invocation."""
+    return (f"To replace {what}, rerun with the same bn invocation you just used, "
+            "adding --force: " + shlex.join(["bn", *(str(word) for word in force_args)]))
+
+
 @_discloses
 def _render_skill_install_text(value: Any) -> str:
     if not isinstance(value, dict):
@@ -8874,7 +8885,13 @@ def _render_skill_install_text(value: Any) -> str:
         lines.extend(
             f"- {row.get('destination')}{force_detail(row.get('destination'))}" for row in other
         )
-    if force_plan and not forced:
+    # The preflight VERDICT is for a run `--force` would change: one that left a
+    # destination not updated, or one a forced rerun would refuse. A clean
+    # install used to end with `--force preflight: ready. Checked without
+    # writes` -- a dry-run verdict about a run that had just written (#1058
+    # item 10). Per-destination detail above stays: a symlinked root's recovery
+    # advice is about that root, not about this run's outcome.
+    if force_plan and not forced and (not_updated or not value.get("force_ready")):
         ready = "ready" if value.get("force_ready") else "refused; fix every blocker first"
         lines.append(
             f"--force preflight: {ready}. Checked without writes; "
@@ -8883,16 +8900,9 @@ def _render_skill_install_text(value: Any) -> str:
     force_note = _text_value(value, "force_note")
     if force_note and not forced:
         lines.append(force_note)
-    # #1035 install comment 2, narrowed under the split rule (#1043 review 3):
-    # the refused arguments plus `--force`, spelled with `bn` as a TEMPLATE.
-    # Which executable ran (and so which checkout gets installed) cannot be
-    # proven, so the note says to reuse the caller's own invocation.
     force_args = _field_list(value, "force_args")
     if force_args:
-        lines.append(
-            "To replace them, rerun with the same bn invocation you just used, "
-            "adding --force: " + shlex.join(["bn", *(str(word) for word in force_args)])
-        )
+        lines.append(_force_rerun_line(force_args))
     # #1039 item 2: the bn-kernel bootstrap's `skill_dir` after a kernel reset.
     lines.extend(
         f"bn-kernel skill_dir: {d}" for d in _field_list(value, "bn_kernel_skill_dirs")

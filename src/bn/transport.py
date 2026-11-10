@@ -320,6 +320,14 @@ def bridge_process_alive(instance: BridgeInstance) -> bool:
     A recycled pid is NOT the bridge: the check runs against a pinned process
     where possible, so the answer cannot be about a pid that was reused between
     the liveness probe and the identity read (#694).
+
+    An exited-but-unreaped process is NOT running (#1058 item 7). `session
+    start` is the bridge's parent and never waits on it after hand-back, so
+    when that same CLI shuts the bridge down (a preload that failed) the child
+    becomes a zombie whose pid, pidfd and start ticks all still resolve. Identity
+    alone then reads it as alive and `wait_for_teardown` burns its whole budget
+    reporting a teardown timeout the registry contradicts. Discovery and the
+    exit diagnosis already ask `_process_running`; convergence asks it too.
     """
     try:
         pin = pin_process(instance.pid)
@@ -327,11 +335,12 @@ def bridge_process_alive(instance: BridgeInstance) -> bool:
         # No pin: either the pid is already gone, or this platform has no pidfd.
         # Nothing is signalled from here, so a best-effort probe is acceptable --
         # it only affects how long teardown polls.
-        if not _process_alive(instance.pid):
+        if not _process_running(instance.pid):
             return False
         return identity_verdict(instance.meta, instance.pid) != "mismatch"
     with pin:
-        return pin.verdict(instance.meta) != "mismatch"
+        # The pin holds the pid still, so the state read is about this process.
+        return pin.verdict(instance.meta) != "mismatch" and _process_running(instance.pid)
 
 
 class BridgeProcessSignal:

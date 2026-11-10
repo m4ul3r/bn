@@ -3854,6 +3854,80 @@ def test_wait_for_teardown_treats_a_reused_pid_as_gone(tmp_path, monkeypatch):
     assert wait_for_teardown(instance, timeout=0.05) is True
 
 
+class _ContextPin(_FakePin):
+    """`_FakePin` as the context manager `bridge_process_alive` holds."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@pytest.mark.parametrize("branch", ["unpinned", "pinned"])
+def test_wait_for_teardown_treats_an_exited_unreaped_child_as_gone(tmp_path, monkeypatch, branch):
+    """#1058 item 7: `session start` spawns the bridge and is its PARENT; after
+    hand-back nothing in the CLI waits on it, so when that same CLI shuts the
+    bridge down (a preload that failed) the exited child is a zombie. Its pid,
+    pidfd and start ticks all still resolve, so a liveness check that stops at
+    identity reads it as running and `wait_for_teardown` burns its whole budget
+    while the registry has been gone for milliseconds -- the `cleanup error:
+    ... timed out waiting for teardown` that `session stop` then contradicts.
+
+    Both branches of `bridge_process_alive` changed, and which one the real
+    `pin_process` takes is a property of the interpreter build (pidfd or not),
+    so each is forced here: `unpinned` makes the pin unavailable, `pinned`
+    hands back a pin whose identity verdict is `proven`. A RUNNING child must
+    stay alive on both, or "gone" would be free."""
+    import subprocess
+
+    import bn.transport as transport
+    from bn.proc_identity import PinUnavailable, boot_id, process_start_ticks
+    from bn.transport import BridgeInstance
+
+    def unavailable(pid):
+        raise PinUnavailable("no pidfd in this test")
+
+    monkeypatch.setattr(
+        transport, "pin_process",
+        unavailable if branch == "unpinned" else (lambda pid: _ContextPin(pid, verdict="proven")))
+
+    def instance_for(proc):
+        return BridgeInstance(
+            pid=proc.pid,
+            socket_path=tmp_path / "z.sock",
+            registry_path=tmp_path / "z.json",   # never written: registry already gone
+            plugin_name="bn_agent_bridge",
+            plugin_version="0.1.0",
+            started_at=None,
+            meta={"pid_start_ticks": process_start_ticks(proc.pid), "boot_id": boot_id()},
+            instance_id="zombie1",
+            instance_token="t",
+        )
+
+    running = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                               start_new_session=True)
+    try:
+        assert transport.bridge_process_alive(instance_for(running)) is True
+    finally:
+        running.kill()
+        running.wait()
+
+    child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    try:
+        instance = instance_for(child)
+        deadline = time.monotonic() + 10
+        while transport._process_state(child.pid) not in transport._EXITED_STATES:
+            assert time.monotonic() < deadline, "child did not exit"
+            time.sleep(0.01)
+        # Exited, deliberately NOT waited on (poll() would reap it): the pid is
+        # still ours, exactly as the CLI leaves its bridge after hand-back.
+        assert transport.bridge_process_alive(instance) is False
+        assert wait_for_teardown(instance, timeout=0.5) is True
+    finally:
+        child.wait()
+
+
 # --------------------------------------------------------------------------
 # #694 finding 10: a socket-less registry never reaches normal discovery
 # --------------------------------------------------------------------------
