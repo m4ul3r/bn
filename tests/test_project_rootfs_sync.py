@@ -178,6 +178,87 @@ def test_sync_aggregate_discovery_refusal_never_commits_a_partial_inventory(worl
     assert w.instance.projects.get_rootfs() == old_metadata
 
 
+def _record_budgets(w, monkeypatch):
+    budgets = []
+    original = w.ops.DiscoveryBudget
+
+    def recording(*args, **kwargs):
+        budget = original(*args, **kwargs)
+        budgets.append(budget)
+        return budget
+
+    monkeypatch.setattr(w.ops, "DiscoveryBudget", recording)
+    return budgets
+
+
+def test_sync_charges_elf_parsing_per_file_not_per_symbol_1075(world, monkeypatch):
+    """#1075 item 2: a ~450-library firmware spent ~460k units of the 100k
+    default because every symbol-name read charged one. Parsing now costs one
+    unit per file (its bytes were already charged per MiB by the hash), so a
+    10k-symbol library costs exactly what a 10-symbol one does."""
+    w = world
+    root = _sources(w, monkeypatch)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "20")
+    budgets = _record_budgets(w, monkeypatch)
+    original = w.ops.parse_elf_file
+    cost = {}
+
+    def parse(path, *, check=None):
+        # The parser probes `check` once per symbol name it reads.
+        before = budgets[-1].work_used
+        for _ in range(10_000 if path.endswith("liba.so") else 10):
+            check()
+        info = original(path, check=check)
+        cost[path.rsplit("/", 1)[1]] = budgets[-1].work_used - before
+        return info
+
+    monkeypatch.setattr(w.ops, "parse_elf_file", parse)
+
+    result = w.ops.project_sync_libs(w.instance, root=str(root))
+
+    assert {row["name"] for row in result["imported"]} == {"liba.so", "libb.so"}
+    assert cost == {"liba.so": 0, "libb.so": 0}
+    # One directory listed, two libraries hashed, two parsed: five units of 20.
+    assert budgets[-1].work_used == 5
+
+
+def test_sync_work_refusal_names_the_knob_and_the_restart_command_1075(world, monkeypatch):
+    w = world
+    root = _sources(w, monkeypatch)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2")
+    old_metadata = w.instance.projects.get_rootfs()
+
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_sync_libs(w.instance, root=str(root))
+
+    message = str(raised.value)
+    assert message.startswith("rootfs discovery refused: work limit exceeded (used more than 2 "
+                              "units, BN_ROOTFS_MAX_WORK=2, charged per file opened and per MiB read)")
+    assert "no inventory committed" in message
+    # The bridge that owns the project read the variable when it started; the
+    # CLI's environment never reaches it, so the advice is a restart.
+    assert "The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart" in message
+    assert message.endswith(": BN_ROOTFS_MAX_WORK=4 bn session restart rootfs-test")
+    assert w.project.files == []
+    assert w.instance.projects.get_rootfs() == old_metadata
+
+
+def test_sync_refusal_restart_command_runs_for_a_dash_leading_instance_id_1075(
+    world, monkeypatch,
+):
+    """#1075 review: an instance id may start with `-`; printed raw, `bn session
+    restart -x` is an argparse error, so the command is spelled `-- -x`."""
+    w = world
+    root = _sources(w, monkeypatch)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2")
+    w.instance.instance_id = "-x"
+
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_sync_libs(w.instance, root=str(root))
+
+    assert str(raised.value).endswith(": BN_ROOTFS_MAX_WORK=4 bn session restart -- -x")
+
+
 def test_sync_cancellation_during_elf_discovery_preserves_inventory(world, monkeypatch):
     w = world
     root = _sources(w, monkeypatch)

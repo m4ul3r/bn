@@ -873,9 +873,14 @@ _STRING_FILTERS = frozenset(
         "probable_format_strings",
         # #1039 item 3: per-row referencing functions, as `strings --with-xrefs`.
         "with_xrefs",
+        # #1044 / #1058 item 15: keep matches in code bytes and linker metadata,
+        # as `strings --include-noise`.
+        "include_noise",
     }
 )
-_IMPORT_FILTERS = frozenset({"query", "regex", "offset", "include_got"})
+# #1044 / #1058 item 15: `with_callers` is `imports --with-callers`, each
+# import's calling functions on its row.
+_IMPORT_FILTERS = frozenset({"query", "regex", "offset", "include_got", "with_callers"})
 _SECTION_FILTERS = frozenset({"query", "offset"})
 
 

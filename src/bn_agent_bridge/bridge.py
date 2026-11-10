@@ -42,6 +42,7 @@ from . import read_taint_slice
 from . import read_types
 from . import read_xrefs
 from . import vars as vars_mod
+from .bridge_env import recorded_environment, withheld_keys
 from ._shared import (
     IMPORT_SYMBOL_TYPE_NAMES,
     OperationFailure,
@@ -1176,8 +1177,9 @@ class TargetManager:
         """The shortest path suffix that RESOLVES to each view, else its target_id.
 
         A candidate counts when `_matching_records` would return this view
-        alone for it -- the same relation, including the saved-database pair
-        rule (`_drop_saved_databases`), so every advertised selector resolves and
+        alone for it -- the same relation, including exact-selector precedence
+        (`_exact_over_stripped`, #1077) and the saved-database pair rule
+        (`_drop_saved_databases`), so every advertised selector resolves and
         the raw `hello` stays `hello` once the `hello.bndb` it saved is open
         (#996). The resolver's aliases and component suffixes are indexed once
         per snapshot; candidate lookup must not re-split every other view's path.
@@ -1189,7 +1191,7 @@ class TargetManager:
 
         def _index(table: dict, key, vid: str, kind: str) -> None:
             kinds = table.setdefault(key, {})
-            if kinds.get(vid) != self._STRONG:
+            if self._RANK[kind] > self._RANK.get(kinds.get(vid), -1):
                 kinds[vid] = kind
 
         for vid, record in records.items():
@@ -1212,13 +1214,17 @@ class TargetManager:
             parts = paths[vid]
             chosen = record.target_id()
             # A project target advertises its path in the project (shortest
-            # unique suffix, `app.bndb` before `fw/app.bndb`) ahead of any
-            # suffix of its opaque blob filename.
+            # unique suffix, `app.bndb` before `fw/app.bndb`), else its FULL
+            # file id -- never a suffix of its opaque blob filename, which is
+            # that id minus the `data/<xx>/` directory it lives in (#1077).
             project_parts = _project_components(record.project_path)
-            candidates = [
-                "/".join(project_parts[-depth:])
-                for depth in range(1, len(project_parts) + 1)
-            ] + [os.sep.join(parts[-depth:]) for depth in range(1, len(parts) + 1)]
+            if record.project_file_id:
+                candidates = [
+                    "/".join(project_parts[-depth:])
+                    for depth in range(1, len(project_parts) + 1)
+                ] + [record.project_file_id]
+            else:
+                candidates = [os.sep.join(parts[-depth:]) for depth in range(1, len(parts) + 1)]
             for candidate in candidates:
                 normalized = candidate.strip()
                 if normalized in ("", "active"):
@@ -1230,9 +1236,10 @@ class TargetManager:
                     for source in (exact.get(normalized, {}),
                                    tails.get(_path_components(normalized), {})):
                         for other, kind in source.items():
-                            if kinds.get(other) != self._STRONG:
+                            if self._RANK[kind] > self._RANK.get(kinds.get(other), -1):
                                 kinds[other] = kind
-                    matches = set(self._drop_saved_databases(kinds, saved_pairs))
+                    matches = set(self._drop_saved_databases(
+                        self._exact_over_stripped(kinds), saved_pairs))
                 if matches == {vid}:
                     chosen = candidate
                     break
@@ -1240,21 +1247,39 @@ class TargetManager:
         return selectors
 
     # How a human selector names a record. Every alias counts equally -- view
-    # id, filename, basename, path tail and the `.bndb`-stripped forms -- so a
-    # selector matching two views is refused as ambiguous, whichever view
-    # opened first. A ranking between aliases was tried and rejected: opening
-    # a view could then silently MOVE a selector that used to be refused onto
-    # the new view (`close 5` closing the view whose id became 5, #996 review).
-    # The kind is kept only for the one narrow exception `_drop_saved_databases`
-    # makes.
-    _STRONG = "strong"        # view id, filename, basename, path tail
+    # id, basename, path tail and the `.bndb`-stripped forms -- so a selector
+    # matching two views is refused as ambiguous, whichever view opened first.
+    # A ranking between aliases was tried and rejected: opening a view could
+    # then silently MOVE a selector that used to be refused onto the new view
+    # (`close 5` closing the view whose id became 5, #996 review). The kind is
+    # kept for two narrow exceptions: `_drop_saved_databases`, and
+    # `_exact_over_stripped` (#1077) -- a spelling that names ONE file by
+    # construction (a project target's full file id or exact path in the
+    # project, a standalone view's own full filename) outranks another view's
+    # `.bndb`-stripped alias of it, which is the raw file against its own
+    # database and nothing more. It outranks nothing else: an exact match and
+    # a STRONG match of another view (a basename, a path tail) stay ambiguous,
+    # as do two exact matches, so loading a file never retargets a selector
+    # that was resolving to a different open view.
+    _EXACT = "exact"          # project file id / exact path in project; own filename
+    _STRONG = "strong"        # view id, basename, path tail, a project view's blob path
     _STRIPPED = "stripped"    # only through a `.bndb`-stripped alias
+    _RANK = {_STRIPPED: 0, _STRONG: 1, _EXACT: 2}
+
+    def _exact_over_stripped(self, kinds: dict[str, str]) -> dict[str, str]:
+        """*kinds* without the stripped-only matches when an exact one exists
+        (#1077). Strong matches are kept: they are not outranked."""
+        if any(kind == self._EXACT for kind in kinds.values()):
+            return {vid: kind for vid, kind in kinds.items() if kind != self._STRIPPED}
+        return kinds
 
     def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
         """Every exact-string alias of *record* with its kind."""
         aliases = [
             (record.view_id, self._STRONG),
-            (record.filename, self._STRONG),
+            # A standalone view's full filename names exactly that view. A
+            # project view's filename is an opaque blob path, an ordinary alias.
+            (record.filename, self._STRONG if record.project_file_id else self._EXACT),
             (record.basename, self._STRONG),
         ]
         # A .bndb corpus loads <binary>.bndb, but the obvious selector is
@@ -1271,11 +1296,12 @@ class TargetManager:
             ):
                 aliases.append((stem, self._STRIPPED))
         if record.project_file_id:
-            # A project target answers to its path in the
-            # project (leading slash optional), its file id and its file name.
-            aliases.append((record.project_path, self._STRONG))
-            aliases.append((record.project_path.lstrip("/"), self._STRONG))
-            aliases.append((record.project_file_id, self._STRONG))
+            # A project target answers to its path in the project (leading
+            # slash optional) and its file id EXACTLY -- each names one file
+            # by construction (#1077) -- and to its file name like a basename.
+            aliases.append((record.project_path, self._EXACT))
+            aliases.append((record.project_path.lstrip("/"), self._EXACT))
+            aliases.append((record.project_file_id, self._EXACT))
             aliases.append((record.project_name, self._STRONG))
             if record.project_name.endswith(".bndb"):
                 aliases.append((record.project_name[: -len(".bndb")], self._STRIPPED))
@@ -1290,7 +1316,7 @@ class TargetManager:
         return variants
 
     def _match_kind(self, record: TargetRecord, selector: str | None) -> str | None:
-        """How *selector* names *record* (strong over stripped), or None."""
+        """How *selector* names *record* (exact over strong over stripped), or None."""
         if selector is None:
             return None
         if isinstance(selector, PinnedTarget):
@@ -1308,11 +1334,15 @@ class TargetManager:
         if candidate == record.target_id():
             return self._STRONG
         found: str | None = None
+
+        def _better(kind: str) -> str | None:
+            return kind if self._RANK[kind] > self._RANK.get(found, -1) else found
+
         for alias, kind in self._aliases(record):
             if candidate == alias:
-                if kind == self._STRONG:
-                    return kind
-                found = kind
+                found = _better(kind)
+        if found == self._EXACT:
+            return found
         suffix = _path_components(candidate)
         if suffix:
             sources = [_path_components(record.filename)]
@@ -1321,9 +1351,7 @@ class TargetManager:
             for parts in sources:
                 for variant, kind in self._tail_variants(parts):
                     if len(variant) >= len(suffix) and variant[-len(suffix):] == suffix:
-                        if kind == self._STRONG:
-                            return kind
-                        found = kind
+                        found = _better(kind)
         return found
 
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
@@ -1433,7 +1461,7 @@ class TargetManager:
             if not (
                 kind == self._STRIPPED
                 and saved_pairs.get(vid) is not None
-                and kinds.get(saved_pairs[vid]) == self._STRONG
+                and self._RANK.get(kinds.get(saved_pairs[vid]), -1) >= self._RANK[self._STRONG]
             )
         ]
 
@@ -1444,10 +1472,12 @@ class TargetManager:
 
         A live full target_id outranks filename aliases, so the last-resort
         selector remains usable even with a file named after another view's ID.
-        Every other alias counts equally (see `_STRONG`), less only a database
-        whose own saved-from raw view also matched (`_drop_saved_databases`).
-        PinnedTarget retains its stricter identity-only semantics, including
-        when its view has disappeared.
+        Every other alias counts equally (see `_STRONG`), less a `.bndb`-
+        stripped alias that an exact spelling of another view also matched
+        (`_exact_over_stripped`, #1077), and less a database whose own
+        saved-from raw view also matched (`_drop_saved_databases`).
+        PinnedTarget retains its stricter
+        identity-only semantics, including when its view has disappeared.
         """
         candidate = str(selector).strip() if selector is not None else None
         if not isinstance(selector, PinnedTarget):
@@ -1459,6 +1489,7 @@ class TargetManager:
             if (kind := self._match_kind(record, selector)) is not None
         }
         if len(kinds) > 1:
+            kinds = self._exact_over_stripped(kinds)
             return [records[vid] for vid in
                     self._drop_saved_databases(kinds, self._saved_pairs(records))]
         return [records[vid] for vid in kinds]
@@ -2143,6 +2174,15 @@ class BinaryNinjaBridge:
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
         self._started_at = datetime.now(timezone.utc).isoformat()
+        # #1076: the BN_* settings this bridge runs under, taken once here so the
+        # registry publishes what the process actually started with rather than
+        # whatever a plugin later wrote into os.environ. `session restart`
+        # replays them, because the restart's caller is often another shell or
+        # agent whose environment never had them. CLI-only keys are left out
+        # by the shared rule (bridge_env).
+        self._bn_environment: dict[str, str] = recorded_environment(os.environ)
+        # Credential keys that were set: names only, never values.
+        self._bn_env_withheld: list[str] = withheld_keys(os.environ)
         self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
@@ -2620,6 +2660,11 @@ class BinaryNinjaBridge:
             "started_at": self._started_at,
             "gui": ui is not None,
             "capabilities": {"refresh_target_gate": True},
+            # BN_* keys only (#1076): the record `session restart` replays. The
+            # bridge writes it, not the spawning CLI, so it is what this process
+            # SAW -- which covers a GUI-plugin bridge nothing spawned.
+            "env": dict(self._bn_environment),
+            "env_withheld": list(self._bn_env_withheld),
         }
         # Durable process identity (#694): a pid alone cannot distinguish this
         # bridge from an unrelated process that recycles its number after a crash,
@@ -5952,7 +5997,9 @@ def _bind_project_export(bridge, params, target):
 
 @op("project_delete", lock="write")
 def _bind_project_delete(bridge, params, target):
-    return project_ops.project_delete(bridge, params.get("selector"))
+    return project_ops.project_delete(
+        bridge, params.get("selector"),
+        _validate_bool(params.get("force"), label="force", default=False))
 
 
 # Findings live in the project, not a selected BinaryView. The write gate is

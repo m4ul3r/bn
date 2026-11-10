@@ -996,6 +996,145 @@ def test_deleted_provider_disappears_from_libs_and_link_inventory(world):
         "project_file_id"] is None
 
 
+def _soname_pair(w, *, same_content=False):
+    """Two files claiming one SONAME: the versioned file the loader maps and a
+    dev-name copy -- different bytes unless *same_content*."""
+    versioned = library(w, "/opt/vendor/lib/libcodec.so.1.2",
+                        info=elf(w, soname="libcodec.so.1.2", exports=exports("decode")))
+    dev = library(w, "/opt/vendor/lib/libcodec.so", names=["libcodec.so", "libcodec.so.1.2"],
+                  info=elf(w, soname="libcodec.so.1.2", exports=exports("decode")))
+    w.meta["libs"][versioned.id]["sha256"] = "aaaa"
+    w.meta["libs"][dev.id]["sha256"] = "aaaa" if same_content else "bbbb"
+    w.instance.projects.set_rootfs(w.meta)
+    return versioned, dev
+
+
+def test_deleted_provider_is_not_replaced_by_an_alias_only_copy_1078(world):
+    # #1078: once the versioned provider is gone, the dev-name copy matched by
+    # SONAME alone and the import was silently rebound to a library the
+    # loader never maps. It must stay unresolved, naming the missing provider.
+    w = world
+    versioned, dev = _soname_pair(w)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    first = link(w)
+    assert bv.externals["libcodec.so.1.2"].backing_file is versioned
+
+    w.project.delete_file(versioned)
+    preview = link(w, dry_run=True)
+
+    row = next(r for r in preview["libraries"] if r["name"] == "libcodec.so.1.2")
+    assert row["resolved"] is False and row["project_file_id"] is None, row
+    assert preview["rebound"] == 0 and preview["scope"] == []
+    assert versioned.id in row["reason"] and "is gone" in row["reason"]
+    assert "alias-only candidate /opt/vendor/lib/libcodec.so has different content" in row["reason"]
+    assert preview["rebinds"] == []
+    assert bv.externals["libcodec.so.1.2"].backing_file is versioned   # untouched
+    assert any(versioned.id in note for note in preview["notes"])
+    # The apply path refuses the same way: nothing is rebound.
+    applied = link(w)
+    assert applied["rebound"] == 0 and applied["status"] == "noop"
+    assert bv.externals["libcodec.so.1.2"].backing_file is versioned
+    # The first link reported its binding as a row, not just a count.
+    assert first["rebinds"] == [{
+        "name": "libcodec.so.1.2", "from_id": None, "from_path": None,
+        "to_id": versioned.id, "to_path": "/opt/vendor/lib/libcodec.so.1.2",
+    }]
+
+
+def test_replayed_database_without_a_live_backing_still_refuses_the_alias_copy_1078(world):
+    # Measured on a real bridge: after the provider is deleted and the saved
+    # database is reopened by a restart, `backing_file` reads None -- the
+    # project no longer has that file. The `bn.links` record the first link
+    # wrote is then the only memory of the provider, and it must be enough.
+    w = world
+    versioned, dev = _soname_pair(w)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    link(w)
+    w.project.delete_file(versioned)
+    bv.externals["libcodec.so.1.2"]._backing_file = None     # what the replay sees
+    bv.locations[0]._library = None
+
+    result = link(w)
+
+    row = next(r for r in result["libraries"] if r["name"] == "libcodec.so.1.2")
+    assert row["resolved"] is False and versioned.id in row["reason"]
+    assert result["rebound"] == 0 and bv.externals["libcodec.so.1.2"].backing_file is None
+    assert result["unresolved"] == [{"symbol": "decode", "reason": "not exported by any linked library"}]
+    # The refused link did not erase the memory it relied on: the next link
+    # (another restart, an explicit `project link`) refuses the same way.
+    recorded = w.instance.projects.get_links()["targets"][bv.project_file.id]["providers"]
+    assert recorded == {"libcodec.so.1.2": versioned.id}
+    again = link(w, dry_run=True)
+    assert next(r for r in again["libraries"] if r["name"] == "libcodec.so.1.2")["resolved"] is False
+
+
+def test_alias_only_copy_with_the_same_content_still_replaces_a_gone_provider_1078(world):
+    w = world
+    versioned, dev = _soname_pair(w, same_content=True)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    link(w)
+    w.project.delete_file(versioned)
+
+    result = link(w)
+
+    assert bv.externals["libcodec.so.1.2"].backing_file is dev
+    assert result["rebinds"] == [{
+        "name": "libcodec.so.1.2", "from_id": versioned.id, "from_path": None,
+        "to_id": dev.id, "to_path": "/opt/vendor/lib/libcodec.so",
+    }]
+    assert any("same recorded content" in note for note in result["notes"])
+
+
+def test_first_binding_through_an_alias_is_still_accepted_1078(world):
+    # No previous provider: an alias-only match is the disclosed fallback it
+    # always was (nothing to compare against).
+    w = world
+    dev = library(w, "/opt/vendor/lib/libcodec.so", names=["libcodec.so", "libcodec.so.1.2"],
+                  info=elf(w, soname="libcodec.so.1.2", exports=exports("decode")))
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    result = link(w)
+    assert bv.externals["libcodec.so.1.2"].backing_file is dev
+    assert result["linked"] == 1
+
+
+def test_link_records_providers_and_delete_refuses_a_linked_provider_1078(world):
+    w = world
+    versioned, dev = _soname_pair(w)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    link(w)
+    manager = w.instance.projects
+    app = bv.project_file
+    assert manager.get_links()["targets"][app.id] == {
+        "project_path": "/app", "providers": {"libcodec.so.1.2": versioned.id},
+    }
+
+    with pytest.raises(RuntimeError) as error:
+        w.bridge.project_ops.project_delete(w.instance, "/opt/vendor/lib/libcodec.so.1.2")
+    text = str(error.value)
+    assert "is the linked provider of 1 target(s)" in text
+    assert "/app (open as app; libcodec.so.1.2)" in text and "--force" in text
+    assert versioned in w.project.files
+
+    # The first save moves the target's identity -- and its link record -- to
+    # the database file, so the dependent is named by the file that holds it.
+    w.instance.targets.mark_dirty(bv)
+    saved = w.instance._save_database("app")
+    assert app.id not in manager.get_links()["targets"]
+    assert manager.get_links()["targets"][saved["project_file_id"]] == {
+        "project_path": "/app.bndb", "providers": {"libcodec.so.1.2": versioned.id},
+    }
+    with pytest.raises(RuntimeError, match=r"/app\.bndb \(open as app\.bndb; libcodec\.so\.1\.2\)"):
+        w.bridge.project_ops.project_delete(w.instance, "/opt/vendor/lib/libcodec.so.1.2")
+
+    result = w.bridge.project_ops.project_delete(
+        w.instance, "/opt/vendor/lib/libcodec.so.1.2", force=True)
+    assert versioned not in w.project.files
+    assert result["dependents"] == [{
+        "project_file_id": saved["project_file_id"], "project_path": "/app.bndb",
+        "libraries": ["libcodec.so.1.2"], "open": True, "selector": "app.bndb",
+    }]
+
+
 def test_unread_version_requirements_never_guess_unrelated_exports(world):
     w = world
     library(w, "/lib/libunrelated.so", info=elf(w, exports=exports("call")))
@@ -1095,3 +1234,142 @@ def test_standalone_view_without_project_binding_can_link_owned_inventory(world)
     assert result["success"] is True
     assert result["linked"] == 1
     assert bv.externals["liba.so"].backing_file is provider
+
+
+# --- #1078 review round --------------------------------------------------------
+
+
+def _delete(w, selector, **params):
+    return w.instance.dispatch({"op": "project_delete",
+                                "params": {"selector": selector, **params}})
+
+
+@pytest.mark.parametrize("force", ["false", "0", "no", 1, "true"])
+def test_project_delete_force_must_be_a_real_boolean_1078(world, force):
+    # `bool("false")` is True: a string on the wire used to delete a linked
+    # provider. Anything but a JSON boolean is refused and nothing is deleted.
+    w = world
+    versioned, _ = _soname_pair(w)
+    target(w, ["libcodec.so.1.2"], ["decode"])
+    link(w)
+
+    response = _delete(w, "/opt/vendor/lib/libcodec.so.1.2", force=force)
+
+    assert response["ok"] is False and response["status"] == "invalid_request"
+    assert "force" in response["error"]
+    assert versioned in w.project.files
+
+
+def test_first_link_does_not_bind_an_alias_copy_of_a_library_that_is_gone_1078(world):
+    # No previous binding to compare with -- the provider was deleted BEFORE
+    # the target was ever linked. The inventory still records the loader's
+    # file (its filename is the NEEDED name) and that it is no longer in the
+    # project; a different-content alias copy is not a stand-in for it.
+    w = world
+    versioned, dev = _soname_pair(w)
+    w.project.delete_file(versioned)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+
+    result = link(w)
+
+    row = next(r for r in result["libraries"] if r["name"] == "libcodec.so.1.2")
+    assert row["resolved"] is False, row
+    assert "/opt/vendor/lib/libcodec.so.1.2" in row["reason"] and versioned.id in row["reason"]
+    assert "no longer in the project" in row["reason"]
+    assert "alias-only candidate /opt/vendor/lib/libcodec.so has different content" in row["reason"]
+    assert result["rebound"] == 0 and bv.externals["libcodec.so.1.2"].backing_file is None
+
+
+def test_first_link_accepts_an_alias_copy_with_the_gone_librarys_content_1078(world):
+    w = world
+    versioned, dev = _soname_pair(w, same_content=True)
+    w.project.delete_file(versioned)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+
+    result = link(w)
+
+    assert bv.externals["libcodec.so.1.2"].backing_file is dev
+    assert any("same recorded content" in note for note in result["notes"])
+
+
+def test_delete_guard_covers_the_raw_library_behind_a_database_provider_1078(world):
+    # A library with its own database is bound through that database, and the
+    # record names the database. Deleting the RAW library -- the file the
+    # inventory is keyed by -- orphans the binding just the same.
+    w = world
+    raw = library(w, "/opt/vendor/lib/libcodec.so.1.2", database=True,
+                  info=elf(w, soname="libcodec.so.1.2", exports=exports("decode")))
+    database = w.instance.projects.resolve_file("/opt/vendor/lib/libcodec.so.1.2.bndb")
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    link(w)
+    assert bv.externals["libcodec.so.1.2"].backing_file is database
+
+    for doomed in (raw, database):
+        response = _delete(w, doomed.id)
+        assert response["ok"] is False, response
+        assert "linked provider of 1 target(s)" in response["error"]
+        assert "/app (open as app; libcodec.so.1.2" in response["error"]
+        assert doomed in w.project.files
+
+    forced = _delete(w, raw.id, force=True)
+    assert forced["ok"] is True and raw not in w.project.files
+    assert forced["result"]["dependents"] == [{
+        "project_file_id": bv.project_file.id, "project_path": "/app",
+        "libraries": ["libcodec.so.1.2"], "open": True, "selector": "app",
+        "provider_path": "/opt/vendor/lib/libcodec.so.1.2.bndb",
+    }]
+
+
+@pytest.mark.parametrize("stored", [
+    '{"version": 1, "targets": {"T": {"project_path": "/app", "providers": ["libcodec.so.1.2"]}}}',
+    '{"version": 999, "targets": {}}',
+    '{"targets": {}}',
+    '{"version": 1, "targets": []}',
+    '{"version": 1, "targets": {"T": "not an entry"}}',
+    '{"version": 1, "targets": {"T": {"project_path": 7, "providers": {}}}}',
+    '{"version": 1, "targets": {"T": {"project_path": "/app", "providers": {"lib": 7}}}}',
+    '["not", "an", "object"]',
+    "not json at all",
+])
+def test_an_unreadable_link_record_is_refused_and_never_overwritten_1078(world, stored):
+    # `bn.links` is project data any tool or bn version can write. A record
+    # this bn cannot read is not "no record": the provider delete guard cannot
+    # be answered from it, so it refuses unless forced, and no link or delete
+    # replaces it with a fresh one.
+    w = world
+    versioned, _ = _soname_pair(w)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    w.project.metadata["bn.links"] = stored
+
+    result = link(w)                                   # used to raise AttributeError
+    assert result["success"] is True
+    assert bv.externals["libcodec.so.1.2"].backing_file is versioned
+    assert any("link record" in note and "not updated" in note for note in result["notes"])
+    assert w.project.metadata["bn.links"] == stored
+
+    refused = _delete(w, versioned.id)
+    assert refused["ok"] is False
+    assert "link record" in refused["error"] and "--force" in refused["error"]
+    assert versioned in w.project.files
+
+    forced = _delete(w, versioned.id, force=True)
+    assert forced["ok"] is True and versioned not in w.project.files
+    assert "link record" in forced["result"]["link_record_error"]
+    assert w.project.metadata["bn.links"] == stored
+
+
+def test_a_dependent_that_left_the_project_no_longer_blocks_a_delete_1078(world):
+    # The recorded target was removed through the native API (the GUI, another
+    # tool): nothing depends on the provider any more.
+    w = world
+    versioned, _ = _soname_pair(w)
+    bv = target(w, ["libcodec.so.1.2"], ["decode"])
+    link(w)
+    w.project.files.remove(bv.project_file)
+    _register_views(w.bridge)
+    w.instance.targets.refresh()
+
+    response = _delete(w, versioned.id)
+
+    assert response["ok"] is True, response
+    assert "dependents" not in response["result"]

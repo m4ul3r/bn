@@ -20,6 +20,7 @@ fake module) and never imports `bridge`.
 
 from __future__ import annotations
 
+import json
 import os
 from collections import deque
 from collections.abc import Callable
@@ -33,6 +34,7 @@ from .elf_dynamic import ElfDynamicInfo, parse_elf_dynamic, parse_elf_file
 from .rootfs_layout import (
     DiscoveryBudget, detect_root, discovery_budget, lookup_paths, scan_libraries,
 )
+from .target_hint import positional_selector
 
 # One number for the writer here and the validating reader in `project_ops`
 # (`ProjectManager.get_rootfs`, #1071); it lives there because this module
@@ -108,7 +110,7 @@ def project_sync_libs(
         state = manager.require()
         meta = manager.get_rootfs() or {}
         live_ids = {str(pf.id) for pf in state.project.files}
-    budget = DiscoveryBudget(cancelled=cancelled)
+    budget = DiscoveryBudget(cancelled=cancelled, restart=_restart_command(bridge))
     with discovery_budget(budget):
         if root is not None and (not isinstance(root, str) or not root.strip() or "\0" in root):
             raise RuntimeError("project_sync_libs: root must be a directory path when given")
@@ -146,6 +148,10 @@ def project_sync_libs(
             project_ops._refuse_finding_path(
                 cand.dir_in_root.rstrip("/") + "/" + cand.names[0])
             if cand.rel_realpath not in existing:
+                # One unit per file parsed; its bytes were charged per MiB by
+                # the hash. `check` is the parser's cancellation/deadline probe
+                # (called per symbol name read), not a per-symbol charge (#1075).
+                budget.charge(files=1)
                 parsed[cand.rel_realpath] = parse_elf_file(cand.realpath, check=budget.check)
         notes.extend(budget.notes)
         with bridge._write_operation_lock():
@@ -158,6 +164,15 @@ def project_sync_libs(
                 manager, state, meta, chosen_root, str(chosen_platform),
                 paths, candidates, parsed, notes, bool(dry_run), budget,
             )
+
+
+def _restart_command(bridge: Any) -> str | None:
+    """`bn session restart <id>` for the headless bridge that read the discovery
+    limits at start; None for the GUI plugin, which has no instance id."""
+    instance_id = getattr(bridge, "instance_id", None)
+    if not isinstance(instance_id, str) or not instance_id:
+        return None
+    return f"bn session restart {positional_selector(instance_id)}"
 
 
 def _apply_sync(
@@ -357,6 +372,7 @@ class _Library:
     elf_class: int | None
     project_path: str
     sibling: Any  # the `<name>.bndb` project file, or None
+    sha256: str | None = None
     # Name by which the global-scope walk first reached this library.
     needed_as: str = ""
 
@@ -370,6 +386,12 @@ class _Plan:
     assignments: list[tuple[Any, str, str, bool]] = field(default_factory=list)
     # (library name, backing project file) per rebinding; planning never writes.
     rebinds: list[tuple[str, Any]] = field(default_factory=list)
+    # {"name", "from_id", "from_path", "to_id", "to_path"} per rebinding --
+    # the provider CHANGE, which a count alone hides (#1078).
+    rebind_rows: list[dict[str, Any]] = field(default_factory=list)
+    # NEEDED name -> why it was left unresolved although an inventory row
+    # matched it (an alias-only candidate refused, #1078).
+    library_reasons: dict[str, str] = field(default_factory=dict)
     linked: int = 0
     already_linked: int = 0
     relinked: int = 0
@@ -434,7 +456,32 @@ def link_view(
     if is_elf and target_elf is not None:
         needed = list(target_elf.needed)
 
-    resolver = _Resolver(manager, inventory, meta, target_elf, plan)
+    # The provider each NEEDED library is bound to NOW. The resolver needs it
+    # to tell a first binding from a rebinding onto a different file (#1078).
+    # The view's own `backing_file` is the first source; it goes None once the
+    # provider is deleted and the database is reopened in a new process
+    # (measured: a replayed database reports no backing for a deleted file),
+    # so the project's `bn.links` record of this target fills the gaps.
+    previous = {
+        name: backing
+        for name in needed
+        if (backing := getattr(_external_library(bv, name, create=False),
+                               "backing_file", None)) is not None
+    }
+    # A record that cannot be read is neither consulted nor, below, rewritten.
+    links_error: str | None = None
+    if pf is not None:
+        try:
+            providers = manager.get_links()["targets"].get(str(pf.id), {}).get("providers", {})
+        except Exception as exc:  # noqa: BLE001 - LinkRecordUnreadable, or BN itself
+            providers = {}
+            links_error = str(exc)
+            plan.notes.append(f"link record not consulted and not updated: {exc}")
+        for name, provider in providers.items():
+            if name in needed and name not in previous and provider:
+                previous[name] = provider
+    resolver = _Resolver(manager, inventory, meta, target_elf, plan, previous,
+                         list(state.project.files))
     direct: dict[str, _Library | None] = {}
     scope: list[_Library] = []
     if is_elf:
@@ -452,12 +499,17 @@ def link_view(
         entry = direct.get(name)
         lib = _external_library(bv, name, create=False)
         lib_objects[name] = lib
-        plan.libraries.append(_library_row(name, entry))
+        plan.libraries.append(_library_row(name, entry, plan.library_reasons.get(name)))
         if entry is None:
             continue
         backing = entry.sibling if entry.sibling is not None else entry.pf
-        if not _same_file(getattr(lib, "backing_file", None), backing):
+        current = getattr(lib, "backing_file", None)
+        if not _same_file(current, backing):
             plan.rebinds.append((name, backing))
+            # Reported FROM what is known: BN's live backing, else the record.
+            plan.rebind_rows.append(
+                _rebind_row(name, current if current is not None else previous.get(name),
+                            backing, resolver))
 
     # Step 4: assign a library to every external location lacking one.
     if is_elf:
@@ -508,6 +560,15 @@ def link_view(
     if not success:
         plan.notes.append(
             "link counters describe the planned changes, not verified completed writes")
+    if not dry_run and success and links_error is None:
+        # What this target is bound to, in the project's own metadata, so
+        # `project delete` can name the targets a provider serves -- saved
+        # databases included, which nothing else can see into (#1078).
+        # Best-effort: a metadata hiccup must not fail a verified link.
+        try:
+            _record_links(manager, pf, direct)
+        except Exception as exc:  # noqa: BLE001
+            plan.notes.append(f"link record not updated in project metadata: {exc}")
     return {
         "status": status,
         "success": success,
@@ -520,11 +581,55 @@ def link_view(
         "already_linked": plan.already_linked,
         "relinked": plan.relinked,
         "rebound": len(plan.rebinds),
+        "rebinds": plan.rebind_rows,
         "locations": plan.locations,
         "unresolved": plan.unresolved,
         "ambiguous_libraries": plan.ambiguous,
         "notes": plan.notes,
         "measured": success,
+    }
+
+
+def _record_links(manager: Any, pf: Any, direct: dict[str, _Library | None]) -> None:
+    """Publish *pf*'s NEEDED -> provider file id map under `bn.links`.
+
+    A name resolved now updates its entry; a name left unresolved KEEPS the
+    provider recorded before -- that memory is what lets the next link (or
+    the next restart replay) tell a different-content alias from the file the
+    import was bound to, after BN itself has forgotten the deleted backing."""
+    if pf is None:
+        return
+    record = manager.get_links()
+    before = json.dumps(record, sort_keys=True)
+    # Entries of targets that have left the project describe nothing.
+    live = {str(owned.id) for owned in manager.files()}
+    targets = record["targets"] = {
+        target_id: entry for target_id, entry in record["targets"].items()
+        if target_id in live
+    }
+    existing = targets.get(str(pf.id))
+    providers = dict(existing.get("providers") or {}) if isinstance(existing, dict) else {}
+    providers.update({
+        name: str((entry.sibling if entry.sibling is not None else entry.pf).id)
+        for name, entry in direct.items() if entry is not None
+    })
+    targets[str(pf.id)] = {
+        "project_path": manager.path_in_project(pf),
+        "providers": providers,
+    }
+    if json.dumps(record, sort_keys=True) == before:
+        return
+    manager.set_links(record)
+
+
+def _rebind_row(name: str, current: Any, backing: Any, resolver: "_Resolver") -> dict[str, Any]:
+    from_id = str(getattr(current, "id", current)) if current is not None else None
+    return {
+        "name": name,
+        "from_id": from_id,
+        "from_path": resolver.path_of(from_id),
+        "to_id": str(backing.id),
+        "to_path": resolver.path_of(str(backing.id)),
     }
 
 
@@ -550,6 +655,7 @@ def _inventory(manager: Any, state: Any, meta: dict[str, Any]) -> list[_Library]
             elf_class=entry.get("elf_class"),
             project_path=manager.path_in_project(pf),
             sibling=manager.sibling_database(pf, index),
+            sha256=str(entry["sha256"]) if entry.get("sha256") else None,
         ))
     return out
 
@@ -558,7 +664,9 @@ class _Resolver:
     """NEEDED name -> project library, with the loader's preference order."""
 
     def __init__(self, manager: Any, inventory: list[_Library], meta: dict[str, Any],
-                 target_elf: ElfDynamicInfo | None, plan: _Plan) -> None:
+                 target_elf: ElfDynamicInfo | None, plan: _Plan,
+                 previous: dict[str, Any] | None = None,
+                 project_files: list[Any] | None = None) -> None:
         self._manager = manager
         self._inventory = inventory
         self._plan = plan
@@ -567,6 +675,105 @@ class _Resolver:
         self._meta = meta
         self._target_elf = target_elf
         self._cache: dict[tuple[Any, ...], _Library | None] = {}
+        # NEEDED name -> the project file it is bound to now (#1078).
+        self._previous = previous or {}
+        self._paths = {
+            str(pf.id): manager.path_in_project(pf) for pf in (project_files or [])
+        }
+        # Live project file ids, or None when the caller did not say (then
+        # "gone from the project" cannot be judged and is never assumed).
+        self._live = set(self._paths) if project_files is not None else None
+
+    def path_of(self, file_id: str | None) -> str | None:
+        """Path in the project of a live file id; None for a deleted one."""
+        return self._paths.get(file_id) if file_id is not None else None
+
+    def _alias_rebind_refusal(self, name: str, wanted: str, chosen: _Library) -> str | None:
+        """Why an ALIAS-ONLY candidate may not replace *name*'s current provider.
+
+        Firmware ships two different files claiming one SONAME: the versioned
+        file the loader maps, and a dev-name copy with different bytes. Once
+        the bound provider is gone, the copy matches by alias alone; binding it
+        would attribute the analysis to a library the loader never used (#1078).
+        It is accepted only when its recorded content equals the previous
+        provider's -- a renamed copy of the same bytes. None means allowed.
+        With no previous provider the inventory answers instead
+        (`_first_binding_refusal`).
+        """
+        current = self._previous.get(name)
+        if current is None:
+            return self._first_binding_refusal(name, wanted, chosen)
+        if _same_file(current, chosen.pf) or _same_file(current, chosen.sibling):
+            return None
+        prev_id = str(getattr(current, "id", current))
+        prev_entry = (self._meta.get("libs") or {}).get(prev_id) or {}
+        prev_sha = prev_entry.get("sha256")
+        if prev_sha and chosen.sha256 and str(prev_sha) == chosen.sha256:
+            self._plan.notes.append(
+                f"{name}: provider {prev_id} replaced by {chosen.project_path}, "
+                "an alias-only match with the same recorded content")
+            return None
+        state = (
+            "is gone" if prev_id not in self._paths
+            else f"({self._paths[prev_id]}) no longer matches this name"
+        )
+        content = (
+            "different content" if prev_sha and chosen.sha256
+            else "content that cannot be compared with the previous provider's"
+        )
+        return (
+            f"{name}: previous provider {prev_id} {state}; alias-only candidate "
+            f"{chosen.project_path} has {content}; import the loader's file and "
+            "relink, or bind it deliberately"
+        )
+
+    def _first_binding_refusal(self, name: str, wanted: str, chosen: _Library) -> str | None:
+        """The same question for a name that was never bound (#1078 review).
+
+        There is no previous provider to compare with, but the inventory may
+        still record the loader's own file: an entry one of whose lookup paths
+        is the NEEDED filename, whose project file has since been deleted (the
+        inventory keeps deleted entries until the next sync). When it does and
+        the alias-only candidate's recorded content differs -- or cannot be
+        compared -- the candidate is not a stand-in for it. With no such entry
+        an alias-only match stays the disclosed fallback it always was.
+        """
+        if self._live is None:
+            return None
+        gone: list[tuple[str, str, Any]] = []
+        for file_id, entry in (self._meta.get("libs") or {}).items():
+            if str(file_id) in self._live or not isinstance(entry, dict):
+                continue
+            machine, elf_class = entry.get("e_machine"), entry.get("elf_class")
+            if self._class and elf_class and elf_class != self._class:
+                continue
+            if self._machine and machine and machine != self._machine:
+                continue
+            paths = [str(p) for p in (entry.get("paths") or [entry.get("rel_realpath") or ""])]
+            if any(os.path.basename(path) == wanted for path in paths):
+                gone.append((str(entry.get("rel_realpath") or paths[0]), str(file_id),
+                             entry.get("sha256")))
+        if not gone:
+            return None
+        gone.sort()
+        same = next((row for row in gone
+                     if row[2] and chosen.sha256 and str(row[2]) == chosen.sha256), None)
+        if same is not None:
+            self._plan.notes.append(
+                f"{name}: the loader's file {same[0]} ({same[1]}) is no longer in the "
+                f"project; bound to {chosen.project_path}, an alias-only match with the "
+                "same recorded content")
+            return None
+        rel, file_id, sha = gone[0]
+        content = (
+            "different content" if sha and chosen.sha256
+            else "content that cannot be compared with that file's"
+        )
+        return (
+            f"{name}: the loader's file {rel} ({file_id}) is no longer in the project; "
+            f"alias-only candidate {chosen.project_path} has {content}; import the "
+            "loader's file and relink, or bind it deliberately"
+        )
 
     def resolve(
         self, name: str, *, by_basename: bool = False,
@@ -617,7 +824,15 @@ class _Resolver:
                      or os.path.basename(path) == wanted), default=len(rank)),
                 lib.project_path))
             chosen = matches[0]
-            if len(matches) > 1:
+            refusal = (
+                self._alias_rebind_refusal(name, wanted, chosen)
+                if not exact_path and not filename_matches else None
+            )
+            if refusal is not None:
+                self._plan.library_reasons[name] = refusal
+                self._plan.notes.append(refusal)
+                chosen = None
+            elif len(matches) > 1:
                 self._plan.ambiguous.append({
                     "name": name,
                     "chosen": chosen.project_path,
@@ -777,7 +992,7 @@ def _plan_locations(
                     break
         if chosen is None:
             reason = (
-                f"library {verneed} not in project"
+                plan.library_reasons.get(verneed) or f"library {verneed} not in project"
                 if verneed is not None and direct.get(verneed) is None
                 else (
                     "symbol version requirements were not read: "
@@ -793,8 +1008,11 @@ def _plan_locations(
             transitive[chosen.needed_as] = lib_obj
             plan.libraries.append(_library_row(chosen.needed_as, chosen))
             backing = chosen.sibling if chosen.sibling is not None else chosen.pf
-            if not _same_file(getattr(lib_obj, "backing_file", None), backing):
+            current_backing = getattr(lib_obj, "backing_file", None)
+            if not _same_file(current_backing, backing):
                 plan.rebinds.append((chosen.needed_as, backing))
+                plan.rebind_rows.append(
+                    _rebind_row(chosen.needed_as, current_backing, backing, resolver))
         if current is not None and _library_name(current) == chosen.needed_as:
             plan.already_linked += 1
             plan.locations.append(_location_row(loc, chosen.needed_as, "already_linked"))
@@ -868,10 +1086,13 @@ def _external_library(bv: Any, name: str, *, create: bool) -> Any:
     return lib
 
 
-def _library_row(name: str, entry: _Library | None) -> dict[str, Any]:
+def _library_row(name: str, entry: _Library | None, reason: str | None = None) -> dict[str, Any]:
     if entry is None:
-        return {"name": name, "resolved": False, "project_file_id": None,
-                "project_path": None, "backing": None}
+        row = {"name": name, "resolved": False, "project_file_id": None,
+               "project_path": None, "backing": None}
+        if reason:
+            row["reason"] = reason
+        return row
     return {
         "name": name,
         "resolved": True,

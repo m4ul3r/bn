@@ -27,6 +27,7 @@ from typing import Any, NoReturn
 from .. import cli
 from ..cli import arg, command
 from ..formatters import (
+    _force_rerun_line,
     _render_capabilities_text,
     _render_doctor_text,
     _render_instance_find_text,
@@ -51,10 +52,17 @@ from ..transport import BridgeError, BridgeUnreachableError, _resolve_timeout, u
 _SHUTDOWN_TEARDOWN_TIMEOUT = 30.0
 _SIGNAL_TEARDOWN_TIMEOUT = 5.0
 # #1036 item 6: a foreground `session start` of a large binary can block for
-# minutes; one stderr line this often says it is still working.
+# minutes; one stderr line this often says it is still working. #1058 item 6:
+# `session status --wait` reports on the same cadence.
 _START_PROGRESS_INTERVAL = 30.0
 # How often `session status <job> --wait` polls the bridge.
 _STATUS_WAIT_INTERVAL = 2.0
+_START_DETACH_HINT = "`session start --detach` returns at once instead"
+
+
+def _still_loading_line(path: str, elapsed: float, hint: str) -> str:
+    """The one spelling of the progress line both long waits print."""
+    return f"bn: still loading {path} ({int(elapsed)}s); {hint}"
 
 
 @contextlib.contextmanager
@@ -67,10 +75,8 @@ def _still_loading_notice(path: str, interval: float):
 
     def tick() -> None:
         while not done.wait(interval):
-            print(
-                f"bn: still loading {path} ({int(time.monotonic() - started)}s); "
-                "`session start --detach` returns at once instead",
-                file=sys.stderr, flush=True)
+            print(_still_loading_line(path, time.monotonic() - started, _START_DETACH_HINT),
+                  file=sys.stderr, flush=True)
 
     thread = threading.Thread(target=tick, name="bn-start-progress", daemon=True)
     thread.start()
@@ -359,7 +365,17 @@ def _plugin_install(args: argparse.Namespace) -> int:
     # names what is there.
     up_to_date = state is not None and state[0] == "up_to_date"
     if not up_to_date:
-        _install_tree(source, dest, mode=args.mode, force=args.force)
+        try:
+            _install_tree(source, dest, mode=args.mode, force=args.force)
+        except ExistingDestinationRefused as exc:
+            # #1058 item 10: the same rerun template a refused `skill install`
+            # prints, and only when the forced preflight said it would help.
+            if not exc.force_ready:
+                raise
+            raise BridgeError(
+                f"{exc}\n"
+                + _force_rerun_line(_forced_install_args(args, "plugin", "install"), what="it")
+            ) from None
 
     result: dict[str, Any] = {
         "installed": not up_to_date,
@@ -560,6 +576,18 @@ FORCE_NOTE = ("--force replaces only what it can remove and proves is this "
               "and then changes no destination.")
 
 
+class ExistingDestinationRefused(BridgeError):
+    """An unforced install refused because something is already at the
+    destination. `force_ready` says whether the forced preflight accepted it,
+    so the caller can print the rerun template only when `--force` would
+    actually change the outcome (#1058 item 10) -- and never by matching the
+    message text."""
+
+    def __init__(self, message: str, *, force_ready: bool):
+        super().__init__(message)
+        self.force_ready = force_ready
+
+
 def _install_path(dest: Path) -> Path:
     """The path an install at `dest` works on, decided before anything is written.
 
@@ -758,12 +786,15 @@ def _plan_install(
                     source, requested_dest, mode=mode, force=True, skill_root=skill_root
                 )
             except BridgeError as exc:
+                force_ready = False
                 force_detail = f"--force preflight refuses: {exc}"
             else:
+                force_ready = True
                 force_detail = "--force preflight accepts this destination"
-            raise BridgeError(
+            raise ExistingDestinationRefused(
                 f"Destination already exists: {dest} ({state[1]}).\n"
-                f"{force_detail}\n{FORCE_NOTE}"
+                f"{force_detail}\n{FORCE_NOTE}",
+                force_ready=force_ready,
             )
         return dest
     reason = _force_refusal_reason(dest, source)
@@ -938,7 +969,7 @@ def _skill_install(args: argparse.Namespace) -> int:
         # 3): the refused run's arguments plus `--force`, never a claim about
         # which executable to run them with.
         "force_args": (
-            _forced_skill_install_args(args)
+            _forced_install_args(args, "skill", "install")
             if not args.force and not_updated_destinations
             and all(row["allowed"] for row in force_plan)
             else None
@@ -967,8 +998,9 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 1 if not_updated_destinations else 0
 
 
-def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
-    """The refused run's own arguments plus `--force`, after the program name.
+def _forced_install_args(args: argparse.Namespace, *command: str) -> list[str]:
+    """The refused run's own arguments plus `--force`, after the program name,
+    for `skill install` or `plugin install` (#1058 item 10 shares it).
 
     Rebuilt from the parsed arguments: `--dest` keeps the caller's spelling (a
     relative path reruns from the same directory; normalising it could change
@@ -980,8 +1012,8 @@ def _forced_skill_install_args(args: argparse.Namespace) -> list[str]:
     something this process can prove -- three review rounds of provenance
     checks each printed a command that installed another checkout (#1043).
     The caller reruns its own invocation with these arguments."""
-    argv = ["skill", "install"]
-    if args.selection is not None:
+    argv = list(command)
+    if getattr(args, "selection", None) is not None:
         argv.append(args.selection)
     if args.dest is not None:
         dest = str(args.dest)
@@ -1220,6 +1252,7 @@ def _session_status(args: argparse.Namespace) -> int:
             "printed, or one listed by `session status` without --wait"
         )
     started = time.monotonic()
+    intervals_reported = 0
     while True:
         response = cli.send_request(
             "load_status",
@@ -1237,6 +1270,26 @@ def _session_status(args: argparse.Namespace) -> int:
         if timeout is not None and elapsed >= timeout:
             result["waited"] = {"seconds": round(elapsed, 1), "timed_out": True}
             break
+        # #1058 item 6: the same stderr line a foreground start prints, on the
+        # same cadence -- a 54 s wait used to print nothing. Driven by elapsed
+        # time, not by poll count, so a slow poll does not skew the cadence,
+        # and nothing is printed when the wait ends inside the first interval.
+        due = int(elapsed // _START_PROGRESS_INTERVAL)
+        if due > intervals_reported:
+            intervals_reported = due
+            job = result.get("job")
+            path = job.get("path") if isinstance(job, dict) else None
+            # A printed command runs as printed: `session status` needs `-i`,
+            # so the hint is the bridge's own `status_command` (the `poll:`
+            # line), or the same command spelled with this call's instance.
+            poll = result.get("status_command")
+            if not isinstance(poll, str) or not poll:
+                poll = (f"bn {cli.instance_option(instance_id)} session status "
+                        f"{shlex.quote(str(job_id))}")
+            print(_still_loading_line(
+                path if isinstance(path, str) and path else f"job {job_id}", elapsed,
+                f"`{poll}` (without --wait) returns at once"),
+                file=sys.stderr, flush=True)
         pause = _STATUS_WAIT_INTERVAL
         if timeout is not None:
             pause = min(pause, max(timeout - elapsed, 0.0))
@@ -1253,6 +1306,71 @@ def _session_status(args: argparse.Namespace) -> int:
     if wait:
         return 0 if result.get("succeeded") is True else 1
     return 0
+
+
+def _lifecycle_instance_id(verb: str, args: argparse.Namespace) -> str:
+    """The instance a lifecycle command (`session stop`/`restart`) acts on.
+
+    #456: accept the id positionally OR via -i/--instance (every other command
+    is driven with -i/--instance, so `session stop -i <id>` is the natural
+    cleanup shape). The positional wins when both are given. Presence, not
+    truthiness (#690 r4): `bn session stop "$ID"` with $ID unset must error, not
+    fall through to the sticky-pin-filled -i and shut down the PINNED bridge.
+
+    #588: the final fallback must NOT pick up a sticky-pinned -i -- only a
+    non-sticky args.instance (an explicit -i/--instance OR the BN_INSTANCE env
+    default; see _instance_option/_apply_sticky_defaults in cli.py) may supply
+    the target for a bare command. Otherwise target_id stays unset and the
+    "requires an instance id" branch fires instead of silently acting on
+    whatever instance the project happens to be pinned to.
+
+    `session restart` additionally refuses two DIFFERENT explicit ids (#1076):
+    `bn -i a session restart b` names two bridges, and silently restarting one
+    of them is not what either name asked for. Every pair of ids typed on the
+    command line is compared; `BN_INSTANCE` is ambient, so the positional wins
+    over it as it always has.
+    """
+    positional = getattr(args, "instance_id", None)
+    alias = getattr(args, "instance_id_flag", None)
+    flag = (
+        getattr(args, "instance", None)
+        if not getattr(args, "_sticky_instance", False)
+        else None
+    )
+    target_id = (
+        positional
+        if positional is not None
+        else alias
+        if alias is not None
+        else flag
+    )
+    if target_id is not None and not str(target_id).strip():
+        raise BridgeError(
+            f"session {verb}: instance id is empty; pass an id from `bn session list`"
+        )
+    if not target_id:
+        raise BridgeError(
+            f"session {verb} requires an instance id: `bn session {verb} <id>` "
+            f"(or `bn session {verb} -i/--instance <id>`). See `bn session list`."
+        )
+    if verb == "restart":
+        # What THIS invocation typed: the positional, `--instance-id`, and
+        # `-i/--instance` only when it was on the command line (`main` records
+        # that; a value that merely equals BN_INSTANCE is still explicit, and
+        # BN_INSTANCE itself never is).
+        explicit = [
+            str(value) for value in (
+                positional, alias,
+                flag if getattr(args, "_explicit_instance", False) else None,
+            ) if value is not None
+        ]
+        different = sorted(set(explicit))
+        if len(different) > 1:
+            raise BridgeError(
+                f"session restart: two different instance ids were given, "
+                f"{different[0]!r} and {different[1]!r}; pass one. See `bn session list`."
+            )
+    return str(target_id)
 
 
 @command(
@@ -1281,38 +1399,7 @@ def _session_status(args: argparse.Namespace) -> int:
     ],
 )
 def _session_stop(args: argparse.Namespace) -> int:
-    # #456: accept the id positionally OR via -i/--instance (every other command is
-    # driven with -i/--instance, so `session stop -i <id>` is the natural
-    # cleanup shape). The positional wins when both are given.
-    # Presence, not truthiness (#690 r4): `bn session stop "$ID"` with $ID
-    # unset must error, not fall through to the sticky-pin-filled -i and shut
-    # down the PINNED bridge.
-    positional = getattr(args, "instance_id", None)
-    alias = getattr(args, "instance_id_flag", None)
-    # #588: the final fallback must NOT pick up a sticky-pinned -i -- only a
-    # non-sticky args.instance (an explicit -i/--instance OR the BN_INSTANCE
-    # env default; see _instance_option/_apply_sticky_defaults in cli.py) may
-    # supply the target for a bare `session stop`. Otherwise target_id stays
-    # unset and the "requires an instance id" branch below fires instead of
-    # silently stopping whatever instance the project happens to be pinned to.
-    target_id = (
-        positional
-        if positional is not None
-        else alias
-        if alias is not None
-        else getattr(args, "instance", None)
-        if not getattr(args, "_sticky_instance", False)
-        else None
-    )
-    if target_id is not None and not str(target_id).strip():
-        raise BridgeError(
-            "session stop: instance id is empty; pass an id from `bn session list`"
-        )
-    if not target_id:
-        raise BridgeError(
-            "session stop requires an instance id: `bn session stop <id>` "
-            "(or `bn session stop -i/--instance <id>`). See `bn session list`."
-        )
+    target_id = _lifecycle_instance_id("stop", args)
     # Resolve the instance up front so we can confirm teardown by pid + files
     # after the shutdown, and SIGTERM it if the socket request fails.
     # Lifecycle lookup, not normal discovery: a bridge whose socket file is gone
@@ -1411,7 +1498,18 @@ def _session_stop(args: argparse.Namespace) -> int:
 
 @command("session", "restart", help="Stop a bridge session and respawn it (same id), reloading its targets",
          args=[
-             arg("instance", help="Instance ID to restart"),
+             arg(
+                 "instance_id",
+                 nargs="?",
+                 metavar="instance",
+                 help="Instance ID to restart (positional, or pass -i/--instance <id>)",
+             ),
+             arg(
+                 "--instance-id",
+                 dest="instance_id_flag",
+                 default=None,
+                 help="Instance ID to restart (alias for the positional or -i/--instance)",
+             ),
              arg(
                  "--discard-unsaved",
                  action="store_true",
@@ -1425,7 +1523,7 @@ def _session_restart(args: argparse.Namespace) -> int:
     targets, stop the process, respawn under the same instance id, and reload the
     same binaries -- so the new bridge serves current code without the caller
     hunting for the right paths."""
-    target_id = args.instance
+    target_id = _lifecycle_instance_id("restart", args)
     # Lifecycle lookup (#694): a socket-less bridge is hidden from normal
     # discovery, but restarting it is a legitimate way to recover it.
     inst = cli.find_lifecycle_instance(target_id)
@@ -1515,6 +1613,19 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
     # associate an unrelated project.
+    # #1076: the new bridge starts with the BN_* settings the OLD one ran under
+    # (its registry records what it saw), and the caller's own BN_* exports win
+    # over them. Without this a restart from another shell or agent silently
+    # dropped BN_ROOTFS_MAX_WORK and friends and the refusal they fixed came
+    # back. Decided HERE, before anything is stopped: the record comes from a
+    # file, and whatever is wrong with it must surface while the old bridge is
+    # still running, never between its teardown and the spawn. A malformed
+    # record is no record (`validated_record`).
+    meta = inst.meta if isinstance(inst.meta, dict) else {}
+    env, env_report = cli.restart_environment(
+        cli.validated_record(meta.get("env")), os.environ, meta.get("env_withheld") or (),
+    )
+
     inherited_roots: list[str] = []
     if isinstance(inst.meta, dict):
         roots = inst.meta.get("project_roots")
@@ -1548,7 +1659,7 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    instance = cli.spawn_instance(resolved_id)
+    instance = cli.spawn_instance(resolved_id, env=env)
     # Reload targets without associating the restart command's cwd.
     #
     # #753: `prefer_bndb` is False, not True. The captured `path` is the row's
@@ -1658,6 +1769,7 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["reload_capture_error"] = reload_capture_error
     if discarded:
         result["discarded_unsaved"] = discarded
+    result["env"] = env_report
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     project_reopen_failed = project_result is not None and not project_result["opened"]
     return 1 if failures or project_reopen_failed or association_error or reload_capture_failed else 0

@@ -5808,19 +5808,74 @@ class TestStringScanSeesCodeOnly1045:
         assert row["strings"][0]["inline"] is True, row
 
     def test_a_literal_holding_a_url_keeps_both_raw_operands(self, shared_bn, tmp_path):
-        # Round 5: BN renders the embedded quotes unescaped, and the regex read
-        # the URL's `//` as a comment: both operands were lost and the arity
-        # notes landed inside the literal. Base names "abc" and "x".
+        # Round 5: the literal holds embedded quotes and a URL, and the regex
+        # read the URL's `//` as a comment: both operands were lost and the
+        # arity notes landed inside the literal. Base names "abc" and "x".
         result = self._decompile_probe(shared_bn, tmp_path, (
             "#include <string.h>\n"
             "__attribute__((noinline)) int probe(const char *s) "
             '{ return strcmp("<a href=\\"http://x\\">", "abc") + strcmp(s, "x"); }\n'
             "int main(int c, char **v) { return probe(v[0]); }\n"))
         [line] = [line for line in result["text"].splitlines() if "http://x" in line]
-        assert '"<a href="http://x">", 0x' in line, line  # the literal is intact
+        # The literal is intact and the second operand stays a raw address. BN
+        # has rendered the literal's inner quotes both bare and as `\"` across
+        # builds; either spelling is the same intact literal.
+        literal = re.search(r'"<a href=\\?"http://x\\?">", (0x[0-9a-f]+)\)', line)
+        assert literal, line
         assert line.index("/* bn:") > line.index("http://x"), line
         [row] = [row for row in result["warning_rows"] if row["code"] == "string"]
         assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row
+
+
+_SHARED_TAIL_ASM = """\
+    .text
+    .globl fa
+    .type fa, @function
+fa:
+    mov %edi, %eax
+    test %edi, %edi
+    jne .Lshared
+    ret
+    .size fa, .-fa
+    .globl fb
+    .type fb, @function
+fb:
+    mov %esi, %eax
+.Lshared:
+    cmp %esi, %edi
+    cmovl %esi, %eax
+    ret
+    .size fb, .-fb
+"""
+
+
+def test_the_select_warning_command_runs_for_a_site_in_a_shared_block_1058(shared_bn, tmp_path):
+    """#1058 item 12 (review): `fa` jumps into the tail of `fb`, so the `cmovl`
+    there lies inside both functions. `bn disasm <that address>` is refused
+    (`lies inside multiple overlapping functions`, exit 2), so the select
+    warning's printed command names the function's own entry instead and must
+    run as printed for both functions."""
+    if os.uname().machine != "x86_64":
+        refuse_silent_skip("the shared-tail fixture is x86-64 assembly")
+    asm, src = tmp_path / "shared.S", tmp_path / "main.c"
+    asm.write_text(_SHARED_TAIL_ASM)
+    src.write_text("int fa(int, int); int fb(int, int);\n"
+                   "int main(int c, char **v) { return fa(c, c + 1) + fb(c, 2); }\n")
+    binary = tmp_path / "overlap"
+    _build("cc", binary, "-O1", "-no-pie", str(src), str(asm))
+    shared_bn.load(binary)
+    for name in ("fa", "fb"):
+        result = shared_bn.json("decompile", name)
+        [row] = [row for row in result["warning_rows"] if row["code"] == "select"]
+        [command] = re.findall(r"`(bn [^`]+)`", row["summary"])
+        site = row["addresses"][0]
+        # The premise: the site itself is ambiguous, which is why it is not printed.
+        refused = shared_bn.run("disasm", site)
+        assert refused.returncode == 2 and "multiple overlapping functions" in refused.stderr, (
+            refused.stdout, refused.stderr)
+        printed = shared_bn.run(*shlex.split(command)[1:])
+        assert printed.returncode == 0, (command, printed.stdout, printed.stderr)
+        assert "cmovl" in printed.stdout, printed.stdout
 
 
 class TestOffsetTypeLookup1000:
