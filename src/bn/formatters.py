@@ -1648,15 +1648,19 @@ def _render_project_load_text(value: Any) -> str:
         status = _text_value(link, "status")
         success = _flag_field(link, "success")
         failed = status in FAILED_MUTATION_STATUSES or success is False
-        if failed:
-            # A failed link carries no counters; `?` would claim an unreadable
-            # count where there is none to read (#1073 item 3). A SUCCESSFUL
-            # link lacking them still states `?` through the measured helpers.
+        counted = _field_present(link, "linked") or _field_present(link, "unresolved")
+        if failed and not counted:
+            # A link that failed by exception carries no counters; `?` would
+            # claim an unreadable count where there is none to read (#1073
+            # item 3). The linker's own failure return (a readback mismatch)
+            # does carry them, with a note about them, so they are stated;
+            # a SUCCESSFUL link lacking them still states `?`.
             text += "\nlinked: n/a (link failed)"
-            text += f"\nauto-link FAILED: {_escape_control_chars(status or '<unknown>')}"
         else:
             text += (f"\nlinked: {_project_count_text(link, 'linked')} "
                      f"({_project_rows_count(link, 'unresolved')} unresolved)")
+        if failed:
+            text += f"\nauto-link FAILED: {_escape_control_chars(status or '<unknown>')}"
         message = _project_link_message(link)
         if message:
             text += f"\nauto-link note: {_escape_control_chars(message)}"
@@ -1754,6 +1758,10 @@ def _render_project_init_text(value: Any) -> str:
         lines.extend(_sync_detail_lines(sync))
     else:
         lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+        # The planner's loader notes (`skipped loader path containing NUL`):
+        # with no sync result to carry them, they are the plan's (#1073 review).
+        for note in _field_list(value, "notes"):
+            lines.append(f"note: {_escape_control_chars(note)}")
         error = _text_value(value, "sync_error")
         if error:
             lines.append(f"libraries: sync FAILED -- {_escape_control_chars(error)}")

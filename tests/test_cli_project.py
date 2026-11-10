@@ -1111,6 +1111,78 @@ def test_project_load_auto_link_failure_keeps_target_and_exits_three(
         assert json.loads(captured.out) == result
 
 
+@pytest.mark.parametrize("link", [
+    {"success": False},                                   # no status at all
+    {"success": False, "status": "verified"},             # a non-failing status
+])
+def test_project_load_success_false_alone_is_a_failed_link_1073(
+        fake_transport, monkeypatch, capsys, link):
+    _one_instance(monkeypatch)
+    fake_transport({"project_load": {"ok": True, "result": {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd", "targets": [],
+        "project_file_id": FILE_ID_A, "project_path": "/usr/bin/app", "link": link}}})
+
+    assert bn.cli.main(["project", "load", "usr/bin/app"]) == 3
+    out = capsys.readouterr().out
+    assert "linked: n/a (link failed)" in out and "auto-link FAILED" in out
+
+
+def test_project_load_failed_link_with_counters_keeps_them_1073(
+        fake_transport, monkeypatch, capsys):
+    """#1073 review: the linker's own failure return (a readback mismatch)
+    DOES carry counters, and its note talks about them; only a failure with
+    no counters at all has nothing to state."""
+    _one_instance(monkeypatch)
+    fake_transport({"project_load": {"ok": True, "result": {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd", "targets": [],
+        "project_file_id": FILE_ID_A, "project_path": "/usr/bin/app",
+        "link": {"status": "verification_failed", "success": False, "linked": 12,
+                 "unresolved": [{"symbol": "a", "reason": "r"}],
+                 "notes": ["link counters describe the planned changes, not verified "
+                           "completed writes"]}}}})
+
+    assert bn.cli.main(["project", "load", "usr/bin/app"]) == 3
+    out = capsys.readouterr().out
+    assert "linked: 12 (1 unresolved)" in out and "linked: n/a" not in out
+    assert "auto-link FAILED: verification_failed" in out
+    assert "link counters describe the planned changes" in out
+
+
+def test_project_init_text_keeps_the_planner_note_when_no_sync_is_rendered_1073(
+        fake_transport, monkeypatch, tmp_path, capsys):
+    """#1073 review: the plan carried the NUL note but the text renderer read
+    `notes` only on a dry run, so `init --no-libs` (and a failed sync) dropped
+    it while `--format json` showed it."""
+    import bn.commands.project
+    from test_rootfs_layout import _linux_rootfs, _touch
+    root = _linux_rootfs(tmp_path)
+    _touch(root, "etc/ld.so.conf", b"/lib\0evil\n/usr/lib\n")
+    _patch_projects_dir(monkeypatch, tmp_path)
+    _one_instance(monkeypatch)
+    _capture_pins(monkeypatch)
+    project_path = str(root.resolve()) + ".bnpr"
+    fake_transport({
+        "project_create": {"ok": True, "result": _project_info(project_path, created=True),
+                           "instance": "bridge-a"},
+        "associate_project_roots": {"ok": True, "result": {"associated": []}},
+        "project_sync_libs": {"ok": False, "error": "unused"},
+    })
+
+    assert bn.cli.main(["project", "init", str(root), "--no-libs"]) == 0
+    out = capsys.readouterr().out
+    assert "libraries: not synced (--no-libs)" in out
+    assert "note: skipped loader path containing NUL" in out
+
+    from bn.formatters import _render_project_init_text
+    failed = _render_project_init_text({
+        "root": "/fw", "platform": "linux", "markers": [], "project_path": "/fw.bnpr",
+        "dry_run": False, "created": True, "sync": None,
+        "sync_error": "disk full", "notes": ["skipped loader path containing NUL"],
+        "lookup_paths": []})
+    assert "libraries: sync FAILED -- disk full" in failed
+    assert "note: skipped loader path containing NUL" in failed
+
+
 def test_project_load_successful_link_without_counters_still_says_unknown_1073(
         fake_transport, monkeypatch, capsys):
     """The `?` stays for a SUCCESSFUL link that genuinely lacks counters: that

@@ -494,7 +494,7 @@ class ProjectManager:
             if operation is None:
                 raise RuntimeError(self._ambiguous(wanted_path, matches))
             raise RuntimeError("\n".join([
-                f"{operation} refused: {len(matches)} database files are named {wanted_path} "
+                f"{operation} refused: {len(matches)} database files are named {wanted_path!r} "
                 "in this project; load one of them explicitly or delete the duplicate:",
                 *self._listing(matches),
             ]))
