@@ -3846,6 +3846,34 @@ def test_resolve_bndb_strip_does_not_silently_pick_on_ambiguity(monkeypatch):
     bridge._headless_views.clear()
 
 
+def test_a_views_full_filename_outranks_only_a_stripped_alias_1077(monkeypatch):
+    # #1077 review: a view's own full filename is exact, and exact outranks
+    # exactly one thing -- another view's `.bndb`-stripped alias. `/x/foo` is
+    # the raw file even with `/x/foo.bndb` open; every weaker spelling the two
+    # share stays ambiguous, and so does a spelling two views match strongly.
+    bridge = _load_bridge(monkeypatch)
+    raw = _FakeFileBV("/x/foo", session_id="1")
+    db = _FakeFileBV("/x/foo.bndb", session_id="2")
+    other = _FakeFileBV("/y/x/foo", session_id="3")
+    _register_views(bridge, raw, db)
+    manager = bridge.TargetManager()
+    manager.refresh()
+    try:
+        assert manager.resolve("/x/foo") is raw
+        assert manager.resolve("/x/foo.bndb") is db
+        for weak in ("foo", "x/foo"):
+            with pytest.raises(Exception, match="mbiguous"):
+                manager.resolve(weak)
+        # A third view matching the same spelling by its path tail: strong
+        # against exact is not ranked.
+        _register_views(bridge, raw, db, other)
+        manager.refresh()
+        with pytest.raises(Exception, match="mbiguous"):
+            manager.resolve("/x/foo")
+    finally:
+        bridge._headless_views.clear()
+
+
 def test_opening_a_view_never_moves_an_advertised_selector_onto_it_996(monkeypatch):
     # #996 review (blocker): `target list` advertised `2` for the file `/public/2`;
     # a second view then opened and got view id 2. The ranked resolver let the

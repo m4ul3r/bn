@@ -644,17 +644,36 @@ def test_resolve_file_id_prefix_needs_eight_characters(populated):
         manager.resolve_file("1111111")
 
 
-def test_resolve_file_unknown_selector_lists_every_file(populated):
-    manager, _, f = populated
+def test_resolve_file_miss_suggests_nearest_names_and_hides_the_ledger_1077(po, populated):
+    # #1077: a miss used to dump up to 50 rows in storage order, findings
+    # ledger records included. It now suggests the files whose names are
+    # nearest the selector's basename -- at most five, in a fixed order --
+    # and never a `/.bn-findings/` record.
+    manager, project, f = populated
+    ledger = project.add_folder(po.FINDINGS_FOLDER)
+    finding = project.add_folder("F-0001", ledger)
+    project.add_file("1.json", finding, data=b"{}")
+    project.add_file("appp.json", finding, data=b"{}")
+    for i in range(8):
+        project.add_file(f"app-{i}", f.fw)
+
+    with pytest.raises(RuntimeError) as exc:
+        manager.resolve_file("fw/appp")
+    lines = str(exc.value).splitlines()
+    assert lines[0] == "No project file matches 'fw/appp'. Nearest by file name:"
+    assert lines[-1] == "Full listing: `bn project files`."
+    rows = lines[1:-1]
+    assert rows[:2] == [f"  {f.app.id}  /fw/app", f"  {f.app_db.id}  /fw/app.bndb"]
+    assert len(rows) == 5
+    assert rows[2:] == sorted(rows[2:], key=lambda r: r.rsplit("  ", 1)[-1])
+    assert not any(".bn-findings" in line or ".json" in line for line in lines)
+
     with pytest.raises(RuntimeError) as exc:
         manager.resolve_file("nope")
-    lines = str(exc.value).splitlines()
-    assert lines[0] == "No project file matches 'nope'. Project files:"
-    assert set(lines[1:]) == {
-        f"  {f.app.id}  /fw/app",
-        f"  {f.app_db.id}  /fw/app.bndb",
-        f"  {f.loose.id}  /loader",
-    }
+    assert str(exc.value) == (
+        "No project file matches 'nope'; no project file has a similar name. "
+        "Full listing: `bn project files`."
+    )
 
 
 def test_resolve_file_rejects_non_string(populated):
