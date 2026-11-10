@@ -1604,7 +1604,13 @@ def _project_file_line(row: dict[str, Any]) -> str:
 def _render_project_file_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _escape_control_chars(_render_fallback_text(value))
-    return "imported: " + _project_file_line(value)
+    line = "imported: " + _project_file_line(value)
+    # Present only when the import followed a symlink: the project name is the
+    # link's, the bytes are the target's (#1079).
+    followed = _text_value(value, "source_symlink")
+    if followed:
+        line += f"  (symlink: {_escape_control_chars(followed)})"
+    return line
 
 
 @_discloses

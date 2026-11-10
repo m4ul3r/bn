@@ -12,6 +12,8 @@ import pytest
 from _cli_helpers import _fake_bridge_instance  # noqa: F401
 from bn.mutation_statuses import FAILED_MUTATION_STATUSES
 from bn.transport import BridgeError
+# The real project handlers' fixtures, for CLI tests that drive them (#1079).
+from test_project_ops import bnpr, opened, po, populated  # noqa: F401
 
 
 FILE_ID_A = "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b"
@@ -261,11 +263,110 @@ def test_project_import_params(fake_transport, monkeypatch, tmp_path, capsys):
     assert bn.cli.main(["project", "import", str(src), "--folder", "fw", "--name", "blob.bin",
                         "--description", "d"]) == 0
 
-    assert calls[0]["params"] == {"path": str(src.resolve())}
-    assert calls[1]["params"] == {"path": str(src.resolve()), "folder": "fw",
+    assert calls[0]["params"] == {"path": os.path.abspath(src)}
+    assert calls[1]["params"] == {"path": os.path.abspath(src), "folder": "fw",
                                   "name": "blob.bin", "description": "d"}
     out = capsys.readouterr().out
     assert "imported:" in out and "/fw/blob.bin" in out
+
+
+def test_project_import_sends_the_requested_path_and_shows_the_followed_link_1079(
+    fake_transport, monkeypatch, tmp_path, capsys
+):
+    """#1079: the CLI resolved the path before sending, so the bridge never saw
+    the applet link's own name."""
+    _one_instance(monkeypatch)
+    play = tmp_path / "play"
+    play.write_bytes(b"\x7fELF")
+    record = tmp_path / "record"
+    record.symlink_to("play")
+    row = {"id": FILE_ID_A, "name": "record", "path": "/usr/bin/record", "folder": "/usr/bin",
+           "description": "", "size": 4, "exists_on_disk": True, "is_database": False,
+           "open_target_id": None, "sibling_database_id": None,
+           "source_symlink": f"{record} -> {play}"}
+    calls = fake_transport({"project_import": {"ok": True, "result": row}})
+    monkeypatch.chdir(tmp_path)
+
+    assert bn.cli.main(["project", "import", "record", "--folder", "usr/bin"]) == 0
+
+    assert calls[0]["params"] == {"path": str(record), "folder": "usr/bin"}
+    out = capsys.readouterr().out
+    assert "/usr/bin/record" in out
+    assert f"  (symlink: {record} -> {play})" in out
+
+
+def test_project_import_through_a_directory_symlink_and_dotdot_reads_the_named_file_1079(
+    po, populated, monkeypatch, tmp_path, capsys
+):
+    """#1079 review: the CLI made the path absolute with `os.path.abspath`,
+    which deletes `vbin/..` from the STRING, so `vbin/../tool` (the kernel
+    follows the directory link first: `opt/vendor/tool`) imported `./tool`.
+    The path is now sent un-normalised and the bridge resolves it."""
+    from test_project_ops import _bridge_with_rows
+    manager, project, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+    image = tmp_path / "image"
+    (image / "opt/vendor/bin").mkdir(parents=True)
+    (image / "opt/vendor/tool").write_bytes(b"VENDOR")
+    (image / "tool").write_bytes(b"ROOT")
+    (image / "vbin").symlink_to("opt/vendor/bin")
+    sent = []
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        sent.append(params["path"])
+        return {"ok": True, "result": po.project_import(bridge, **params)}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.chdir(image)
+
+    assert bn.cli.main(["project", "import", "vbin/../tool", "--folder", "opt/vendor",
+                        "--format", "json"]) == 0
+
+    row = json.loads(capsys.readouterr().out)
+    assert os.path.isabs(sent[0]) and sent[0].endswith("/image/vbin/../tool")
+    assert row["path"] == "/opt/vendor/tool" and "source_symlink" not in row
+    stored = manager.resolve_file("/opt/vendor/tool")
+    assert open(stored.path_on_disk, "rb").read() == b"VENDOR"
+
+
+def test_project_import_onto_an_existing_path_is_exit_2_with_the_refusal_1079(
+    po, populated, monkeypatch, tmp_path, capsys
+):
+    """The real `project_import` handler behind the CLI: the bridge's refusal
+    travels as the `ok: false` error, which is exit 2, and nothing is created."""
+    from test_project_ops import _bridge_with_rows
+    manager, project, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+    src = tmp_path / "play"
+    src.write_bytes(b"\x7fELF")
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        assert op == "project_import"
+        try:
+            return {"ok": True, "result": po.project_import(bridge, **params)}
+        except RuntimeError as exc:  # the dispatcher's `ok: false` envelope
+            raise BridgeError(str(exc)) from exc
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    assert bn.cli.main(["project", "import", str(src), "--folder", "usr/bin"]) == 0
+    capsys.readouterr()
+    [existing] = [pf for pf in project.files if manager.path_in_project(pf) == "/usr/bin/play"]
+    before = list(project.files)
+
+    assert bn.cli.main(["project", "import", str(src), "--folder", "usr/bin"]) == 2
+
+    captured = capsys.readouterr()
+    assert (f"project_import: /usr/bin/play already exists in the project (file {existing.id}); "
+            "import it under another name with --name <other>, or remove the existing file "
+            f"first with `bn project delete {existing.id}`") in captured.err
+    assert "imported:" not in captured.out
+    assert project.files == before
 
 
 def test_project_export_params(fake_transport, monkeypatch, tmp_path, capsys):

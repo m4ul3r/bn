@@ -775,6 +775,13 @@ def _refuse_finding_path(path: str) -> None:
         )
 
 
+def _refuse_nul(label: str, value: str) -> None:
+    """Binary Ninja cuts a project name at the first NUL, so a check on the
+    requested string would look past the path that is actually created."""
+    if "\0" in value:
+        raise RuntimeError(f"project_import: {label} must not contain a NUL byte")
+
+
 def project_import(
     bridge: Any,
     path: Any,
@@ -786,26 +793,51 @@ def project_import(
     state = manager.require()
     if not isinstance(path, str) or not path.strip():
         raise RuntimeError("project_import: path must be the file to import")
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise RuntimeError(f"project_import: not a file: {source}")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise RuntimeError("project_import: name must be a non-empty string when given")
-    _refuse_finding_path(
-        (folder if isinstance(folder, str) else "") + "/" + (name or source.name).strip()
-    )
-    target_folder = manager.ensure_folder(folder if isinstance(folder, str) else None)
+    if isinstance(name, str):
+        _refuse_nul("name", name)
+    if isinstance(folder, str):
+        _refuse_nul("folder", folder)
+    # The name defaults to the REQUESTED basename: importing the applet link
+    # `usr/bin/record -> play` stored a second `play` at `/usr/bin/play` when
+    # it came from the resolved path (#1079). The bytes still come through
+    # the resolved path.
+    requested = Path(path).expanduser()
+    source = requested.resolve()
+    if not source.is_file():
+        raise RuntimeError(f"project_import: not a file: {source}")
+    final_name = (name or requested.name or source.name).strip()
+    folder_path = folder if isinstance(folder, str) else ""
+    _refuse_finding_path(folder_path + "/" + final_name)
+    path_in_project = "/" + "/".join(
+        [*[part for part in folder_path.split("/") if part], final_name])
+    existing = [
+        pf for pf in state.project.files if manager.path_in_project(pf) == path_in_project
+    ]
+    if existing:
+        # Two files at one path-in-project make every later selector for it
+        # ambiguous; the duplicate is refused rather than created.
+        raise RuntimeError(
+            f"project_import: {path_in_project} already exists in the project "
+            f"(file {existing[0].id}); import it under another name with --name <other>, "
+            f"or remove the existing file first with `bn project delete {existing[0].id}`"
+        )
+    target_folder = manager.ensure_folder(folder_path or None)
     try:
         pf = state.project.create_file_from_path(
             str(source),
             target_folder,
-            (name or source.name).strip(),
+            final_name,
             str(description or ""),
         )
     except Exception as exc:  # noqa: BLE001 - ProjectException
         raise RuntimeError(f"Binary Ninja could not import {source}: {exc}") from exc
     bridge._write_registry()
-    return manager.file_row(pf)
+    row = manager.file_row(pf)
+    if requested.is_symlink():
+        row["source_symlink"] = f"{requested} -> {source}"
+    return row
 
 
 def project_export(bridge: Any, selector: Any, dest: Any) -> dict[str, Any]:

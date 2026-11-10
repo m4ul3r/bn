@@ -451,7 +451,14 @@ def _project_load(args: argparse.Namespace) -> int:
 def _project_import(args: argparse.Namespace) -> int:
     if not str(args.path).strip():
         raise BridgeError("path is empty: pass the file to import")
-    params: dict[str, Any] = {"path": str(Path(args.path).expanduser().resolve())}
+    # Absolute (the bridge's cwd is not ours) but neither resolved nor
+    # normalised: the requested basename is the default project name, so
+    # resolving an applet link `record -> play` here would hand the bridge
+    # `play` (#1079); and `os.path.abspath` deletes `x/..` from the STRING,
+    # which names a different file when `x` is a directory symlink (the
+    # kernel follows the link first). The bridge resolves the path.
+    params: dict[str, Any] = {
+        "path": os.path.join(os.getcwd(), os.path.expanduser(args.path))}
     if args.folder is not None:
         params["folder"] = args.folder
     if args.name is not None:

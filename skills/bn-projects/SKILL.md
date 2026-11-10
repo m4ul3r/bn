@@ -48,7 +48,7 @@ bn project delete <selector>
 bn project close [--force]
 ```
 
-Import adds a file to the project, export copies a project file to the destination, and delete removes the selected project file. Closing refuses unsaved targets unless `--force` explicitly discards their work. Do not force-close another agent's work. Headless `session stop` / `session restart` likewise refuse unsaved targets unless `--discard-unsaved` is intentional. Restart reopens the owned project even when no targets were loaded, then replays project targets and re-links symbols when library metadata is present. A failed project reopen is a partial restart failure (exit 1), not success.
+Import adds a file to the project under the requested basename (a symlink such as an applet `record -> play` is stored as `record` with the target's bytes, and the result reports `source_symlink`); importing onto a path-in-project that already exists is refused (exit 2) naming the existing file id -- choose `--name <other>` or `bn project delete <id>` first. Export copies a project file to the destination, and delete removes the selected project file. Closing refuses unsaved targets unless `--force` explicitly discards their work. Do not force-close another agent's work. Headless `session stop` / `session restart` likewise refuse unsaved targets unless `--discard-unsaved` is intentional. Restart reopens the owned project even when no targets were loaded, then replays project targets and re-links symbols when library metadata is present. A failed project reopen is a partial restart failure (exit 1), not success.
 
 ## Firmware initialization, import, and libraries
 
