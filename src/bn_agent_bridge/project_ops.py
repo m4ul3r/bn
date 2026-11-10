@@ -514,12 +514,15 @@ class ProjectManager:
 
     def sibling_database(
         self, pf: Any, index: dict[str, list[Any]] | None = None, *,
-        allow_ambiguous: bool = False,
+        allow_ambiguous: bool = False, operation: str | None = None,
     ) -> Any | None:
         """The unique `<name>.bndb` beside *pf*, or None when absent.
 
         Loads and saves refuse ambiguous siblings instead of treating them as
         absent. Listings may opt out so the conflicting files remain visible.
+        *operation* names the caller in that refusal for a command that took no
+        selector (`bn save`), whose user cannot be told their selector was
+        ambiguous (#1073 item 2); without it the selector wording stands.
         """
         name = str(pf.name)
         if name.endswith(".bndb"):
@@ -535,7 +538,13 @@ class ProjectManager:
                 siblings = list(project.files)
             matches = [f for f in siblings if self.path_in_project(f) == wanted_path]
         if len(matches) > 1 and not allow_ambiguous:
-            raise RuntimeError(self._ambiguous(wanted_path, matches))
+            if operation is None:
+                raise RuntimeError(self._ambiguous(wanted_path, matches))
+            raise RuntimeError("\n".join([
+                f"{operation} refused: {len(matches)} database files are named {wanted_path!r} "
+                "in this project; load one of them explicitly or delete the duplicate:",
+                *self._listing(matches),
+            ]))
         return matches[0] if len(matches) == 1 else None
 
     def ensure_folder(self, path: str | None) -> Any | None:
@@ -617,14 +626,23 @@ class ProjectManager:
                 f"Binary Ninja could not add {name} to the project: {exc}"
             ) from exc
         dest = str(new.path_on_disk)
+        parent = Path(dest).parent
+        # Remember whether THIS save made the blob's directory: a rollback may
+        # remove only that, and only while it is still empty (#1073 item 1).
+        parent_created = not parent.exists()
         try:
-            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            parent.mkdir(parents=True, exist_ok=True)
             created = bv.create_database(dest)
             if created is False or not Path(dest).is_file():
                 raise RuntimeError("Binary Ninja reported no file was written")
         except BaseException as exc:
             primary_error = f"Failed to save project database to {dest}: {exc}"
             self._discard_file(project, new, dest, primary_error)
+            if parent_created:
+                try:
+                    os.rmdir(parent)  # refuses a non-empty directory by itself
+                except OSError:
+                    pass
             if not isinstance(exc, Exception):
                 raise
             raise RuntimeError(primary_error) from exc
@@ -1014,7 +1032,7 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     # Raw project file: the F3 recipe. Refuse to create a SECOND database for a
     # binary that already has its `<name>.bndb` sibling (F9: BN would allow the
     # duplicate, and two databases for one binary is never what a save means).
-    sibling = manager.sibling_database(pf)
+    sibling = manager.sibling_database(pf, operation="save")
     if sibling is not None:
         writers = _other_database_writers(bridge, bv, str(sibling.path_on_disk))
         open_note = f" Open targets: {', '.join(writers)}." if writers else ""

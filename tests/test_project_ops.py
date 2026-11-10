@@ -845,11 +845,67 @@ def test_save_with_ambiguous_databases_never_creates_a_third(po, populated):
     duplicate = project.add_file("app.bndb", f.fw)
     before = list(project.files)
     bv = SaveBV(f.app)
-    with pytest.raises(RuntimeError, match="Ambiguous") as error:
+    with pytest.raises(RuntimeError) as error:
         po.save_project_database(_bridge(manager), bv, None)
-    assert duplicate.id in str(error.value) and f.app_db.id in str(error.value)
+    text = str(error.value)
+    # #1073 item 2: the user passed no selector, so the refusal names the
+    # OPERATION and keeps the id listing.
+    assert text.startswith("save refused: 2 database files are named '/fw/app.bndb' in this "
+                           "project; load one of them explicitly or delete the duplicate:")
+    assert "selector" not in text
+    assert f"  {duplicate.id}  /fw/app.bndb" in text and f"  {f.app_db.id}  /fw/app.bndb" in text
     assert project.files == before
     assert bv.created_with is None
+
+
+def test_rolled_back_first_save_removes_only_the_directory_it_created_1073(po, populated):
+    """#1073 item 1: `create_database` needs the blob's parent, so the save made
+    it; a failed save discarded the row and blob but left an empty `data/<xx>/`
+    behind on every attempt."""
+    manager, project, f = populated
+    fresh = project.root / "data" / "zz" / ("0" * 34)
+    project._blob_path = lambda: fresh
+    bv = SaveBV(f.loose, create_result=False)
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), bv, None)
+    assert bv.created_with == str(fresh) and bv.parent_existed is True
+    assert not fresh.parent.exists(), "the directory this save created is gone"
+    assert (project.root / "data").is_dir()
+
+    # A parent that existed before the save is not this save's to remove, even
+    # when it is EMPTY (so `rmdir` itself would not refuse it).
+    empty = project.root / "data" / "zx"
+    empty.mkdir(parents=True)
+    project._blob_path = lambda: empty / ("2" * 34)
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), SaveBV(f.loose, create_result=False), None)
+    assert empty.is_dir(), "a directory the save did not create was removed"
+
+    # A parent that already held another blob is not this save's to remove.
+    shared = Path(f.app.path_on_disk).parent
+    project._blob_path = lambda: shared / ("1" * 34)
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), SaveBV(f.loose, create_result=False), None)
+    assert shared.is_dir() and Path(f.app.path_on_disk).read_bytes() == b"\x7fELF"
+    assert [pf.name for pf in project.files] == ["app", "app.bndb", "loader"]
+
+
+def test_rolled_back_first_save_keeps_a_directory_that_is_not_empty_1073(po, populated):
+    """A directory this save created but something else filled meanwhile is
+    not removed: only an empty one is, and only ever by `rmdir`."""
+    manager, project, f = populated
+    fresh = project.root / "data" / "zy" / ("0" * 34)
+    project._blob_path = lambda: fresh
+    bv = SaveBV(f.loose)
+
+    def filled_save(dest):
+        (Path(dest).parent / "other-blob").write_bytes(b"\x7fELF-other")
+        return False
+
+    bv.create_database = filled_save
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), bv, None)
+    assert (fresh.parent / "other-blob").read_bytes() == b"\x7fELF-other"
 
 
 @pytest.mark.parametrize("cleanup", ["false", "raises", "row_only", "blob_only", "no_op"])
@@ -884,6 +940,9 @@ def test_first_save_reports_verified_cleanup_residue(po, populated, cleanup):
     assert residue["path"] in str(failure)
     assert residue["project_file_id"] in str(failure)
     assert bridge.registry_writes == 0 and bridge.targets.cleared == []
+    # #1073 review: a FAILED rollback leaves the directory alone (the residue
+    # it reports lives there); only a clean rollback removes what it created.
+    assert Path(residue["path"]).parent.is_dir()
 
 
 def test_first_save_verifies_complete_cleanup_after_partial_blob(po, populated):

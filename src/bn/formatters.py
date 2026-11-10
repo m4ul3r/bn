@@ -1651,11 +1651,21 @@ def _render_project_load_text(value: Any) -> str:
     # `notes` (which `_render_load_text` prints); no second line for it.
     if _field_present(value, "link"):
         link = _field_dict(value, "link")
-        text += (f"\nlinked: {_project_count_text(link, 'linked')} "
-                 f"({_project_rows_count(link, 'unresolved')} unresolved)")
         status = _text_value(link, "status")
         success = _flag_field(link, "success")
-        if status in FAILED_MUTATION_STATUSES or success is False:
+        failed = status in FAILED_MUTATION_STATUSES or success is False
+        counted = _field_present(link, "linked") or _field_present(link, "unresolved")
+        if failed and not counted:
+            # A link that failed by exception carries no counters; `?` would
+            # claim an unreadable count where there is none to read (#1073
+            # item 3). The linker's own failure return (a readback mismatch)
+            # does carry them, with a note about them, so they are stated;
+            # a SUCCESSFUL link lacking them still states `?`.
+            text += "\nlinked: n/a (link failed)"
+        else:
+            text += (f"\nlinked: {_project_count_text(link, 'linked')} "
+                     f"({_project_rows_count(link, 'unresolved')} unresolved)")
+        if failed:
             text += f"\nauto-link FAILED: {_escape_control_chars(status or '<unknown>')}"
         message = _project_link_message(link)
         if message:
@@ -1761,6 +1771,10 @@ def _render_project_init_text(value: Any) -> str:
         lines.extend(_sync_detail_lines(sync))
     else:
         lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
+        # The planner's loader notes (`skipped loader path containing NUL`):
+        # with no sync result to carry them, they are the plan's (#1073 review).
+        for note in _field_list(value, "notes"):
+            lines.append(f"note: {_escape_control_chars(note)}")
         error = _text_value(value, "sync_error")
         if error:
             # The inventory was not updated (a new project is empty), so the
