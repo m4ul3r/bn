@@ -1033,15 +1033,154 @@ def test_project_delete_refuses_a_provider_of_a_saved_database_unless_forced_107
 
 
 
-@pytest.mark.parametrize("folder", [".bn-findings", "/.bn-findings/F-example", "//.bn-findings//"])
+@pytest.mark.parametrize("folder", [
+    ".bn-findings", "/.bn-findings/F-example", "//.bn-findings//",
+    # #1074 item 2: `.` and empty components carry no meaning in a
+    # path-in-project, so these spell the same reserved first component and
+    # must not create a literal `/./.bn-findings/...` folder instead.
+    "./.bn-findings/lookalike", "././.bn-findings", ".//.bn-findings/",
+])
 def test_project_import_cannot_inject_finding_history(po, populated, tmp_path, folder):
     manager, project, _ = populated
     source = tmp_path / "record.json"
     source.write_bytes(b'{"claim":"forged"}')
     before = list(project.files)
-    with pytest.raises(RuntimeError, match="reserved findings history"):
+    before_folders = list(project.folders)
+    with pytest.raises(RuntimeError, match=r"reserved findings history `/\.bn-findings`"):
         po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder)
     assert project.files == before
+    assert project.folders == before_folders
+
+
+def test_project_import_allows_the_reserved_name_below_the_root(po, populated, tmp_path):
+    """Only the FIRST normalised component is the ledger namespace."""
+    manager, _, _ = populated
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x7fELF")
+    row = po.project_import(_bridge_with_rows(manager, []), str(src), folder="usr/.bn-findings")
+    assert row["folder"] == "/usr/.bn-findings" and row["path"] == "/usr/.bn-findings/blob.bin"
+
+
+def _truncate_at_nul_like_the_native_api(monkeypatch, project):
+    """Binary Ninja's project API takes C strings: a folder or file name is cut
+    at its first NUL. The shared fake keeps the NUL, so no mocked test could
+    see a check that looked at the requested string and a create that landed
+    somewhere else (#1074 review)."""
+    create_folder, create_file = project.create_folder, project.create_file_from_path
+    monkeypatch.setattr(project, "create_folder",
+                        lambda parent, name: create_folder(parent, name.split("\0")[0]))
+    monkeypatch.setattr(
+        project, "create_file_from_path",
+        lambda path, folder, name, description="": create_file(
+            path, folder, name.split("\0")[0], description))
+
+
+@pytest.mark.parametrize("folder,name", [
+    (".bn-findings\0", "note"),                                   # lands in the ledger
+    (".bn-findings\0x/F-abababababababababababababababab", "000001.json"),   # forged record
+    ("usr/\0.bn-findings", "note"),
+    ("fw\0x", None),                                              # second /fw folder
+    ("fw", "app\0x"),                                             # second /fw/app
+    (None, ".bn-findings\0"),
+])
+def test_project_import_refuses_a_nul_in_folder_or_name(
+        po, populated, tmp_path, monkeypatch, folder, name):
+    """#1074 review: the native API cuts a name at the first NUL, so
+    `--folder '.bn-findings\\0'` passed the reserved-namespace check as a
+    different string and was then created AS `.bn-findings`. Only the raw
+    protocol can carry a NUL (argv cannot); it is refused before any path
+    check."""
+    manager, project, _ = populated
+    _truncate_at_nul_like_the_native_api(monkeypatch, project)
+    source = tmp_path / "record.json"
+    source.write_bytes(b'{"claim":"forged"}')
+    files, folders = list(project.files), list(project.folders)
+    label = "name" if name is not None and "\0" in name else "folder"
+    with pytest.raises(RuntimeError, match=f"project_import: {label} must not contain a NUL byte"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder, name=name)
+    assert project.files == files and project.folders == folders
+
+
+@pytest.mark.parametrize("name", [
+    "./.bn-findings/x",                  # the `/./.bn-findings` lookalike through --name
+    "./.bn-findings/F-abababababababababababababababab/000003.json",
+    "sub/tool", "/tool", "tool/",
+])
+def test_project_import_refuses_a_slash_in_the_name(po, populated, tmp_path, name):
+    """#1074 review: a name is ONE path component (`--folder` names folders).
+    A `/` in it produced a path-in-project the folder normalisation never saw,
+    so `--name ./.bn-findings/x` was stored as `/./.bn-findings/x`."""
+    manager, project, _ = populated
+    source = tmp_path / "record.json"
+    source.write_bytes(b"x")
+    files, folders = list(project.files), list(project.folders)
+    with pytest.raises(RuntimeError, match="name must be a single path component.*--folder"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), name=name)
+    assert project.files == files and project.folders == folders
+
+
+
+@pytest.mark.parametrize("folder", ["./usr//bin/", "usr/./bin", "/usr/bin/", "usr/bin"])
+def test_project_import_normalises_the_folder_spelling(po, populated, tmp_path, folder):
+    """#1074 item 2: `./`, `//`, a leading and a trailing `/` are spellings of
+    one path-in-project, not distinct native folders."""
+    manager, project, _ = populated
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x7fELF")
+    row = po.project_import(_bridge_with_rows(manager, []), str(src), folder=folder)
+    assert row["folder"] == "/usr/bin" and row["path"] == "/usr/bin/blob.bin"
+    assert [f.name for f in project.folders if f.name in {".", ""}] == []
+    assert manager.folder_path(manager.ensure_folder("./usr/bin/")) == "/usr/bin"
+    assert len([f for f in project.folders if f.name == "bin"]) == 1
+
+
+def test_project_import_duplicate_check_sees_through_the_folder_spelling(po, populated, tmp_path):
+    """Wave 1 recheck (#1074/#1079/#1080 composition): the duplicate
+    path-in-project refusal must compare the SAME normalised folder
+    `folder_components` builds the destination from, not the raw string, or
+    an existing `/usr/bin/<name>` could be duplicated by importing again
+    under a lookalike spelling (`./usr//bin/`, `usr/./bin`, a leading/trailing
+    `/`) of the identical folder."""
+    manager, project, _ = populated
+    first_src = tmp_path / "blob.bin"
+    first_src.write_bytes(b"\x7fELF")
+    first = po.project_import(_bridge_with_rows(manager, []), str(first_src), folder="usr/bin")
+    assert first["path"] == "/usr/bin/blob.bin"
+    second_src = tmp_path / "other.bin"
+    second_src.write_bytes(b"\x7fELF-2")
+    for folder in ("./usr//bin/", "usr/./bin", "/usr/bin/", "//usr/bin"):
+        with pytest.raises(RuntimeError, match=f"/usr/bin/blob.bin already exists in the "
+                                               f"project \\(file {first['id']}\\)"):
+            po.project_import(_bridge_with_rows(manager, []), str(second_src), folder=folder,
+                              name="blob.bin")
+    assert [f for f in project.files if manager.path_in_project(f) == "/usr/bin/blob.bin"] == \
+        [f for f in project.files if f.id == first["id"]]
+
+
+def test_project_files_normalises_the_folder_filter(po, populated):
+    manager, _, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    plain = po.project_files(bridge, folder="fw")
+    for spelling in ("./fw//", "/fw/", "fw/./"):
+        assert po.project_files(bridge, folder=spelling) == plain, spelling
+    # Key-agnostic on purpose: the file rows are `files` here and `items` once
+    # the paged listing (#1080) lands; the equality above is the assertion.
+    rows = plain.get("items", plain.get("files"))
+    assert [r["path"] for r in rows]
+
+
+def test_project_files_can_still_list_a_legacy_dot_folder_unfiltered(po, populated):
+    """A literal `.` folder written before #1074 is no longer addressable with
+    `--folder ./…` (that spelling now means the root); the unfiltered listing
+    still shows its files, and delete works on the stored path."""
+    manager, project, _ = populated
+    dot = project.add_folder(".bn-findings", project.add_folder("."))
+    old = project.add_file("old.bin", dot)
+    bridge = _bridge_with_rows(manager, [])
+    listing = po.project_files(bridge)
+    assert "/./.bn-findings/old.bin" in [r["path"] for r in listing.get("items", listing.get("files"))]
+    assert po.project_delete(bridge, "/./.bn-findings/old.bin")["deleted"] is True
+    assert old not in project.files
 
 
 def test_project_delete_cannot_erase_finding_history(po, populated):

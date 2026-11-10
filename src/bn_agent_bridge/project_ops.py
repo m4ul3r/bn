@@ -850,12 +850,13 @@ class ProjectManager:
 
     def ensure_folder(self, path: str | None) -> Any | None:
         """The folder at path-in-project *path*, created level by level when
-        missing. None (the root) for empty/`/`."""
-        if not path or path.strip("/") == "":
+        missing. None (the root) for empty/`/`/`./`."""
+        components = folder_components(path)
+        if not components:
             return None
         project = self.require().project
         parent = None
-        for component in [c for c in path.split("/") if c]:
+        for component in components:
             existing = [
                 f
                 for f in project.folders
@@ -1104,7 +1105,8 @@ def project_files(
         raise RuntimeError(
             "project_files: folder must be a path in the project or null"
         )
-    wanted = ("/" + folder.strip("/")) if folder and folder.strip("/") else ""
+    components = folder_components(folder)
+    wanted = "/" + "/".join(components) if components else ""
     open_targets = {
         str(row["project_file_id"]): str(row.get("target_id") or "")
         for row in _open_project_targets(bridge)
@@ -1132,8 +1134,26 @@ def project_files(
     return {"files": rows, "folders": folders}
 
 
+def folder_components(path: Any) -> list[str]:
+    """`./usr//bin/` -> `["usr", "bin"]`: the components of a path-in-project
+    that NAME a folder. Empty and `.` components are spellings of "here", not
+    folders, so `./.bn-findings/x` is the reserved namespace rather than a
+    literal `.` folder beside it (#1074 item 2). Nothing else is rewritten:
+    `..` is a legal native folder name and is kept as one."""
+    if not isinstance(path, str):
+        return []
+    return [part for part in path.split("/") if part and part != "."]
+
+
 def is_finding_path(path: str) -> bool:
-    """Whether *path* (a path in the project) lies in the findings ledger."""
+    """Whether *path* (a path in the project) lies in the findings ledger.
+
+    Literal on purpose, NOT `folder_components`: an existing file's stored
+    `path_in_project` has no `.`/empty components to strip, and a file in a
+    literal `/./.bn-findings/...` folder (which `--folder ./.bn-findings/...`
+    or a `/` in `--name` could create before #1074) is NOT ledger history, so
+    it must stay deletable. Caller-supplied folder/name input is normalised by
+    `folder_components` BEFORE it reaches this check, not inside it."""
     components = [part for part in path.split("/") if part]
     return bool(components) and components[0] == FINDINGS_FOLDER
 
@@ -1141,8 +1161,9 @@ def is_finding_path(path: str) -> bool:
 def _refuse_finding_path(path: str) -> None:
     if is_finding_path(path):
         raise RuntimeError(
-            "reserved findings history: use `bn project finding` to append a "
-            "revision or review; existing finding records cannot be overwritten or deleted"
+            f"reserved findings history `/{FINDINGS_FOLDER}`: use `bn project finding` "
+            "to append a revision or review; existing finding records cannot be "
+            "overwritten or deleted"
         )
 
 
@@ -1176,6 +1197,13 @@ def project_import(
         _refuse_nul("name", name)
     if isinstance(folder, str):
         _refuse_nul("folder", folder)
+    if isinstance(name, str) and "/" in name:
+        # A name is one path component. With a `/` it spelled a path the folder
+        # normalisation never saw: `--name ./.bn-findings/x` was stored as
+        # `/./.bn-findings/x`, the lookalike `--folder` already refuses (#1074).
+        raise RuntimeError(
+            "project_import: name must be a single path component (no `/`); "
+            "name the folder with --folder")
     # The name defaults to the REQUESTED basename: importing the applet link
     # `usr/bin/record -> play` stored a second `play` at `/usr/bin/play` when
     # it came from the resolved path (#1079). The bytes still come through
@@ -1185,10 +1213,13 @@ def project_import(
     if not source.is_file():
         raise RuntimeError(f"project_import: not a file: {source}")
     final_name = (name or requested.name or source.name).strip()
-    folder_path = folder if isinstance(folder, str) else ""
-    _refuse_finding_path(folder_path + "/" + final_name)
-    path_in_project = "/" + "/".join(
-        [*[part for part in folder_path.split("/") if part], final_name])
+    # Duplicate detection runs over the NORMALISED folder (#1074 item 2:
+    # `./usr//bin/` and `usr/bin` name the same folder), composed with the
+    # final name, so a lookalike spelling of an existing folder cannot create
+    # a second file at the path-in-project an existing one already occupies.
+    components = folder_components(folder)
+    path_in_project = "/" + "/".join([*components, final_name])
+    _refuse_finding_path(path_in_project)
     existing = [
         pf for pf in state.project.files if manager.path_in_project(pf) == path_in_project
     ]
@@ -1200,7 +1231,7 @@ def project_import(
             f"(file {existing[0].id}); import it under another name with --name <other>, "
             f"or remove the existing file first with `bn project delete {existing[0].id}`"
         )
-    target_folder = manager.ensure_folder(folder_path or None)
+    target_folder = manager.ensure_folder("/".join(components) or None)
     try:
         pf = state.project.create_file_from_path(
             str(source),
