@@ -461,9 +461,18 @@ def _read_text(root: str, rel: str) -> str:
             data = fh.read(limit + 1)
             _charge_work(files=1, bytes_read=len(data))
             if len(data) > limit:
+                # Naming the variable (#1098 review): when the AGGREGATE
+                # allowance is what bound `limit` above, `_charge_work` just
+                # charged `limit + 1` bytes, pushing `_bytes` to
+                # `max_bytes + 1` -- `check()` inside it always raises first,
+                # already correctly naming `BN_ROOTFS_MAX_BYTES`. So the only
+                # way execution reaches this line at all is the OTHER case:
+                # the per-config-file limit bound, and it is what to name.
+                detail = (f" (BN_ROOTFS_MAX_CONFIG_BYTES={budget.max_text_bytes})"
+                         if budget is not None else "")
                 raise RuntimeError(
-                    f"rootfs discovery refused: loader config {rel} exceeds the text limit; "
-                    "no inventory committed")
+                    f"rootfs discovery refused: loader config {rel} exceeds the text "
+                    f"limit{detail}; no inventory committed")
             return data.decode("utf-8", "replace")
     except OSError:
         return ""

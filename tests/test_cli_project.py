@@ -1163,7 +1163,10 @@ def test_project_init_planner_config_limit_refusal_is_exit_2_not_a_traceback_109
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert "loader config" in err and "exceeds the text limit" in err
-    assert "BN_ROOTFS_" in err and "relevant `BN_ROOTFS_*` variable" in err
+    # #1098 review: the generic sentence's own `` `BN_ROOTFS_*` `` substring
+    # satisfied a bare "BN_ROOTFS_" check without ever naming the variable
+    # that actually bound; pin the SPECIFIC one.
+    assert "BN_ROOTFS_MAX_CONFIG_BYTES=4" in err
     assert "planning step" in err and "the CLI process" in err
     assert "session restart" not in err
 
@@ -1199,6 +1202,7 @@ def test_project_init_planner_work_limit_refusal_during_detection_is_exit_2_1096
     conversion, not just the later one; this uses the real (unmocked)
     `detect_root` to prove it, rather than the patched-detection helper the
     other two tests use."""
+    import bn.commands.project
     root = tmp_path / "rootfs"
     for d in ("bin", "sbin", "etc", "lib"):
         (root / d).mkdir(parents=True)
@@ -1227,6 +1231,7 @@ def test_project_init_planner_deadline_refusal_is_exit_2_not_a_traceback_1096(
     """#1096 A4: the issue text calls out the deadline explicitly (#1092 made
     it, like the work limit, reachable from the planner); same conversion,
     same real unmocked discovery."""
+    import bn.commands.project
     root = tmp_path / "rootfs"
     for d in ("bin", "sbin", "etc", "lib"):
         (root / d).mkdir(parents=True)
