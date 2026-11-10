@@ -751,6 +751,35 @@ def test_work_is_charged_per_file_and_per_mib_never_per_check_1075(tmp_path: Pat
         "BN_ROOTFS_MAX_WORK=6 bn session restart w1")
 
 
+def test_gui_restart_hint_is_used_only_without_a_restart_command_1096(tmp_path: Path) -> None:
+    """#1096 A6a: the GUI plugin bridge has no instance id, so it passes
+    `restart=None`; before this it printed no advice at all. `gui_restart_hint`
+    fills that gap with an instruction shaped for "restart the application",
+    not "run this command" -- and never both at once."""
+    gui = rl.DiscoveryBudget(
+        max_work=3, timeout=30,
+        gui_restart_hint="restart Binary Ninja with {variable}={doubled} set in its environment",
+    )
+    with pytest.raises(RuntimeError) as raised:
+        gui.charge(files=4)
+    assert str(raised.value).endswith(
+        "The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart; the "
+        "total needed is not known, so doubling is only a starting point: restart Binary "
+        "Ninja with BN_ROOTFS_MAX_WORK=6 set in its environment")
+
+    # A real restart command always wins over the GUI hint: they are never
+    # both applicable (headless has an instance id, the GUI plugin does not).
+    both = rl.DiscoveryBudget(
+        max_work=3, timeout=30, restart="bn session restart w1",
+        gui_restart_hint="restart Binary Ninja with {variable}={doubled} set in its environment",
+    )
+    with pytest.raises(RuntimeError) as raised:
+        both.charge(files=4)
+    assert str(raised.value).endswith(
+        "starting point: BN_ROOTFS_MAX_WORK=6 bn session restart w1")
+    assert "restart Binary Ninja" not in str(raised.value)
+
+
 def test_deadline_and_byte_refusals_name_their_knob_and_the_restart_1075(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

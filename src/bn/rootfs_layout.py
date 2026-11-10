@@ -71,8 +71,17 @@ class DiscoveryBudget:
         default_factory=lambda: _positive_limit("BN_ROOTFS_MAX_CONFIG_BYTES", 1 << 20))
     cancelled: Callable[[], bool] | None = None
     # The command that restarts the process which read these limits from its
-    # environment (`bn session restart <id>`); None when there is none to name.
+    # environment (`bn session restart <id>`); None when there is none to name
+    # -- the GUI plugin bridge, with no instance id, or a CLI-side caller with
+    # no bridge to restart at all (#1096 A4).
     restart: str | None = None
+    # A GUI-only fallback instruction, used only when `restart` is None and
+    # there IS a process to restart (the GUI plugin bridge): a template with
+    # `{variable}`/`{doubled}` placeholders, filled in at refusal time (#1096
+    # A6a). `restart`'s own `{self.restart}` stays a literal command precisely
+    # because every existing caller constructs it that way; this is a
+    # separate field rather than a second meaning for the same one.
+    gui_restart_hint: str | None = None
     notes: list[str] = field(default_factory=list)
     _files: int = 0
     _bytes: int = 0
@@ -124,13 +133,19 @@ class DiscoveryBudget:
         if reason is None:
             return
         message = f"rootfs discovery refused: {reason}; no inventory committed"
-        if knob is not None and self.restart:
-            # The CLI's environment never reaches the bridge that does the
-            # work; the knob only applies to a process started with it.
+        if knob is not None:
             variable, doubled = knob
-            message += (f". The owning bridge reads {variable} at start, so set it and "
-                        "restart; the total needed is not known, so doubling is only a "
-                        f"starting point: {variable}={doubled} {self.restart}")
+            tail = None
+            if self.restart:
+                # The CLI's environment never reaches the bridge that does the
+                # work; the knob only applies to a process started with it.
+                tail = f"{variable}={doubled} {self.restart}"
+            elif self.gui_restart_hint:
+                tail = self.gui_restart_hint.format(variable=variable, doubled=doubled)
+            if tail is not None:
+                message += (f". The owning bridge reads {variable} at start, so set it and "
+                            "restart; the total needed is not known, so doubling is only a "
+                            f"starting point: {tail}")
         raise RuntimeError(message)
 
 

@@ -1694,11 +1694,21 @@ def _sync_counts_line(sync: dict[str, Any]) -> str:
             f"changed {_project_rows_count(sync, 'changed')}")
 
 
+# `project init`/`project libs --sync` text listed every imported row (~450 on
+# a real root); capped here, a module constant so both callers agree (#1096
+# A5). `--format json` is unaffected: it renders the raw payload, not this.
+_SYNC_IMPORTED_LISTING_CAP = 20
+
+
 def _sync_detail_lines(sync: dict[str, Any]) -> list[str]:
     lines: list[str] = []
-    for row in _field_list(sync, "imported"):
+    imported = _field_list(sync, "imported")
+    for row in imported[:_SYNC_IMPORTED_LISTING_CAP]:
         lines.append("  " + (_project_file_line(row) if isinstance(row, dict)
                              else _escape_control_chars(_render_fallback_text(row))))
+    if len(imported) > _SYNC_IMPORTED_LISTING_CAP:
+        lines.append(f"  +{len(imported) - _SYNC_IMPORTED_LISTING_CAP} more; "
+                     "`bn project libs` lists them")
     changed = _field_list(sync, "changed")
     if changed:
         lines.append("changed on disk (not replaced; delete and re-sync to update):")
@@ -1739,7 +1749,13 @@ def _render_project_init_text(value: Any) -> str:
     ]
     path = _escape_control_chars(value.get("project_path", "<unknown>"))
     fallback_from = _text_value(value, "fallback_from")
-    fallback_note = (f"fallback: parent {_escape_control_chars(fallback_from)} is not writable "
+    fallback_reason = _text_value(value, "fallback_reason")
+    # #1096 A6b: "not writable" was said alike for a read-only mount and a
+    # permission denial; the fix differs (remount, versus chown/chmod/run as
+    # the owner), so the note now says which.
+    why = ("is on a read-only filesystem" if fallback_reason == "read_only"
+          else "is not writable by this user")
+    fallback_note = (f"fallback: parent {_escape_control_chars(fallback_from)} {why} "
                      f"\u2192 cache fallback {path}") if fallback_from else None
     dry_run = _flag_field(value, "dry_run")
     if dry_run is True:

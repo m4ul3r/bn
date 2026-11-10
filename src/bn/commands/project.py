@@ -177,6 +177,39 @@ def _unusable_cache_fallback(directory: str, problem: str, rootfs_parent: str) -
         "project; set BN_CACHE_DIR to a writable directory.")
 
 
+def _unwritable_reason(directory: str) -> str:
+    """Why *directory* failed the writability check a caller already made:
+    `"read_only"` when the filesystem itself refuses writes (a read-only
+    mount), else `"permission"` (#1096 A6b). `os.access` alone cannot tell
+    these apart, and the fix differs -- remount, versus chown/chmod or run as
+    the owning user."""
+    try:
+        if os.statvfs(directory).f_flag & os.ST_RDONLY:
+            return "read_only"
+    except OSError:
+        pass
+    return "permission"
+
+
+def _cli_side_discovery_refusal(exc: RuntimeError) -> BridgeError:
+    """A `rootfs_layout` discovery refusal raised while PLANNING (#1096 A4):
+    `_init_plan` runs `lookup_paths`/`scan_libraries` in the CLI process,
+    under the CLI's own `BN_ROOTFS_*` environment -- a different process and
+    environment than the one `project libs --sync` runs discovery in (the
+    owning bridge's). The planner's budget carries no restart command and no
+    GUI hint (nothing to restart here), so the raw refusal says only the
+    reason -- most name their variable's value directly (`BN_ROOTFS_MAX_WORK=
+    5`), one names neither of the two that can bind it -- and either way
+    reads as a bare internal message; this wraps it so `main()`, which
+    handles only `BridgeError`, reports it as a refusal naming where to act,
+    not a traceback."""
+    return BridgeError(
+        f"{exc} This refusal is from `bn project init`'s own planning step, which runs in "
+        "the CLI process: set the relevant `BN_ROOTFS_*` variable in the environment you "
+        "run `bn` from (not the bridge's) and retry."
+    )
+
+
 def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     """Everything `project init` decides without a bridge: the rootfs, the
     project path (existing preferred, existing fallback, else create at the
@@ -186,15 +219,24 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     start = os.path.realpath(os.path.expanduser(args.root)) if explicit else os.getcwd()
     if explicit and not os.path.isdir(start):
         raise BridgeError(f"not a directory: {start}")
-    info = rootfs_layout.detect_root(start, explicit=explicit)
+    # `detect_root` is itself `@_bounded`, its own standalone budget (globbing
+    # the loader markers charges work too): a refusal there is exactly as much
+    # the CLI's own planning step as the lookup/scan one below (#1096 A4).
+    try:
+        info = rootfs_layout.detect_root(start, explicit=explicit)
+    except RuntimeError as exc:
+        raise _cli_side_discovery_refusal(exc) from exc
     if info is None:
         raise BridgeError(
             f"not inside a firmware root filesystem (looked from {start} up to /); "
             "pass an explicit firmware root: bn project init ROOT")
     preferred, fallback = rootfs_layout.project_location(info.root, str(paths.projects_dir()))
     # `fallback_from` names the unwritable parent when the cache fallback is
-    # chosen over the preferred location, so the reason is visible (#1075).
+    # chosen over the preferred location, so the reason is visible (#1075);
+    # `fallback_reason` distinguishes a read-only mount from a permission
+    # denial (#1096 A6b) -- only meaningful alongside `fallback_from`.
     fallback_from = None
+    fallback_reason = None
     if os.path.isdir(preferred):
         project_path, exists = preferred, True
     elif os.path.isdir(fallback):
@@ -204,6 +246,7 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     else:
         project_path, exists = fallback, False
         fallback_from = os.path.dirname(preferred) or os.sep
+        fallback_reason = _unwritable_reason(fallback_from)
         # Planned here, so `--dry-run` cannot promise `[new]` for a location
         # the real run would fail to create (#1075 review).
         problem = _cache_fallback_problem(os.path.dirname(fallback))
@@ -214,11 +257,15 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     # One budget across both calls, as the sync has: loader diagnostics
     # (`skipped loader path containing NUL`) land in its `notes`, and a per-call
     # budget dropped them so the dry run showed `notes: []` for a root the sync
-    # flags (#1073 item 4).
-    with rootfs_layout.discovery_budget() as budget:
-        lookup = rootfs_layout.lookup_paths(info.root, info.platform)
-        candidates, notes = rootfs_layout.scan_libraries(info.root, lookup)
-        notes = [*notes, *budget.notes]
+    # flags (#1073 item 4). This budget has no `restart`: it runs in the CLI
+    # process, which nothing restarts (#1096 A4); a refusal is converted below.
+    try:
+        with rootfs_layout.discovery_budget() as budget:
+            lookup = rootfs_layout.lookup_paths(info.root, info.platform)
+            candidates, notes = rootfs_layout.scan_libraries(info.root, lookup)
+            notes = [*notes, *budget.notes]
+    except RuntimeError as exc:
+        raise _cli_side_discovery_refusal(exc) from exc
     return {
         "root": info.root,
         "platform": info.platform,
@@ -226,6 +273,7 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
         "project_path": project_path,
         "project_exists": exists,
         "fallback_from": fallback_from,
+        "fallback_reason": fallback_reason,
         "name": args.name or os.path.basename(info.root.rstrip(os.sep)) or "rootfs",
         "lookup_paths": _lookup_rows(lookup),
         "candidate_libraries": len(candidates),

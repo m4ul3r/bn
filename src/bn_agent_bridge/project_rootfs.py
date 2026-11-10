@@ -107,7 +107,13 @@ def project_sync_libs(
         state = manager.require()
         meta = manager.get_rootfs() or {}
         live_ids = {str(pf.id) for pf in state.project.files}
-    budget = DiscoveryBudget(cancelled=cancelled, restart=_restart_command(bridge))
+    restart_command = _restart_command(bridge)
+    budget = DiscoveryBudget(
+        cancelled=cancelled, restart=restart_command,
+        # No instance id to restart (the GUI plugin, #1096 A6a): the only
+        # lever left is the running application's own environment.
+        gui_restart_hint=None if restart_command else _GUI_RESTART_HINT,
+    )
     with discovery_budget(budget):
         if root is not None and (not isinstance(root, str) or not root.strip() or "\0" in root):
             raise RuntimeError("project_sync_libs: root must be a directory path when given")
@@ -163,9 +169,14 @@ def project_sync_libs(
             )
 
 
+_GUI_RESTART_HINT = "restart Binary Ninja with {variable}={doubled} set in its environment"
+
+
 def _restart_command(bridge: Any) -> str | None:
     """`bn session restart <id>` for the headless bridge that read the discovery
-    limits at start; None for the GUI plugin, which has no instance id."""
+    limits at start; None for the GUI plugin, which has no instance id -- its
+    caller then falls back to `_GUI_RESTART_HINT` (#1096 A6a), since nothing
+    was printed at all before."""
     instance_id = getattr(bridge, "instance_id", None)
     if not isinstance(instance_id, str) or not instance_id:
         return None
