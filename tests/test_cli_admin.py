@@ -4099,6 +4099,91 @@ def test_session_stop_sigterm_fallback_sends_through_the_verified_pin(monkeypatc
     assert parsed["stopped"] is True and parsed["method"] == "sigterm"
 
 
+# --- #1096 A2: the CLI reaps a bridge it spawned, in the failed-start cleanup --
+
+
+def test_failed_session_start_reaps_the_bridge_it_spawned_1096(monkeypatch, capsys, tmp_path):
+    """A bridge that crashes/exits during a failed `session start` used to
+    stay a zombie for the CLI's whole remaining lifetime: `spawn_instance`
+    hands back the instance, not the `Popen` that created it, so nothing in
+    this process ever calls `waitpid` on it again. This drives a REAL child
+    process through the cleanup path that already signals/shuts it down, so
+    `instance.pid` names a process this CLI is the genuine parent of."""
+    import subprocess
+    import sys as sys_mod
+    import time as time_mod
+
+    import bn.transport as transport
+    from bn.transport import BridgeError
+
+    binary = tmp_path / "app.bin"
+    binary.write_bytes(b"\x7fELF")
+    child = subprocess.Popen([sys_mod.executable, "-c", "pass"], start_new_session=True)
+    deadline = time_mod.monotonic() + 10
+    # NOT child.poll(): Popen's own bookkeeping calls waitpid(WNOHANG) and
+    # would reap the child itself the moment it notices the exit, defeating
+    # the whole test. /proc is read directly instead, exactly as the
+    # existing zombie tests in test_transport.py do.
+    while transport._process_state(child.pid) not in transport._EXITED_STATES:
+        assert time_mod.monotonic() < deadline, "child did not exit"
+        time_mod.sleep(0.01)
+    # Exited, deliberately not reaped by the test: exactly the zombie a real
+    # spawn leaves once its Popen handle is dropped.
+
+    instance = _fake_bridge_instance("start1", pid=child.pid)  # noqa: F405
+
+    def fake_send_request(op, **kwargs):
+        if op == "associate_project_roots":
+            return {"ok": True, "result": {"associated": []}}
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise BridgeError("load failed")
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "start", str(binary), "--format", "json"])
+
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out)["stopped"] is True
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child.pid, os.WNOHANG)   # already reaped by the cleanup path
+
+
+def test_a_live_detached_bridge_is_not_waited_on_1096(monkeypatch, capsys, tmp_path):
+    """The cleanup/reap path fires only when every preload failed; a
+    successful `--detach` must leave the (still running) bridge untouched."""
+    import subprocess
+    import sys as sys_mod
+
+    binary = tmp_path / "app.bin"
+    binary.write_bytes(b"\x7fELF")
+    child = subprocess.Popen([sys_mod.executable, "-c", "import time; time.sleep(5)"],
+                             start_new_session=True)
+    instance = _fake_bridge_instance("start1", pid=child.pid)  # noqa: F405
+
+    def fake_send_request(op, **kwargs):
+        if op == "associate_project_roots":
+            return {"ok": True, "result": {"associated": []}}
+        assert op == "load_binary_async"
+        return {"ok": True, "result": {"job_id": "job1", "state": "queued"}}
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    try:
+        rc = bn.cli.main(["session", "start", str(binary), "--detach", "--format", "json"])
+        assert rc == 0
+        assert "stopped" not in json.loads(capsys.readouterr().out)
+        # Still running and still OURS to reap later: proves nothing waited on it.
+        assert os.waitpid(child.pid, os.WNOHANG) == (0, 0)
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_session_stop_escalates_sigkill_through_the_same_pin(monkeypatch, capsys):
     import signal as signal_mod
 
@@ -7109,6 +7194,53 @@ def test_session_restart_ambient_instance_does_not_conflict_with_the_positional_
     monkeypatch.setenv("BN_INSTANCE", "other-2")
     assert bn.cli.main(["session", "restart", "env-1"]) == 0
     assert len(popen_calls) == 1
+
+
+# --- #1096 A1: `session stop` refuses two different explicit ids, like restart --
+
+
+def _stop_fixture(monkeypatch):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append({"op": op, "instance_id": instance_id})
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: None)
+    return calls
+
+
+def test_session_stop_refuses_a_different_explicit_i_than_the_positional_1096(
+    monkeypatch, capsys
+):
+    # #1096 A1: `bn -i a session stop b` used to stop `b` without a word --
+    # the conflict `session restart` already refused since #1076.
+    calls = _stop_fixture(monkeypatch)
+
+    rc = bn.cli.main(["-i", "a", "session", "stop", "b"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "two different instance ids" in err and "'a'" in err and "'b'" in err
+    assert not calls
+
+
+@pytest.mark.parametrize("argv", [
+    ["-i", "a", "session", "stop", "a"],      # same id both ways: no conflict
+    ["-i", "a", "session", "stop"],            # no positional: -i alone names it
+])
+def test_session_stop_still_stops_when_ids_agree_or_only_one_is_given_1096(
+    monkeypatch, capsys, argv
+):
+    calls = _stop_fixture(monkeypatch)
+
+    rc = bn.cli.main(argv)
+
+    assert rc == 0
+    assert calls == [{"op": "shutdown", "instance_id": "a"}]
 
 
 def test_restart_env_line_escapes_key_names_1076():

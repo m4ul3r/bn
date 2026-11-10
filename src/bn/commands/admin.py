@@ -1200,6 +1200,15 @@ def _session_start(args: argparse.Namespace) -> int:
                     cleanup_errors.append(f"SIGKILL not sent: {reason}")
                 stopped = cli.wait_for_teardown(instance, timeout=2.0)
         result["stopped"] = stopped
+        # #1096 A2: `spawn_instance` hands back the instance, not the `Popen`
+        # it created, so once that handle is garbage collected nothing ever
+        # calls waitpid on this bridge again -- if it exits HERE (the crash
+        # this whole cleanup path exists for, or the shutdown/signal just
+        # sent), it is a zombie for as long as this CLI process keeps
+        # running. Best-effort and never blocking: a live bridge (a detached
+        # one, or a signal this escalation could not deliver) answers
+        # WNOHANG with nothing to reap and is left exactly as it was.
+        cli.reap_if_exited(instance.pid)
         if cleanup_errors:
             result["cleanup_errors"] = cleanup_errors
         if not stopped:
@@ -1324,9 +1333,10 @@ def _lifecycle_instance_id(verb: str, args: argparse.Namespace) -> str:
     "requires an instance id" branch fires instead of silently acting on
     whatever instance the project happens to be pinned to.
 
-    `session restart` additionally refuses two DIFFERENT explicit ids (#1076):
-    `bn -i a session restart b` names two bridges, and silently restarting one
-    of them is not what either name asked for. Every pair of ids typed on the
+    Every lifecycle verb refuses two DIFFERENT explicit ids (#1076, extended to
+    `stop` by #1096 A1): `bn -i a session stop b` used to stop `b` without a
+    word, silently preferring the positional over a different `-i` -- exactly
+    the conflict `restart` already refused. Every pair of ids typed on the
     command line is compared; `BN_INSTANCE` is ambient, so the positional wins
     over it as it always has.
     """
@@ -1353,23 +1363,22 @@ def _lifecycle_instance_id(verb: str, args: argparse.Namespace) -> str:
             f"session {verb} requires an instance id: `bn session {verb} <id>` "
             f"(or `bn session {verb} -i/--instance <id>`). See `bn session list`."
         )
-    if verb == "restart":
-        # What THIS invocation typed: the positional, `--instance-id`, and
-        # `-i/--instance` only when it was on the command line (`main` records
-        # that; a value that merely equals BN_INSTANCE is still explicit, and
-        # BN_INSTANCE itself never is).
-        explicit = [
-            str(value) for value in (
-                positional, alias,
-                flag if getattr(args, "_explicit_instance", False) else None,
-            ) if value is not None
-        ]
-        different = sorted(set(explicit))
-        if len(different) > 1:
-            raise BridgeError(
-                f"session restart: two different instance ids were given, "
-                f"{different[0]!r} and {different[1]!r}; pass one. See `bn session list`."
-            )
+    # What THIS invocation typed: the positional, `--instance-id`, and
+    # `-i/--instance` only when it was on the command line (`main` records
+    # that; a value that merely equals BN_INSTANCE is still explicit, and
+    # BN_INSTANCE itself never is).
+    explicit = [
+        str(value) for value in (
+            positional, alias,
+            flag if getattr(args, "_explicit_instance", False) else None,
+        ) if value is not None
+    ]
+    different = sorted(set(explicit))
+    if len(different) > 1:
+        raise BridgeError(
+            f"session {verb}: two different instance ids were given, "
+            f"{different[0]!r} and {different[1]!r}; pass one. See `bn session list`."
+        )
     return str(target_id)
 
 

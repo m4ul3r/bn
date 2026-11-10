@@ -89,22 +89,22 @@ def test_lifecycle_and_non_target_hints_keep_their_own_arguments(command):
 
 @pytest.mark.parametrize(("command", "expected"), [
     ("il 'handler with $space' --view llil --ssa",
-     "-i X1 '--target=-local sample' il 'handler with $space' --view llil --ssa"),
+     "-i X1 --target='-local sample' il 'handler with $space' --view llil --ssa"),
     ('proto set 0x401000 "void f(char *p)"',
-     '-i X1 \'--target=-local sample\' proto set 0x401000 "void f(char *p)"'),
+     '-i X1 --target=\'-local sample\' proto set 0x401000 "void f(char *p)"'),
     ("taint forward -f 'handler with space' --source 'var:a b'",
-     "-i X1 '--target=-local sample' taint forward -f 'handler with space' --source 'var:a b'"),
+     "-i X1 --target='-local sample' taint forward -f 'handler with space' --source 'var:a b'"),
     ("il 0x401000 --target='other target' --ssa",
      "-i X1 il 0x401000 --target='other target' --ssa"),
     ("il 0x401000 -i other --ssa",
-     "'--target=-local sample' il 0x401000 -i other --ssa"),
+     "--target='-local sample' il 0x401000 -i other --ssa"),
     ("il 0x401000 -i other -t 'other target' --ssa",
      "il 0x401000 -i other -t 'other target' --ssa"),
-    ("-i other target info", "'--target=-local sample' -i other target info"),
-    ("target -i other info", "'--target=-local sample' target -i other info"),
-    ("--instance=other target info", "'--target=-local sample' --instance=other target info"),
-    ("-i session target info", "'--target=-local sample' -i session target info"),
-    ("-iother target info", "'--target=-local sample' -iother target info"),
+    ("-i other target info", "--target='-local sample' -i other target info"),
+    ("target -i other info", "--target='-local sample' target -i other info"),
+    ("--instance=other target info", "--target='-local sample' --instance=other target info"),
+    ("-i session target info", "--target='-local sample' -i session target info"),
+    ("-iother target info", "--target='-local sample' -iother target info"),
     ("--target='other target' il 0x401000", "-i X1 --target='other target' il 0x401000"),
     ("-i other -t 'other target' target info", "-i other -t 'other target' target info"),
 ])
@@ -122,6 +122,22 @@ def test_target_hints_route_without_rebuilding_shell_arguments(command, expected
     assert value["assumptions"][0]["detail"] == f"Inspect `bn {expected}`."
     assert value["name"] == f"`bn {command}`"
     assert value["il_text"] == f"`bn {command}`"
+
+
+def test_dash_leading_target_and_instance_route_byte_identically_to_target_hint_1096():
+    """#1096 A3: `_contextualize_diagnostic_hints` used to hand-spell the `-t`
+    flag instead of calling `target_option` (it already called `instance_option`
+    for `-i`). For a selector/id that needs no quoting beyond the dash-leading
+    attachment itself, the two spellings coincide byte-for-byte; assert that
+    directly against `target_option`/`instance_option` rather than a literal,
+    so this stays true even if their quoting style changes later."""
+    from bn.target_hint import instance_option, target_option
+
+    value = {"hints": ["Inspect `bn il 0x401000`."]}
+    bn.cli._contextualize_diagnostic_hints(value, target="-weird", instance="-also-weird")
+    expected = f"{instance_option('-also-weird')} {target_option('-weird')} il 0x401000"
+    assert value["hints"] == [f"Inspect `bn {expected}`."]
+    assert expected == "--instance=-also-weird --target=-weird il 0x401000"
 
 
 def test_unparseable_or_unclosed_hint_is_not_rewritten():
