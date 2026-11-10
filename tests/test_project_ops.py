@@ -996,6 +996,42 @@ def test_project_delete_removes_a_closed_file(po, populated):
     assert f.app not in project.files and bridge.registry_writes == 1
 
 
+def test_project_delete_refuses_a_provider_of_a_saved_database_unless_forced_1078(po, populated):
+    # #1078: the link record names a saved database (not open now) bound to
+    # the file; deleting the provider refuses without --force and names it,
+    # and the forced delete reports the same list.
+    manager, project, f = populated
+    metadata = {}
+    project.store_metadata = lambda key, value: metadata.__setitem__(key, value) or True
+    project.query_metadata = metadata.__getitem__
+    manager.set_links({"version": 1, "targets": {
+        f.app_db.id: {"project_path": "/fw/app.bndb",
+                      "providers": {"libloader.so": f.loose.id, "libother.so": "zzzz"}},
+    }})
+    bridge = _bridge_with_rows(manager, [])
+
+    with pytest.raises(RuntimeError) as exc:
+        po.project_delete(bridge, "loader")
+    text = str(exc.value)
+    assert text.startswith(f"project file /loader ({f.loose.id}) is the linked provider of 1 target(s): "
+                           "/fw/app.bndb (saved database; libloader.so)")
+    assert "--force" in text
+    assert f.loose in project.files and bridge.registry_writes == 0
+
+    result = po.project_delete(bridge, "loader", force=True)
+    assert f.loose not in project.files
+    assert result["dependents"] == [{
+        "project_file_id": f.app_db.id, "project_path": "/fw/app.bndb",
+        "libraries": ["libloader.so"], "open": False, "selector": None,
+    }]
+    # A provider nothing references deletes as before, and a deleted target's
+    # own stale record goes with it.
+    manager.set_links({"version": 1, "targets": {f.app.id: {"project_path": "/fw/app", "providers": {}}}})
+    assert po.project_delete(bridge, "fw/app") == {
+        "deleted": True, "project_file_id": f.app.id, "project_path": "/fw/app"}
+    assert manager.get_links()["targets"] == {}
+
+
 
 @pytest.mark.parametrize("folder", [".bn-findings", "/.bn-findings/F-example", "//.bn-findings//"])
 def test_project_import_cannot_inject_finding_history(po, populated, tmp_path, folder):

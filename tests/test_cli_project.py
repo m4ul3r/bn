@@ -392,6 +392,54 @@ def test_project_delete_params(fake_transport, monkeypatch, capsys):
     assert FILE_ID_A in capsys.readouterr().out
 
 
+def test_project_delete_force_forwards_and_warns_about_dependents_1078(fake_transport, monkeypatch, capsys):
+    # #1078: `--force` is the only way past the linked-provider refusal; the
+    # forced delete names what it orphaned, in text and JSON.
+    _one_instance(monkeypatch)
+    dependents = [
+        {"project_file_id": "db-1", "project_path": "/usr/bin/player.bndb",
+         "libraries": ["libcodec.so.1.2"], "open": False, "selector": None},
+        {"project_file_id": "raw-2", "project_path": "/usr/bin/viewer",
+         "libraries": ["libcodec.so.1.2"], "open": True, "selector": "viewer"},
+    ]
+    calls = fake_transport({"project_delete": {
+        "ok": True,
+        "result": {"deleted": True, "project_file_id": FILE_ID_A,
+                   "project_path": "/opt/vendor/lib/libcodec.so.1.2", "dependents": dependents}}})
+
+    assert bn.cli.main(["project", "delete", "opt/vendor/lib/libcodec.so.1.2", "--force"]) == 0
+    assert calls[0]["params"] == {"selector": "opt/vendor/lib/libcodec.so.1.2", "force": True}
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"deleted: {FILE_ID_A}"
+    assert out[1].startswith("warning: this file was the linked provider of 2 target(s)")
+    assert out[2] == "  /usr/bin/player.bndb  (saved database; libcodec.so.1.2)"
+    assert out[3] == "  /usr/bin/viewer  (open as viewer; libcodec.so.1.2)"
+
+    assert bn.cli.main(["project", "delete", FILE_ID_A, "--force", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["dependents"] == dependents
+
+
+def test_project_delete_text_explains_sibling_and_unreadable_record_1078(fake_transport, monkeypatch, capsys):
+    # A dependent bound through the library's database, and a forced delete
+    # past a link record nobody could read: both are said in text mode.
+    _one_instance(monkeypatch)
+    fake_transport({"project_delete": {"ok": True, "result": {
+        "deleted": True, "project_file_id": FILE_ID_A,
+        "project_path": "/opt/vendor/lib/libcodec.so.1.2",
+        "dependents": [{"project_file_id": "db-1", "project_path": "/usr/bin/player.bndb",
+                        "libraries": ["libcodec.so.1.2"], "open": False, "selector": None,
+                        "provider_path": "/opt/vendor/lib/libcodec.so.1.2.bndb"}],
+        "link_record_error": "the project's link record cannot be read: it is version 999",
+    }}})
+
+    assert bn.cli.main(["project", "delete", FILE_ID_A, "--force"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[2] == ("  /usr/bin/player.bndb  (saved database; libcodec.so.1.2 "
+                      "through /opt/vendor/lib/libcodec.so.1.2.bndb)")
+    assert out[3] == ("warning: could not tell which targets were linked to this file: "
+                      "the project's link record cannot be read: it is version 999")
+
+
 def test_project_close_params_and_text(fake_transport, monkeypatch, capsys):
     _one_instance(monkeypatch)
     calls = fake_transport({"project_close": {"ok": True, "result": {

@@ -1802,6 +1802,52 @@ def test_session_restart_replays_project_targets_by_file_id(monkeypatch, capsys)
     assert [x.get("project_file_id") for x in payload["loaded"]] == [None, _PROJECT_FILE_ID]
 
 
+def test_session_restart_lists_each_rebind_of_a_replayed_project_target_1078(monkeypatch, capsys):
+    """#1078: the replay's auto-link could move an import onto a different
+    provider and the restart said nothing (a `rebound` count buried in the
+    JSON). Each provider CHANGE is a line; a first binding is not a change."""
+    _restart_project_fixture(monkeypatch, meta=_PROJECT_META, rows=_PROJECT_ROWS)
+    inner = bn.cli.send_request
+
+    def with_link(op, **kwargs):
+        response = inner(op, **kwargs)
+        if op == "project_load":
+            response["result"]["link"] = {
+                "status": "verified", "success": True, "linked": 0, "rebound": 2,
+                "rebinds": [
+                    {"name": "libcodec.so.1.2", "from_id": "old-provider-id",
+                     "from_path": None, "to_id": "new-provider-id",
+                     "to_path": "/opt/vendor/lib/libcodec.so"},
+                    {"name": "libfresh.so", "from_id": None, "from_path": None,
+                     "to_id": "fresh-id", "to_path": "/lib/libfresh.so"},
+                ],
+                "libraries": [
+                    {"name": "libaudio.so.2", "resolved": False, "project_file_id": None,
+                     "project_path": None, "backing": None,
+                     "reason": "libaudio.so.2: previous provider gone-id is gone; alias-only "
+                               "candidate /opt/vendor/lib/libaudio.so has different content"},
+                    {"name": "libc.so.6", "resolved": False, "project_file_id": None,
+                     "project_path": None, "backing": None},
+                ],
+                "unresolved": [], "notes": [],
+            }
+        return response
+
+    monkeypatch.setattr(bn.cli, "send_request", with_link)
+
+    assert bn.cli.main(["session", "restart", "keep-me"]) == 0
+    out = capsys.readouterr().out
+    assert "  rebound: libcodec.so.1.2 old-provider-id -> new-provider-id (/opt/vendor/lib/libcodec.so)" in out
+    assert "libfresh.so" not in out                      # first binding: not a change
+    assert "  unresolved: libaudio.so.2  libaudio.so.2: previous provider gone-id is gone" in out
+    assert "libc.so.6" not in out                        # plainly absent: not a refusal
+
+    assert bn.cli.main(["session", "restart", "keep-me", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    replayed = next(x for x in payload["loaded"] if x.get("project_file_id") == _PROJECT_FILE_ID)
+    assert [r["name"] for r in replayed["link"]["rebinds"]] == ["libcodec.so.1.2", "libfresh.so"]
+
+
 @pytest.mark.parametrize("project_targets", [None, []])
 @pytest.mark.parametrize("reopen_fails", [False, True])
 def test_session_restart_preserves_project_without_open_targets(
