@@ -188,13 +188,25 @@ def test_unforced_successful_skill_install_prints_no_force_preflight_1058(tmp_pa
     out = capsys.readouterr().out
     assert "Already up to date:" in out and "--force preflight:" not in out
 
-    # A run --force WOULD change keeps the preflight verdict and the template.
+    # A refusal --force WOULD fix (a link into another checkout) keeps the
+    # `ready` verdict and prints the rerun template.
+    (destination / "bn").unlink()
+    (destination / "bn").symlink_to(tmp_path / "old-checkout" / "bn")
+    assert bn.cli.main(["skill", "install", "--dest", str(destination)]) == 2
+    err = capsys.readouterr().err
+    assert "--force preflight: ready." in err
+    assert ("rerun with the same bn invocation you just used, adding --force: "
+            f"bn skill install --dest {destination} --force") in err
+
+    # A refusal --force would NOT fix (an unmarked directory with local edits)
+    # says so, and prints no template to a dead end.
     (destination / "bn").unlink()
     (destination / "bn").mkdir()
     (destination / "bn" / "SKILL.md").write_text("local edits")
     assert bn.cli.main(["skill", "install", "--dest", str(destination)]) == 2
     err = capsys.readouterr().err
-    assert "--force preflight:" in err
+    assert "--force preflight: refused; fix every blocker first." in err
+    assert "rerun with the same bn invocation" not in err
 
 
 def test_skill_install_copy_mode(tmp_path):
@@ -2400,15 +2412,23 @@ class _FakeClock:
         self.now += seconds
 
 
-@pytest.mark.parametrize("polls_before_done,expected_lines", [
+@pytest.mark.parametrize("polls_before_done,expected_lines,status_command", [
     # 2 s polls, 30 s notice cadence: 40 polls span two intervals, 5 span none.
-    (40, 2), (5, 0),
+    (40, 2, "bn -i worker session status job123"), (5, 0, "bn -i worker session status job123"),
+    # A bridge that cannot name itself sends no command; the CLI spells it
+    # with the instance this call was routed to.
+    (40, 2, None),
 ])
 def test_session_status_wait_reports_progress_on_stderr_1058(
-        monkeypatch, capsys, polls_before_done, expected_lines):
+        monkeypatch, capsys, polls_before_done, expected_lines, status_command):
     """#1058 item 6: a 54-second `--wait` left stderr empty. It now prints the
     same `bn: still loading …` line a foreground start prints, on the same
-    cadence, and nothing at all when the wait ends inside the first interval."""
+    cadence, and nothing at all when the wait ends inside the first interval.
+    The hint in it is a command that runs as printed: `session status` needs
+    `-i`, so a bare `session status <job>` exited 2 when pasted."""
+    import re
+    import shlex
+
     import bn.commands.admin as admin
 
     clock = _FakeClock()
@@ -2418,7 +2438,9 @@ def test_session_status_wait_reports_progress_on_stderr_1058(
     def fake_send_request(op, **kwargs):
         polls.append(clock.now)
         done = len(polls) > polls_before_done
-        return _job_status("complete" if done else "running", succeeded=True if done else None)
+        reply = _job_status("complete" if done else "running", succeeded=True if done else None)
+        reply["result"]["status_command"] = status_command
+        return reply
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -2430,7 +2452,9 @@ def test_session_status_wait_reports_progress_on_stderr_1058(
     assert len(lines) == expected_lines, captured.err
     for line in lines:
         assert line.startswith("bn: still loading /tmp/s.bndb (")
-        assert "session status job123" in line
+        [command] = re.findall(r"`(bn [^`]+)`", line)
+        parsed = bn.cli.build_parser().parse_args(shlex.split(command)[1:])
+        assert (parsed.instance, parsed.job_id, parsed.wait) == ("worker", "job123", False)
     assert "still loading" not in captured.out
     if lines:
         # Elapsed stamps are the real cadence, not a count of polls.

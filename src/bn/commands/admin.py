@@ -66,7 +66,7 @@ def _still_loading_line(path: str, elapsed: float, hint: str) -> str:
 
 
 @contextlib.contextmanager
-def _still_loading_notice(path: str, interval: float, hint: str = _START_DETACH_HINT):
+def _still_loading_notice(path: str, interval: float):
     """Print ``bn: still loading <path> (<N>s)`` on stderr every *interval*
     seconds while the body runs, so a long foreground load is visibly alive
     (#1036 item 6). Stderr only: stdout stays the command's result."""
@@ -75,7 +75,7 @@ def _still_loading_notice(path: str, interval: float, hint: str = _START_DETACH_
 
     def tick() -> None:
         while not done.wait(interval):
-            print(_still_loading_line(path, time.monotonic() - started, hint),
+            print(_still_loading_line(path, time.monotonic() - started, _START_DETACH_HINT),
                   file=sys.stderr, flush=True)
 
     thread = threading.Thread(target=tick, name="bn-start-progress", daemon=True)
@@ -1279,9 +1279,16 @@ def _session_status(args: argparse.Namespace) -> int:
             intervals_reported = due
             job = result.get("job")
             path = job.get("path") if isinstance(job, dict) else None
+            # A printed command runs as printed: `session status` needs `-i`,
+            # so the hint is the bridge's own `status_command` (the `poll:`
+            # line), or the same command spelled with this call's instance.
+            poll = result.get("status_command")
+            if not isinstance(poll, str) or not poll:
+                poll = (f"bn {cli.instance_option(instance_id)} session status "
+                        f"{shlex.quote(str(job_id))}")
             print(_still_loading_line(
                 path if isinstance(path, str) and path else f"job {job_id}", elapsed,
-                f"`session status {job_id}` without --wait returns at once"),
+                f"`{poll}` (without --wait) returns at once"),
                 file=sys.stderr, flush=True)
         pause = _STATUS_WAIT_INTERVAL
         if timeout is not None:
