@@ -738,6 +738,10 @@ def project_files(
     requested folder and, when *recursive*, every folder below it; at the root,
     every folder, or none when flat. Each folder row counts its direct files
     (`files`) and, when recursive, its whole subtree (`files_recursive`).
+    A flat listing also carries `below` -- how many files and folders lie
+    under the scope and were not listed -- so the flat root of a populated
+    project is not mistaken for an empty one. A *folder* that names no folder
+    in the project is refused, not answered with an empty listing.
     Before #1080 `folders` was every folder in the project whatever the
     filter said, so one requested row came with hundreds of unrelated folders."""
     manager = bridge.projects
@@ -762,6 +766,20 @@ def project_files(
         for row in _open_project_targets(bridge)
     }
     files = list(state.project.files)
+    project_folders = [(manager.folder_path(f), f) for f in state.project.folders]
+    if wanted and all(path != wanted for path, _f in project_folders):
+        # A typo or a file's path used to answer `items: [], folders: []` --
+        # exactly what an empty project answers (#1080 review).
+        is_file = any(manager.path_in_project(pf) == wanted for pf in files)
+        top = sorted(path for path, _f in project_folders if path.count("/") == 1)
+        listed = ", ".join(top[:_LISTING_CAP]) or "none"
+        if len(top) > _LISTING_CAP:
+            listed += f", ... {len(top) - _LISTING_CAP} more"
+        raise RuntimeError(
+            f"No project folder matches {wanted!r}"
+            + (" (that path is a file)" if is_file else "")
+            + f". Top-level folders: {listed}"
+        )
     index = manager.sibling_index(files)
     direct: dict[str, int] = {}
     selected: list[tuple[str, Any]] = []
@@ -778,9 +796,12 @@ def project_files(
     # and reads its magic, which a 450-file project must not pay per page.
     rows = [manager.file_row(pf, open_targets, index) for _path, pf in selected[start:stop]]
     folders: list[dict[str, Any]] = []
-    for f in state.project.folders:
-        path = manager.folder_path(f)
-        if not path or not in_scope(path):
+    below_folders = 0
+    for path, f in project_folders:
+        if not path:
+            continue
+        if not in_scope(path):
+            below_folders += (not wanted) or path.startswith(wanted + "/")
             continue
         row: dict[str, Any] = {"id": str(f.id), "path": path, "files": direct.get(path, 0)}
         if recursive:
@@ -789,7 +810,7 @@ def project_files(
                 if here == path or here.startswith(path + "/"))
         folders.append(row)
     folders.sort(key=lambda r: r["path"])
-    return {
+    result: dict[str, Any] = {
         "kind": "project_files",
         "items": rows,
         "total": total,
@@ -799,6 +820,14 @@ def project_files(
         "has_more": offset + len(rows) < total,
         "folders": folders,
     }
+    if not recursive:
+        result["below"] = {
+            "files": sum(
+                count for here, count in direct.items()
+                if (here.startswith(wanted + "/") if wanted else bool(here))),
+            "folders": int(below_folders),
+        }
+    return result
 
 
 def _refuse_finding_path(path: str) -> None:

@@ -29,6 +29,24 @@ def _dispatch(w, op, params=None, **fields):
     return w.instance.dispatch({"op": op, "params": params or {}, **fields})
 
 
+def test_project_files_paging_params_reach_the_handler_through_dispatch_1080(dispatch_world):
+    """The binder is what carries `offset`/`limit` off the wire; a test that
+    calls the handler directly cannot see it dropped."""
+    w = dispatch_world
+    for name in ("a", "b", "c", "d", "e"):
+        w.project.add_file(name)
+
+    response = _dispatch(w, "project_files", {"offset": 3, "limit": 1})
+
+    assert response["ok"] is True, response
+    page = response["result"]
+    assert [row["name"] for row in page["items"]] == ["d"]
+    assert (page["total"], page["offset"], page["limit"], page["returned"], page["has_more"]) == (
+        5, 3, 1, 1, True)
+    refused = _dispatch(w, "project_files", {"limit": 0})
+    assert refused["ok"] is False and "limit must be a positive integer" in refused["error"]
+
+
 def _start(call, *, observed=None):
     result = {}
     done = threading.Event()

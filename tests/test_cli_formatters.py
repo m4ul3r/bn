@@ -9046,3 +9046,48 @@ def test_project_files_text_states_folder_counts_and_a_summary_1080():
     assert "- /usr/bin  (? files)" in text and "\n? files, 1 folder" in text
     assert "! malformed files, total fields" in text
     assert "0 files" not in text and "(0 " not in text
+
+
+def test_project_files_text_reads_a_pre_paging_bridge_and_never_invents_counts_1080():
+    """#1080 review: a bridge started before the upgrade answers `{files,
+    folders}` with no counts. The CLI printed no file row, `(0 files)` after
+    every folder and `? files`, at exit 0 and with no disclosure."""
+    from bn.formatters import _render_project_files_text
+
+    old = {"files": [{"id": "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b", "path": "/usr/bin/play",
+                      "size": 4096, "is_database": False, "exists_on_disk": True}],
+           "folders": [{"id": "f-1", "path": "/usr/bin"}]}
+    lines = _render_project_files_text(old).splitlines()
+    assert lines[0].startswith("4f0c2a1e  raw") and lines[0].endswith("/usr/bin/play")
+    assert "- /usr/bin" in lines, lines                      # no count was sent: none is stated
+    assert lines[-1] == "1 file, 1 folder"
+    assert "malformed" not in "\n".join(lines) and "0 files" not in "\n".join(lines)
+
+
+def test_project_files_text_for_scopes_that_list_nothing_1080():
+    from bn.formatters import _render_project_files_text
+
+    def page(**fields):
+        return {"kind": "project_files", "items": [], "total": 0, "offset": 0, "limit": 100,
+                "returned": 0, "has_more": False, "folders": [], **fields}
+
+    # A truly empty project keeps the empty marker ...
+    assert _render_project_files_text(page()) == "(no project files)"
+    # ... the flat root of a populated one states its scope instead ...
+    flat_root = _render_project_files_text(page(below={"files": 431, "folders": 14}))
+    assert flat_root == "0 files, 0 folders; 431 files in 14 folders below (not listed: --flat)"
+    # ... and a page past the end says so in the listings' shared sentence,
+    # with no blank first line and no "impossible page" footer.
+    past = _render_project_files_text(page(total=2, offset=5))
+    assert past == "none (offset 5 is past the end; 2 total)\n\n2 files, 0 folders"
+
+
+def test_project_files_text_refuses_a_negative_folder_count_1080():
+    from bn.formatters import _render_project_files_text
+
+    text = _render_project_files_text({
+        "items": [], "total": 3, "offset": 0, "returned": 0, "has_more": False,
+        "folders": [{"id": "f-1", "path": "/usr", "files": -3, "files_recursive": 5},
+                    {"id": "f-2", "path": "/opt", "files": 2, "files_recursive": -1}]})
+    assert "- /usr  (? files, 5 recursive)" in text and "-3" not in text and "-1" not in text
+    assert "! malformed files" in text

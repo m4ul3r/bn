@@ -340,12 +340,14 @@ def _project_info(args: argparse.Namespace) -> int:
 @command("project", "files", help="List the files in the open project", paged=True,
          args=[
              arg("--folder", default=None, metavar="PATH",
-                 help="Path-in-project of a folder to list (default: the root). "
-                      "folders[] lists that folder and everything below it, each with "
-                      "its file counts"),
+                 help="Path-in-project of a folder to list (default: the root); a path "
+                      "that names no folder is refused. folders[] lists that folder and "
+                      "everything below it, each with its file counts; --limit/--offset "
+                      "page the files only: folders[] is returned whole on every page"),
              arg("--flat", action="store_true",
                  help="Only the folder's direct files; folders[] then holds just the "
-                      "requested folder (none at the root) (default: recurse)"),
+                      "requested folder (none at the root) and the summary states what "
+                      "lies below (default: recurse)"),
          ])
 def _project_files(args: argparse.Namespace) -> int:
     # Files page like every other list read; folders are a small side list

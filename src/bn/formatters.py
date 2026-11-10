@@ -1607,14 +1607,18 @@ def _render_project_file_text(value: Any) -> str:
     return "imported: " + _project_file_line(value)
 
 
-def _project_folder_count_text(folder: dict[str, Any]) -> str:
+def _project_folder_count_text(folder: dict[str, Any]) -> str | None:
     """`3 files`, or `1 file, 5 recursive` when the subtree count differs from
-    the direct one (#1080). Both counts are stated through the choke point, so
-    an unreadable one prints `?` and is disclosed, never a 0."""
-    direct = _stated_count(folder, "files")
+    the direct one (#1080); None when the row carries no count at all (a
+    bridge from before the counts existed), so none is invented. The counts
+    are cardinalities read through the choke point: an unreadable or negative
+    one prints `?` and is disclosed, never a number."""
+    if not _field_present(folder, "files"):
+        return None
+    direct = _project_count_text(folder, "files")
     text = f"{direct} file{'' if direct == '1' else 's'}"
     if _field_present(folder, "files_recursive"):
-        recursive = _stated_count(folder, "files_recursive")
+        recursive = _project_count_text(folder, "files_recursive")
         if recursive != direct:
             text += f", {recursive} recursive"
     return text
@@ -1624,14 +1628,35 @@ def _project_folder_count_text(folder: dict[str, Any]) -> str:
 def _render_project_files_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _escape_control_chars(_render_fallback_text(value))
-    files = _field_list(value, "items")
-    page_unreadable = _field_skewed("items")
+    # `files` is the retained alias of the page (#1080 review): a bridge
+    # started before the listing was paged still answers `{files, folders}`,
+    # and reading only `items` printed no file row for it, undisclosed.
+    files = _field_list(value, "items", "files")
+    page_key = "items" if _field_present(value, "items") or not _field_present(value, "files") \
+        else "files"
+    page_unreadable = _field_skewed(page_key)
+    # The summary counts the whole scope (`total`), not the page. Read before
+    # the folder rows, whose own `files` count shares the alias's key name.
+    total = (_project_count_text(value, "total") if _field_present(value, "total")
+             else _project_rows_count(value, page_key))
     folders = _field_list(value, "folders")
-    # An empty page past the end of a non-empty scope is not an empty project:
-    # it still gets the summary and the footer that say where the rows are.
-    if not files and not folders and not _count_field(value, "total"):
+    folder_count = _project_rows_count(value, "folders")
+    # What a flat listing did not descend into.
+    below = _field_dict(value, "below")
+    below_files = _nonnegative_count(below, "files")
+    below_folders = _nonnegative_count(below, "folders")
+    scope_total = _count_field(value, "total")
+    offset = _count_field(value, "offset")
+    # Only a scope with nothing in it AND nothing below it is an empty project:
+    # a page past the end, or the flat root of a project whose files all live
+    # in folders, says where the rows are instead.
+    if not files and not folders and not scope_total and not (below_files or below_folders):
         return _empty_result("project files")
+    past_the_end = not files and bool(scope_total) and offset >= scope_total
     lines = []
+    if past_the_end:
+        # The sentence the other paged listings use for an over-shot page.
+        lines.append(f"none (offset {offset} is past the end; {scope_total} total)")
     for row in files:
         lines.append(_project_file_line(row) if isinstance(row, dict)
                      else _escape_control_chars(_render_fallback_text(row)))
@@ -1641,19 +1666,22 @@ def _render_project_files_text(value: Any) -> str:
         lines.append("folders:")
         for folder in folders:
             if isinstance(folder, dict):
+                counts = _project_folder_count_text(folder)
                 lines.append(f"- {_escape_control_chars(folder.get('path', '<unknown>'))}"
-                             f"  ({_project_folder_count_text(folder)})")
+                             + (f"  ({counts})" if counts else ""))
             else:
                 lines.append(f"- {_escape_control_chars(_render_fallback_text(folder))}")
-    # The summary counts the whole scope (`total`), not the page; the shared
-    # footer says how much of it this page shows (#1080).
-    total = (_project_count_text(value, "total") if _field_present(value, "total")
-             else _project_rows_count(value, "items"))
-    folder_count = _project_rows_count(value, "folders")
-    lines.append("")
-    lines.append(f"{total} file{'' if total == '1' else 's'}, "
-                 f"{folder_count} folder{'' if folder_count == '1' else 's'}")
-    footer = _paging_footer(value, files, page_unreadable)
+    if lines:
+        lines.append("")
+    summary = (f"{total} file{'' if total == '1' else 's'}, "
+               f"{folder_count} folder{'' if folder_count == '1' else 's'}")
+    if below_files or below_folders:
+        summary += (f"; {below_files} file{'' if below_files == 1 else 's'} in "
+                    f"{below_folders} folder{'' if below_folders == 1 else 's'} below "
+                    "(not listed: --flat)")
+    lines.append(summary)
+    # The shared footer says how much of the scope this page shows (#1080).
+    footer = None if past_the_end else _paging_footer(value, files, page_unreadable)
     if footer is not None:
         lines.append(footer)
     return "\n".join(lines)

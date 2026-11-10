@@ -269,6 +269,40 @@ def test_project_files_folder_filter_and_flat_reach_the_text_1080(
     assert lines[-1] == "// showing 2 of 5 (3 more); rerun with --offset 2 or a larger --limit"
 
 
+def test_project_files_unknown_folder_is_exit_2_and_help_says_folders_are_unpaged_1080(
+    po, opened, monkeypatch, capsys
+):
+    from test_project_ops import _bridge_with_rows, _firmware_tree
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        try:
+            return {"ok": True, "result": po.project_files(bridge, **params)}
+        except RuntimeError as exc:  # the dispatcher's `ok: false` envelope
+            raise BridgeError(str(exc)) from exc
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    assert bn.cli.main(["project", "files", "--folder", "usr/bni", "--flat"]) == 2
+    captured = capsys.readouterr()
+    assert "No project folder matches '/usr/bni'. Top-level folders: /opt, /usr" in captured.err
+    assert "(no project files)" not in captured.out
+
+    assert bn.cli.main(["project", "files", "--flat"]) == 0
+    assert capsys.readouterr().out.strip() == (
+        "0 files, 0 folders; 5 files in 4 folders below (not listed: --flat)")
+
+    with pytest.raises(SystemExit):
+        bn.cli.main(["project", "files", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "folders[] is returned whole on every page" in help_text
+
+
 def test_project_load_params(fake_transport, monkeypatch):
     from bn.transport import REFRESH_REQUEST_TIMEOUT
     _one_instance(monkeypatch)

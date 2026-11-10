@@ -1065,6 +1065,70 @@ def test_project_files_pages_the_files_not_the_folders_1080(po, opened):
     assert everything["has_more"] is False
 
 
+def test_project_files_refuses_a_folder_that_is_not_in_the_project_1080(po, opened):
+    """#1080 review: a `--folder` naming no folder (a typo, a file's path)
+    answered `items: [], folders: []` at exit 0 -- byte-identical to an empty
+    project. It is refused, naming it and the top-level folders."""
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    with pytest.raises(RuntimeError) as typo:
+        po.project_files(bridge, "usr/bni")
+    assert str(typo.value) == (
+        "No project folder matches '/usr/bni'. Top-level folders: /opt, /usr")
+    with pytest.raises(RuntimeError) as a_file:
+        po.project_files(bridge, "usr/bin/play", recursive=False)
+    assert str(a_file.value) == (
+        "No project folder matches '/usr/bin/play' (that path is a file). "
+        "Top-level folders: /opt, /usr")
+    # An existing but EMPTY folder is a real, empty scope.
+    empty = po.project_files(bridge, "opt")
+    assert empty["items"] == [] and [r["path"] for r in empty["folders"]] == ["/opt"]
+
+
+def test_project_files_flat_scope_states_what_lies_below_1080(po, opened):
+    """#1080 review: the flat root of a project whose files all live in
+    folders is not an empty project; the envelope says what was not listed."""
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    root = po.project_files(bridge, None, recursive=False)
+    assert (root["items"], root["total"], root["folders"]) == ([], 0, [])
+    assert root["below"] == {"files": 5, "folders": 4}
+    usr = po.project_files(bridge, "usr", recursive=False)
+    assert usr["total"] == 1 and usr["below"] == {"files": 4, "folders": 2}
+    assert "below" not in po.project_files(bridge, "usr")
+
+
+def test_project_files_scope_stops_at_the_folder_boundary_1080(po, opened):
+    # `/lib` must not swallow its sibling `/lib64` (a string-prefix match would).
+    manager, project = opened
+    lib, lib64 = project.add_folder("lib"), project.add_folder("lib64")
+    project.add_folder("ld", lib)
+    project.add_file("libc.so", lib)
+    project.add_file("ld-linux.so", lib64)
+    bridge = _bridge_with_rows(manager, [])
+
+    scoped = po.project_files(bridge, "lib")
+    assert [r["path"] for r in scoped["items"]] == ["/lib/libc.so"]
+    assert [(r["path"], r["files"], r["files_recursive"]) for r in scoped["folders"]] == [
+        ("/lib", 1, 1), ("/lib/ld", 0, 0)]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"offset": -1}, {"offset": True}, {"offset": 1.5},
+    {"limit": 0}, {"limit": -1}, {"limit": False}, {"limit": 0.5},
+])
+def test_project_files_refuses_paging_values_no_page_can_have_1080(po, opened, kwargs):
+    manager, project = opened
+    _firmware_tree(project)
+    name = next(iter(kwargs))
+    with pytest.raises(RuntimeError, match=f"project_files: {name} must be"):
+        po.project_files(_bridge_with_rows(manager, []), "usr", **kwargs)
+
+
 def test_project_info_and_open_handler(po, bnpr, monkeypatch):
     project = FakeProject(bnpr, name="demo")
     project.add_folder("fw")
