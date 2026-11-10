@@ -1134,6 +1134,29 @@ def test_project_import_normalises_the_folder_spelling(po, populated, tmp_path, 
     assert len([f for f in project.folders if f.name == "bin"]) == 1
 
 
+def test_project_import_duplicate_check_sees_through_the_folder_spelling(po, populated, tmp_path):
+    """Wave 1 recheck (#1074/#1079/#1080 composition): the duplicate
+    path-in-project refusal must compare the SAME normalised folder
+    `folder_components` builds the destination from, not the raw string, or
+    an existing `/usr/bin/<name>` could be duplicated by importing again
+    under a lookalike spelling (`./usr//bin/`, `usr/./bin`, a leading/trailing
+    `/`) of the identical folder."""
+    manager, project, _ = populated
+    first_src = tmp_path / "blob.bin"
+    first_src.write_bytes(b"\x7fELF")
+    first = po.project_import(_bridge_with_rows(manager, []), str(first_src), folder="usr/bin")
+    assert first["path"] == "/usr/bin/blob.bin"
+    second_src = tmp_path / "other.bin"
+    second_src.write_bytes(b"\x7fELF-2")
+    for folder in ("./usr//bin/", "usr/./bin", "/usr/bin/", "//usr/bin"):
+        with pytest.raises(RuntimeError, match=f"/usr/bin/blob.bin already exists in the "
+                                               f"project \\(file {first['id']}\\)"):
+            po.project_import(_bridge_with_rows(manager, []), str(second_src), folder=folder,
+                              name="blob.bin")
+    assert [f for f in project.files if manager.path_in_project(f) == "/usr/bin/blob.bin"] == \
+        [f for f in project.files if f.id == first["id"]]
+
+
 def test_project_files_normalises_the_folder_filter(po, populated):
     manager, _, _ = populated
     bridge = _bridge_with_rows(manager, [])
