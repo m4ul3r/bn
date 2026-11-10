@@ -641,6 +641,62 @@ def test_save_distinguishes_failed_rollback_from_file_refusal(
         assert json.loads(output.out)["observed"]["rolled_back"] is False
 
 
+@pytest.mark.parametrize("output_format", ["text", "json"])
+def test_save_into_project_storage_is_refused_with_nothing_written_1072(
+    monkeypatch, capsys, tmp_path, output_format,
+):
+    """#1072: `bn save <dest inside a .bnpr>` from a standalone target. Driven
+    through the REAL bridge dispatch (fake binaryninja) so the exit code and
+    payload are the refusal's own. Exit 2, not 3: save is a file write, and
+    an ordinary pre-write save refusal is exit 2 (`invalid_request` +
+    `written: false`), the same class as the cache-entry refusal."""
+    import bn.transport
+    from _bridge_fakes import _SaveBV, _load_bridge, _register_views
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    raw = tmp_path / "samples" / "httpd"
+    raw.parent.mkdir()
+    raw.write_bytes(b"\x7fELF")
+    bv = _SaveBV(str(raw))
+    bv.file.session_id = "1"
+    _register_views(bridge, bv)
+    project = tmp_path / "firmware-demo.bnpr"
+    (project / "data" / "6e").mkdir(parents=True)
+    (project / "project.bnpm").write_bytes(b"SQLite format 3\x00")
+    dest = project / "data" / "6e" / "stray.bndb"
+
+    selected = types.SimpleNamespace(instance_id="one", meta={})
+
+    def send(selected_instance, op, *, params=None, target=None, **kwargs):
+        response = instance.dispatch({"op": op, "params": params, "target": target})
+        if response.get("ok"):
+            return response
+        raise bn.cli.BridgeError(
+            str(response.get("error")), status=response.get("status"),
+            requested=response.get("requested"), observed=response.get("observed"),
+        )
+
+    monkeypatch.setattr(bn.transport, "choose_instance", lambda *a, **k: selected)
+    monkeypatch.setattr(bn.transport, "_send_request_to_instance", send)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["save", str(dest), "--format", output_format])
+
+    assert rc == 2
+    assert bv.created_with is None and not dest.exists()
+    out, err = capsys.readouterr()
+    if output_format == "json":
+        payload = json.loads(out)
+        assert payload["ok"] is False and payload["status"] == "invalid_request"
+        assert payload["observed"]["written"] is False
+        assert payload["requested"] == {"path": str(dest)}
+        assert "Cannot save into project storage" in payload["error"]
+    else:
+        assert "Cannot save into project storage" in err
+        assert str(project) in err and "bn project import" in err
+
+
 _TWO_TARGETS = {
     "ok": True,
     "result": [

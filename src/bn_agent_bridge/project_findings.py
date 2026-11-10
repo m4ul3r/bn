@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -91,6 +92,38 @@ def _text(value: Any, label: str, maximum: int = 32768) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise RuntimeError(f"{label} must be a nonempty string of at most {maximum} characters")
     return value.strip()
+
+
+def _same_label(a: str, b: str) -> bool:
+    """Do two declared identity labels spell the same name?
+
+    A typo guard for the self-accept refusal, NOT authentication (#1074 item
+    1): `Analyst`, ` analyst ` and a fullwidth spelling are one label for the
+    purpose of "the reviewer must differ from the author", because a declared
+    label proves nothing about who typed it either way. Compared after NFKC
+    normalisation, case folding, trimming and collapsing internal whitespace;
+    the labels themselves are stored exactly as declared."""
+    def fold(label: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", label).casefold().split())
+    return fold(a) == fold(b)
+
+
+def _relabeled_reviewer(reviewer: str, reviews: list[dict]) -> str | None:
+    """The EXISTING reviewer label on *reviews* that folds the same as
+    *reviewer* but is spelled differently, or None.
+
+    Same rationale as the self-accept typo guard, no trust change: a reviewer
+    label that differs from an existing one only in case, Unicode width or
+    spacing is a typo, not a second independent reviewer -- refusing it keeps
+    one spelling per actual reviewer on a finding, the way the self-accept
+    guard keeps the author and the reviewer from being the same actor under
+    two spellings. An EXACT repeat is the ordinary "change my own verdict"
+    case `_review_state` already handles and is not refused here."""
+    return next(
+        (label for label in {review["reviewer"] for review in reviews}
+         if label != reviewer and _same_label(label, reviewer)),
+        None,
+    )
 
 
 def _integer(value: Any, label: str, minimum: int = 1) -> int:
@@ -226,6 +259,10 @@ def _record_schema(record: Any, project_id: str, finding_id: str, revision: int)
         if _integer(review["reviewed_revision"], "reviewed_revision") >= revision or review["claim_revision"] != record["claim_revision"]:
             raise RuntimeError("Invalid review revision")
         _captured_schema(review["evidence"], nonempty=verdict != "supersede")
+        # Exact, not `_same_label`: this validates records already on disk, and
+        # a ledger written before the typo guard may hold an accept whose
+        # labels differ only in case. Tightening here would turn such history
+        # into an integrity failure; the guard belongs at the write.
         if verdict == "accept" and reviewer == record["author"]:
             raise RuntimeError("Self acceptance is forbidden")
         if verdict == "supersede":
@@ -617,6 +654,13 @@ def project_finding_review(bridge: Any, id: Any, document: Any, expected_revisio
     ledger = _Ledger(bridge)
     previous = ledger.mutation(id, expected_revision)
     reviewer = _text(reviewer, "reviewer", 256)
+    relabeled = _relabeled_reviewer(reviewer, previous["reviews"])
+    if relabeled is not None:
+        raise RuntimeError(
+            f"Reviewer label {reviewer!r} matches the existing reviewer {relabeled!r} on "
+            "this finding (labels are compared ignoring case, Unicode width/compatibility "
+            "forms and spacing); use that spelling to change your own verdict, or a "
+            "genuinely different label for an independent review")
     _bounded(document)
     _object(document, {"verdict", "rationale", "evidence", "replacement"}, {"verdict", "rationale", "evidence"}, "review document")
     verdict = document["verdict"]
@@ -624,8 +668,12 @@ def project_finding_review(bridge: Any, id: Any, document: Any, expected_revisio
         raise RuntimeError("verdict must be accept, reject, dispute, or supersede")
     rationale = _text(document["rationale"], "rationale")
     inputs = _array(document["evidence"], "review evidence", nonempty=verdict != "supersede")
-    if verdict == "accept" and reviewer == previous["author"]:
-        raise RuntimeError("Self acceptance is forbidden: reviewer must differ from claim author")
+    if verdict == "accept" and _same_label(reviewer, previous["author"]):
+        # Both labels, because as typed they may differ (`Analyst` / `analyst`).
+        raise RuntimeError(
+            f"Self acceptance is forbidden: reviewer {reviewer!r} is the claim author "
+            f"{previous['author']!r} (labels are compared ignoring case, Unicode "
+            "width/compatibility forms and spacing); a different reviewer must accept")
     replacement = None
     if verdict == "supersede":
         replacement = ledger.get(document.get("replacement"))["id"]

@@ -396,7 +396,7 @@ def test_lifetime_owner_retains_handle_when_bridge_reference_is_dropped(
     assert _subprocess_open(po, bnpr, tmp_path)["opened"] is True
 
 
-def test_set_rootfs_checks_native_result_and_readback(opened):
+def test_set_rootfs_checks_native_result_and_readback(po, opened):
     manager, project = opened
     metadata = {}
 
@@ -406,7 +406,7 @@ def test_set_rootfs_checks_native_result_and_readback(opened):
 
     project.store_metadata = store
     project.query_metadata = metadata.__getitem__
-    value = {"root": "/firmware", "libs": {}}
+    value = {"version": po.ROOTFS_METADATA_VERSION, "root": "/firmware", "libs": {}}
     manager.set_rootfs(value)
     assert manager.get_rootfs() == value
     project.store_metadata = lambda key, value: False
@@ -414,7 +414,7 @@ def test_set_rootfs_checks_native_result_and_readback(opened):
         manager.set_rootfs(value)
     project.store_metadata = lambda key, value: True
     with pytest.raises(RuntimeError, match="did not match"):
-        manager.set_rootfs({"root": "/different"})
+        manager.set_rootfs({**value, "root": "/different"})
 
 
 def test_create_handoff_excludes_process_and_adopts_without_reopening(po, tmp_path):
@@ -644,17 +644,36 @@ def test_resolve_file_id_prefix_needs_eight_characters(populated):
         manager.resolve_file("1111111")
 
 
-def test_resolve_file_unknown_selector_lists_every_file(populated):
-    manager, _, f = populated
+def test_resolve_file_miss_suggests_nearest_names_and_hides_the_ledger_1077(po, populated):
+    # #1077: a miss used to dump up to 50 rows in storage order, findings
+    # ledger records included. It now suggests the files whose names are
+    # nearest the selector's basename -- at most five, in a fixed order --
+    # and never a `/.bn-findings/` record.
+    manager, project, f = populated
+    ledger = project.add_folder(po.FINDINGS_FOLDER)
+    finding = project.add_folder("F-0001", ledger)
+    project.add_file("1.json", finding, data=b"{}")
+    project.add_file("appp.json", finding, data=b"{}")
+    for i in range(8):
+        project.add_file(f"app-{i}", f.fw)
+
+    with pytest.raises(RuntimeError) as exc:
+        manager.resolve_file("fw/appp")
+    lines = str(exc.value).splitlines()
+    assert lines[0] == "No project file matches 'fw/appp'. Nearest by file name:"
+    assert lines[-1] == "Full listing: `bn project files`."
+    rows = lines[1:-1]
+    assert rows[:2] == [f"  {f.app.id}  /fw/app", f"  {f.app_db.id}  /fw/app.bndb"]
+    assert len(rows) == 5
+    assert rows[2:] == sorted(rows[2:], key=lambda r: r.rsplit("  ", 1)[-1])
+    assert not any(".bn-findings" in line or ".json" in line for line in lines)
+
     with pytest.raises(RuntimeError) as exc:
         manager.resolve_file("nope")
-    lines = str(exc.value).splitlines()
-    assert lines[0] == "No project file matches 'nope'. Project files:"
-    assert set(lines[1:]) == {
-        f"  {f.app.id}  /fw/app",
-        f"  {f.app_db.id}  /fw/app.bndb",
-        f"  {f.loose.id}  /loader",
-    }
+    assert str(exc.value) == (
+        "No project file matches 'nope'; no project file has a similar name. "
+        "Full listing: `bn project files`."
+    )
 
 
 def test_resolve_file_rejects_non_string(populated):
@@ -826,11 +845,67 @@ def test_save_with_ambiguous_databases_never_creates_a_third(po, populated):
     duplicate = project.add_file("app.bndb", f.fw)
     before = list(project.files)
     bv = SaveBV(f.app)
-    with pytest.raises(RuntimeError, match="Ambiguous") as error:
+    with pytest.raises(RuntimeError) as error:
         po.save_project_database(_bridge(manager), bv, None)
-    assert duplicate.id in str(error.value) and f.app_db.id in str(error.value)
+    text = str(error.value)
+    # #1073 item 2: the user passed no selector, so the refusal names the
+    # OPERATION and keeps the id listing.
+    assert text.startswith("save refused: 2 database files are named '/fw/app.bndb' in this "
+                           "project; load one of them explicitly or delete the duplicate:")
+    assert "selector" not in text
+    assert f"  {duplicate.id}  /fw/app.bndb" in text and f"  {f.app_db.id}  /fw/app.bndb" in text
     assert project.files == before
     assert bv.created_with is None
+
+
+def test_rolled_back_first_save_removes_only_the_directory_it_created_1073(po, populated):
+    """#1073 item 1: `create_database` needs the blob's parent, so the save made
+    it; a failed save discarded the row and blob but left an empty `data/<xx>/`
+    behind on every attempt."""
+    manager, project, f = populated
+    fresh = project.root / "data" / "zz" / ("0" * 34)
+    project._blob_path = lambda: fresh
+    bv = SaveBV(f.loose, create_result=False)
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), bv, None)
+    assert bv.created_with == str(fresh) and bv.parent_existed is True
+    assert not fresh.parent.exists(), "the directory this save created is gone"
+    assert (project.root / "data").is_dir()
+
+    # A parent that existed before the save is not this save's to remove, even
+    # when it is EMPTY (so `rmdir` itself would not refuse it).
+    empty = project.root / "data" / "zx"
+    empty.mkdir(parents=True)
+    project._blob_path = lambda: empty / ("2" * 34)
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), SaveBV(f.loose, create_result=False), None)
+    assert empty.is_dir(), "a directory the save did not create was removed"
+
+    # A parent that already held another blob is not this save's to remove.
+    shared = Path(f.app.path_on_disk).parent
+    project._blob_path = lambda: shared / ("1" * 34)
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), SaveBV(f.loose, create_result=False), None)
+    assert shared.is_dir() and Path(f.app.path_on_disk).read_bytes() == b"\x7fELF"
+    assert [pf.name for pf in project.files] == ["app", "app.bndb", "loader"]
+
+
+def test_rolled_back_first_save_keeps_a_directory_that_is_not_empty_1073(po, populated):
+    """A directory this save created but something else filled meanwhile is
+    not removed: only an empty one is, and only ever by `rmdir`."""
+    manager, project, f = populated
+    fresh = project.root / "data" / "zy" / ("0" * 34)
+    project._blob_path = lambda: fresh
+    bv = SaveBV(f.loose)
+
+    def filled_save(dest):
+        (Path(dest).parent / "other-blob").write_bytes(b"\x7fELF-other")
+        return False
+
+    bv.create_database = filled_save
+    with pytest.raises(RuntimeError, match="Failed to save project database"):
+        po.save_project_database(_bridge(manager), bv, None)
+    assert (fresh.parent / "other-blob").read_bytes() == b"\x7fELF-other"
 
 
 @pytest.mark.parametrize("cleanup", ["false", "raises", "row_only", "blob_only", "no_op"])
@@ -865,6 +940,9 @@ def test_first_save_reports_verified_cleanup_residue(po, populated, cleanup):
     assert residue["path"] in str(failure)
     assert residue["project_file_id"] in str(failure)
     assert bridge.registry_writes == 0 and bridge.targets.cleared == []
+    # #1073 review: a FAILED rollback leaves the directory alone (the residue
+    # it reports lives there); only a clean rollback removes what it created.
+    assert Path(residue["path"]).parent.is_dir()
 
 
 def test_first_save_verifies_complete_cleanup_after_partial_blob(po, populated):
@@ -918,16 +996,189 @@ def test_project_delete_removes_a_closed_file(po, populated):
     assert f.app not in project.files and bridge.registry_writes == 1
 
 
+def test_project_delete_refuses_a_provider_of_a_saved_database_unless_forced_1078(po, populated):
+    # #1078: the link record names a saved database (not open now) bound to
+    # the file; deleting the provider refuses without --force and names it,
+    # and the forced delete reports the same list.
+    manager, project, f = populated
+    metadata = {}
+    project.store_metadata = lambda key, value: metadata.__setitem__(key, value) or True
+    project.query_metadata = metadata.__getitem__
+    manager.set_links({"version": 1, "targets": {
+        f.app_db.id: {"project_path": "/fw/app.bndb",
+                      "providers": {"libloader.so": f.loose.id, "libother.so": "zzzz"}},
+    }})
+    bridge = _bridge_with_rows(manager, [])
 
-@pytest.mark.parametrize("folder", [".bn-findings", "/.bn-findings/F-example", "//.bn-findings//"])
+    with pytest.raises(RuntimeError) as exc:
+        po.project_delete(bridge, "loader")
+    text = str(exc.value)
+    assert text.startswith(f"project file /loader ({f.loose.id}) is the linked provider of 1 target(s): "
+                           "/fw/app.bndb (saved database; libloader.so)")
+    assert "--force" in text
+    assert f.loose in project.files and bridge.registry_writes == 0
+
+    result = po.project_delete(bridge, "loader", force=True)
+    assert f.loose not in project.files
+    assert result["dependents"] == [{
+        "project_file_id": f.app_db.id, "project_path": "/fw/app.bndb",
+        "libraries": ["libloader.so"], "open": False, "selector": None,
+    }]
+    # A provider nothing references deletes as before, and a deleted target's
+    # own stale record goes with it.
+    manager.set_links({"version": 1, "targets": {f.app.id: {"project_path": "/fw/app", "providers": {}}}})
+    assert po.project_delete(bridge, "fw/app") == {
+        "deleted": True, "project_file_id": f.app.id, "project_path": "/fw/app"}
+    assert manager.get_links()["targets"] == {}
+
+
+
+@pytest.mark.parametrize("folder", [
+    ".bn-findings", "/.bn-findings/F-example", "//.bn-findings//",
+    # #1074 item 2: `.` and empty components carry no meaning in a
+    # path-in-project, so these spell the same reserved first component and
+    # must not create a literal `/./.bn-findings/...` folder instead.
+    "./.bn-findings/lookalike", "././.bn-findings", ".//.bn-findings/",
+])
 def test_project_import_cannot_inject_finding_history(po, populated, tmp_path, folder):
     manager, project, _ = populated
     source = tmp_path / "record.json"
     source.write_bytes(b'{"claim":"forged"}')
     before = list(project.files)
-    with pytest.raises(RuntimeError, match="reserved findings history"):
+    before_folders = list(project.folders)
+    with pytest.raises(RuntimeError, match=r"reserved findings history `/\.bn-findings`"):
         po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder)
     assert project.files == before
+    assert project.folders == before_folders
+
+
+def test_project_import_allows_the_reserved_name_below_the_root(po, populated, tmp_path):
+    """Only the FIRST normalised component is the ledger namespace."""
+    manager, _, _ = populated
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x7fELF")
+    row = po.project_import(_bridge_with_rows(manager, []), str(src), folder="usr/.bn-findings")
+    assert row["folder"] == "/usr/.bn-findings" and row["path"] == "/usr/.bn-findings/blob.bin"
+
+
+def _truncate_at_nul_like_the_native_api(monkeypatch, project):
+    """Binary Ninja's project API takes C strings: a folder or file name is cut
+    at its first NUL. The shared fake keeps the NUL, so no mocked test could
+    see a check that looked at the requested string and a create that landed
+    somewhere else (#1074 review)."""
+    create_folder, create_file = project.create_folder, project.create_file_from_path
+    monkeypatch.setattr(project, "create_folder",
+                        lambda parent, name: create_folder(parent, name.split("\0")[0]))
+    monkeypatch.setattr(
+        project, "create_file_from_path",
+        lambda path, folder, name, description="": create_file(
+            path, folder, name.split("\0")[0], description))
+
+
+@pytest.mark.parametrize("folder,name", [
+    (".bn-findings\0", "note"),                                   # lands in the ledger
+    (".bn-findings\0x/F-abababababababababababababababab", "000001.json"),   # forged record
+    ("usr/\0.bn-findings", "note"),
+    ("fw\0x", None),                                              # second /fw folder
+    ("fw", "app\0x"),                                             # second /fw/app
+    (None, ".bn-findings\0"),
+])
+def test_project_import_refuses_a_nul_in_folder_or_name(
+        po, populated, tmp_path, monkeypatch, folder, name):
+    """#1074 review: the native API cuts a name at the first NUL, so
+    `--folder '.bn-findings\\0'` passed the reserved-namespace check as a
+    different string and was then created AS `.bn-findings`. Only the raw
+    protocol can carry a NUL (argv cannot); it is refused before any path
+    check."""
+    manager, project, _ = populated
+    _truncate_at_nul_like_the_native_api(monkeypatch, project)
+    source = tmp_path / "record.json"
+    source.write_bytes(b'{"claim":"forged"}')
+    files, folders = list(project.files), list(project.folders)
+    label = "name" if name is not None and "\0" in name else "folder"
+    with pytest.raises(RuntimeError, match=f"project_import: {label} must not contain a NUL byte"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder, name=name)
+    assert project.files == files and project.folders == folders
+
+
+@pytest.mark.parametrize("name", [
+    "./.bn-findings/x",                  # the `/./.bn-findings` lookalike through --name
+    "./.bn-findings/F-abababababababababababababababab/000003.json",
+    "sub/tool", "/tool", "tool/",
+])
+def test_project_import_refuses_a_slash_in_the_name(po, populated, tmp_path, name):
+    """#1074 review: a name is ONE path component (`--folder` names folders).
+    A `/` in it produced a path-in-project the folder normalisation never saw,
+    so `--name ./.bn-findings/x` was stored as `/./.bn-findings/x`."""
+    manager, project, _ = populated
+    source = tmp_path / "record.json"
+    source.write_bytes(b"x")
+    files, folders = list(project.files), list(project.folders)
+    with pytest.raises(RuntimeError, match="name must be a single path component.*--folder"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), name=name)
+    assert project.files == files and project.folders == folders
+
+
+
+@pytest.mark.parametrize("folder", ["./usr//bin/", "usr/./bin", "/usr/bin/", "usr/bin"])
+def test_project_import_normalises_the_folder_spelling(po, populated, tmp_path, folder):
+    """#1074 item 2: `./`, `//`, a leading and a trailing `/` are spellings of
+    one path-in-project, not distinct native folders."""
+    manager, project, _ = populated
+    src = tmp_path / "blob.bin"
+    src.write_bytes(b"\x7fELF")
+    row = po.project_import(_bridge_with_rows(manager, []), str(src), folder=folder)
+    assert row["folder"] == "/usr/bin" and row["path"] == "/usr/bin/blob.bin"
+    assert [f.name for f in project.folders if f.name in {".", ""}] == []
+    assert manager.folder_path(manager.ensure_folder("./usr/bin/")) == "/usr/bin"
+    assert len([f for f in project.folders if f.name == "bin"]) == 1
+
+
+def test_project_import_duplicate_check_sees_through_the_folder_spelling(po, populated, tmp_path):
+    """Wave 1 recheck (#1074/#1079/#1080 composition): the duplicate
+    path-in-project refusal must compare the SAME normalised folder
+    `folder_components` builds the destination from, not the raw string, or
+    an existing `/usr/bin/<name>` could be duplicated by importing again
+    under a lookalike spelling (`./usr//bin/`, `usr/./bin`, a leading/trailing
+    `/`) of the identical folder."""
+    manager, project, _ = populated
+    first_src = tmp_path / "blob.bin"
+    first_src.write_bytes(b"\x7fELF")
+    first = po.project_import(_bridge_with_rows(manager, []), str(first_src), folder="usr/bin")
+    assert first["path"] == "/usr/bin/blob.bin"
+    second_src = tmp_path / "other.bin"
+    second_src.write_bytes(b"\x7fELF-2")
+    for folder in ("./usr//bin/", "usr/./bin", "/usr/bin/", "//usr/bin"):
+        with pytest.raises(RuntimeError, match=f"/usr/bin/blob.bin already exists in the "
+                                               f"project \\(file {first['id']}\\)"):
+            po.project_import(_bridge_with_rows(manager, []), str(second_src), folder=folder,
+                              name="blob.bin")
+    assert [f for f in project.files if manager.path_in_project(f) == "/usr/bin/blob.bin"] == \
+        [f for f in project.files if f.id == first["id"]]
+
+
+def test_project_files_normalises_the_folder_filter(po, populated):
+    manager, _, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    plain = po.project_files(bridge, folder="fw")
+    for spelling in ("./fw//", "/fw/", "fw/./"):
+        assert po.project_files(bridge, folder=spelling) == plain, spelling
+    # #1080 landed: the paged listing's file rows are `items`, not `files`.
+    assert [r["path"] for r in plain["items"]]
+
+
+def test_project_files_can_still_list_a_legacy_dot_folder_unfiltered(po, populated):
+    """A literal `.` folder written before #1074 is no longer addressable with
+    `--folder ./…` (that spelling now means the root); the unfiltered listing
+    still shows its files, and delete works on the stored path."""
+    manager, project, _ = populated
+    dot = project.add_folder(".bn-findings", project.add_folder("."))
+    old = project.add_file("old.bin", dot)
+    bridge = _bridge_with_rows(manager, [])
+    listing = po.project_files(bridge)
+    assert "/./.bn-findings/old.bin" in [r["path"] for r in listing["items"]]
+    assert po.project_delete(bridge, "/./.bn-findings/old.bin")["deleted"] is True
+    assert old not in project.files
 
 
 def test_project_delete_cannot_erase_finding_history(po, populated):
@@ -970,6 +1221,104 @@ def test_project_import_creates_the_folder_and_returns_a_row(po, populated, tmp_
     assert row["size"] == len(b"\x7fELF-imported") and row["description"] == "d"
     assert manager.resolve_file("/fw/new/blob.bin").id == row["id"]
     assert bridge.registry_writes == 1
+
+
+def _applet_pair(tmp_path):
+    """A busybox-style applet: `usr/bin/record -> play` beside the real `play`."""
+    usr_bin = tmp_path / "image/usr/bin"
+    usr_bin.mkdir(parents=True)
+    play = usr_bin / "play"
+    play.write_bytes(b"\x7fELF-player")
+    (usr_bin / "record").symlink_to("play")
+    return usr_bin / "record", play
+
+
+def test_project_import_of_a_symlink_keeps_the_requested_name_1079(po, populated, tmp_path):
+    """#1079: the default name was the RESOLVED basename, so importing the
+    applet link `record -> play` stored a second `play`."""
+    manager, project, _ = populated
+    record, play = _applet_pair(tmp_path)
+    bridge = _bridge_with_rows(manager, [])
+
+    row = po.project_import(bridge, str(record), folder="usr/bin")
+
+    assert row["name"] == "record" and row["path"] == "/usr/bin/record"
+    assert row["source_symlink"] == f"{record} -> {play}"
+    assert Path(manager.resolve_file("/usr/bin/record").path_on_disk).read_bytes() == play.read_bytes()
+
+
+def test_project_import_of_a_regular_file_reports_no_symlink_1079(po, populated, tmp_path):
+    manager, _, _ = populated
+    _record, play = _applet_pair(tmp_path)
+    row = po.project_import(_bridge_with_rows(manager, []), str(play), folder="usr/bin")
+    assert row["name"] == "play" and "source_symlink" not in row
+
+
+@pytest.mark.parametrize("explicit_name", [False, True])
+def test_project_import_refuses_an_existing_path_in_project_1079(
+    po, populated, tmp_path, explicit_name,
+):
+    manager, project, _ = populated
+    record, play = _applet_pair(tmp_path)
+    bridge = _bridge_with_rows(manager, [])
+    first = po.project_import(bridge, str(play), folder="usr/bin")
+    before = list(project.files)
+    # The same path-in-project again: through the link with the colliding
+    # explicit `--name`, or the file itself a second time.
+    path, kwargs = (record, {"name": "play"}) if explicit_name else (play, {})
+
+    with pytest.raises(RuntimeError) as raised:
+        po.project_import(bridge, str(path), folder="usr/bin", **kwargs)
+
+    message = str(raised.value)
+    assert message.startswith("project_import: /usr/bin/play already exists in the project "
+                              f"(file {first['id']})")
+    assert "--name <other>" in message and f"bn project delete {first['id']}" in message
+    assert project.files == before
+    # One entry at the path, asked of the project itself (the `project files`
+    # envelope is another PR's subject).
+    assert [pf.id for pf in project.files
+            if manager.path_in_project(pf) == "/usr/bin/play"] == [first["id"]]
+
+
+def test_project_import_duplicate_check_is_scoped_to_the_folder_1079(po, populated, tmp_path):
+    manager, _, f = populated
+    source = tmp_path / "app"
+    source.write_bytes(b"\x7fELF-other-app")
+    # `/fw/app` exists; `/other/app` and the root `/app` do not collide with it.
+    bridge = _bridge_with_rows(manager, [])
+    assert po.project_import(bridge, str(source), folder="other")["path"] == "/other/app"
+    assert po.project_import(bridge, str(source))["path"] == "/app"
+    with pytest.raises(RuntimeError, match="already exists"):
+        po.project_import(bridge, str(source), folder="fw")
+
+
+@pytest.mark.parametrize("field", ["name", "folder"])
+def test_project_import_refuses_a_nul_that_would_hide_a_duplicate_1079(
+    po, populated, tmp_path, field,
+):
+    """#1079 review: Binary Ninja cuts a project name at the first NUL, so the
+    duplicate check compared `tool\0x` (no such path) while the file landed on
+    `/fw/tool` beside the existing one. Raw clients only: argv cannot carry a
+    NUL. The fake truncates like the native API so the harm is observable."""
+    manager, project, _ = populated
+    source = tmp_path / "tool"
+    source.write_bytes(b"\x7fELF-tool")
+    bridge = _bridge_with_rows(manager, [])
+    native_file, native_folder = project.create_file_from_path, project.create_folder
+    project.create_file_from_path = lambda path, folder, name, description="": native_file(
+        path, folder, name.split("\0", 1)[0], description)
+    project.create_folder = lambda parent, name: native_folder(parent, name.split("\0", 1)[0])
+    first = po.project_import(bridge, str(source), folder="fw")
+    assert first["path"] == "/fw/tool"
+    before = list(project.files), list(project.folders)
+    kwargs = {"folder": "fw", "name": "tool\0x"} if field == "name" else {"folder": "fw\0x"}
+
+    with pytest.raises(RuntimeError, match=f"project_import: {field} must not contain a NUL byte"):
+        po.project_import(bridge, str(source), **kwargs)
+
+    assert (list(project.files), list(project.folders)) == before
+    assert [manager.path_in_project(pf) for pf in project.files].count("/fw/tool") == 1
 
 
 def test_project_import_refuses_a_missing_source(po, populated, tmp_path):

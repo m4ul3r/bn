@@ -47,10 +47,15 @@ _FINDING = {"id": "CELL", "type": "CELL", "review_state": "CELL",
         "open_targets": [{"project_path": "CELL", "target_id": "CELL", "view_id": "CELL",
                           "project_file_id": "CELL"}, "CELL"]}),
     (fmt._render_project_file_text, _FILE),
+    (fmt._render_project_file_text, {**_FILE, "source_symlink": "CELL -> CELL"}),
     (fmt._render_project_files_text, {"items": [_FILE, "CELL"], "total": "CELL",
                                     "offset": "CELL", "limit": "CELL", "has_more": "CELL",
                                     "folders": [{"id": "CELL", "path": "CELL", "files": "CELL",
                                                  "files_recursive": "CELL"}, "CELL"]}),
+    # The retained `files` alias (#1080 review: a bridge from before the
+    # items/paging upgrade), exercised on the same escaping contract.
+    (fmt._render_project_files_text, {"files": [_FILE, "CELL"],
+                                    "folders": [{"id": "CELL", "path": "CELL"}, "CELL"]}),
     (fmt._render_project_load_text, {"path": "CELL", "project_path": "CELL",
         "project_file_id": "CELL", "notes": ["CELL"],
         "targets": [{"selector": "CELL"}, "CELL"]}),
@@ -322,7 +327,7 @@ def test_project_load_auto_link_failure_notes_are_terminal_safe():
     assert "\x1b" not in text and "\u202e" not in text
 
 
-def test_project_load_caught_link_exception_keeps_failure_and_unknown_counts_visible():
+def test_project_load_caught_link_exception_keeps_failure_visible():
     payload = {"path": "/sample/app", "loaded": True, "target": "app",
                "targets": [{"selector": "app"}],
                "link": {"success": False, "status": "internal_error",
@@ -330,6 +335,7 @@ def test_project_load_caught_link_exception_keeps_failure_and_unknown_counts_vis
                         "notes": ["provider open failed"]}}
     text = fmt._render_project_load_text(payload)
     assert "loaded: /sample/app" in text and "targets:\n- app" in text
-    assert "linked: ? (? unresolved)" in text
+    # #1073 item 3: a failed link has no counters to be unknown about.
+    assert "linked: n/a (link failed)" in text and "linked: ?" not in text
     assert "auto-link FAILED: internal_error" in text
     assert "auto-link note: provider open failed" in text

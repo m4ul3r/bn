@@ -47,6 +47,63 @@ def test_registry_records_boot_id_and_process_start_time(instance):
     assert payload["boot_id"] == boot_id()
 
 
+def test_registry_publishes_the_bridge_bn_environment_1076(monkeypatch, tmp_path):
+    # #1076: `session restart` replays the BN_* settings the OLD bridge ran
+    # with, so the bridge publishes what it actually sees -- BN_* keys only,
+    # never the rest of its environment -- as recorded at construction. Keys
+    # only the CLI reads (routing, budgets, spill knobs) are not bridge
+    # settings and stay out of the record.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2000000")
+    monkeypatch.setenv("BN_ROOTFS_TIMEOUT", "")
+    monkeypatch.setenv("BN_DISABLE_USER_PLUGINS", "1")   # Binary Ninja's own: kept
+    monkeypatch.setenv("HOME_SECRET", "not-bn")
+    for cli_only in ("BN_INSTANCE", "BN_TARGET", "BN_REQUEST_TIMEOUT", "BN_NO_WAIT",
+                     "BN_SPAWN_TIMEOUT", "BN_SPILL_TOKENS", "BN_SPILL_RETENTION_DAYS",
+                     "BN_BATCH_APPLY_MAX_OPS", "BN_BATCH_APPLY_MAX_BYTES", "BN_PLUGIN_DIR"):
+        monkeypatch.setenv(cli_only, "cli-side")
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="env1")
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "mutated-after-start")
+
+    inst._write_registry()
+
+    env = json.loads(inst.registry_path.read_text(encoding="utf-8"))["env"]
+    assert env["BN_ROOTFS_MAX_WORK"] == "2000000"
+    assert env["BN_ROOTFS_TIMEOUT"] == ""
+    assert env["BN_CACHE_DIR"] == str(tmp_path)
+    assert env["BN_DISABLE_USER_PLUGINS"] == "1"
+    assert "HOME_SECRET" not in env
+    assert all(key.startswith("BN_") for key in env)
+    assert "cli-side" not in env.values()
+    assert {"BN_INSTANCE", "BN_TARGET"}.isdisjoint(env)
+
+
+def test_registry_never_holds_a_credential_value_1076(monkeypatch, tmp_path):
+    # A credential passed through the environment (the usual reason for that
+    # route is to keep it off the filesystem) must not land in the cache
+    # directory. The registry records that the key was SET, never its value.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    canary = "CANARY-do-not-store"
+    for key in ("BN_LICENSE", "BN_UPDATE_TOKEN", "BN_API_SECRET", "BN_PROXY_PASSWORD",
+                "BN_CLOUD_CREDENTIALS", "BN_SPILL_TOKENS"):
+        monkeypatch.setenv(key, canary)
+    monkeypatch.setenv("BN_LICENSE_FILE", "/opt/demo/license.dat")   # a path: recorded
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="env2")
+
+    inst._write_registry()
+
+    raw = inst.registry_path.read_text(encoding="utf-8")
+    assert canary not in raw
+    payload = json.loads(raw)
+    assert payload["env"]["BN_LICENSE_FILE"] == "/opt/demo/license.dat"
+    assert payload["env_withheld"] == [
+        "BN_API_SECRET", "BN_CLOUD_CREDENTIALS", "BN_LICENSE", "BN_PROXY_PASSWORD",
+        "BN_UPDATE_TOKEN",
+    ]                                      # BN_SPILL_TOKENS is CLI-only: not ours at all
+
+
 def test_registry_updates_preserve_bridge_start_time(instance, monkeypatch, tmp_path):
     module = __import__(type(instance).__module__, fromlist=["datetime"])
     instance._write_registry()

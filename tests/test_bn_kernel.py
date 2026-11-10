@@ -4153,6 +4153,29 @@ def test_strings_forwards_with_xrefs_on_both_backends(monkeypatch, tmp_path):
     assert "--with-xrefs" in json.loads(marker.read_text())
 
 
+@pytest.mark.parametrize("method,param,flag,row", [
+    ("strings", "include_noise", "--include-noise", {"value": "usage"}),
+    ("imports", "with_callers", "--with-callers", {"name": "read", "callers": []}),
+])
+def test_noise_and_caller_filters_reach_both_backends_1058(monkeypatch, tmp_path, method, param, flag, row):
+    """#1058 item 15: `strings(include_noise=True)` and `imports(with_callers=True)`
+    forward the #1044 CLI flags -- as wire params natively, as the flag on the CLI."""
+    native, client = _native_session()
+    _run(getattr(native, method)(limit=5, **{param: True}))
+    assert client.calls[-1] == ("collect", method, {param: True}, {"limit": 5})
+
+    marker = tmp_path / "argv.json"
+    script = _page_script(
+        f'json.dump(argv, open({str(marker)!r}, "w"))\n'
+        f'page = {{"items": [{row!r}], "offset": offset, '
+        '"returned": 1, "has_more": False, "total": 1}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    cli = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+    assert _run(getattr(cli, method)(limit=5, **{param: True})) == [row]
+    assert flag in json.loads(marker.read_text())
+
+
 def test_all_unlimited_is_one_uncapped_cli_request(monkeypatch, tmp_path):
     """`limit=None` sends no `--limit`, which the CLI's `--out` export answers
     uncapped: one subprocess instead of one per 500 rows (#1039 item 4)."""

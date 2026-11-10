@@ -31,12 +31,35 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 # enough that 8 characters are unique in any realistic project, and a shorter
 # prefix invites `-t 7` style accidents).
 MIN_ID_PREFIX = 8
-# Cap on the "did you mean" listing appended to selector errors.
+# Cap on the listing appended to an AMBIGUOUS selector error (the matches
+# themselves) ...
 _LISTING_CAP = 50
+# ... and on the "nearest by file name" suggestions a MISS gets (#1077): a
+# miss used to dump up to _LISTING_CAP rows in storage order, findings ledger
+# records included, which told the reader nothing about what they mistyped.
+_SUGGESTION_CAP = 5
 # Project metadata key holding the firmware rootfs inventory (root, platform,
 # lookup paths, imported libraries) that `project_sync_libs` writes and
 # `project_link` reads.
 ROOTFS_METADATA_KEY = "bn.rootfs"
+# The format of that blob. It is project-level data any tool or any other bn
+# version can write, so it is untrusted input: `validate_rootfs_metadata` is
+# the one gate every reader goes through (#1071).
+ROOTFS_METADATA_VERSION = 1
+# A document this bn cannot read cannot be rebuilt in place either: the `libs`
+# map is what says which project files are the inventory, so a sync over a
+# fresh document would import every library again beside the old copies.
+_ROOTFS_REINIT = ("this bn cannot rebuild an inventory it cannot read: upgrade bn, or move "
+                  "the project aside and re-run `bn project init <root>`")
+# What `_rootfs_raw` returns for an ABSENT key, so no stored value -- not even
+# a stored null -- can be mistaken for "this project records no rootfs".
+_NO_METADATA: Any = object()
+# Project metadata key recording, per linked target, which project file each
+# of its NEEDED libraries is bound to (#1078). Written by `project_link` and
+# the load-time auto-link; read by `project delete` to name the targets a
+# provider serves, saved databases included.
+LINKS_METADATA_KEY = "bn.links"
+LINKS_METADATA_VERSION = 1
 # Append-only finding revisions are managed by project_findings, never through
 # ordinary file import/delete or BinaryView save operations.
 FINDINGS_FOLDER = ".bn-findings"
@@ -50,6 +73,117 @@ _LEASE_LOCK = threading.RLock()
 _LEASE_OWNERS: dict[int, ProjectManager] = {}
 # Do not invoke native handle destructors from a post-fork child callback.
 _FORKED_OWNERS: list[ProjectManager] = []
+
+
+def _shape_name(value: Any) -> str:
+    return type(value).__name__
+
+
+def _clip(text: str, limit: int = 80) -> str:
+    """*text* for a refusal message: what was refused, not a megabyte of it."""
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _refuse_shape(path: str, expected: str, value: Any) -> None:
+    raise RuntimeError(
+        f"rootfs metadata key '{path}' must be {expected}, got {_shape_name(value)}; "
+        f"{_ROOTFS_REINIT}"
+    )
+
+
+def _require_str(document: dict[str, Any], key: str, path: str, *, nullable: bool = False,
+                 required: bool = True) -> None:
+    if key not in document:
+        if required:
+            raise RuntimeError(f"rootfs metadata key '{path}' is missing; {_ROOTFS_REINIT}")
+        return
+    value = document[key]
+    if isinstance(value, str) or (nullable and value is None):
+        return
+    _refuse_shape(path, "a string or null" if nullable else "a string", value)
+
+
+def _require_str_list(document: dict[str, Any], key: str, path: str) -> None:
+    if key not in document:
+        return
+    value = document[key]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        _refuse_shape(path, "an array of strings", value)
+
+
+def _require_int_or_null(document: dict[str, Any], key: str, path: str) -> None:
+    if key not in document:
+        return
+    value = document[key]
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return
+    _refuse_shape(path, "an integer or null", value)
+
+
+def validate_rootfs_metadata(raw: Any) -> dict[str, Any]:
+    """*raw* (the decoded `bn.rootfs` blob) as the version-1 document the
+    consumers in `project_rootfs` index into, or a user-facing refusal naming
+    the offending key path and the way back.
+
+    Every shape checked here is one a consumer relies on: `libs` is iterated
+    with `.items()` and each entry read for `rel_realpath`/`names`/`paths`/
+    `soname`/`sha256`/`e_machine`/`elf_class`; `lookup_paths` rows are read
+    for `path`/`source`; `root`/`platform`/`synced_at` are reported. Before
+    this gate `{"libs": ["bad"]}` reached `.items()` as an `internal error:
+    AttributeError`, and `version: 999` was read as version 1 (#1071).
+    Unknown extra keys are accepted and ignored (a later bn may add some),
+    but a sync rewrites the document from what this bn understands and does
+    not carry them over. Only `libs` must be present; the rest are checked
+    when they are."""
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"rootfs metadata must be a JSON object, got {_shape_name(raw)}; {_ROOTFS_REINIT}")
+    version = raw.get("version")
+    if type(version) is not int or version != ROOTFS_METADATA_VERSION:
+        # The integer current version only: `"1"`, `1.0` and `true` are not it.
+        if version is None:
+            stated = "has no version"
+        elif type(version) is int:
+            stated = f"is version {version}"
+        else:
+            stated = (f"is version {_clip(repr(version))} "
+                      f"(a {_shape_name(version)}, not an integer)")
+        raise RuntimeError(
+            f"this project's rootfs metadata {stated}; this bn understands version "
+            f"{ROOTFS_METADATA_VERSION}; {_ROOTFS_REINIT}")
+    # Only `libs` is required: every other key is read with a tolerant
+    # `.get(...)` by its consumers, and the issue's own repro document carries
+    # just `version`/`platform`/`libs` (#1071). Present keys must have the shape
+    # the consumer indexes.
+    _require_str(raw, "root", "root", nullable=True, required=False)
+    _require_str(raw, "platform", "platform", nullable=True, required=False)
+    _require_str(raw, "synced_at", "synced_at", nullable=True, required=False)
+    lookup_paths = raw.get("lookup_paths", [])
+    if not isinstance(lookup_paths, list):
+        _refuse_shape("lookup_paths", "an array", lookup_paths)
+    for index, row in enumerate(lookup_paths):
+        path = f"lookup_paths[{index}]"
+        if not isinstance(row, dict):
+            _refuse_shape(path, "an object", row)
+        _require_str({"path": row.get("path")}, "path", f"{path}.path")
+        _require_str({"source": row.get("source")}, "source", f"{path}.source")
+    if "libs" not in raw:
+        raise RuntimeError(f"rootfs metadata key 'libs' is missing; {_ROOTFS_REINIT}")
+    libs = raw["libs"]
+    if not isinstance(libs, dict):
+        _refuse_shape("libs", "an object", libs)
+    for file_id, entry in libs.items():
+        path = f"libs[{_clip(repr(file_id))}]"
+        if not isinstance(entry, dict):
+            _refuse_shape(path, "an object", entry)
+        _require_str(entry, "rel_realpath", f"{path}.rel_realpath")
+        _require_str(entry, "soname", f"{path}.soname", nullable=True, required=False)
+        _require_str(entry, "sha256", f"{path}.sha256", required=False)
+        _require_str_list(entry, "names", f"{path}.names")
+        _require_str_list(entry, "paths", f"{path}.paths")
+        _require_int_or_null(entry, "e_machine", f"{path}.e_machine")
+        _require_int_or_null(entry, "elf_class", f"{path}.elf_class")
+    return raw
 
 
 def _after_fork_child() -> None:
@@ -72,16 +206,106 @@ os.register_at_fork(
 )
 
 
-def refuse_raw_project_path(path: str | os.PathLike[str]) -> None:
-    """Reject standalone access to project storage, including symlink aliases."""
+def project_storage_hit(path: str | os.PathLike[str]) -> tuple[Path, Path] | None:
+    """``(spelling, project)`` when *path* lies inside a `.bnpr` -- any
+    ancestor holding `project.bnpm` -- judged on the spelling as given AND on
+    its resolved form, so a file symlink into project storage, a directory
+    symlink onto it, and a link inside the project all count. None otherwise."""
     requested = Path(path).expanduser().absolute()
     for candidate in (requested, requested.resolve()):
         for ancestor in candidate.parents:
             if (ancestor / "project.bnpm").is_file():
-                raise RuntimeError(
-                    f"Cannot load project storage as a standalone binary: {candidate}. "
-                    f"Use `bn project open {ancestor}` and `bn project load <selector>`."
-                )
+                return candidate, ancestor
+    return None
+
+
+# How each operation is refused when its path lands in project storage. Same
+# family of wording, each naming the project command that does what the
+# standalone one was asked to (#1072).
+_STORAGE_REFUSALS = {
+    "load": (
+        "Cannot load project storage as a standalone binary: {path}. "
+        "Use `bn project open {project}` and `bn project load <selector>`."
+    ),
+    "save": (
+        "Cannot save into project storage: {path} is inside {project}; use "
+        "`bn project import` to add a file or `bn project load` + `bn save` to "
+        "save a project target."
+    ),
+    "export": (
+        "Cannot export into project storage: {path} is inside {project}; use "
+        "`bn project import` to add a file to a project."
+    ),
+    "import": (
+        "Cannot import project storage: {path} is inside {project}; use "
+        "`bn project export <selector> <dest>` to copy a file out of a project first."
+    ),
+}
+
+
+def refuse_raw_project_path(
+    path: str | os.PathLike[str], operation: str = "load"
+) -> None:
+    """Reject standalone access to project storage, including symlink aliases.
+
+    *operation* picks the wording: ``load`` (a standalone open of a blob),
+    ``save`` / ``export`` (a destination inside a project), ``import`` (a
+    source inside one). Raises RuntimeError; callers that owe a structured
+    refusal wrap it (`_save_database`).
+    """
+    hit = project_storage_hit(path)
+    if hit is not None:
+        spelling, project = hit
+        raise RuntimeError(
+            _STORAGE_REFUSALS[operation].format(path=spelling, project=project)
+        )
+
+
+class LinkRecordUnreadable(RuntimeError):
+    """The project's `bn.links` metadata is not a record this bn can read."""
+
+    def __init__(self, detail: str):
+        super().__init__(
+            f"the project's link record (`{LINKS_METADATA_KEY}` metadata) cannot be read: "
+            f"{detail}; it is left untouched")
+
+
+def validate_link_record(raw: Any) -> dict[str, Any]:
+    """*raw* (the decoded `bn.links` blob) as the version-1 record its readers
+    index into -- `{"version": 1, "targets": {<file id>: {"project_path": str,
+    "providers": {<NEEDED name>: <file id>}}}}` -- or `LinkRecordUnreadable`
+    naming the offending key.
+
+    It is project-level data any tool or any other bn version can write, so
+    it is untrusted input, like `bn.rootfs`. Before this gate a `providers`
+    list reached `.items()` as an `internal error:`, the delete guard read a
+    record it could not parse as "no dependents", and a `version: 999` record
+    was rewritten as version 1 on the next link (#1078 review)."""
+    if not isinstance(raw, dict):
+        raise LinkRecordUnreadable(f"it must be a JSON object, got {type(raw).__name__}")
+    version = raw.get("version")
+    if isinstance(version, bool) or version != LINKS_METADATA_VERSION:
+        raise LinkRecordUnreadable(
+            f"it is version {version!r}; this bn understands version {LINKS_METADATA_VERSION}")
+    targets = raw.get("targets")
+    if not isinstance(targets, dict):
+        raise LinkRecordUnreadable(
+            f"key 'targets' must be an object, got {type(targets).__name__}")
+    for target_id, entry in targets.items():
+        where = f"targets[{target_id!r}]"
+        if not isinstance(entry, dict):
+            raise LinkRecordUnreadable(
+                f"key '{where}' must be an object, got {type(entry).__name__}")
+        if not isinstance(entry.get("project_path"), str):
+            raise LinkRecordUnreadable(f"key '{where}.project_path' must be a string")
+        providers = entry.get("providers")
+        if not isinstance(providers, dict) or not all(
+            isinstance(name, str) and isinstance(provider, str)
+            for name, provider in providers.items()
+        ):
+            raise LinkRecordUnreadable(
+                f"key '{where}.providers' must map library names to file ids")
+    return raw
 
 
 def canonical_project_path(path: str | os.PathLike[str]) -> Path:
@@ -342,12 +566,79 @@ class ProjectManager:
 
     # -- rootfs metadata ----------------------------------------------------
 
-    def get_rootfs(self) -> dict[str, Any] | None:
-        """The `bn.rootfs` project metadata (a JSON object), or None when the
-        project records no rootfs or the stored value is unreadable."""
+    def _rootfs_raw(self) -> Any:
+        """The decoded `bn.rootfs` blob as stored, or `_NO_METADATA` when the
+        key is absent. ONLY an absent key is "none" (#1071 review): a stored
+        `null` or empty string is metadata somebody wrote, and reading it as
+        "none" let the next sync start from an empty inventory and import
+        every library a second time. Text that is not JSON -- or nests too
+        deeply to decode -- is a refusal too."""
         project = self.require().project
         try:
             raw = project.query_metadata(ROOTFS_METADATA_KEY)
+        except KeyError:  # Binary Ninja raises KeyError for a missing key
+            return _NO_METADATA
+        except Exception as exc:  # noqa: BLE001 - unreadable is not "absent"
+            raise RuntimeError(
+                f"rootfs metadata could not be read ({type(exc).__name__}: {_clip(str(exc))}); "
+                f"{_ROOTFS_REINIT}") from exc
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, RecursionError) as exc:
+                raise RuntimeError(
+                    f"rootfs metadata is not valid JSON ({type(exc).__name__}: "
+                    f"{_clip(str(exc))}); {_ROOTFS_REINIT}") from exc
+        return raw
+
+    def get_rootfs(self) -> dict[str, Any] | None:
+        """The `bn.rootfs` project metadata, validated (`validate_rootfs_metadata`),
+        or None when the project records no rootfs. The ONE gate: every reader
+        -- `project_libs`, `project_sync_libs`, `link_view`, the load-time
+        auto-link -- reads through here, so a future version or a malformed
+        shape is a user-facing refusal everywhere and an `internal error:`
+        nowhere (#1071)."""
+        raw = self._rootfs_raw()
+        return None if raw is _NO_METADATA else validate_rootfs_metadata(raw)
+
+    def set_rootfs(self, value: dict[str, Any]) -> None:
+        """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
+        self._set_json_metadata(ROOTFS_METADATA_KEY, value, "rootfs")
+
+    def get_links(self) -> dict[str, Any]:
+        """The `bn.links` record, validated (`validate_link_record`): which
+        project file each linked target's NEEDED libraries are bound to
+        (#1078). A fresh empty record when the project stores none. The ONE
+        gate: a record this bn cannot read raises `LinkRecordUnreadable`, so
+        no reader indexes into a shape it did not check and no writer replaces
+        a record it could not read."""
+        project = self.require().project
+        try:
+            raw = project.query_metadata(LINKS_METADATA_KEY)
+        except Exception:  # noqa: BLE001 - BN raises for a missing key
+            return {"version": LINKS_METADATA_VERSION, "targets": {}}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError as exc:
+                raise LinkRecordUnreadable(f"it is not valid JSON ({exc})") from exc
+        return validate_link_record(raw)
+
+    def set_links(self, value: dict[str, Any]) -> None:
+        self._set_json_metadata(LINKS_METADATA_KEY, value, "link")
+
+    def _get_json_metadata(self, key: str) -> dict[str, Any] | None:
+        """Raw decoded value of *key*, unvalidated: None for a missing key, bad
+        JSON, or any read failure. Used only as the post-write readback in
+        `_set_json_metadata` (for both `bn.rootfs` and `bn.links`) -- never as
+        a reader's own gate, which `_rootfs_raw`/`get_links` are instead."""
+        project = self.require().project
+        try:
+            raw = project.query_metadata(key)
         except Exception:  # noqa: BLE001 - BN raises for a missing key
             return None
         if isinstance(raw, (bytes, bytearray)):
@@ -357,19 +648,34 @@ class ProjectManager:
                 raw = json.loads(raw)
             except ValueError:
                 return None
-        return raw if isinstance(raw, dict) else None
+        return raw
 
-    def set_rootfs(self, value: dict[str, Any]) -> None:
-        """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
+    def _set_json_metadata(self, key: str, value: dict[str, Any], what: str) -> None:
         project = self.require().project
         try:
-            if project.store_metadata(ROOTFS_METADATA_KEY, json.dumps(value, sort_keys=True)) is False:
+            if project.store_metadata(key, json.dumps(value, sort_keys=True)) is False:
                 raise RuntimeError("Binary Ninja returned False")
-            if self.get_rootfs() != value:
+            if self._get_json_metadata(key) != value:
                 raise RuntimeError("stored metadata did not match the requested value")
         except Exception as exc:  # noqa: BLE001 - ProjectException
             raise RuntimeError(
-                f"Binary Ninja could not store the rootfs metadata in the project: {exc}"
+                f"Binary Ninja could not store the {what} metadata in the project: {exc}"
+            ) from exc
+
+    def clear_rootfs(self) -> None:
+        """Remove the `bn.rootfs` metadata: the rollback for a sync that found
+        none to restore (storing `{}` instead would leave a blob the gate above
+        refuses as versionless). Checked like `set_rootfs`: the native result,
+        then a readback."""
+        project = self.require().project
+        try:
+            if project.remove_metadata(ROOTFS_METADATA_KEY) is False:
+                raise RuntimeError("Binary Ninja returned False")
+            if self._rootfs_raw() is not _NO_METADATA:
+                raise RuntimeError("the metadata is still present after the removal")
+        except Exception as exc:  # noqa: BLE001 - ProjectException
+            raise RuntimeError(
+                f"Binary Ninja could not remove the rootfs metadata from the project: {exc}"
             ) from exc
 
     # -- file lookups ------------------------------------------------------
@@ -433,14 +739,56 @@ class ProjectManager:
                 return by_prefix[0]
             if len(by_prefix) > 1:
                 raise RuntimeError(self._ambiguous(wanted, by_prefix))
-        raise RuntimeError(
-            "\n".join(
-                [
-                    f"No project file matches {wanted!r}. Project files:",
-                    *self._listing(files),
-                ]
+        raise RuntimeError(self._miss(wanted, files))
+
+    def _miss(self, wanted: str, files: list[Any]) -> str:
+        """The error for a selector naming no file: the files whose NAMES are
+        nearest the selector's last component, at most `_SUGGESTION_CAP`, in a
+        fixed order, and never a findings-ledger record (#1077)."""
+        suggestions = self._nearest_by_name(wanted, files)
+        if not suggestions:
+            return (
+                f"No project file matches {wanted!r}; no project file has a similar "
+                "name. Full listing: `bn project files`."
             )
-        )
+        return "\n".join([
+            f"No project file matches {wanted!r}. Nearest by file name:",
+            *self._listing(suggestions),
+            "Full listing: `bn project files`.",
+        ])
+
+    def _nearest_by_name(self, wanted: str, files: list[Any]) -> list[Any]:
+        """*files* ranked by how closely their name matches the last component
+        of *wanted*, ties by path: the same name (or its `.bndb`-stripped
+        stem), then one a prefix of the other, then a substring, then a
+        `difflib` ratio of 0.6 or better. Ledger records are never offered."""
+        import difflib
+
+        base = wanted.strip().rstrip("/").rsplit("/", 1)[-1].lower()
+        if base.endswith(".bndb"):
+            base = base[: -len(".bndb")]
+        if not base:
+            return []
+        ranked: list[tuple[int, str, Any]] = []
+        for pf in files:
+            path = self.path_in_project(pf)
+            if is_finding_path(path):
+                continue
+            name = str(pf.name).lower()
+            stem = name[: -len(".bndb")] if name.endswith(".bndb") else name
+            if base in (name, stem):
+                rank = 0
+            elif stem.startswith(base) or base.startswith(stem):
+                rank = 1
+            elif base in stem or stem in base:
+                rank = 2
+            elif difflib.SequenceMatcher(None, base, stem).ratio() >= 0.6:
+                rank = 3
+            else:
+                continue
+            ranked.append((rank, path, pf))
+        ranked.sort(key=lambda item: (item[0], item[1], str(item[2].id)))
+        return [pf for _, _, pf in ranked[:_SUGGESTION_CAP]]
 
     def _ambiguous(self, selector: str, matches: list[Any]) -> str:
         return "\n".join(
@@ -467,12 +815,15 @@ class ProjectManager:
 
     def sibling_database(
         self, pf: Any, index: dict[str, list[Any]] | None = None, *,
-        allow_ambiguous: bool = False,
+        allow_ambiguous: bool = False, operation: str | None = None,
     ) -> Any | None:
         """The unique `<name>.bndb` beside *pf*, or None when absent.
 
         Loads and saves refuse ambiguous siblings instead of treating them as
         absent. Listings may opt out so the conflicting files remain visible.
+        *operation* names the caller in that refusal for a command that took no
+        selector (`bn save`), whose user cannot be told their selector was
+        ambiguous (#1073 item 2); without it the selector wording stands.
         """
         name = str(pf.name)
         if name.endswith(".bndb"):
@@ -488,17 +839,24 @@ class ProjectManager:
                 siblings = list(project.files)
             matches = [f for f in siblings if self.path_in_project(f) == wanted_path]
         if len(matches) > 1 and not allow_ambiguous:
-            raise RuntimeError(self._ambiguous(wanted_path, matches))
+            if operation is None:
+                raise RuntimeError(self._ambiguous(wanted_path, matches))
+            raise RuntimeError("\n".join([
+                f"{operation} refused: {len(matches)} database files are named {wanted_path!r} "
+                "in this project; load one of them explicitly or delete the duplicate:",
+                *self._listing(matches),
+            ]))
         return matches[0] if len(matches) == 1 else None
 
     def ensure_folder(self, path: str | None) -> Any | None:
         """The folder at path-in-project *path*, created level by level when
-        missing. None (the root) for empty/`/`."""
-        if not path or path.strip("/") == "":
+        missing. None (the root) for empty/`/`/`./`."""
+        components = folder_components(path)
+        if not components:
             return None
         project = self.require().project
         parent = None
-        for component in [c for c in path.split("/") if c]:
+        for component in components:
             existing = [
                 f
                 for f in project.folders
@@ -570,14 +928,23 @@ class ProjectManager:
                 f"Binary Ninja could not add {name} to the project: {exc}"
             ) from exc
         dest = str(new.path_on_disk)
+        parent = Path(dest).parent
+        # Remember whether THIS save made the blob's directory: a rollback may
+        # remove only that, and only while it is still empty (#1073 item 1).
+        parent_created = not parent.exists()
         try:
-            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            parent.mkdir(parents=True, exist_ok=True)
             created = bv.create_database(dest)
             if created is False or not Path(dest).is_file():
                 raise RuntimeError("Binary Ninja reported no file was written")
         except BaseException as exc:
             primary_error = f"Failed to save project database to {dest}: {exc}"
             self._discard_file(project, new, dest, primary_error)
+            if parent_created:
+                try:
+                    os.rmdir(parent)  # refuses a non-empty directory by itself
+                except OSError:
+                    pass
             if not isinstance(exc, Exception):
                 raise
             raise RuntimeError(primary_error) from exc
@@ -754,7 +1121,10 @@ def project_files(
         raise RuntimeError("project_files: offset must be a non-negative integer")
     if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
         raise RuntimeError("project_files: limit must be a positive integer or null")
-    wanted = ("/" + folder.strip("/")) if folder and folder.strip("/") else ""
+    # Normalised the same way `project_import`'s duplicate check is (#1074):
+    # `./usr//bin/` and `usr/bin` name the same scope.
+    components = folder_components(folder)
+    wanted = "/" + "/".join(components) if components else ""
 
     def in_scope(path: str) -> bool:
         if wanted:
@@ -830,13 +1200,44 @@ def project_files(
     return result
 
 
-def _refuse_finding_path(path: str) -> None:
+def folder_components(path: Any) -> list[str]:
+    """`./usr//bin/` -> `["usr", "bin"]`: the components of a path-in-project
+    that NAME a folder. Empty and `.` components are spellings of "here", not
+    folders, so `./.bn-findings/x` is the reserved namespace rather than a
+    literal `.` folder beside it (#1074 item 2). Nothing else is rewritten:
+    `..` is a legal native folder name and is kept as one."""
+    if not isinstance(path, str):
+        return []
+    return [part for part in path.split("/") if part and part != "."]
+
+
+def is_finding_path(path: str) -> bool:
+    """Whether *path* (a path in the project) lies in the findings ledger.
+
+    Literal on purpose, NOT `folder_components`: an existing file's stored
+    `path_in_project` has no `.`/empty components to strip, and a file in a
+    literal `/./.bn-findings/...` folder (which `--folder ./.bn-findings/...`
+    or a `/` in `--name` could create before #1074) is NOT ledger history, so
+    it must stay deletable. Caller-supplied folder/name input is normalised by
+    `folder_components` BEFORE it reaches this check, not inside it."""
     components = [part for part in path.split("/") if part]
-    if components and components[0] == FINDINGS_FOLDER:
+    return bool(components) and components[0] == FINDINGS_FOLDER
+
+
+def _refuse_finding_path(path: str) -> None:
+    if is_finding_path(path):
         raise RuntimeError(
-            "reserved findings history: use `bn project finding` to append a "
-            "revision or review; existing finding records cannot be overwritten or deleted"
+            f"reserved findings history `/{FINDINGS_FOLDER}`: use `bn project finding` "
+            "to append a revision or review; existing finding records cannot be "
+            "overwritten or deleted"
         )
+
+
+def _refuse_nul(label: str, value: str) -> None:
+    """Binary Ninja cuts a project name at the first NUL, so a check on the
+    requested string would look past the path that is actually created."""
+    if "\0" in value:
+        raise RuntimeError(f"project_import: {label} must not contain a NUL byte")
 
 
 def project_import(
@@ -850,26 +1251,67 @@ def project_import(
     state = manager.require()
     if not isinstance(path, str) or not path.strip():
         raise RuntimeError("project_import: path must be the file to import")
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise RuntimeError(f"project_import: not a file: {source}")
+    # #1072: a source inside a `.bnpr` -- this project's or another's -- is a
+    # blob, reached by the project API, never copied in by path. Checked on
+    # the requested spelling (symlink aliases) AND the resolved path, before
+    # anything else -- #1079's requested-basename naming included -- runs,
+    # exactly like the duplicate-path refusal below.
+    refuse_raw_project_path(path, "import")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise RuntimeError("project_import: name must be a non-empty string when given")
-    _refuse_finding_path(
-        (folder if isinstance(folder, str) else "") + "/" + (name or source.name).strip()
-    )
-    target_folder = manager.ensure_folder(folder if isinstance(folder, str) else None)
+    if isinstance(name, str):
+        _refuse_nul("name", name)
+    if isinstance(folder, str):
+        _refuse_nul("folder", folder)
+    if isinstance(name, str) and "/" in name:
+        # A name is one path component. With a `/` it spelled a path the folder
+        # normalisation never saw: `--name ./.bn-findings/x` was stored as
+        # `/./.bn-findings/x`, the lookalike `--folder` already refuses (#1074).
+        raise RuntimeError(
+            "project_import: name must be a single path component (no `/`); "
+            "name the folder with --folder")
+    # The name defaults to the REQUESTED basename: importing the applet link
+    # `usr/bin/record -> play` stored a second `play` at `/usr/bin/play` when
+    # it came from the resolved path (#1079). The bytes still come through
+    # the resolved path.
+    requested = Path(path).expanduser()
+    source = requested.resolve()
+    if not source.is_file():
+        raise RuntimeError(f"project_import: not a file: {source}")
+    final_name = (name or requested.name or source.name).strip()
+    # Duplicate detection runs over the NORMALISED folder (#1074 item 2:
+    # `./usr//bin/` and `usr/bin` name the same folder), composed with the
+    # final name, so a lookalike spelling of an existing folder cannot create
+    # a second file at the path-in-project an existing one already occupies.
+    components = folder_components(folder)
+    path_in_project = "/" + "/".join([*components, final_name])
+    _refuse_finding_path(path_in_project)
+    existing = [
+        pf for pf in state.project.files if manager.path_in_project(pf) == path_in_project
+    ]
+    if existing:
+        # Two files at one path-in-project make every later selector for it
+        # ambiguous; the duplicate is refused rather than created.
+        raise RuntimeError(
+            f"project_import: {path_in_project} already exists in the project "
+            f"(file {existing[0].id}); import it under another name with --name <other>, "
+            f"or remove the existing file first with `bn project delete {existing[0].id}`"
+        )
+    target_folder = manager.ensure_folder("/".join(components) or None)
     try:
         pf = state.project.create_file_from_path(
             str(source),
             target_folder,
-            (name or source.name).strip(),
+            final_name,
             str(description or ""),
         )
     except Exception as exc:  # noqa: BLE001 - ProjectException
         raise RuntimeError(f"Binary Ninja could not import {source}: {exc}") from exc
     bridge._write_registry()
-    return manager.file_row(pf)
+    row = manager.file_row(pf)
+    if requested.is_symlink():
+        row["source_symlink"] = f"{requested} -> {source}"
+    return row
 
 
 def project_export(bridge: Any, selector: Any, dest: Any) -> dict[str, Any]:
@@ -878,6 +1320,9 @@ def project_export(bridge: Any, selector: Any, dest: Any) -> dict[str, Any]:
     if not isinstance(dest, str) or not dest.strip():
         raise RuntimeError("project_export: dest must be the output path")
     out = Path(dest).expanduser().resolve()
+    # #1072: an export is a copy OUT of project storage; a destination inside
+    # a `.bnpr` would plant an unregistered file in one.
+    refuse_raw_project_path(dest, "export")
     if out.exists():
         raise RuntimeError(
             f"project_export: {out} already exists; remove it or choose another path"
@@ -902,15 +1347,14 @@ def project_export(bridge: Any, selector: Any, dest: Any) -> dict[str, Any]:
     }
 
 
-def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
+def project_delete(bridge: Any, selector: Any, force: Any = False) -> dict[str, Any]:
     manager = bridge.projects
     state = manager.require()
     pf = manager.resolve_file(selector)
     _refuse_finding_path(manager.path_in_project(pf))
+    open_targets = _open_project_targets(bridge)
     open_rows = [
-        row
-        for row in _open_project_targets(bridge)
-        if row.get("project_file_id") == str(pf.id)
+        row for row in open_targets if row.get("project_file_id") == str(pf.id)
     ]
     if open_rows:
         sel = open_rows[0].get("selector") or open_rows[0].get("target_id")
@@ -920,14 +1364,125 @@ def project_delete(bridge: Any, selector: Any) -> dict[str, Any]:
         )
     path = manager.path_in_project(pf)
     file_id = str(pf.id)
+    # Only a real `True` forces: `bool("false")` is True, and this flag deletes
+    # a file other targets depend on. The binder refuses a non-boolean on the
+    # wire; a direct caller gets the same strictness.
+    forced = force is True
+    # #1078: a file some target's imports are bound to. Deleting it silently
+    # left those links dangling and the next link (or restart replay) free to
+    # rebind the name onto whatever alias matched. Refuse unless forced; the
+    # targets are named either way. A record that cannot be READ cannot answer
+    # the question, so it refuses too: unknown is not "nothing depends on it".
+    record_error: str | None = None
+    try:
+        dependents = linked_dependents(manager, pf, open_targets)
+    except LinkRecordUnreadable as exc:
+        dependents = []
+        record_error = str(exc)
+    if record_error is not None and not forced:
+        raise RuntimeError(
+            f"cannot tell whether any target is linked to project file {path} ({file_id}): "
+            f"{record_error}. Pass --force to delete anyway."
+        )
+    if dependents and not forced:
+        raise RuntimeError(
+            f"project file {path} ({file_id}) is the linked provider of "
+            f"{len(dependents)} target(s): {_dependents_text(dependents)}. "
+            "Deleting it leaves their imports without a provider; pass --force to "
+            "delete anyway, then import the right file and `bn project link -t <selector>`."
+        )
     try:
         ok = state.project.delete_file(pf)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Binary Ninja could not delete {path}: {exc}") from exc
     if ok is False:
         raise RuntimeError(f"Binary Ninja refused to delete {path}")
+    # The deleted file's own link record (when it was a linked target) is
+    # stale; records that POINT at it stay, since the dangling binding they
+    # describe is still what those databases hold. An unreadable record is
+    # never rewritten.
+    if record_error is None:
+        try:
+            record = manager.get_links()
+            if file_id in record["targets"]:
+                del record["targets"][file_id]
+                manager.set_links(record)
+        except Exception:  # noqa: BLE001 - a stale record never fails a delete
+            pass
     bridge._write_registry()
-    return {"deleted": True, "project_file_id": file_id, "project_path": path}
+    result: dict[str, Any] = {"deleted": True, "project_file_id": file_id, "project_path": path}
+    if dependents:
+        result["dependents"] = dependents
+    if record_error is not None:
+        result["link_record_error"] = record_error
+    return result
+
+
+def linked_dependents(
+    manager: Any, pf: Any, open_targets: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """The targets whose recorded links depend on project file *pf*: one row
+    per target with its project path, the NEEDED names concerned, and whether
+    that target is open now or a saved database (#1078). Ordered by path.
+
+    A library is ONE provider in two files: the raw file the inventory is
+    keyed by, and the `<name>.bndb` a binding is backed by once it exists. A
+    record naming either depends on both -- deleting the raw file behind a
+    database-backed binding orphans it just the same -- so the sibling pair is
+    matched, and such a row carries `provider_path`, the file the record
+    names. A recorded target that is no longer a project file depends on
+    nothing. Raises `LinkRecordUnreadable` for a record that cannot be read.
+    """
+    record = manager.get_links()
+    files = manager.files()
+    live = {str(owned.id) for owned in files}
+    index = manager.sibling_index(files)
+    path = manager.path_in_project(pf)
+    file_id = str(pf.id)
+    related = {file_id: path}
+    for sibling in index.get(path + ".bndb", []):
+        related[str(sibling.id)] = path + ".bndb"
+    if path.endswith(".bndb"):
+        for raw in index.get(path[: -len(".bndb")], []):
+            related[str(raw.id)] = path[: -len(".bndb")]
+    open_ids = {
+        str(row.get("project_file_id")): row for row in (open_targets or [])
+        if row.get("project_file_id")
+    }
+    out: list[dict[str, Any]] = []
+    for target_id, entry in record["targets"].items():
+        if str(target_id) not in live:
+            continue
+        matched = {
+            name: provider for name, provider in entry["providers"].items()
+            if provider in related
+        }
+        if not matched:
+            continue
+        open_row = open_ids.get(str(target_id))
+        row = {
+            "project_file_id": str(target_id),
+            "project_path": entry["project_path"],
+            "libraries": sorted(matched),
+            "open": open_row is not None,
+            "selector": (open_row.get("selector") or open_row.get("target_id")) if open_row else None,
+        }
+        through = sorted({related[provider] for provider in matched.values()} - {path})
+        if through:
+            row["provider_path"] = through[0]
+        out.append(row)
+    out.sort(key=lambda row: (row["project_path"], row["project_file_id"]))
+    return out
+
+
+def _dependents_text(dependents: list[dict[str, Any]]) -> str:
+    parts = []
+    for row in dependents:
+        where = f"open as {row['selector']}" if row["open"] else "saved database"
+        through = f" through {row['provider_path']}" if row.get("provider_path") else ""
+        parts.append(f"{row['project_path'] or row['project_file_id']} ({where}; "
+                     f"{', '.join(row['libraries'])}{through})")
+    return "; ".join(parts)
 
 
 def _other_database_writers(bridge: Any, bv: Any, blob: str) -> list[str]:
@@ -994,7 +1549,7 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     # Raw project file: the F3 recipe. Refuse to create a SECOND database for a
     # binary that already has its `<name>.bndb` sibling (F9: BN would allow the
     # duplicate, and two databases for one binary is never what a save means).
-    sibling = manager.sibling_database(pf)
+    sibling = manager.sibling_database(pf, operation="save")
     if sibling is not None:
         writers = _other_database_writers(bridge, bv, str(sibling.path_on_disk))
         open_note = f" Open targets: {', '.join(writers)}." if writers else ""
@@ -1010,6 +1565,18 @@ def save_project_database(bridge: Any, bv: Any, path: Any) -> dict[str, Any]:
     bridge.targets.clear_dirty(bv)
     bridge.targets.note_database(bv, blob)
     bridge.targets.note_project_database(bv, new_id, new_path)
+    # #1078: the target's link record moves with its identity -- the links
+    # now live in the database file, and `project delete` reports dependents
+    # by that file. Best-effort: a metadata hiccup never fails a save.
+    try:
+        record = bridge.projects.get_links()
+        entry = record.get("targets", {}).pop(str(pf.id), None)
+        if entry is not None:
+            entry["project_path"] = new_path
+            record["targets"][new_id] = entry
+            bridge.projects.set_links(record)
+    except Exception:  # noqa: BLE001
+        pass
     bridge._write_registry()
     return {
         "ok": True,

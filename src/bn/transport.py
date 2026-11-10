@@ -30,6 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from .paths import (
@@ -319,6 +320,14 @@ def bridge_process_alive(instance: BridgeInstance) -> bool:
     A recycled pid is NOT the bridge: the check runs against a pinned process
     where possible, so the answer cannot be about a pid that was reused between
     the liveness probe and the identity read (#694).
+
+    An exited-but-unreaped process is NOT running (#1058 item 7). `session
+    start` is the bridge's parent and never waits on it after hand-back, so
+    when that same CLI shuts the bridge down (a preload that failed) the child
+    becomes a zombie whose pid, pidfd and start ticks all still resolve. Identity
+    alone then reads it as alive and `wait_for_teardown` burns its whole budget
+    reporting a teardown timeout the registry contradicts. Discovery and the
+    exit diagnosis already ask `_process_running`; convergence asks it too.
     """
     try:
         pin = pin_process(instance.pid)
@@ -326,11 +335,12 @@ def bridge_process_alive(instance: BridgeInstance) -> bool:
         # No pin: either the pid is already gone, or this platform has no pidfd.
         # Nothing is signalled from here, so a best-effort probe is acceptable --
         # it only affects how long teardown polls.
-        if not _process_alive(instance.pid):
+        if not _process_running(instance.pid):
             return False
         return identity_verdict(instance.meta, instance.pid) != "mismatch"
     with pin:
-        return pin.verdict(instance.meta) != "mismatch"
+        # The pin holds the pid still, so the state read is about this process.
+        return pin.verdict(instance.meta) != "mismatch" and _process_running(instance.pid)
 
 
 class BridgeProcessSignal:
@@ -1970,8 +1980,13 @@ def spawn_instance(
     *,
     timeout: float | None = None,
     poll_interval: float = 0.2,
+    env: Mapping[str, str] | None = None,
 ) -> BridgeInstance:
-    """Spawn a bridge within one lock-and-registration deadline."""
+    """Spawn a bridge within one lock-and-registration deadline.
+
+    *env* is the child's complete environment; ``None`` means this process's
+    own, which is what every spawn but `session restart` wants (#1076).
+    """
     if timeout is None:
         timeout = _resolve_spawn_timeout()
     if instance_id is not None and instance_id != "default":
@@ -1983,6 +1998,7 @@ def spawn_instance(
             instance_id,
             timeout=remaining if remaining is not None else timeout,
             poll_interval=poll_interval,
+            env=env,
         )
 
 
@@ -2111,6 +2127,7 @@ def _spawn_instance_unlocked(
     *,
     timeout: float = DEFAULT_SPAWN_TIMEOUT,
     poll_interval: float = 0.2,
+    env: Mapping[str, str] | None = None,
 ) -> BridgeInstance:
     """Spawn-and-register core. MUST run under _spawn_lock()."""
     deadline = time.monotonic() + timeout
@@ -2214,7 +2231,7 @@ def _spawn_instance_unlocked(
                 start_new_session=True,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"},
             )
         finally:
             # The child inherits the fd across a successful Popen; close the

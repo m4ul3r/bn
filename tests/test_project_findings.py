@@ -133,6 +133,77 @@ def test_no_self_accept_and_manual_evidence_cannot_establish_acceptance(ledger):
     assert rejected["reviews"][0]["evidence"][0]["text"] == "Unsupported interpretation"
 
 
+def test_relabeled_reviewer_is_refused_the_same_typo_guard_as_self_accept_1074(ledger):
+    """User decision on #1074: a review whose reviewer label folds to an
+    EXISTING reviewer's label on this finding, but is spelled differently, is
+    refused naming the existing spelling -- the self-accept guard's rationale
+    applied to reviewer-vs-reviewer identity, not just reviewer-vs-author. An
+    exact repeat (changing one's own verdict) and a genuinely different label
+    are unaffected."""
+    first = add(ledger)
+    rejected = review(ledger, first, reviewer="peer", verdict="reject",
+                       evidence=[{"check": "note", "text": "Unsupported interpretation"}])
+    assert rejected["review_state"] == "rejected"
+    with pytest.raises(RuntimeError, match=r"Reviewer label 'Peer' matches the existing "
+                                             r"reviewer 'peer'"):
+        review(ledger, rejected, reviewer="Peer", verdict="reject",
+               evidence=[{"check": "note", "text": "Another objection"}])
+    assert len(snapshots(ledger)) == 2
+    # The same spelling may change its own verdict.
+    disputed = review(ledger, rejected, reviewer="peer", verdict="dispute",
+                      evidence=[{"check": "note", "text": "Reconsidering"}])
+    assert disputed["review_state"] == "disputed"
+    assert len(disputed["reviews"]) == 2
+    # A genuinely different label still reviews normally.
+    second = review(ledger, disputed, reviewer="reviewer-2", verdict="reject",
+                     evidence=[{"check": "note", "text": "Different objection"}])
+    assert second["reviews"][-1]["reviewer"] == "reviewer-2"
+
+
+
+@pytest.mark.parametrize("author, reviewer", [
+    ("analyst", "Analyst"),
+    ("analyst", "ANALYST"),
+    ("analyst", "\uff41\uff4e\uff41\uff4c\uff59\uff53\uff54"),   # fullwidth: NFKC-equal
+    ("lead analyst", "lead \t  analyst"),                         # whitespace run
+    ("lead analyst", "lead\u00a0analyst"),                        # no-break space
+])
+def test_self_accept_refusal_is_a_typo_guard_over_the_declared_label(ledger, author, reviewer):
+    """#1074 item 1: the self-accept check compares labels after NFKC, case
+    folding, trimming and whitespace collapse. It is a typo guard, not
+    authentication -- a genuinely different label still accepts. The refusal
+    names both labels and the comparison, since they do differ as typed."""
+    first = ledger.api.project_finding_add(ledger.bridge, claim(ledger), author)
+    assert first["author"] == author
+    with pytest.raises(RuntimeError, match="Self acceptance") as refused:
+        review(ledger, first, reviewer=reviewer)
+    message = str(refused.value)
+    assert repr(reviewer) in message and repr(author) in message
+    assert "ignoring case" in message
+    assert len(snapshots(ledger)) == 1
+    accepted = review(ledger, first, reviewer="analyst-2")
+    assert accepted["review_state"] == "accepted"
+    assert accepted["reviews"][-1]["reviewer"] == "analyst-2"
+    assert accepted["author"] == author
+
+
+def test_a_stored_accept_from_before_the_typo_guard_still_loads(ledger, monkeypatch):
+    """The guard is at the WRITE. A ledger written by an earlier version may
+    hold an accept whose reviewer differs from the author only in case; the
+    stored-record validator compares exactly, so that history still loads
+    instead of becoming an integrity failure (#1074 review)."""
+    first = add(ledger)
+    with monkeypatch.context() as earlier:
+        earlier.setattr(ledger.api, "_same_label", lambda a, b: a == b)
+        accepted = review(ledger, first, reviewer="Analyst")
+    assert accepted["review_state"] == "accepted"
+    shown = ledger.api.project_finding_show(ledger.bridge, first["id"])
+    assert shown["review_state"] == "accepted"
+    assert shown["reviews"][-1]["reviewer"] == "Analyst" and shown["author"] == "analyst"
+    listed = ledger.api.project_finding_list(ledger.bridge)
+    assert [row["id"] for row in listed["items"]] == [first["id"]]
+
+
 def test_acceptance_uses_declared_author_of_current_claim_revision(ledger):
     first = add(ledger)
     changed = ledger.api.project_finding_update(

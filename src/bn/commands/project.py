@@ -153,6 +153,30 @@ def _lookup_rows(lookup: list[Any]) -> list[dict[str, Any]]:
     return [{"path": lp.path_in_root, "source": lp.source} for lp in lookup]
 
 
+def _cache_fallback_problem(directory: str) -> str | None:
+    """Why the cache `projects` directory cannot be created or written, judged
+    without creating anything: the nearest existing ancestor must be a
+    writable directory. None when it can."""
+    probe = directory
+    while not os.path.lexists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if not os.path.isdir(probe):
+        return f"{probe} exists and is not a directory"
+    if not os.access(probe, os.W_OK | os.X_OK):
+        return f"{probe} is not writable"
+    return None
+
+
+def _unusable_cache_fallback(directory: str, problem: str, rootfs_parent: str) -> BridgeError:
+    return BridgeError(
+        f"cannot create the cache projects directory {directory}: {problem}. The rootfs's "
+        f"parent {rootfs_parent} is not writable either, so there is nowhere to create the "
+        "project; set BN_CACHE_DIR to a writable directory.")
+
+
 def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     """Everything `project init` decides without a bridge: the rootfs, the
     project path (existing preferred, existing fallback, else create at the
@@ -168,6 +192,9 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
             f"not inside a firmware root filesystem (looked from {start} up to /); "
             "pass an explicit firmware root: bn project init ROOT")
     preferred, fallback = rootfs_layout.project_location(info.root, str(paths.projects_dir()))
+    # `fallback_from` names the unwritable parent when the cache fallback is
+    # chosen over the preferred location, so the reason is visible (#1075).
+    fallback_from = None
     if os.path.isdir(preferred):
         project_path, exists = preferred, True
     elif os.path.isdir(fallback):
@@ -176,16 +203,29 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
         project_path, exists = preferred, False
     else:
         project_path, exists = fallback, False
+        fallback_from = os.path.dirname(preferred) or os.sep
+        # Planned here, so `--dry-run` cannot promise `[new]` for a location
+        # the real run would fail to create (#1075 review).
+        problem = _cache_fallback_problem(os.path.dirname(fallback))
+        if problem is not None:
+            raise _unusable_cache_fallback(os.path.dirname(fallback), problem, fallback_from)
     # An explicit root that matches no detector is still usable as a project
     # root; its loader is unknown, so library sync has nothing to scan.
-    lookup = rootfs_layout.lookup_paths(info.root, info.platform)
-    candidates, notes = rootfs_layout.scan_libraries(info.root, lookup)
+    # One budget across both calls, as the sync has: loader diagnostics
+    # (`skipped loader path containing NUL`) land in its `notes`, and a per-call
+    # budget dropped them so the dry run showed `notes: []` for a root the sync
+    # flags (#1073 item 4).
+    with rootfs_layout.discovery_budget() as budget:
+        lookup = rootfs_layout.lookup_paths(info.root, info.platform)
+        candidates, notes = rootfs_layout.scan_libraries(info.root, lookup)
+        notes = [*notes, *budget.notes]
     return {
         "root": info.root,
         "platform": info.platform,
         "markers": list(info.markers),
         "project_path": project_path,
         "project_exists": exists,
+        "fallback_from": fallback_from,
         "name": args.name or os.path.basename(info.root.rstrip(os.sep)) or "rootfs",
         "lookup_paths": _lookup_rows(lookup),
         "candidate_libraries": len(candidates),
@@ -218,6 +258,17 @@ def _project_init(args: argparse.Namespace) -> int:
     if plan["project_exists"]:
         op, params = "project_open", {"path": path}
     else:
+        # The cache fallback parent does not exist on a fresh machine, and the
+        # bridge opens it (its creation gate) before creating the project, so
+        # it died with FileNotFoundError (#1075). Create it here, owner-private
+        # like every other cache directory.
+        if plan["fallback_from"] is not None:
+            directory = os.path.dirname(path)
+            try:
+                paths.ensure_private_dir(Path(directory))
+            except OSError as exc:  # raced with the plan's own check
+                raise _unusable_cache_fallback(
+                    directory, exc.strerror or str(exc), plan["fallback_from"]) from exc
         op, params = "project_create", {
             "path": path, "name": plan["name"],
             "rootfs": {"root": plan["root"], "platform": plan["platform"]},
@@ -421,7 +472,14 @@ def _project_load(args: argparse.Namespace) -> int:
 def _project_import(args: argparse.Namespace) -> int:
     if not str(args.path).strip():
         raise BridgeError("path is empty: pass the file to import")
-    params: dict[str, Any] = {"path": str(Path(args.path).expanduser().resolve())}
+    # Absolute (the bridge's cwd is not ours) but neither resolved nor
+    # normalised: the requested basename is the default project name, so
+    # resolving an applet link `record -> play` here would hand the bridge
+    # `play` (#1079); and `os.path.abspath` deletes `x/..` from the STRING,
+    # which names a different file when `x` is a directory symlink (the
+    # kernel follows the link first). The bridge resolves the path.
+    params: dict[str, Any] = {
+        "path": os.path.join(os.getcwd(), os.path.expanduser(args.path))}
     if args.folder is not None:
         params["folder"] = args.folder
     if args.name is not None:
@@ -459,16 +517,23 @@ def _project_export(args: argparse.Namespace) -> int:
     )
 
 
-@command("project", "delete", help="Delete a file from the open project (refused while it is an open target)",
+@command("project", "delete", help="Delete a file from the open project (refused while it is an open target, "
+                                   "or the linked provider of a target unless --force)",
          args=[arg("selector", help="Project file: id, >=8-char id prefix, path-in-project, or "
-                                    "unique file name")])
+                                    "unique file name"),
+               arg("--force", action="store_true",
+                   help="Delete even when open or saved targets have imports linked to this "
+                        "file (they are named in the output and will need relinking)")])
 def _project_delete(args: argparse.Namespace) -> int:
     if not str(args.selector).strip():
         raise BridgeError("selector is empty: pass the project file to delete")
+    params: dict[str, Any] = {"selector": args.selector}
+    if getattr(args, "force", False):
+        params["force"] = True
     return _call(
         args,
         "project_delete",
-        {"selector": args.selector},
+        params,
         require_target=False,
         text_renderer=_render_project_delete_text,
         stem="project-delete",
