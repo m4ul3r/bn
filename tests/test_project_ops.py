@@ -1024,8 +1024,10 @@ def test_project_import_refuses_an_existing_path_in_project_1079(
                               f"(file {first['id']})")
     assert "--name <other>" in message and f"bn project delete {first['id']}" in message
     assert project.files == before
-    assert po.project_files(bridge, folder="usr/bin")["files"] == [
-        manager.file_row(manager.resolve_file(first["id"]))]
+    # One entry at the path, asked of the project itself (the `project files`
+    # envelope is another PR's subject).
+    assert [pf.id for pf in project.files
+            if manager.path_in_project(pf) == "/usr/bin/play"] == [first["id"]]
 
 
 def test_project_import_duplicate_check_is_scoped_to_the_folder_1079(po, populated, tmp_path):
