@@ -388,20 +388,25 @@ def _flattened_guard_warning(bv, func) -> dict[str, Any] | None:
     sites.sort()
     where = ", ".join(hex(a) for a in sites[:3]) + (
         f" +{len(sites) - 3} more" if len(sites) > 3 else "")
-    # #1058 item 12: a printed command runs as printed. The summary names the
-    # first site; the detail carries them all in `addresses`, so it says which
-    # placeholder to fill rather than printing a `bn disasm` with no address.
+    # #1058 item 12: a printed command runs as printed. It names the function's
+    # own ENTRY, not a select site: `bn disasm` resolves an interior address by
+    # containment and refuses one inside a block two functions share (a select
+    # in a shared tail), while the entry always resolves and lists the same
+    # code. The sites are the addresses to look for in that listing; text mode
+    # shows the first three, JSON carries them all.
+    entry = hex(int(func.start))
     return _warning_row(
         "select",
         f"branch-free {names} at {where}: a guard there may read as a ternary or "
-        f"flag math; confirm it in `bn disasm {hex(sites[0])}`",
+        f"flag math; confirm it in `bn disasm {entry}`",
         f"branch-free conditional(s) in this function ({names}): Pseudo-C "
         f"renders these as ternaries, folds them into one compound condition, "
         f"or decomposes them into raw flag arithmetic (`v`/`z`/`n` locals) -- "
         f"a two-sided range guard can come out as none of the three shapes a "
         f"reader is looking for, so a bound that IS enforced can read as one "
-        f"that never fires. Confirm each site in `bn disasm <address>` (the "
-        f"addresses listed with this warning) before concluding on an "
+        f"that never fires. Confirm each site ({where}; `--format json` lists "
+        f"every one under `warning_rows[].addresses`) in this function's "
+        f"listing, `bn disasm {entry}`, before concluding on an "
         f"off-by-one, truncation or missing check.",
         addresses=[hex(a) for a in sites],
     )
@@ -613,8 +618,8 @@ def _struct_layout_warnings(bv: Any, func: Any) -> list[dict[str, Any]]:
             "class was not, so another type may also fit. "
             "Offsets and widths alone do not prove the parameter's type. "
             f"Review `bn struct show {shlex.quote(name)}` and `bn disasm {address}`; "
-            f"if confirmed, use `bn proto get {address}`, then `bn proto set {address}` "
-            f"with the full prototype, changing only this parameter to "
+            f"if confirmed, use `bn proto get {address}`, then "
+            f"`bn proto set {address} '<full prototype>'` with only this parameter changed to "
             f"`{pointer_type}` (preserve other parameters, qualifiers and calling convention). "
             "No type was applied.",
         ))
@@ -1542,7 +1547,7 @@ def _unresolved_jump_warning(func, row: dict[str, Any], inline: bool) -> dict[st
         "which. A tail call through a pointer, leaving the function: the callee's "
         f"arguments are then in the argument registers{regs} at the jump and are not "
         f"rendered; read them in `bn disasm {where}`, and type the callee (`bn proto "
-        "set <callee> '<prototype>'`) or the object the pointer is loaded from so BN can render the call. Or a "
+        "set '<callee>' '<prototype>'`) or the object the pointer is loaded from so BN can render the call. Or a "
         "computed goto or jump table BN did not resolve, staying in this function: the "
         "code it reaches may not be part of this function's decompile or disassembly. None "
         "of these steps is sure to find the targets: " + "; ".join(steps) + ". Read a "

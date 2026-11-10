@@ -5043,6 +5043,7 @@ class _GuardBlock:
 class _GuardFunc:
     def __init__(self, span=8):
         self.arch = "probe-arch"
+        self.start = 0
         self.basic_blocks = [_GuardBlock(0, span)]
 
 
@@ -5107,6 +5108,11 @@ def _assert_runs_as_printed(command: str) -> None:
 
 
 def test_the_select_warning_prints_a_disasm_command_that_runs_1058(monkeypatch):
+    """The command names the FUNCTION ENTRY, not a select site: `bn disasm`
+    resolves an interior address by containment and refuses one that lies in a
+    block two functions share (exit 2), which is where a select in a shared
+    tail sits. The entry always resolves and lists the same code; the sites
+    are the addresses to look for in it (#1058 review)."""
     from bn_agent_bridge import il_format, read_decompile
 
     listing = ["add x0, x1, x2", "csel x0, x1, x2, lt", "ret", "ccmp x0, x1, #0, ge"]
@@ -5115,11 +5121,13 @@ def test_the_select_warning_prints_a_disasm_command_that_runs_1058(monkeypatch):
         lambda bv, addr, arch=None: ((listing[addr // 4], 4) if addr // 4 < len(listing)
                                      else ("", 4)))
     note = read_decompile._flattened_guard_warning(object(), _GuardFunc(16))
-    assert "`bn disasm 0x4`" in note["summary"]           # the first site, a real address
-    assert "`bn disasm <address>`" in note["detail"]       # a marked template
+    assert "at 0x4, 0xc" in note["summary"]
+    assert "`bn disasm 0x0`" in note["summary"] and "`bn disasm 0x0`" in note["detail"]
     assert note["addresses"] == ["0x4", "0xc"]
+    # Text mode lists at most three sites; the detail says where all of them are.
+    assert "--format json" in note["detail"] and "addresses" in note["detail"]
     commands = _printed_commands(note["summary"], note["detail"])
-    assert commands and not any(c.endswith(" disasm") for c in commands), commands
+    assert commands and all(c.endswith(" disasm 0x0") for c in commands), commands
     for command in commands:
         _assert_runs_as_printed(command)
 
@@ -5137,11 +5145,51 @@ def test_split_and_jump_warnings_print_commands_that_run_1058():
 
     jump_bv, func = _jump_case()
     [row] = read_decompile._unresolved_jump_findings(jump_bv, func)
-    texts.append(read_decompile._unresolved_jump_warning(func, row, True)["detail"])
+    jump_detail = read_decompile._unresolved_jump_warning(func, row, True)["detail"]
+    texts.append(jump_detail)
+    # Both placeholders quoted: unquoted, `<callee> '<prototype>'` is a pair of
+    # shell redirections (`< callee` and `> '<prototype>'`).
+    assert "`bn proto set '<callee>' '<prototype>'`" in jump_detail
 
     commands = _printed_commands(*texts)
     assert commands
     bare = [c for c in commands if re.search(r"\b(disasm|proto set|types (show|declare))$", c)]
+    assert not bare, bare
+    for command in commands:
+        _assert_runs_as_printed(command)
+
+
+def test_layout_offset_and_undefined_type_notes_print_commands_that_run_1058():
+    """#1058 review: three more texts the audit owns. The struct-layout note
+    still printed `bn proto set <addr>` with no prototype; the `__offset`
+    warning and the undefined-type note were changed but pinned by no test."""
+    import re
+
+    from bn_agent_bridge import read_decompile
+
+    bv, func, _var, _insns = _struct_assist_case()
+    layout = [w for w in read_decompile._struct_layout_warnings(bv, func)]
+    assert layout, "the #903 fixture must produce the layout note"
+    texts = [w[key] for w in layout for key in ("summary", "detail")]
+    assert any("`bn proto set 0x401000 '<full prototype>'`" in t for t in texts), texts
+
+    offset = read_decompile._offset_warning(
+        types.SimpleNamespace(get_type_by_name=lambda name: None), _offset_func(), _OFFSET_TEXT)
+    assert offset is not None
+    texts += [offset["summary"], offset["detail"]]
+    assert "`bn types declare '<declaration>'`" in offset["detail"]
+
+    rows = [{"name": "ns::Cls", "declare_command": None}]
+    undefined = read_decompile._undefined_type_note(rows, [types.SimpleNamespace(name="this")])
+    texts.append(undefined)
+    assert "`bn types declare '<declaration>'`" in undefined
+    # Prose mentions carry no backticked `bn …`, so the CLI's routing pass
+    # cannot turn them into a command missing its operands.
+    assert "`bn proto set`" not in undefined and "proto set" in undefined
+
+    commands = _printed_commands(*texts)
+    assert len(commands) >= 5, commands
+    bare = [c for c in commands if re.search(r"\b(disasm|proto set|proto get|types (show|declare))$", c)]
     assert not bare, bare
     for command in commands:
         _assert_runs_as_printed(command)

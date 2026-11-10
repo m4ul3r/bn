@@ -5823,6 +5823,57 @@ class TestStringScanSeesCodeOnly1045:
         assert sorted(s["value"] for s in row["strings"]) == ["abc", "x"], row
 
 
+_SHARED_TAIL_ASM = """\
+    .text
+    .globl fa
+    .type fa, @function
+fa:
+    mov %edi, %eax
+    test %edi, %edi
+    jne .Lshared
+    ret
+    .size fa, .-fa
+    .globl fb
+    .type fb, @function
+fb:
+    mov %esi, %eax
+.Lshared:
+    cmp %esi, %edi
+    cmovl %esi, %eax
+    ret
+    .size fb, .-fb
+"""
+
+
+def test_the_select_warning_command_runs_for_a_site_in_a_shared_block_1058(shared_bn, tmp_path):
+    """#1058 item 12 (review): `fa` jumps into the tail of `fb`, so the `cmovl`
+    there lies inside both functions. `bn disasm <that address>` is refused
+    (`lies inside multiple overlapping functions`, exit 2), so the select
+    warning's printed command names the function's own entry instead and must
+    run as printed for both functions."""
+    if os.uname().machine != "x86_64":
+        refuse_silent_skip("the shared-tail fixture is x86-64 assembly")
+    asm, src = tmp_path / "shared.S", tmp_path / "main.c"
+    asm.write_text(_SHARED_TAIL_ASM)
+    src.write_text("int fa(int, int); int fb(int, int);\n"
+                   "int main(int c, char **v) { return fa(c, c + 1) + fb(c, 2); }\n")
+    binary = tmp_path / "overlap"
+    _build("cc", binary, "-O1", "-no-pie", str(src), str(asm))
+    shared_bn.load(binary)
+    for name in ("fa", "fb"):
+        result = shared_bn.json("decompile", name)
+        [row] = [row for row in result["warning_rows"] if row["code"] == "select"]
+        [command] = re.findall(r"`(bn [^`]+)`", row["summary"])
+        site = row["addresses"][0]
+        # The premise: the site itself is ambiguous, which is why it is not printed.
+        refused = shared_bn.run("disasm", site)
+        assert refused.returncode == 2 and "multiple overlapping functions" in refused.stderr, (
+            refused.stdout, refused.stderr)
+        printed = shared_bn.run(*shlex.split(command)[1:])
+        assert printed.returncode == 0, (command, printed.stdout, printed.stderr)
+        assert "cmovl" in printed.stdout, printed.stdout
+
+
 class TestOffsetTypeLookup1000:
     """#1000 item 4 (review round 8): a type BN keys by a multi-part qualified
     name -- every type a library or the demangler supplies -- is not found by
