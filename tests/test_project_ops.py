@@ -1040,6 +1040,34 @@ def test_project_import_duplicate_check_is_scoped_to_the_folder_1079(po, populat
         po.project_import(bridge, str(source), folder="fw")
 
 
+@pytest.mark.parametrize("field", ["name", "folder"])
+def test_project_import_refuses_a_nul_that_would_hide_a_duplicate_1079(
+    po, populated, tmp_path, field,
+):
+    """#1079 review: Binary Ninja cuts a project name at the first NUL, so the
+    duplicate check compared `tool\0x` (no such path) while the file landed on
+    `/fw/tool` beside the existing one. Raw clients only: argv cannot carry a
+    NUL. The fake truncates like the native API so the harm is observable."""
+    manager, project, _ = populated
+    source = tmp_path / "tool"
+    source.write_bytes(b"\x7fELF-tool")
+    bridge = _bridge_with_rows(manager, [])
+    native_file, native_folder = project.create_file_from_path, project.create_folder
+    project.create_file_from_path = lambda path, folder, name, description="": native_file(
+        path, folder, name.split("\0", 1)[0], description)
+    project.create_folder = lambda parent, name: native_folder(parent, name.split("\0", 1)[0])
+    first = po.project_import(bridge, str(source), folder="fw")
+    assert first["path"] == "/fw/tool"
+    before = list(project.files), list(project.folders)
+    kwargs = {"folder": "fw", "name": "tool\0x"} if field == "name" else {"folder": "fw\0x"}
+
+    with pytest.raises(RuntimeError, match=f"project_import: {field} must not contain a NUL byte"):
+        po.project_import(bridge, str(source), **kwargs)
+
+    assert (list(project.files), list(project.folders)) == before
+    assert [manager.path_in_project(pf) for pf in project.files].count("/fw/tool") == 1
+
+
 def test_project_import_refuses_a_missing_source(po, populated, tmp_path):
     manager, _, _ = populated
     with pytest.raises(RuntimeError, match="not a file"):

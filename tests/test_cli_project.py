@@ -295,6 +295,43 @@ def test_project_import_sends_the_requested_path_and_shows_the_followed_link_107
     assert f"  (symlink: {record} -> {play})" in out
 
 
+def test_project_import_through_a_directory_symlink_and_dotdot_reads_the_named_file_1079(
+    po, populated, monkeypatch, tmp_path, capsys
+):
+    """#1079 review: the CLI made the path absolute with `os.path.abspath`,
+    which deletes `vbin/..` from the STRING, so `vbin/../tool` (the kernel
+    follows the directory link first: `opt/vendor/tool`) imported `./tool`.
+    The path is now sent un-normalised and the bridge resolves it."""
+    from test_project_ops import _bridge_with_rows
+    manager, project, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+    image = tmp_path / "image"
+    (image / "opt/vendor/bin").mkdir(parents=True)
+    (image / "opt/vendor/tool").write_bytes(b"VENDOR")
+    (image / "tool").write_bytes(b"ROOT")
+    (image / "vbin").symlink_to("opt/vendor/bin")
+    sent = []
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        sent.append(params["path"])
+        return {"ok": True, "result": po.project_import(bridge, **params)}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.chdir(image)
+
+    assert bn.cli.main(["project", "import", "vbin/../tool", "--folder", "opt/vendor",
+                        "--format", "json"]) == 0
+
+    row = json.loads(capsys.readouterr().out)
+    assert os.path.isabs(sent[0]) and sent[0].endswith("/image/vbin/../tool")
+    assert row["path"] == "/opt/vendor/tool" and "source_symlink" not in row
+    stored = manager.resolve_file("/opt/vendor/tool")
+    assert open(stored.path_on_disk, "rb").read() == b"VENDOR"
+
+
 def test_project_import_onto_an_existing_path_is_exit_2_with_the_refusal_1079(
     po, populated, monkeypatch, tmp_path, capsys
 ):

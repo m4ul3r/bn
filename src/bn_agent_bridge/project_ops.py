@@ -775,6 +775,13 @@ def _refuse_finding_path(path: str) -> None:
         )
 
 
+def _refuse_nul(label: str, value: str) -> None:
+    """Binary Ninja cuts a project name at the first NUL, so a check on the
+    requested string would look past the path that is actually created."""
+    if "\0" in value:
+        raise RuntimeError(f"project_import: {label} must not contain a NUL byte")
+
+
 def project_import(
     bridge: Any,
     path: Any,
@@ -786,6 +793,12 @@ def project_import(
     state = manager.require()
     if not isinstance(path, str) or not path.strip():
         raise RuntimeError("project_import: path must be the file to import")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        raise RuntimeError("project_import: name must be a non-empty string when given")
+    if isinstance(name, str):
+        _refuse_nul("name", name)
+    if isinstance(folder, str):
+        _refuse_nul("folder", folder)
     # The name defaults to the REQUESTED basename: importing the applet link
     # `usr/bin/record -> play` stored a second `play` at `/usr/bin/play` when
     # it came from the resolved path (#1079). The bytes still come through
@@ -794,8 +807,6 @@ def project_import(
     source = requested.resolve()
     if not source.is_file():
         raise RuntimeError(f"project_import: not a file: {source}")
-    if name is not None and (not isinstance(name, str) or not name.strip()):
-        raise RuntimeError("project_import: name must be a non-empty string when given")
     final_name = (name or requested.name or source.name).strip()
     folder_path = folder if isinstance(folder, str) else ""
     _refuse_finding_path(folder_path + "/" + final_name)
