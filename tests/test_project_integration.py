@@ -798,7 +798,16 @@ def test_findings_links_invalidate_when_a_project_provider_disappears(rootfs_lan
     provider_ids = {row["project_file_id"] for row in inventory}
     assert set(observed["providers"]) == provider_ids
     provider = next(row for row in inventory if "libgreet.so.1" in row["names"])
-    lane.json("project", "delete", provider["project_file_id"])
+    # #1078: the provider is bound by the saved database; a bare delete refuses
+    # and names that target, `--force` deletes and reports it.
+    refused = lane.run("project", "delete", provider["project_file_id"])
+    assert refused.returncode == 2, refused.stdout
+    assert "is the linked provider of" in refused.stderr
+    assert "/usr/bin/app.bndb" in refused.stderr and "--force" in refused.stderr
+    assert provider["project_file_id"] in {
+        row["project_file_id"] for row in lane.json("project", "libs")["libs"]}
+    forced = lane.json("project", "delete", provider["project_file_id"], "--force")
+    assert [row["project_path"] for row in forced["dependents"]] == ["/usr/bin/app.bndb"]
     lane.json("close", "-t", database_id)
     checked = lane.json("project", "finding", "check", finding["id"])
     assert checked["freshness"] == "stale", checked

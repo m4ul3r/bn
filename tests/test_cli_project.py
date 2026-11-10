@@ -12,6 +12,8 @@ import pytest
 from _cli_helpers import _fake_bridge_instance  # noqa: F401
 from bn.mutation_statuses import FAILED_MUTATION_STATUSES
 from bn.transport import BridgeError
+# The real project handlers' fixtures, for CLI tests that drive them (#1079).
+from test_project_ops import bnpr, opened, po, populated  # noqa: F401
 
 
 FILE_ID_A = "4f0c2a1e-7b3d-4e8f-9a21-0c5d6e7f8a9b"
@@ -261,11 +263,110 @@ def test_project_import_params(fake_transport, monkeypatch, tmp_path, capsys):
     assert bn.cli.main(["project", "import", str(src), "--folder", "fw", "--name", "blob.bin",
                         "--description", "d"]) == 0
 
-    assert calls[0]["params"] == {"path": str(src.resolve())}
-    assert calls[1]["params"] == {"path": str(src.resolve()), "folder": "fw",
+    assert calls[0]["params"] == {"path": os.path.abspath(src)}
+    assert calls[1]["params"] == {"path": os.path.abspath(src), "folder": "fw",
                                   "name": "blob.bin", "description": "d"}
     out = capsys.readouterr().out
     assert "imported:" in out and "/fw/blob.bin" in out
+
+
+def test_project_import_sends_the_requested_path_and_shows_the_followed_link_1079(
+    fake_transport, monkeypatch, tmp_path, capsys
+):
+    """#1079: the CLI resolved the path before sending, so the bridge never saw
+    the applet link's own name."""
+    _one_instance(monkeypatch)
+    play = tmp_path / "play"
+    play.write_bytes(b"\x7fELF")
+    record = tmp_path / "record"
+    record.symlink_to("play")
+    row = {"id": FILE_ID_A, "name": "record", "path": "/usr/bin/record", "folder": "/usr/bin",
+           "description": "", "size": 4, "exists_on_disk": True, "is_database": False,
+           "open_target_id": None, "sibling_database_id": None,
+           "source_symlink": f"{record} -> {play}"}
+    calls = fake_transport({"project_import": {"ok": True, "result": row}})
+    monkeypatch.chdir(tmp_path)
+
+    assert bn.cli.main(["project", "import", "record", "--folder", "usr/bin"]) == 0
+
+    assert calls[0]["params"] == {"path": str(record), "folder": "usr/bin"}
+    out = capsys.readouterr().out
+    assert "/usr/bin/record" in out
+    assert f"  (symlink: {record} -> {play})" in out
+
+
+def test_project_import_through_a_directory_symlink_and_dotdot_reads_the_named_file_1079(
+    po, populated, monkeypatch, tmp_path, capsys
+):
+    """#1079 review: the CLI made the path absolute with `os.path.abspath`,
+    which deletes `vbin/..` from the STRING, so `vbin/../tool` (the kernel
+    follows the directory link first: `opt/vendor/tool`) imported `./tool`.
+    The path is now sent un-normalised and the bridge resolves it."""
+    from test_project_ops import _bridge_with_rows
+    manager, project, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+    image = tmp_path / "image"
+    (image / "opt/vendor/bin").mkdir(parents=True)
+    (image / "opt/vendor/tool").write_bytes(b"VENDOR")
+    (image / "tool").write_bytes(b"ROOT")
+    (image / "vbin").symlink_to("opt/vendor/bin")
+    sent = []
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        sent.append(params["path"])
+        return {"ok": True, "result": po.project_import(bridge, **params)}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    monkeypatch.chdir(image)
+
+    assert bn.cli.main(["project", "import", "vbin/../tool", "--folder", "opt/vendor",
+                        "--format", "json"]) == 0
+
+    row = json.loads(capsys.readouterr().out)
+    assert os.path.isabs(sent[0]) and sent[0].endswith("/image/vbin/../tool")
+    assert row["path"] == "/opt/vendor/tool" and "source_symlink" not in row
+    stored = manager.resolve_file("/opt/vendor/tool")
+    assert open(stored.path_on_disk, "rb").read() == b"VENDOR"
+
+
+def test_project_import_onto_an_existing_path_is_exit_2_with_the_refusal_1079(
+    po, populated, monkeypatch, tmp_path, capsys
+):
+    """The real `project_import` handler behind the CLI: the bridge's refusal
+    travels as the `ok: false` error, which is exit 2, and nothing is created."""
+    from test_project_ops import _bridge_with_rows
+    manager, project, _ = populated
+    bridge = _bridge_with_rows(manager, [])
+    _one_instance(monkeypatch)
+    src = tmp_path / "play"
+    src.write_bytes(b"\x7fELF")
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        assert op == "project_import"
+        try:
+            return {"ok": True, "result": po.project_import(bridge, **params)}
+        except RuntimeError as exc:  # the dispatcher's `ok: false` envelope
+            raise BridgeError(str(exc)) from exc
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+    assert bn.cli.main(["project", "import", str(src), "--folder", "usr/bin"]) == 0
+    capsys.readouterr()
+    [existing] = [pf for pf in project.files if manager.path_in_project(pf) == "/usr/bin/play"]
+    before = list(project.files)
+
+    assert bn.cli.main(["project", "import", str(src), "--folder", "usr/bin"]) == 2
+
+    captured = capsys.readouterr()
+    assert (f"project_import: /usr/bin/play already exists in the project (file {existing.id}); "
+            "import it under another name with --name <other>, or remove the existing file "
+            f"first with `bn project delete {existing.id}`") in captured.err
+    assert "imported:" not in captured.out
+    assert project.files == before
 
 
 def test_project_export_params(fake_transport, monkeypatch, tmp_path, capsys):
@@ -289,6 +390,54 @@ def test_project_delete_params(fake_transport, monkeypatch, capsys):
 
     assert calls[0]["params"] == {"selector": "fw/app"}
     assert FILE_ID_A in capsys.readouterr().out
+
+
+def test_project_delete_force_forwards_and_warns_about_dependents_1078(fake_transport, monkeypatch, capsys):
+    # #1078: `--force` is the only way past the linked-provider refusal; the
+    # forced delete names what it orphaned, in text and JSON.
+    _one_instance(monkeypatch)
+    dependents = [
+        {"project_file_id": "db-1", "project_path": "/usr/bin/player.bndb",
+         "libraries": ["libcodec.so.1.2"], "open": False, "selector": None},
+        {"project_file_id": "raw-2", "project_path": "/usr/bin/viewer",
+         "libraries": ["libcodec.so.1.2"], "open": True, "selector": "viewer"},
+    ]
+    calls = fake_transport({"project_delete": {
+        "ok": True,
+        "result": {"deleted": True, "project_file_id": FILE_ID_A,
+                   "project_path": "/opt/vendor/lib/libcodec.so.1.2", "dependents": dependents}}})
+
+    assert bn.cli.main(["project", "delete", "opt/vendor/lib/libcodec.so.1.2", "--force"]) == 0
+    assert calls[0]["params"] == {"selector": "opt/vendor/lib/libcodec.so.1.2", "force": True}
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"deleted: {FILE_ID_A}"
+    assert out[1].startswith("warning: this file was the linked provider of 2 target(s)")
+    assert out[2] == "  /usr/bin/player.bndb  (saved database; libcodec.so.1.2)"
+    assert out[3] == "  /usr/bin/viewer  (open as viewer; libcodec.so.1.2)"
+
+    assert bn.cli.main(["project", "delete", FILE_ID_A, "--force", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["dependents"] == dependents
+
+
+def test_project_delete_text_explains_sibling_and_unreadable_record_1078(fake_transport, monkeypatch, capsys):
+    # A dependent bound through the library's database, and a forced delete
+    # past a link record nobody could read: both are said in text mode.
+    _one_instance(monkeypatch)
+    fake_transport({"project_delete": {"ok": True, "result": {
+        "deleted": True, "project_file_id": FILE_ID_A,
+        "project_path": "/opt/vendor/lib/libcodec.so.1.2",
+        "dependents": [{"project_file_id": "db-1", "project_path": "/usr/bin/player.bndb",
+                        "libraries": ["libcodec.so.1.2"], "open": False, "selector": None,
+                        "provider_path": "/opt/vendor/lib/libcodec.so.1.2.bndb"}],
+        "link_record_error": "the project's link record cannot be read: it is version 999",
+    }}})
+
+    assert bn.cli.main(["project", "delete", FILE_ID_A, "--force"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[2] == ("  /usr/bin/player.bndb  (saved database; libcodec.so.1.2 "
+                      "through /opt/vendor/lib/libcodec.so.1.2.bndb)")
+    assert out[3] == ("warning: could not tell which targets were linked to this file: "
+                      "the project's link record cannot be read: it is version 999")
 
 
 def test_project_close_params_and_text(fake_transport, monkeypatch, capsys):
@@ -598,7 +747,7 @@ def test_project_init_creates_syncs_and_pins(fake_transport, monkeypatch, tmp_pa
     import bn.commands.project
     root = _rootfs(tmp_path)
     _patch_layout(monkeypatch, root)
-    _patch_projects_dir(monkeypatch, tmp_path)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
     _one_instance(monkeypatch)
     pins = _capture_pins(monkeypatch)
     project_path = root + ".bnpr"
@@ -629,6 +778,9 @@ def test_project_init_creates_syncs_and_pins(fake_transport, monkeypatch, tmp_pa
     assert "/lib/libc.so" in out
     assert "skipped (not ELF): 1" in out
     assert "next: `bn project files`" in out and "bn project load <path-in-project>" in out
+    # #1075 review: the cache `projects` directory is the FALLBACK's parent; a
+    # project created at the preferred location must not leave one behind.
+    assert not cache.exists() and not cache.parent.exists()
 
 
 def test_project_init_name_override(fake_transport, monkeypatch, tmp_path):
@@ -698,16 +850,29 @@ def test_project_init_prefers_existing_fallback_over_new_preferred(
     assert calls[0]["params"] == {"path": fallback}
 
 
+def _readonly_parent_rootfs(monkeypatch, tmp_path):
+    """A rootfs whose PARENT is not writable (and only that directory: the
+    cache location keeps the real answer), as `os.access` reports it."""
+    import bn.commands.project
+    parent = tmp_path / "srv"
+    parent.mkdir()
+    root = _rootfs(parent)
+    real_access = os.access
+    monkeypatch.setattr(
+        bn.commands.project.os, "access",
+        lambda p, mode: False if os.fspath(p) == str(parent.resolve()) else real_access(p, mode))
+    return root
+
+
 def test_project_init_falls_back_to_cache_when_parent_unwritable(
     fake_transport, monkeypatch, tmp_path
 ):
     import bn.commands.project
     from bn import rootfs_layout
-    root = _rootfs(tmp_path)
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
     _patch_layout(monkeypatch, root)
     cache = _patch_projects_dir(monkeypatch, tmp_path)
     _preferred, fallback = rootfs_layout.project_location(root, str(cache))
-    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: False)
     _one_instance(monkeypatch)
     _capture_pins(monkeypatch)
     calls = fake_transport({
@@ -719,6 +884,120 @@ def test_project_init_falls_back_to_cache_when_parent_unwritable(
 
     assert calls[0]["op"] == "project_create"
     assert calls[0]["params"]["path"] == fallback
+
+
+def test_project_init_creates_the_cache_projects_dir_before_the_bridge_creates_1075(
+    monkeypatch, tmp_path, capsys
+):
+    """#1075 item 1: the fallback parent `<cache>/projects` did not exist on a
+    fresh machine, so the bridge's `os.open(parent)` died with FileNotFoundError."""
+    import stat
+    import bn.commands.project
+    from bn import rootfs_layout
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    preferred, fallback = rootfs_layout.project_location(root, str(cache))
+    _one_instance(monkeypatch)
+    _capture_pins(monkeypatch)
+    assert not cache.exists()
+    seen = []
+
+    def send(op, *, params=None, target=None, timeout=None, default_timeout=None,
+             connect_retries=4, instance_id=None, spawn_missing_named=False,
+             resolved=False, idle_probe=False):
+        if op == "project_create":
+            # The bridge opens the parent BEFORE it creates the project.
+            seen.append((os.path.isdir(os.path.dirname(params["path"])),
+                         stat.S_IMODE(os.stat(cache).st_mode)))
+            return {"ok": True, "result": _project_info(fallback, created=True)}
+        return {"ok": True, "result": {"associated": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", send)
+
+    assert bn.cli.main(["project", "init", root, "--no-libs"]) == 0
+
+    assert seen == [(True, 0o700)]
+    out = capsys.readouterr().out
+    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable "
+            f"\u2192 cache fallback {fallback}") in out
+
+
+def test_project_init_dry_run_explains_the_cache_fallback_and_creates_nothing_1075(
+    monkeypatch, tmp_path, capsys
+):
+    import bn.commands.project
+    from bn import rootfs_layout
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    preferred, fallback = rootfs_layout.project_location(root, str(cache))
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("dry-run must not send"))
+
+    assert bn.cli.main(["project", "init", root, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert f"project: {fallback}  [new]" in out
+    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable "
+            f"\u2192 cache fallback {fallback}") in out
+    assert not cache.exists(), "--dry-run must not create the cache projects dir"
+
+    assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["project_path"] == fallback
+    assert data["fallback_from"] == os.path.dirname(preferred)
+
+    # A writable parent is the preferred location: no fallback, no note.
+    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: True)
+    assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["project_path"] == preferred and data["fallback_from"] is None
+
+
+@pytest.mark.parametrize("obstacle", ["cache_root_is_a_file", "projects_is_a_file",
+                                      "projects_is_a_dangling_symlink", "cache_root_unwritable"])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_project_init_with_an_unusable_cache_fallback_is_a_handled_refusal_1075(
+    monkeypatch, tmp_path, capsys, obstacle, dry_run
+):
+    """#1075 review: when the cache fallback cannot be created the real run
+    died with a traceback (`PermissionError` / `FileExistsError`, exit 1) while
+    `--dry-run` had just promised `[new]` at exit 0. Both now refuse at exit 2
+    naming the directory and the reason, before anything is sent."""
+    import bn.commands.project
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    blocker = cache.parent
+    if obstacle == "cache_root_is_a_file":
+        cache.parent.write_text("not a directory")
+    elif obstacle == "projects_is_a_file":
+        cache.parent.mkdir()
+        cache.write_text("not a directory")
+        blocker = cache
+    elif obstacle == "projects_is_a_dangling_symlink":
+        cache.parent.mkdir()
+        cache.symlink_to(tmp_path / "nowhere")
+        blocker = cache
+    else:
+        cache.parent.mkdir()
+        patched = bn.commands.project.os.access
+        monkeypatch.setattr(
+            bn.commands.project.os, "access",
+            lambda p, mode: False if os.fspath(p) == str(cache.parent) else patched(p, mode))
+    _one_instance(monkeypatch)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("nothing may be sent"))
+
+    argv = ["project", "init", root] + (["--dry-run"] if dry_run else [])
+    assert bn.cli.main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert f"cannot create the cache projects directory {cache}" in captured.err
+    assert str(blocker) in captured.err
+    assert "BN_CACHE_DIR" in captured.err and "Traceback" not in captured.err
+    assert "[new]" not in captured.out
+    assert not cache.is_dir()
 
 
 def test_project_init_attaches_to_the_owner_then_syncs(
@@ -827,6 +1106,10 @@ def test_project_init_sync_failure_after_open_is_exit_1(
     assert "error: project_sync_libs: Binary Ninja could not import" in captured.err
     assert f"project: {project_path}  [created]" in captured.out
     assert "libraries: sync FAILED -- Binary Ninja could not import" in captured.out
+    # #1075 item 3: the project exists but is empty, so `next: bn project
+    # files` would point at nothing; the retry is the sync itself.
+    assert "next:" not in captured.out
+    assert "`bn project libs --sync`" in captured.out
 
 
 def test_project_init_json_summary(fake_transport, monkeypatch, tmp_path, capsys):
@@ -1103,8 +1386,125 @@ def test_project_load_auto_link_failure_keeps_target_and_exits_three(
         assert "usr/bin/app" in captured.out
         assert f"auto-link FAILED: {status}" in captured.out
         assert "synthetic provider binding failed" in captured.out
+        # #1073 item 3: a failed link carries no counters; `?` would claim an
+        # unreadable count where there is no count to read.
+        assert "linked: ?" not in captured.out
+        assert "linked: n/a (link failed)" in captured.out
     else:
         assert json.loads(captured.out) == result
+
+
+@pytest.mark.parametrize("link", [
+    {"success": False},                                   # no status at all
+    {"success": False, "status": "verified"},             # a non-failing status
+])
+def test_project_load_success_false_alone_is_a_failed_link_1073(
+        fake_transport, monkeypatch, capsys, link):
+    _one_instance(monkeypatch)
+    fake_transport({"project_load": {"ok": True, "result": {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd", "targets": [],
+        "project_file_id": FILE_ID_A, "project_path": "/usr/bin/app", "link": link}}})
+
+    assert bn.cli.main(["project", "load", "usr/bin/app"]) == 3
+    out = capsys.readouterr().out
+    assert "linked: n/a (link failed)" in out and "auto-link FAILED" in out
+
+
+def test_project_load_failed_link_with_counters_keeps_them_1073(
+        fake_transport, monkeypatch, capsys):
+    """#1073 review: the linker's own failure return (a readback mismatch)
+    DOES carry counters, and its note talks about them; only a failure with
+    no counters at all has nothing to state."""
+    _one_instance(monkeypatch)
+    fake_transport({"project_load": {"ok": True, "result": {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd", "targets": [],
+        "project_file_id": FILE_ID_A, "project_path": "/usr/bin/app",
+        "link": {"status": "verification_failed", "success": False, "linked": 12,
+                 "unresolved": [{"symbol": "a", "reason": "r"}],
+                 "notes": ["link counters describe the planned changes, not verified "
+                           "completed writes"]}}}})
+
+    assert bn.cli.main(["project", "load", "usr/bin/app"]) == 3
+    out = capsys.readouterr().out
+    assert "linked: 12 (1 unresolved)" in out and "linked: n/a" not in out
+    assert "auto-link FAILED: verification_failed" in out
+    assert "link counters describe the planned changes" in out
+
+
+def test_project_init_text_keeps_the_planner_note_when_no_sync_is_rendered_1073(
+        fake_transport, monkeypatch, tmp_path, capsys):
+    """#1073 review: the plan carried the NUL note but the text renderer read
+    `notes` only on a dry run, so `init --no-libs` (and a failed sync) dropped
+    it while `--format json` showed it."""
+    import bn.commands.project
+    from test_rootfs_layout import _linux_rootfs, _touch
+    root = _linux_rootfs(tmp_path)
+    _touch(root, "etc/ld.so.conf", b"/lib\0evil\n/usr/lib\n")
+    _patch_projects_dir(monkeypatch, tmp_path)
+    _one_instance(monkeypatch)
+    _capture_pins(monkeypatch)
+    project_path = str(root.resolve()) + ".bnpr"
+    fake_transport({
+        "project_create": {"ok": True, "result": _project_info(project_path, created=True),
+                           "instance": "bridge-a"},
+        "associate_project_roots": {"ok": True, "result": {"associated": []}},
+        "project_sync_libs": {"ok": False, "error": "unused"},
+    })
+
+    assert bn.cli.main(["project", "init", str(root), "--no-libs"]) == 0
+    out = capsys.readouterr().out
+    assert "libraries: not synced (--no-libs)" in out
+    assert "note: skipped loader path containing NUL" in out
+
+    from bn.formatters import _render_project_init_text
+    failed = _render_project_init_text({
+        "root": "/fw", "platform": "linux", "markers": [], "project_path": "/fw.bnpr",
+        "dry_run": False, "created": True, "sync": None,
+        "sync_error": "disk full", "notes": ["skipped loader path containing NUL"],
+        "lookup_paths": []})
+    assert "libraries: sync FAILED -- disk full" in failed
+    assert "note: skipped loader path containing NUL" in failed
+
+
+def test_project_load_successful_link_without_counters_still_says_unknown_1073(
+        fake_transport, monkeypatch, capsys):
+    """The `?` stays for a SUCCESSFUL link that genuinely lacks counters: that
+    is an unreadable count, which the renderer discloses rather than fabricates."""
+    _one_instance(monkeypatch)
+    fake_transport({"project_load": {"ok": True, "result": {
+        "loaded": True, "path": "/p/fw.bnpr/data/ab/cd", "targets": [],
+        "project_file_id": FILE_ID_A, "project_path": "/usr/bin/app",
+        "link": {"status": "verified", "success": True, "linked": "many"}}}})
+
+    assert bn.cli.main(["project", "load", "usr/bin/app"]) == 0
+    out = capsys.readouterr().out
+    assert "linked: ? (? unresolved)" in out and "auto-link FAILED" not in out
+    assert "! malformed linked field" in out
+
+
+def test_project_init_dry_run_surfaces_nul_loader_diagnostics_like_sync_1073(
+        monkeypatch, tmp_path, capsys):
+    """#1073 item 4: the init planner ran discovery without a budget context,
+    so `_invalid_path`'s `skipped loader path containing NUL` note had nowhere
+    to go and the dry run reported `notes: []` for a root the sync flags."""
+    import bn.commands.project
+    from bn import rootfs_layout as rl
+    from test_rootfs_layout import _linux_rootfs, _touch
+    root = _linux_rootfs(tmp_path)
+    _touch(root, "etc/ld.so.conf", b"/lib\0evil\n/usr/lib\n")
+    _patch_projects_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("dry-run must not send"))
+
+    assert bn.cli.main(["project", "init", str(root), "--dry-run", "--format", "json"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["notes"].count("skipped loader path containing NUL") == 1
+    assert plan["candidate_libraries"] == 1  # the valid entries (and defaults) are still scanned
+
+    # The sync's own discovery (a shared budget) reports the same note, once.
+    with rl.discovery_budget(rl.DiscoveryBudget()) as budget:
+        rl.scan_libraries(str(root), rl.lookup_paths(str(root), "linux"))
+    assert budget.notes == ["skipped loader path containing NUL"]
 
 
 @pytest.mark.parametrize("link,no_link", [
