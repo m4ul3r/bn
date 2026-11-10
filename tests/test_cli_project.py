@@ -318,19 +318,25 @@ def test_project_delete_force_forwards_and_warns_about_dependents_1078(fake_tran
     assert json.loads(capsys.readouterr().out)["dependents"] == dependents
 
 
-def test_project_delete_refusal_for_a_linked_provider_is_exit_2_1078(monkeypatch, capsys):
+def test_project_delete_text_explains_sibling_and_unreadable_record_1078(fake_transport, monkeypatch, capsys):
+    # A dependent bound through the library's database, and a forced delete
+    # past a link record nobody could read: both are said in text mode.
     _one_instance(monkeypatch)
+    fake_transport({"project_delete": {"ok": True, "result": {
+        "deleted": True, "project_file_id": FILE_ID_A,
+        "project_path": "/opt/vendor/lib/libcodec.so.1.2",
+        "dependents": [{"project_file_id": "db-1", "project_path": "/usr/bin/player.bndb",
+                        "libraries": ["libcodec.so.1.2"], "open": False, "selector": None,
+                        "provider_path": "/opt/vendor/lib/libcodec.so.1.2.bndb"}],
+        "link_record_error": "the project's link record cannot be read: it is version 999",
+    }}})
 
-    def refuse(op, **kwargs):
-        raise bn.cli.BridgeError(
-            "project file /opt/vendor/lib/libcodec.so.1.2 (id) is the linked provider of "
-            "1 target(s): /usr/bin/player.bndb (saved database; libcodec.so.1.2). "
-            "Deleting it leaves their imports without a provider; pass --force to delete anyway")
-
-    monkeypatch.setattr(bn.cli, "send_request", refuse)
-    assert bn.cli.main(["project", "delete", "opt/vendor/lib/libcodec.so.1.2"]) == 2
-    err = capsys.readouterr().err
-    assert "linked provider of 1 target(s)" in err and "/usr/bin/player.bndb" in err
+    assert bn.cli.main(["project", "delete", FILE_ID_A, "--force"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[2] == ("  /usr/bin/player.bndb  (saved database; libcodec.so.1.2 "
+                      "through /opt/vendor/lib/libcodec.so.1.2.bndb)")
+    assert out[3] == ("warning: could not tell which targets were linked to this file: "
+                      "the project's link record cannot be read: it is version 999")
 
 
 def test_project_close_params_and_text(fake_transport, monkeypatch, capsys):

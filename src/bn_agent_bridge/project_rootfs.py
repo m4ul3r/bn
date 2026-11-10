@@ -20,6 +20,7 @@ fake module) and never imports `bridge`.
 
 from __future__ import annotations
 
+import json
 import os
 from collections import deque
 from collections.abc import Callable
@@ -445,15 +446,18 @@ def link_view(
         if (backing := getattr(_external_library(bv, name, create=False),
                                "backing_file", None)) is not None
     }
+    # A record that cannot be read is neither consulted nor, below, rewritten.
+    links_error: str | None = None
     if pf is not None:
         try:
-            recorded = manager.get_links().get("targets", {}).get(str(pf.id), {})
-            providers = recorded.get("providers") if isinstance(recorded, dict) else None
-        except Exception:  # noqa: BLE001 - unreadable metadata is no record
-            providers = None
-        for name, provider in (providers or {}).items():
+            providers = manager.get_links()["targets"].get(str(pf.id), {}).get("providers", {})
+        except Exception as exc:  # noqa: BLE001 - LinkRecordUnreadable, or BN itself
+            providers = {}
+            links_error = str(exc)
+            plan.notes.append(f"link record not consulted and not updated: {exc}")
+        for name, provider in providers.items():
             if name in needed and name not in previous and provider:
-                previous[name] = str(provider)
+                previous[name] = provider
     resolver = _Resolver(manager, inventory, meta, target_elf, plan, previous,
                          list(state.project.files))
     direct: dict[str, _Library | None] = {}
@@ -534,7 +538,7 @@ def link_view(
     if not success:
         plan.notes.append(
             "link counters describe the planned changes, not verified completed writes")
-    if not dry_run and success:
+    if not dry_run and success and links_error is None:
         # What this target is bound to, in the project's own metadata, so
         # `project delete` can name the targets a provider serves -- saved
         # databases included, which nothing else can see into (#1078).
@@ -574,7 +578,13 @@ def _record_links(manager: Any, pf: Any, direct: dict[str, _Library | None]) -> 
     if pf is None:
         return
     record = manager.get_links()
-    targets = record.setdefault("targets", {})
+    before = json.dumps(record, sort_keys=True)
+    # Entries of targets that have left the project describe nothing.
+    live = {str(owned.id) for owned in manager.files()}
+    targets = record["targets"] = {
+        target_id: entry for target_id, entry in record["targets"].items()
+        if target_id in live
+    }
     existing = targets.get(str(pf.id))
     providers = dict(existing.get("providers") or {}) if isinstance(existing, dict) else {}
     providers.update({
@@ -585,7 +595,7 @@ def _record_links(manager: Any, pf: Any, direct: dict[str, _Library | None]) -> 
         "project_path": manager.path_in_project(pf),
         "providers": providers,
     }
-    if existing == targets[str(pf.id)]:
+    if json.dumps(record, sort_keys=True) == before:
         return
     manager.set_links(record)
 
@@ -648,12 +658,15 @@ class _Resolver:
         self._paths = {
             str(pf.id): manager.path_in_project(pf) for pf in (project_files or [])
         }
+        # Live project file ids, or None when the caller did not say (then
+        # "gone from the project" cannot be judged and is never assumed).
+        self._live = set(self._paths) if project_files is not None else None
 
     def path_of(self, file_id: str | None) -> str | None:
         """Path in the project of a live file id; None for a deleted one."""
         return self._paths.get(file_id) if file_id is not None else None
 
-    def _alias_rebind_refusal(self, name: str, chosen: _Library) -> str | None:
+    def _alias_rebind_refusal(self, name: str, wanted: str, chosen: _Library) -> str | None:
         """Why an ALIAS-ONLY candidate may not replace *name*'s current provider.
 
         Firmware ships two different files claiming one SONAME: the versioned
@@ -662,9 +675,13 @@ class _Resolver:
         would attribute the analysis to a library the loader never used (#1078).
         It is accepted only when its recorded content equals the previous
         provider's -- a renamed copy of the same bytes. None means allowed.
+        With no previous provider the inventory answers instead
+        (`_first_binding_refusal`).
         """
         current = self._previous.get(name)
-        if current is None or _same_file(current, chosen.pf) or _same_file(current, chosen.sibling):
+        if current is None:
+            return self._first_binding_refusal(name, wanted, chosen)
+        if _same_file(current, chosen.pf) or _same_file(current, chosen.sibling):
             return None
         prev_id = str(getattr(current, "id", current))
         prev_entry = (self._meta.get("libs") or {}).get(prev_id) or {}
@@ -686,6 +703,54 @@ class _Resolver:
             f"{name}: previous provider {prev_id} {state}; alias-only candidate "
             f"{chosen.project_path} has {content}; import the loader's file and "
             "relink, or bind it deliberately"
+        )
+
+    def _first_binding_refusal(self, name: str, wanted: str, chosen: _Library) -> str | None:
+        """The same question for a name that was never bound (#1078 review).
+
+        There is no previous provider to compare with, but the inventory may
+        still record the loader's own file: an entry one of whose lookup paths
+        is the NEEDED filename, whose project file has since been deleted (the
+        inventory keeps deleted entries until the next sync). When it does and
+        the alias-only candidate's recorded content differs -- or cannot be
+        compared -- the candidate is not a stand-in for it. With no such entry
+        an alias-only match stays the disclosed fallback it always was.
+        """
+        if self._live is None:
+            return None
+        gone: list[tuple[str, str, Any]] = []
+        for file_id, entry in (self._meta.get("libs") or {}).items():
+            if str(file_id) in self._live or not isinstance(entry, dict):
+                continue
+            machine, elf_class = entry.get("e_machine"), entry.get("elf_class")
+            if self._class and elf_class and elf_class != self._class:
+                continue
+            if self._machine and machine and machine != self._machine:
+                continue
+            paths = [str(p) for p in (entry.get("paths") or [entry.get("rel_realpath") or ""])]
+            if any(os.path.basename(path) == wanted for path in paths):
+                gone.append((str(entry.get("rel_realpath") or paths[0]), str(file_id),
+                             entry.get("sha256")))
+        if not gone:
+            return None
+        gone.sort()
+        same = next((row for row in gone
+                     if row[2] and chosen.sha256 and str(row[2]) == chosen.sha256), None)
+        if same is not None:
+            self._plan.notes.append(
+                f"{name}: the loader's file {same[0]} ({same[1]}) is no longer in the "
+                f"project; bound to {chosen.project_path}, an alias-only match with the "
+                "same recorded content")
+            return None
+        rel, file_id, sha = gone[0]
+        content = (
+            "different content" if sha and chosen.sha256
+            else "content that cannot be compared with that file's"
+        )
+        return (
+            f"{name}: the loader's file {rel} ({file_id}) is no longer in the project; "
+            f"alias-only candidate {chosen.project_path} has {content}; import the "
+            "loader's file and relink, or bind it deliberately"
         )
 
     def resolve(
@@ -738,7 +803,7 @@ class _Resolver:
                 lib.project_path))
             chosen = matches[0]
             refusal = (
-                self._alias_rebind_refusal(name, chosen)
+                self._alias_rebind_refusal(name, wanted, chosen)
                 if not exact_path and not filename_matches else None
             )
             if refusal is not None:

@@ -1927,9 +1927,20 @@ def _render_project_delete_text(value: Any) -> str:
                      if _flag_field(row, "open") else "saved database")
             names = ", ".join(
                 _escape_control_chars(str(n)) for n in _field_list(row, "libraries"))
+            # The record names the library's other file (its database, or the
+            # raw file behind one): say which, so the row explains itself.
+            provider_path = _text_value(row, "provider_path")
+            through = f" through {_escape_control_chars(provider_path)}" if provider_path else ""
             lines.append(
                 f"  {_escape_control_chars(_text_value(row, 'project_path') or '<unknown>')}"
-                f"  ({where}; {names})")
+                f"  ({where}; {names}{through})")
+    record_error = _text_value(value, "link_record_error")
+    if record_error:
+        # A forced delete past a link record that could not be read: nobody
+        # could say what depended on the file.
+        lines.append(
+            "warning: could not tell which targets were linked to this file: "
+            f"{_escape_control_chars(record_error)}")
     return "\n".join(lines)
 
 

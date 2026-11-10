@@ -90,6 +90,53 @@ def refuse_raw_project_path(path: str | os.PathLike[str]) -> None:
                 )
 
 
+class LinkRecordUnreadable(RuntimeError):
+    """The project's `bn.links` metadata is not a record this bn can read."""
+
+    def __init__(self, detail: str):
+        super().__init__(
+            f"the project's link record (`{LINKS_METADATA_KEY}` metadata) cannot be read: "
+            f"{detail}; it is left untouched")
+
+
+def validate_link_record(raw: Any) -> dict[str, Any]:
+    """*raw* (the decoded `bn.links` blob) as the version-1 record its readers
+    index into -- `{"version": 1, "targets": {<file id>: {"project_path": str,
+    "providers": {<NEEDED name>: <file id>}}}}` -- or `LinkRecordUnreadable`
+    naming the offending key.
+
+    It is project-level data any tool or any other bn version can write, so
+    it is untrusted input, like `bn.rootfs`. Before this gate a `providers`
+    list reached `.items()` as an `internal error:`, the delete guard read a
+    record it could not parse as "no dependents", and a `version: 999` record
+    was rewritten as version 1 on the next link (#1078 review)."""
+    if not isinstance(raw, dict):
+        raise LinkRecordUnreadable(f"it must be a JSON object, got {type(raw).__name__}")
+    version = raw.get("version")
+    if isinstance(version, bool) or version != LINKS_METADATA_VERSION:
+        raise LinkRecordUnreadable(
+            f"it is version {version!r}; this bn understands version {LINKS_METADATA_VERSION}")
+    targets = raw.get("targets")
+    if not isinstance(targets, dict):
+        raise LinkRecordUnreadable(
+            f"key 'targets' must be an object, got {type(targets).__name__}")
+    for target_id, entry in targets.items():
+        where = f"targets[{target_id!r}]"
+        if not isinstance(entry, dict):
+            raise LinkRecordUnreadable(
+                f"key '{where}' must be an object, got {type(entry).__name__}")
+        if not isinstance(entry.get("project_path"), str):
+            raise LinkRecordUnreadable(f"key '{where}.project_path' must be a string")
+        providers = entry.get("providers")
+        if not isinstance(providers, dict) or not all(
+            isinstance(name, str) and isinstance(provider, str)
+            for name, provider in providers.items()
+        ):
+            raise LinkRecordUnreadable(
+                f"key '{where}.providers' must map library names to file ids")
+    return raw
+
+
 def canonical_project_path(path: str | os.PathLike[str]) -> Path:
     """The `.bnpr` DIRECTORY for *path*, which may name the directory or its
     `project.bnpm` metadata file (BN accepts both; the registry publishes one)."""
@@ -358,12 +405,25 @@ class ProjectManager:
         self._set_json_metadata(ROOTFS_METADATA_KEY, value, "rootfs")
 
     def get_links(self) -> dict[str, Any]:
-        """The `bn.links` record: which project file each linked target's
-        NEEDED libraries are bound to (#1078). Empty when nothing was recorded."""
-        record = self._get_json_metadata(LINKS_METADATA_KEY)
-        if record is None or not isinstance(record.get("targets"), dict):
+        """The `bn.links` record, validated (`validate_link_record`): which
+        project file each linked target's NEEDED libraries are bound to
+        (#1078). A fresh empty record when the project stores none. The ONE
+        gate: a record this bn cannot read raises `LinkRecordUnreadable`, so
+        no reader indexes into a shape it did not check and no writer replaces
+        a record it could not read."""
+        project = self.require().project
+        try:
+            raw = project.query_metadata(LINKS_METADATA_KEY)
+        except Exception:  # noqa: BLE001 - BN raises for a missing key
             return {"version": LINKS_METADATA_VERSION, "targets": {}}
-        return record
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError as exc:
+                raise LinkRecordUnreadable(f"it is not valid JSON ({exc})") from exc
+        return validate_link_record(raw)
 
     def set_links(self, value: dict[str, Any]) -> None:
         self._set_json_metadata(LINKS_METADATA_KEY, value, "link")
@@ -878,12 +938,27 @@ def project_delete(bridge: Any, selector: Any, force: Any = False) -> dict[str, 
         )
     path = manager.path_in_project(pf)
     file_id = str(pf.id)
+    # Only a real `True` forces: `bool("false")` is True, and this flag deletes
+    # a file other targets depend on. The binder refuses a non-boolean on the
+    # wire; a direct caller gets the same strictness.
+    forced = force is True
     # #1078: a file some target's imports are bound to. Deleting it silently
     # left those links dangling and the next link (or restart replay) free to
     # rebind the name onto whatever alias matched. Refuse unless forced; the
-    # targets are named either way.
-    dependents = linked_dependents(manager, file_id, open_targets)
-    if dependents and not bool(force):
+    # targets are named either way. A record that cannot be READ cannot answer
+    # the question, so it refuses too: unknown is not "nothing depends on it".
+    record_error: str | None = None
+    try:
+        dependents = linked_dependents(manager, pf, open_targets)
+    except LinkRecordUnreadable as exc:
+        dependents = []
+        record_error = str(exc)
+    if record_error is not None and not forced:
+        raise RuntimeError(
+            f"cannot tell whether any target is linked to project file {path} ({file_id}): "
+            f"{record_error}. Pass --force to delete anyway."
+        )
+    if dependents and not forced:
         raise RuntimeError(
             f"project file {path} ({file_id}) is the linked provider of "
             f"{len(dependents)} target(s): {_dependents_text(dependents)}. "
@@ -898,47 +973,78 @@ def project_delete(bridge: Any, selector: Any, force: Any = False) -> dict[str, 
         raise RuntimeError(f"Binary Ninja refused to delete {path}")
     # The deleted file's own link record (when it was a linked target) is
     # stale; records that POINT at it stay, since the dangling binding they
-    # describe is still what those databases hold.
-    record = manager.get_links()
-    if file_id in record.get("targets", {}):
+    # describe is still what those databases hold. An unreadable record is
+    # never rewritten.
+    if record_error is None:
         try:
-            del record["targets"][file_id]
-            manager.set_links(record)
+            record = manager.get_links()
+            if file_id in record["targets"]:
+                del record["targets"][file_id]
+                manager.set_links(record)
         except Exception:  # noqa: BLE001 - a stale record never fails a delete
             pass
     bridge._write_registry()
     result: dict[str, Any] = {"deleted": True, "project_file_id": file_id, "project_path": path}
     if dependents:
         result["dependents"] = dependents
+    if record_error is not None:
+        result["link_record_error"] = record_error
     return result
 
 
 def linked_dependents(
-    manager: Any, file_id: str, open_targets: list[dict[str, Any]] | None = None,
+    manager: Any, pf: Any, open_targets: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """The targets whose recorded links name *file_id* as a provider: one row
-    per target with its project path, the NEEDED names it provides, and whether
-    that target is open now or a saved database (#1078). Ordered by path."""
+    """The targets whose recorded links depend on project file *pf*: one row
+    per target with its project path, the NEEDED names concerned, and whether
+    that target is open now or a saved database (#1078). Ordered by path.
+
+    A library is ONE provider in two files: the raw file the inventory is
+    keyed by, and the `<name>.bndb` a binding is backed by once it exists. A
+    record naming either depends on both -- deleting the raw file behind a
+    database-backed binding orphans it just the same -- so the sibling pair is
+    matched, and such a row carries `provider_path`, the file the record
+    names. A recorded target that is no longer a project file depends on
+    nothing. Raises `LinkRecordUnreadable` for a record that cannot be read.
+    """
+    record = manager.get_links()
+    files = manager.files()
+    live = {str(owned.id) for owned in files}
+    index = manager.sibling_index(files)
+    path = manager.path_in_project(pf)
+    file_id = str(pf.id)
+    related = {file_id: path}
+    for sibling in index.get(path + ".bndb", []):
+        related[str(sibling.id)] = path + ".bndb"
+    if path.endswith(".bndb"):
+        for raw in index.get(path[: -len(".bndb")], []):
+            related[str(raw.id)] = path[: -len(".bndb")]
     open_ids = {
         str(row.get("project_file_id")): row for row in (open_targets or [])
         if row.get("project_file_id")
     }
     out: list[dict[str, Any]] = []
-    for target_id, entry in manager.get_links().get("targets", {}).items():
-        providers = entry.get("providers") if isinstance(entry, dict) else None
-        if not isinstance(providers, dict):
+    for target_id, entry in record["targets"].items():
+        if str(target_id) not in live:
             continue
-        names = sorted(name for name, provider in providers.items() if str(provider) == file_id)
-        if not names:
+        matched = {
+            name: provider for name, provider in entry["providers"].items()
+            if provider in related
+        }
+        if not matched:
             continue
         open_row = open_ids.get(str(target_id))
-        out.append({
+        row = {
             "project_file_id": str(target_id),
-            "project_path": str(entry.get("project_path") or ""),
-            "libraries": names,
+            "project_path": entry["project_path"],
+            "libraries": sorted(matched),
             "open": open_row is not None,
             "selector": (open_row.get("selector") or open_row.get("target_id")) if open_row else None,
-        })
+        }
+        through = sorted({related[provider] for provider in matched.values()} - {path})
+        if through:
+            row["provider_path"] = through[0]
+        out.append(row)
     out.sort(key=lambda row: (row["project_path"], row["project_file_id"]))
     return out
 
@@ -947,8 +1053,9 @@ def _dependents_text(dependents: list[dict[str, Any]]) -> str:
     parts = []
     for row in dependents:
         where = f"open as {row['selector']}" if row["open"] else "saved database"
+        through = f" through {row['provider_path']}" if row.get("provider_path") else ""
         parts.append(f"{row['project_path'] or row['project_file_id']} ({where}; "
-                     f"{', '.join(row['libraries'])})")
+                     f"{', '.join(row['libraries'])}{through})")
     return "; ".join(parts)
 
 
