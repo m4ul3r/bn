@@ -3509,7 +3509,7 @@ def test_spawn_instance_still_resolves_its_own_env_budget(monkeypatch):
     monkeypatch.setattr(
         transport,
         "_spawn_instance_unlocked",
-        lambda instance_id=None, timeout=None, poll_interval=0.2: seen.append(timeout)
+        lambda instance_id=None, timeout=None, poll_interval=0.2, env=None: seen.append(timeout)
         or "spawned",
     )
 

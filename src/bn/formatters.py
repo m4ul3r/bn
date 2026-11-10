@@ -2140,7 +2140,40 @@ def _render_session_start_text(value: Any) -> str:
         )
         lines.append("warning: bridge process may still be running; no clean stop was confirmed")
     lines.extend(_discarded_unsaved_lines(value))
+    lines.extend(_restart_env_lines(value))
     return "\n".join(lines)
+
+
+def _restart_env_lines(value: dict[str, Any]) -> list[str]:
+    """The one `env:` line `session restart` prints about the new bridge's
+    BN_* environment (#1076): which keys came from the old bridge's record,
+    which the caller overrode, which the caller added, and which credential
+    keys the old bridge had that the record never held. Nothing when nothing
+    differs; a note when the record predates the field (or is malformed) and
+    so nothing could be replayed."""
+    report = _field_dict(value, "env")
+    if not report:
+        return []
+    if _flag_field(report, "recorded") is False:
+        return [
+            "env: no recorded environment for this instance; restarted with the "
+            "caller's environment"
+        ]
+    def names(key: str) -> str:
+        # Key names come from a registry file; escaped like every other
+        # payload string so one cannot forge a line or carry an escape code.
+        return ", ".join(_escape_control_chars(str(name)) for name in _field_list(report, key))
+
+    parts = [
+        f"{verb} {names(verb)}"
+        for verb in ("replayed", "overridden", "added")
+        if _field_list(report, verb)
+    ]
+    # A credential's value is never recorded; say which one the restart could
+    # not carry, since the new bridge now runs without it.
+    if _field_list(report, "not_recorded"):
+        parts.append(f"not recorded: {names('not_recorded')} (re-export it)")
+    return [f"env: {'; '.join(parts)}"] if parts else []
 
 
 @_discloses

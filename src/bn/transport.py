@@ -30,6 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 from .paths import (
@@ -1970,8 +1971,13 @@ def spawn_instance(
     *,
     timeout: float | None = None,
     poll_interval: float = 0.2,
+    env: Mapping[str, str] | None = None,
 ) -> BridgeInstance:
-    """Spawn a bridge within one lock-and-registration deadline."""
+    """Spawn a bridge within one lock-and-registration deadline.
+
+    *env* is the child's complete environment; ``None`` means this process's
+    own, which is what every spawn but `session restart` wants (#1076).
+    """
     if timeout is None:
         timeout = _resolve_spawn_timeout()
     if instance_id is not None and instance_id != "default":
@@ -1983,6 +1989,7 @@ def spawn_instance(
             instance_id,
             timeout=remaining if remaining is not None else timeout,
             poll_interval=poll_interval,
+            env=env,
         )
 
 
@@ -2111,6 +2118,7 @@ def _spawn_instance_unlocked(
     *,
     timeout: float = DEFAULT_SPAWN_TIMEOUT,
     poll_interval: float = 0.2,
+    env: Mapping[str, str] | None = None,
 ) -> BridgeInstance:
     """Spawn-and-register core. MUST run under _spawn_lock()."""
     deadline = time.monotonic() + timeout
@@ -2214,7 +2222,7 @@ def _spawn_instance_unlocked(
                 start_new_session=True,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env={**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"},
             )
         finally:
             # The child inherits the fd across a successful Popen; close the
