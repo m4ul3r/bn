@@ -77,6 +77,46 @@ def test_failed_metadata_commit_removes_unrecorded_imports(world, monkeypatch):
     assert w.instance.projects.get_rootfs() == old
 
 
+def test_failed_first_sync_leaves_no_metadata_blob_and_retry_works_1071(world, monkeypatch):
+    """#1071 review: a sync that found NO metadata rolls back by removing the
+    key. Storing `{}` instead (the old rollback) would leave a blob the
+    validating reader refuses as versionless."""
+    w = world
+    root = _sources(w, monkeypatch)
+    w.project.metadata.clear()
+    assert w.instance.projects.get_rootfs() is None
+    store = w.project.store_metadata
+
+    def refuse_inventory(key, value):
+        import json
+        if json.loads(value).get("libs"):
+            return False
+        return store(key, value)
+
+    monkeypatch.setattr(w.project, "store_metadata", refuse_inventory)
+    with pytest.raises(RuntimeError, match="Binary Ninja returned False") as raised:
+        w.ops.project_sync_libs(w.instance, root=str(root))
+    assert "rollback incomplete" not in str(raised.value)
+    assert "bn.rootfs" not in w.project.metadata
+    assert w.project.files == [] and not w.project.in_bulk
+    assert w.instance.projects.get_rootfs() is None
+
+    monkeypatch.setattr(w.project, "store_metadata", store)
+    retry = w.ops.project_sync_libs(w.instance, root=str(root))
+    assert {row["name"] for row in retry["imported"]} == {"liba.so", "libb.so"}
+    assert w.instance.projects.get_rootfs()["version"] == 1
+
+
+def test_clear_rootfs_checks_the_native_result_and_the_readback_1071(world):
+    manager = world.instance.projects
+    world.project.remove_metadata = lambda key: False
+    with pytest.raises(RuntimeError, match="could not remove the rootfs metadata"):
+        manager.clear_rootfs()
+    world.project.remove_metadata = lambda key: True      # claims success, removes nothing
+    with pytest.raises(RuntimeError, match="still present"):
+        manager.clear_rootfs()
+
+
 def test_sync_refreshes_new_aliases_without_copying_library_again(world, monkeypatch):
     w = world
     root = _sources(w, monkeypatch)

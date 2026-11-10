@@ -46,6 +46,9 @@ ROOTFS_METADATA_VERSION = 1
 # fresh document would import every library again beside the old copies.
 _ROOTFS_REINIT = ("this bn cannot rebuild an inventory it cannot read: upgrade bn, or move "
                   "the project aside and re-run `bn project init <root>`")
+# What `_rootfs_raw` returns for an ABSENT key, so no stored value -- not even
+# a stored null -- can be mistaken for "this project records no rootfs".
+_NO_METADATA: Any = object()
 # Append-only finding revisions are managed by project_findings, never through
 # ordinary file import/delete or BinaryView save operations.
 FINDINGS_FOLDER = ".bn-findings"
@@ -63,6 +66,11 @@ _FORKED_OWNERS: list[ProjectManager] = []
 
 def _shape_name(value: Any) -> str:
     return type(value).__name__
+
+
+def _clip(text: str, limit: int = 80) -> str:
+    """*text* for a refusal message: what was refused, not a megabyte of it."""
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _refuse_shape(path: str, expected: str, value: Any) -> None:
@@ -112,21 +120,26 @@ def validate_rootfs_metadata(raw: Any) -> dict[str, Any]:
     for `path`/`source`; `root`/`platform`/`synced_at` are reported. Before
     this gate `{"libs": ["bad"]}` reached `.items()` as an `internal error:
     AttributeError`, and `version: 999` was read as version 1 (#1071).
-    Unknown extra keys are left alone: they are the current version's
-    forward-compatible room, not a different format. Only `libs` must be
-    present; the rest are checked when they are."""
+    Unknown extra keys are accepted and ignored (a later bn may add some),
+    but a sync rewrites the document from what this bn understands and does
+    not carry them over. Only `libs` must be present; the rest are checked
+    when they are."""
     if not isinstance(raw, dict):
         raise RuntimeError(
             f"rootfs metadata must be a JSON object, got {_shape_name(raw)}; {_ROOTFS_REINIT}")
     version = raw.get("version")
-    if version is None:
+    if type(version) is not int or version != ROOTFS_METADATA_VERSION:
+        # The integer current version only: `"1"`, `1.0` and `true` are not it.
+        if version is None:
+            stated = "has no version"
+        elif type(version) is int:
+            stated = f"is version {version}"
+        else:
+            stated = (f"is version {_clip(repr(version))} "
+                      f"(a {_shape_name(version)}, not an integer)")
         raise RuntimeError(
-            "this project's rootfs metadata has no version; this bn understands version "
-            f"{ROOTFS_METADATA_VERSION} \u2014 upgrade bn or re-run project init")
-    if isinstance(version, bool) or version != ROOTFS_METADATA_VERSION:
-        raise RuntimeError(
-            f"this project's rootfs metadata is version {version}; this bn understands "
-            f"version {ROOTFS_METADATA_VERSION} \u2014 upgrade bn or re-run project init")
+            f"this project's rootfs metadata {stated}; this bn understands version "
+            f"{ROOTFS_METADATA_VERSION}; {_ROOTFS_REINIT}")
     # Only `libs` is required: every other key is read with a tolerant
     # `.get(...)` by its consumers, and the issue's own repro document carries
     # just `version`/`platform`/`libs` (#1071). Present keys must have the shape
@@ -149,7 +162,7 @@ def validate_rootfs_metadata(raw: Any) -> dict[str, Any]:
     if not isinstance(libs, dict):
         _refuse_shape("libs", "an object", libs)
     for file_id, entry in libs.items():
-        path = f"libs[{file_id!r}]"
+        path = f"libs[{_clip(repr(file_id))}]"
         if not isinstance(entry, dict):
             _refuse_shape(path, "an object", entry)
         _require_str(entry, "rel_realpath", f"{path}.rel_realpath")
@@ -453,24 +466,30 @@ class ProjectManager:
     # -- rootfs metadata ----------------------------------------------------
 
     def _rootfs_raw(self) -> Any:
-        """The decoded `bn.rootfs` blob as stored, or None when the project
-        records none. Text that is not JSON is a refusal, not "none": it is
-        metadata somebody wrote, which this bn cannot read (#1071)."""
+        """The decoded `bn.rootfs` blob as stored, or `_NO_METADATA` when the
+        key is absent. ONLY an absent key is "none" (#1071 review): a stored
+        `null` or empty string is metadata somebody wrote, and reading it as
+        "none" let the next sync start from an empty inventory and import
+        every library a second time. Text that is not JSON -- or nests too
+        deeply to decode -- is a refusal too."""
         project = self.require().project
         try:
             raw = project.query_metadata(ROOTFS_METADATA_KEY)
-        except Exception:  # noqa: BLE001 - BN raises for a missing key
-            return None
+        except KeyError:  # Binary Ninja raises KeyError for a missing key
+            return _NO_METADATA
+        except Exception as exc:  # noqa: BLE001 - unreadable is not "absent"
+            raise RuntimeError(
+                f"rootfs metadata could not be read ({type(exc).__name__}: {_clip(str(exc))}); "
+                f"{_ROOTFS_REINIT}") from exc
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", "replace")
-        if raw is None or raw == "":
-            return None
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
-            except ValueError as exc:
+            except (ValueError, RecursionError) as exc:
                 raise RuntimeError(
-                    f"rootfs metadata is not valid JSON ({exc}); {_ROOTFS_REINIT}") from exc
+                    f"rootfs metadata is not valid JSON ({type(exc).__name__}: "
+                    f"{_clip(str(exc))}); {_ROOTFS_REINIT}") from exc
         return raw
 
     def get_rootfs(self) -> dict[str, Any] | None:
@@ -481,7 +500,7 @@ class ProjectManager:
         shape is a user-facing refusal everywhere and an `internal error:`
         nowhere (#1071)."""
         raw = self._rootfs_raw()
-        return None if raw is None else validate_rootfs_metadata(raw)
+        return None if raw is _NO_METADATA else validate_rootfs_metadata(raw)
 
     def set_rootfs(self, value: dict[str, Any]) -> None:
         """Store *value* as the `bn.rootfs` project metadata (JSON text)."""
@@ -499,10 +518,14 @@ class ProjectManager:
     def clear_rootfs(self) -> None:
         """Remove the `bn.rootfs` metadata: the rollback for a sync that found
         none to restore (storing `{}` instead would leave a blob the gate above
-        refuses as versionless)."""
+        refuses as versionless). Checked like `set_rootfs`: the native result,
+        then a readback."""
         project = self.require().project
         try:
-            project.remove_metadata(ROOTFS_METADATA_KEY)
+            if project.remove_metadata(ROOTFS_METADATA_KEY) is False:
+                raise RuntimeError("Binary Ninja returned False")
+            if self._rootfs_raw() is not _NO_METADATA:
+                raise RuntimeError("the metadata is still present after the removal")
         except Exception as exc:  # noqa: BLE001 - ProjectException
             raise RuntimeError(
                 f"Binary Ninja could not remove the rootfs metadata from the project: {exc}"

@@ -33,6 +33,12 @@ class RootfsProject(FakeProject):
         self.metadata[key] = value
         return True
 
+    def remove_metadata(self, key):
+        # Native: True for a present and for an absent key.
+        self.writes.append(("remove", key))
+        self.metadata.pop(key, None)
+        return True
+
     @contextmanager
     def bulk_operation(self):
         self.bulk_entries += 1
@@ -240,7 +246,8 @@ def _store_raw_metadata(w, document):
 
 
 _VERSION_REFUSAL = ("this project's rootfs metadata is version 999; this bn understands "
-                    "version 1 \u2014 upgrade bn or re-run project init")
+                    "version 1; this bn cannot rebuild an inventory it cannot read: upgrade "
+                    "bn, or move the project aside and re-run `bn project init <root>`")
 
 
 def test_malformed_libs_metadata_is_refused_by_key_1071(world):
@@ -324,6 +331,80 @@ def test_future_metadata_version_is_refused_by_every_consumer_1071(world, monkey
     with pytest.raises(RuntimeError, match=r"rootfs metadata has no version"):
         _store_raw_metadata(w, {"root": str(w.tmp), "platform": "linux", "libs": {}})
         w.ops.project_libs(w.instance)
+
+
+@pytest.mark.parametrize(("blob", "expected"), [
+    pytest.param("null", "rootfs metadata must be a JSON object, got NoneType", id="null"),
+    pytest.param("", "rootfs metadata is not valid JSON", id="empty-string"),
+    pytest.param('{"version": 1, "libs": ' + "[" * 100_000 + "]" * 100_000 + "}",
+                 "rootfs metadata is not valid JSON (RecursionError", id="deep-nesting"),
+])
+def test_a_stored_blob_is_never_read_as_no_metadata_1071(world, monkeypatch, blob, expected):
+    """#1071 review: a stored `null` or empty string was read as "no metadata",
+    so the next sync started from an empty inventory and imported every
+    library a second time; a deeply nested blob was `internal error:
+    RecursionError`. Only an ABSENT key is "none"."""
+    w = world
+    root = w.tmp / "rootfs"
+    (root / "lib").mkdir(parents=True)
+    (root / "lib" / "liba.so").write_bytes(b"\x7fELF")
+    w.infos[str(root / "lib" / "liba.so")] = elf(w)
+    monkeypatch.setattr(w.ops, "lookup_paths", lambda *a: [NS(path_in_root="/lib", source="default")])
+    assert len(w.ops.project_sync_libs(w.instance, root=str(root))["imported"]) == 1
+    w.project.metadata["bn.rootfs"] = blob
+    files_before, writes_before = list(w.project.files), list(w.project.writes)
+
+    for entry in (
+        lambda: w.instance.projects.get_rootfs(),
+        lambda: w.ops.project_libs(w.instance),
+        lambda: w.ops.project_sync_libs(w.instance, root=str(root)),
+    ):
+        with pytest.raises(RuntimeError) as raised:
+            entry()
+        assert str(raised.value).startswith(expected), str(raised.value)[:200]
+    assert w.project.files == files_before and w.project.writes == writes_before
+    assert w.project.metadata["bn.rootfs"] == blob
+
+    del w.project.metadata["bn.rootfs"]
+    assert w.instance.projects.get_rootfs() is None
+
+
+@pytest.mark.parametrize(("version", "shown"), [
+    ("1", "version '1' (a str, not an integer)"),
+    (1.0, "version 1.0 (a float, not an integer)"),
+    (True, "version True (a bool, not an integer)"),
+    (-1, "version -1"),
+    (2, "version 2"),
+])
+def test_only_the_integer_current_version_is_current_1071(world, version, shown):
+    w = world
+    _store_raw_metadata(w, {**w.meta, "version": version})
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_libs(w.instance)
+    message = str(raised.value)
+    assert message.startswith(f"this project's rootfs metadata is {shown}; this bn understands "
+                              "version 1; "), message
+    assert "move the project aside and re-run `bn project init <root>`" in message
+
+
+def test_unknown_metadata_keys_are_accepted_and_refusals_are_bounded_1071(world):
+    w = world
+    pf = library(w, "/lib/libz.so")
+    extra = {**w.meta, "added_by_a_later_bn": {"x": 1},
+             "lookup_paths": [{"path": "/lib", "source": "default", "note": "extra"}]}
+    extra["libs"][pf.id]["added_too"] = True
+    _store_raw_metadata(w, extra)
+    assert [row["project_path"] for row in w.ops.project_libs(w.instance)["libs"]] == ["/lib/libz.so"]
+
+    # A refusal echoes what it refuses, but not a megabyte of it.
+    _store_raw_metadata(w, {**w.meta, "version": "9" * 1_000_000})
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_libs(w.instance)
+    assert len(str(raised.value)) < 600 and "..." in str(raised.value)
+    _store_raw_metadata(w, {**w.meta, "libs": {"k" * 1_000_000: "x"}})
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_libs(w.instance)
+    assert len(str(raised.value)) < 600 and "must be an object, got str" in str(raised.value)
 
 
 def test_sync_group_skip_changed_bulk_and_metadata(world, monkeypatch):
