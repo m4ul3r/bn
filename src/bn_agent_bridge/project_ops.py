@@ -781,11 +781,11 @@ def folder_components(path: Any) -> list[str]:
 
 def _refuse_finding_path(path: str) -> None:
     """Refuse a path whose first component is the ledger namespace. Literal on
-    purpose: an existing file's `path_in_project` has no `.`/empty components,
-    and a file in a literal `/./.bn-findings/...` folder (which earlier
-    versions let `--folder ./.bn-findings/...` create) is NOT ledger history,
-    so it stays deletable. User-supplied folder input is normalised by
-    `folder_components` BEFORE it reaches this check."""
+    purpose: a file in a literal `/./.bn-findings/...` folder (which earlier
+    versions let `--folder ./.bn-findings/...` or a `/` in `--name` create) is
+    NOT ledger history, so it stays deletable by its stored path.
+    User-supplied folder input is normalised by `folder_components`, and a
+    name is held to one component, BEFORE either reaches this check."""
     components = [part for part in path.split("/") if part]
     if components and components[0] == FINDINGS_FOLDER:
         raise RuntimeError(
@@ -793,6 +793,13 @@ def _refuse_finding_path(path: str) -> None:
             "to append a revision or review; existing finding records cannot be "
             "overwritten or deleted"
         )
+
+
+def _refuse_nul(label: str, value: str) -> None:
+    """Binary Ninja cuts a project name at the first NUL, so a check on the
+    requested string would look past the path that is actually created."""
+    if "\0" in value:
+        raise RuntimeError(f"project_import: {label} must not contain a NUL byte")
 
 
 def project_import(
@@ -811,6 +818,17 @@ def project_import(
         raise RuntimeError(f"project_import: not a file: {source}")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise RuntimeError("project_import: name must be a non-empty string when given")
+    if isinstance(name, str):
+        _refuse_nul("name", name)
+    if isinstance(folder, str):
+        _refuse_nul("folder", folder)
+    if isinstance(name, str) and "/" in name:
+        # A name is one path component. With a `/` it spelled a path the folder
+        # normalisation never saw: `--name ./.bn-findings/x` was stored as
+        # `/./.bn-findings/x`, the lookalike `--folder` already refuses (#1074).
+        raise RuntimeError(
+            "project_import: name must be a single path component (no `/`); "
+            "name the folder with --folder")
     components = folder_components(folder)
     _refuse_finding_path("/".join(components + [(name or source.name).strip()]))
     target_folder = manager.ensure_folder("/".join(components))

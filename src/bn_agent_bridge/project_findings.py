@@ -644,7 +644,11 @@ def project_finding_review(bridge: Any, id: Any, document: Any, expected_revisio
     rationale = _text(document["rationale"], "rationale")
     inputs = _array(document["evidence"], "review evidence", nonempty=verdict != "supersede")
     if verdict == "accept" and _same_label(reviewer, previous["author"]):
-        raise RuntimeError("Self acceptance is forbidden: reviewer must differ from claim author")
+        # Both labels, because as typed they may differ (`Analyst` / `analyst`).
+        raise RuntimeError(
+            f"Self acceptance is forbidden: reviewer {reviewer!r} is the claim author "
+            f"{previous['author']!r} (labels are compared ignoring case, Unicode "
+            "width/compatibility forms and spacing); a different reviewer must accept")
     replacement = None
     if verdict == "supersede":
         replacement = ledger.get(document.get("replacement"))["id"]

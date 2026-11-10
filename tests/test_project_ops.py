@@ -947,6 +947,65 @@ def test_project_import_allows_the_reserved_name_below_the_root(po, populated, t
     assert row["folder"] == "/usr/.bn-findings" and row["path"] == "/usr/.bn-findings/blob.bin"
 
 
+def _truncate_at_nul_like_the_native_api(monkeypatch, project):
+    """Binary Ninja's project API takes C strings: a folder or file name is cut
+    at its first NUL. The shared fake keeps the NUL, so no mocked test could
+    see a check that looked at the requested string and a create that landed
+    somewhere else (#1074 review)."""
+    create_folder, create_file = project.create_folder, project.create_file_from_path
+    monkeypatch.setattr(project, "create_folder",
+                        lambda parent, name: create_folder(parent, name.split("\0")[0]))
+    monkeypatch.setattr(
+        project, "create_file_from_path",
+        lambda path, folder, name, description="": create_file(
+            path, folder, name.split("\0")[0], description))
+
+
+@pytest.mark.parametrize("folder,name", [
+    (".bn-findings\0", "note"),                                   # lands in the ledger
+    (".bn-findings\0x/F-abababababababababababababababab", "000001.json"),   # forged record
+    ("usr/\0.bn-findings", "note"),
+    ("fw\0x", None),                                              # second /fw folder
+    ("fw", "app\0x"),                                             # second /fw/app
+    (None, ".bn-findings\0"),
+])
+def test_project_import_refuses_a_nul_in_folder_or_name(
+        po, populated, tmp_path, monkeypatch, folder, name):
+    """#1074 review: the native API cuts a name at the first NUL, so
+    `--folder '.bn-findings\\0'` passed the reserved-namespace check as a
+    different string and was then created AS `.bn-findings`. Only the raw
+    protocol can carry a NUL (argv cannot); it is refused before any path
+    check."""
+    manager, project, _ = populated
+    _truncate_at_nul_like_the_native_api(monkeypatch, project)
+    source = tmp_path / "record.json"
+    source.write_bytes(b'{"claim":"forged"}')
+    files, folders = list(project.files), list(project.folders)
+    label = "name" if name is not None and "\0" in name else "folder"
+    with pytest.raises(RuntimeError, match=f"project_import: {label} must not contain a NUL byte"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), folder=folder, name=name)
+    assert project.files == files and project.folders == folders
+
+
+@pytest.mark.parametrize("name", [
+    "./.bn-findings/x",                  # the `/./.bn-findings` lookalike through --name
+    "./.bn-findings/F-abababababababababababababababab/000003.json",
+    "sub/tool", "/tool", "tool/",
+])
+def test_project_import_refuses_a_slash_in_the_name(po, populated, tmp_path, name):
+    """#1074 review: a name is ONE path component (`--folder` names folders).
+    A `/` in it produced a path-in-project the folder normalisation never saw,
+    so `--name ./.bn-findings/x` was stored as `/./.bn-findings/x`."""
+    manager, project, _ = populated
+    source = tmp_path / "record.json"
+    source.write_bytes(b"x")
+    files, folders = list(project.files), list(project.folders)
+    with pytest.raises(RuntimeError, match="name must be a single path component.*--folder"):
+        po.project_import(_bridge_with_rows(manager, []), str(source), name=name)
+    assert project.files == files and project.folders == folders
+
+
+
 @pytest.mark.parametrize("folder", ["./usr//bin/", "usr/./bin", "/usr/bin/", "usr/bin"])
 def test_project_import_normalises_the_folder_spelling(po, populated, tmp_path, folder):
     """#1074 item 2: `./`, `//`, a leading and a trailing `/` are spellings of
@@ -967,7 +1026,24 @@ def test_project_files_normalises_the_folder_filter(po, populated):
     plain = po.project_files(bridge, folder="fw")
     for spelling in ("./fw//", "/fw/", "fw/./"):
         assert po.project_files(bridge, folder=spelling) == plain, spelling
-    assert [r["path"] for r in plain["files"]]
+    # Key-agnostic on purpose: the file rows are `files` here and `items` once
+    # the paged listing (#1080) lands; the equality above is the assertion.
+    rows = plain.get("items", plain.get("files"))
+    assert [r["path"] for r in rows]
+
+
+def test_project_files_can_still_list_a_legacy_dot_folder_unfiltered(po, populated):
+    """A literal `.` folder written before #1074 is no longer addressable with
+    `--folder ./…` (that spelling now means the root); the unfiltered listing
+    still shows its files, and delete works on the stored path."""
+    manager, project, _ = populated
+    dot = project.add_folder(".bn-findings", project.add_folder("."))
+    old = project.add_file("old.bin", dot)
+    bridge = _bridge_with_rows(manager, [])
+    listing = po.project_files(bridge)
+    assert "/./.bn-findings/old.bin" in [r["path"] for r in listing.get("items", listing.get("files"))]
+    assert po.project_delete(bridge, "/./.bn-findings/old.bin")["deleted"] is True
+    assert old not in project.files
 
 
 def test_project_delete_cannot_erase_finding_history(po, populated):
