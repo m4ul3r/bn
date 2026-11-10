@@ -192,16 +192,31 @@ def test_sync_work_refusal_names_the_knob_and_the_restart_command_1075(world, mo
         w.ops.project_sync_libs(w.instance, root=str(root))
 
     message = str(raised.value)
-    assert message.startswith("rootfs discovery refused: work limit exceeded (used 3 units, "
-                              "BN_ROOTFS_MAX_WORK=2, charged per file opened and per MiB read)")
+    assert message.startswith("rootfs discovery refused: work limit exceeded (used more than 2 "
+                              "units, BN_ROOTFS_MAX_WORK=2, charged per file opened and per MiB read)")
     assert "no inventory committed" in message
     # The bridge that owns the project read the variable when it started; the
     # CLI's environment never reaches it, so the advice is a restart.
-    assert message.endswith(
-        "The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart: "
-        "BN_ROOTFS_MAX_WORK=4 bn session restart rootfs-test")
+    assert "The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart" in message
+    assert message.endswith(": BN_ROOTFS_MAX_WORK=4 bn session restart rootfs-test")
     assert w.project.files == []
     assert w.instance.projects.get_rootfs() == old_metadata
+
+
+def test_sync_refusal_restart_command_runs_for_a_dash_leading_instance_id_1075(
+    world, monkeypatch,
+):
+    """#1075 review: an instance id may start with `-`; printed raw, `bn session
+    restart -x` is an argparse error, so the command is spelled `-- -x`."""
+    w = world
+    root = _sources(w, monkeypatch)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2")
+    w.instance.instance_id = "-x"
+
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_sync_libs(w.instance, root=str(root))
+
+    assert str(raised.value).endswith(": BN_ROOTFS_MAX_WORK=4 bn session restart -- -x")
 
 
 def test_sync_cancellation_during_elf_discovery_preserves_inventory(world, monkeypatch):

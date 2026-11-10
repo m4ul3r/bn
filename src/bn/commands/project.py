@@ -153,6 +153,30 @@ def _lookup_rows(lookup: list[Any]) -> list[dict[str, Any]]:
     return [{"path": lp.path_in_root, "source": lp.source} for lp in lookup]
 
 
+def _cache_fallback_problem(directory: str) -> str | None:
+    """Why the cache `projects` directory cannot be created or written, judged
+    without creating anything: the nearest existing ancestor must be a
+    writable directory. None when it can."""
+    probe = directory
+    while not os.path.lexists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if not os.path.isdir(probe):
+        return f"{probe} exists and is not a directory"
+    if not os.access(probe, os.W_OK | os.X_OK):
+        return f"{probe} is not writable"
+    return None
+
+
+def _unusable_cache_fallback(directory: str, problem: str, rootfs_parent: str) -> BridgeError:
+    return BridgeError(
+        f"cannot create the cache projects directory {directory}: {problem}. The rootfs's "
+        f"parent {rootfs_parent} is not writable either, so there is nowhere to create the "
+        "project; set BN_CACHE_DIR to a writable directory.")
+
+
 def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     """Everything `project init` decides without a bridge: the rootfs, the
     project path (existing preferred, existing fallback, else create at the
@@ -180,6 +204,11 @@ def _init_plan(args: argparse.Namespace) -> dict[str, Any]:
     else:
         project_path, exists = fallback, False
         fallback_from = os.path.dirname(preferred) or os.sep
+        # Planned here, so `--dry-run` cannot promise `[new]` for a location
+        # the real run would fail to create (#1075 review).
+        problem = _cache_fallback_problem(os.path.dirname(fallback))
+        if problem is not None:
+            raise _unusable_cache_fallback(os.path.dirname(fallback), problem, fallback_from)
     # An explicit root that matches no detector is still usable as a project
     # root; its loader is unknown, so library sync has nothing to scan.
     lookup = rootfs_layout.lookup_paths(info.root, info.platform)
@@ -228,7 +257,12 @@ def _project_init(args: argparse.Namespace) -> int:
         # it died with FileNotFoundError (#1075). Create it here, owner-private
         # like every other cache directory.
         if plan["fallback_from"] is not None:
-            paths.ensure_private_dir(Path(os.path.dirname(path)))
+            directory = os.path.dirname(path)
+            try:
+                paths.ensure_private_dir(Path(directory))
+            except OSError as exc:  # raced with the plan's own check
+                raise _unusable_cache_fallback(
+                    directory, exc.strerror or str(exc), plan["fallback_from"]) from exc
         op, params = "project_create", {
             "path": path, "name": plan["name"],
             "rootfs": {"root": plan["root"], "platform": plan["platform"]},

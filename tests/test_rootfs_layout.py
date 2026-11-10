@@ -735,7 +735,9 @@ def test_work_is_charged_per_file_and_per_mib_never_per_check_1075(tmp_path: Pat
         budget.charge(files=1)
     message = str(raised.value)
     assert message.startswith("rootfs discovery refused: work limit exceeded")
-    assert "used 4 units" in message and "BN_ROOTFS_MAX_WORK=3" in message
+    # The budget stops at the first unit over the limit, so the number it can
+    # state is the limit, not the tree's need (#1075 review).
+    assert "used more than 3 units" in message and "BN_ROOTFS_MAX_WORK=3" in message
     assert "charged per file opened and per MiB read" in message
     assert "no inventory committed" in message
     assert "session restart" not in message, "no restart advice without a restart command"
@@ -743,8 +745,57 @@ def test_work_is_charged_per_file_and_per_mib_never_per_check_1075(tmp_path: Pat
     with_restart = rl.DiscoveryBudget(max_work=3, timeout=30, restart="bn session restart w1")
     with pytest.raises(RuntimeError) as raised:
         with_restart.charge(files=4)
-    assert ("The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart: "
-            "BN_ROOTFS_MAX_WORK=6 bn session restart w1") in str(raised.value)
+    assert str(raised.value).endswith(
+        "The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart; the "
+        "total needed is not known, so doubling is only a starting point: "
+        "BN_ROOTFS_MAX_WORK=6 bn session restart w1")
+
+
+def test_deadline_and_byte_refusals_name_their_knob_and_the_restart_1075(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1075 review: only the work refusal named its variable; a deadline or
+    byte refusal left the same trap (the CLI's environment is ignored)."""
+    too_many = rl.DiscoveryBudget(max_bytes=8, timeout=30, restart="bn session restart w1")
+    with pytest.raises(RuntimeError) as raised:
+        too_many.charge(bytes_read=9)
+    message = str(raised.value)
+    assert message.startswith("rootfs discovery refused: discovery byte limit exceeded "
+                              "(read more than 8 bytes, BN_ROOTFS_MAX_BYTES=8)")
+    assert message.endswith("BN_ROOTFS_MAX_BYTES=16 bn session restart w1")
+
+    late = rl.DiscoveryBudget(timeout=1.5, restart="bn session restart w1")
+    expired = rl.time.monotonic() + 5
+    monkeypatch.setattr(rl.time, "monotonic", lambda: expired)
+    with pytest.raises(RuntimeError) as raised:
+        late.check()
+    message = str(raised.value)
+    assert message.startswith("rootfs discovery refused: discovery deadline exceeded "
+                              "(BN_ROOTFS_TIMEOUT=1.5 seconds)")
+    assert "reads BN_ROOTFS_TIMEOUT at start" in message
+    assert message.endswith("BN_ROOTFS_TIMEOUT=3 bn session restart w1")
+
+
+def test_directory_listings_of_the_startup_glob_are_charged_1075(tmp_path: Path) -> None:
+    """#1075 review: the per-listing charge in the glob walk is the only
+    non-deadline bound on `etc/rc.d/**` and wildcard `include` patterns. A deep
+    tree of EMPTY directories holds no file to read, so every unit spent here
+    is a directory listed."""
+    root = _linux_rootfs(tmp_path)
+    (root / "etc/profile").unlink()
+    deep = root / "etc/rc.d"
+    for index in range(40):
+        deep = deep / f"d{index}"
+    deep.mkdir(parents=True)
+
+    budget = rl.DiscoveryBudget(max_work=1_000, timeout=30)
+    with rl.discovery_budget(budget):
+        assert rl.env_hint(str(root)) == []
+    assert budget.work_used >= 40, budget.work_used
+
+    with rl.discovery_budget(rl.DiscoveryBudget(max_work=20, timeout=30)):
+        with pytest.raises(RuntimeError, match="work limit exceeded"):
+            rl.env_hint(str(root))
 
 
 def test_scan_charges_one_unit_per_file_plus_its_mib_regardless_of_entry_count_1075(

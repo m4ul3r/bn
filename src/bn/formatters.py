@@ -1757,8 +1757,8 @@ def _render_project_init_text(value: Any) -> str:
         lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
         error = _text_value(value, "sync_error")
         if error:
-            # The project is open but empty: `next: bn project files` would
-            # list nothing, so the next step is the sync itself (#1075).
+            # The inventory was not updated (a new project is empty), so the
+            # next step is the sync itself, not `bn project files` (#1075).
             lines.append(f"libraries: sync FAILED -- {_escape_control_chars(error)}")
             lines.append("retry: `bn project libs --sync` once the cause is fixed")
             return "\n".join(lines)

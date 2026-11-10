@@ -598,7 +598,7 @@ def test_project_init_creates_syncs_and_pins(fake_transport, monkeypatch, tmp_pa
     import bn.commands.project
     root = _rootfs(tmp_path)
     _patch_layout(monkeypatch, root)
-    _patch_projects_dir(monkeypatch, tmp_path)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
     _one_instance(monkeypatch)
     pins = _capture_pins(monkeypatch)
     project_path = root + ".bnpr"
@@ -629,6 +629,9 @@ def test_project_init_creates_syncs_and_pins(fake_transport, monkeypatch, tmp_pa
     assert "/lib/libc.so" in out
     assert "skipped (not ELF): 1" in out
     assert "next: `bn project files`" in out and "bn project load <path-in-project>" in out
+    # #1075 review: the cache `projects` directory is the FALLBACK's parent; a
+    # project created at the preferred location must not leave one behind.
+    assert not cache.exists() and not cache.parent.exists()
 
 
 def test_project_init_name_override(fake_transport, monkeypatch, tmp_path):
@@ -698,16 +701,29 @@ def test_project_init_prefers_existing_fallback_over_new_preferred(
     assert calls[0]["params"] == {"path": fallback}
 
 
+def _readonly_parent_rootfs(monkeypatch, tmp_path):
+    """A rootfs whose PARENT is not writable (and only that directory: the
+    cache location keeps the real answer), as `os.access` reports it."""
+    import bn.commands.project
+    parent = tmp_path / "srv"
+    parent.mkdir()
+    root = _rootfs(parent)
+    real_access = os.access
+    monkeypatch.setattr(
+        bn.commands.project.os, "access",
+        lambda p, mode: False if os.fspath(p) == str(parent.resolve()) else real_access(p, mode))
+    return root
+
+
 def test_project_init_falls_back_to_cache_when_parent_unwritable(
     fake_transport, monkeypatch, tmp_path
 ):
     import bn.commands.project
     from bn import rootfs_layout
-    root = _rootfs(tmp_path)
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
     _patch_layout(monkeypatch, root)
     cache = _patch_projects_dir(monkeypatch, tmp_path)
     _preferred, fallback = rootfs_layout.project_location(root, str(cache))
-    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: False)
     _one_instance(monkeypatch)
     _capture_pins(monkeypatch)
     calls = fake_transport({
@@ -729,11 +745,10 @@ def test_project_init_creates_the_cache_projects_dir_before_the_bridge_creates_1
     import stat
     import bn.commands.project
     from bn import rootfs_layout
-    root = _rootfs(tmp_path)
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
     _patch_layout(monkeypatch, root)
     cache = _patch_projects_dir(monkeypatch, tmp_path)
     preferred, fallback = rootfs_layout.project_location(root, str(cache))
-    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: False)
     _one_instance(monkeypatch)
     _capture_pins(monkeypatch)
     assert not cache.exists()
@@ -764,11 +779,10 @@ def test_project_init_dry_run_explains_the_cache_fallback_and_creates_nothing_10
 ):
     import bn.commands.project
     from bn import rootfs_layout
-    root = _rootfs(tmp_path)
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
     _patch_layout(monkeypatch, root)
     cache = _patch_projects_dir(monkeypatch, tmp_path)
     preferred, fallback = rootfs_layout.project_location(root, str(cache))
-    monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: False)
     monkeypatch.setattr(bn.cli, "send_request",
                         lambda *a, **k: pytest.fail("dry-run must not send"))
 
@@ -789,6 +803,52 @@ def test_project_init_dry_run_explains_the_cache_fallback_and_creates_nothing_10
     assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["project_path"] == preferred and data["fallback_from"] is None
+
+
+@pytest.mark.parametrize("obstacle", ["cache_root_is_a_file", "projects_is_a_file",
+                                      "projects_is_a_dangling_symlink", "cache_root_unwritable"])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_project_init_with_an_unusable_cache_fallback_is_a_handled_refusal_1075(
+    monkeypatch, tmp_path, capsys, obstacle, dry_run
+):
+    """#1075 review: when the cache fallback cannot be created the real run
+    died with a traceback (`PermissionError` / `FileExistsError`, exit 1) while
+    `--dry-run` had just promised `[new]` at exit 0. Both now refuse at exit 2
+    naming the directory and the reason, before anything is sent."""
+    import bn.commands.project
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    blocker = cache.parent
+    if obstacle == "cache_root_is_a_file":
+        cache.parent.write_text("not a directory")
+    elif obstacle == "projects_is_a_file":
+        cache.parent.mkdir()
+        cache.write_text("not a directory")
+        blocker = cache
+    elif obstacle == "projects_is_a_dangling_symlink":
+        cache.parent.mkdir()
+        cache.symlink_to(tmp_path / "nowhere")
+        blocker = cache
+    else:
+        cache.parent.mkdir()
+        patched = bn.commands.project.os.access
+        monkeypatch.setattr(
+            bn.commands.project.os, "access",
+            lambda p, mode: False if os.fspath(p) == str(cache.parent) else patched(p, mode))
+    _one_instance(monkeypatch)
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("nothing may be sent"))
+
+    argv = ["project", "init", root] + (["--dry-run"] if dry_run else [])
+    assert bn.cli.main(argv) == 2
+
+    captured = capsys.readouterr()
+    assert f"cannot create the cache projects directory {cache}" in captured.err
+    assert str(blocker) in captured.err
+    assert "BN_CACHE_DIR" in captured.err and "Traceback" not in captured.err
+    assert "[new]" not in captured.out
+    assert not cache.is_dir()
 
 
 def test_project_init_attaches_to_the_owner_then_syncs(

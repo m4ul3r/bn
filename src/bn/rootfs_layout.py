@@ -103,24 +103,34 @@ class DiscoveryBudget:
         """Refuse on cancellation, the deadline, or a limit the work charged so
         far exceeds. Charges nothing."""
         reason = None
+        # (variable, a doubled value) for a limit a restart can raise.
+        knob: tuple[str, str] | None = None
         if self.cancelled is not None and self.cancelled():
             reason = "request cancelled"
         elif time.monotonic() - self._started >= self.timeout:
-            reason = "discovery deadline exceeded"
+            reason = f"discovery deadline exceeded (BN_ROOTFS_TIMEOUT={self.timeout:g} seconds)"
+            knob = ("BN_ROOTFS_TIMEOUT", f"{2 * self.timeout:g}")
         elif self.work_used > self.max_work:
-            reason = (f"work limit exceeded (used {self.work_used} units, "
+            # Discovery stops at the first unit over the limit, so the limit is
+            # the only number known: "more than N", never the tree's need.
+            reason = (f"work limit exceeded (used more than {self.max_work} units, "
                       f"BN_ROOTFS_MAX_WORK={self.max_work}, charged per file opened "
                       "and per MiB read)")
+            knob = ("BN_ROOTFS_MAX_WORK", str(2 * self.max_work))
         elif self._bytes > self.max_bytes:
-            reason = "discovery byte limit exceeded"
+            reason = (f"discovery byte limit exceeded (read more than {self.max_bytes} bytes, "
+                      f"BN_ROOTFS_MAX_BYTES={self.max_bytes})")
+            knob = ("BN_ROOTFS_MAX_BYTES", str(2 * self.max_bytes))
         if reason is None:
             return
         message = f"rootfs discovery refused: {reason}; no inventory committed"
-        if reason.startswith("work limit") and self.restart:
+        if knob is not None and self.restart:
             # The CLI's environment never reaches the bridge that does the
             # work; the knob only applies to a process started with it.
-            message += (". The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set "
-                        f"it and restart: BN_ROOTFS_MAX_WORK={2 * self.max_work} {self.restart}")
+            variable, doubled = knob
+            message += (f". The owning bridge reads {variable} at start, so set it and "
+                        "restart; the total needed is not known, so doubling is only a "
+                        f"starting point: {variable}={doubled} {self.restart}")
         raise RuntimeError(message)
 
 
