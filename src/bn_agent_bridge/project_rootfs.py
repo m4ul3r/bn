@@ -36,7 +36,10 @@ from .rootfs_layout import (
 )
 from .target_hint import positional_selector
 
-METADATA_VERSION = 1
+# One number for the writer here and the validating reader in `project_ops`
+# (`ProjectManager.get_rootfs`, #1071); it lives there because this module
+# imports that one.
+METADATA_VERSION = project_ops.ROOTFS_METADATA_VERSION
 # ld.so builds the global scope breadth-first over NEEDED; a firmware tree
 # with a deeper chain than this is pathological, so the walk is bounded.
 _MAX_SCOPE_DEPTH = 8
@@ -275,7 +278,12 @@ def _apply_sync(
                     rollback_errors.append(f"file {pf.id}: {rollback_exc}")
             if metadata_attempted:
                 try:
-                    manager.set_rootfs(meta)
+                    # A sync that found no metadata restores "none", not `{}`:
+                    # the reader refuses a versionless blob (#1071).
+                    if meta:
+                        manager.set_rootfs(meta)
+                    else:
+                        manager.clear_rootfs()
                 except Exception as rollback_exc:  # noqa: BLE001
                     rollback_errors.append(f"metadata: {rollback_exc}")
             if rollback_errors:
