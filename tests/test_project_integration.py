@@ -149,10 +149,12 @@ class Lane:
         return self._cli_or_wire(["project", "info"], "project_info", {})
 
     def project_files(self, folder: str | None = None) -> list[dict[str, Any]]:
+        """The file rows in *folder*: the first page (#1080), which holds every
+        row of a lane project -- they stay far below the default limit."""
         args = ["project", "files"] + (["--folder", folder] if folder else [])
         params: dict[str, Any] = {"folder": folder} if folder else {}
         result = self._cli_or_wire(args, "project_files", params)
-        return result["files"] if isinstance(result, dict) else result
+        return result["items"] if isinstance(result, dict) else result
 
     def project_import(self, path: Path, folder: str) -> dict[str, Any]:
         return self._cli_or_wire(

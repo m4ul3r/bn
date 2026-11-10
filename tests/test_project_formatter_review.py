@@ -48,6 +48,12 @@ _FINDING = {"id": "CELL", "type": "CELL", "review_state": "CELL",
                           "project_file_id": "CELL"}, "CELL"]}),
     (fmt._render_project_file_text, _FILE),
     (fmt._render_project_file_text, {**_FILE, "source_symlink": "CELL -> CELL"}),
+    (fmt._render_project_files_text, {"items": [_FILE, "CELL"], "total": "CELL",
+                                    "offset": "CELL", "limit": "CELL", "has_more": "CELL",
+                                    "folders": [{"id": "CELL", "path": "CELL", "files": "CELL",
+                                                 "files_recursive": "CELL"}, "CELL"]}),
+    # The retained `files` alias (#1080 review: a bridge from before the
+    # items/paging upgrade), exercised on the same escaping contract.
     (fmt._render_project_files_text, {"files": [_FILE, "CELL"],
                                     "folders": [{"id": "CELL", "path": "CELL"}, "CELL"]}),
     (fmt._render_project_load_text, {"path": "CELL", "project_path": "CELL",

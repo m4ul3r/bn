@@ -5986,7 +5986,9 @@ def _bind_project_info(bridge, params, target):
 def _bind_project_files(bridge, params, target):
     return project_ops.project_files(
         bridge, params.get("folder"),
-        recursive=_validate_bool(params.get("recursive"), label="recursive", default=True))
+        recursive=_validate_bool(params.get("recursive"), label="recursive", default=True),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None)
 
 
 @op("project_load", lock="none")

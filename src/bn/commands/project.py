@@ -388,20 +388,35 @@ def _project_info(args: argparse.Namespace) -> int:
     )
 
 
-@command("project", "files", help="List the files in the open project",
+@command("project", "files", help="List the files in the open project", paged=True,
          args=[
              arg("--folder", default=None, metavar="PATH",
-                 help="Path-in-project of a folder to list (default: the root)"),
+                 help="Path-in-project of a folder to list (default: the root); a path "
+                      "that names no folder is refused. folders[] lists that folder and "
+                      "everything below it, each with its file counts; --limit/--offset "
+                      "page the files only: folders[] is returned whole on every page"),
              arg("--flat", action="store_true",
-                 help="Only the folder's direct children (default: recurse)"),
+                 help="Only the folder's direct files; folders[] then holds just the "
+                      "requested folder (none at the root) and the summary states what "
+                      "lies below (default: recurse)"),
          ])
 def _project_files(args: argparse.Namespace) -> int:
+    # Files page like every other list read; folders are a small side list
+    # the bridge returns whole on every page (#1080).
+    params: dict[str, Any] = {
+        "folder": args.folder, "recursive": not args.flat, "offset": args.offset,
+    }
+    limit = cli._effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     return _call(
         args,
         "project_files",
-        {"folder": args.folder, "recursive": not args.flat},
+        params,
         require_target=False,
         text_renderer=_render_project_files_text,
+        page_label="project files",
+        paged_spill=True,
         stem="project-files",
     )
 

@@ -1163,10 +1163,8 @@ def test_project_files_normalises_the_folder_filter(po, populated):
     plain = po.project_files(bridge, folder="fw")
     for spelling in ("./fw//", "/fw/", "fw/./"):
         assert po.project_files(bridge, folder=spelling) == plain, spelling
-    # Key-agnostic on purpose: the file rows are `files` here and `items` once
-    # the paged listing (#1080) lands; the equality above is the assertion.
-    rows = plain.get("items", plain.get("files"))
-    assert [r["path"] for r in rows]
+    # #1080 landed: the paged listing's file rows are `items`, not `files`.
+    assert [r["path"] for r in plain["items"]]
 
 
 def test_project_files_can_still_list_a_legacy_dot_folder_unfiltered(po, populated):
@@ -1178,7 +1176,7 @@ def test_project_files_can_still_list_a_legacy_dot_folder_unfiltered(po, populat
     old = project.add_file("old.bin", dot)
     bridge = _bridge_with_rows(manager, [])
     listing = po.project_files(bridge)
-    assert "/./.bn-findings/old.bin" in [r["path"] for r in listing.get("items", listing.get("files"))]
+    assert "/./.bn-findings/old.bin" in [r["path"] for r in listing["items"]]
     assert po.project_delete(bridge, "/./.bn-findings/old.bin")["deleted"] is True
     assert old not in project.files
 
@@ -1337,15 +1335,147 @@ def test_project_files_filters_by_folder_and_recursion(po, populated):
         {"target_id": "t-1", "project_file_id": f.app.id, "selector": "fw/app"},
     ])
     everything = po.project_files(bridge)
-    assert [r["path"] for r in everything["files"]] == [
+    assert [r["path"] for r in everything["items"]] == [
         "/fw/app", "/fw/app.bndb", "/fw/boot/stage2", "/loader"]
     assert [r["path"] for r in everything["folders"]] == ["/fw", "/fw/boot"]
-    assert next(r for r in everything["files"] if r["path"] == "/fw/app")["open_target_id"] == "t-1"
+    assert next(r for r in everything["items"] if r["path"] == "/fw/app")["open_target_id"] == "t-1"
 
     shallow = po.project_files(bridge, "fw", recursive=False)
-    assert [r["path"] for r in shallow["files"]] == ["/fw/app", "/fw/app.bndb"]
+    assert [r["path"] for r in shallow["items"]] == ["/fw/app", "/fw/app.bndb"]
     root_only = po.project_files(bridge, None, recursive=False)
-    assert [r["path"] for r in root_only["files"]] == ["/loader"]
+    assert [r["path"] for r in root_only["items"]] == ["/loader"]
+
+
+def _firmware_tree(project):
+    """`/usr/bin` (3 files), `/usr/lib` (1), `/usr` (1 of its own), `/opt` (0)."""
+    usr = project.add_folder("usr")
+    usr_bin = project.add_folder("bin", usr)
+    usr_lib = project.add_folder("lib", usr)
+    project.add_folder("opt")
+    for name in ("play", "record", "sh"):
+        project.add_file(name, usr_bin)
+    project.add_file("libc.so", usr_lib)
+    project.add_file("README", usr)
+
+
+def test_project_files_folders_follow_the_folder_filter_1080(po, opened):
+    """#1080: `folders[]` was every folder in the project whatever `--folder`
+    and `--flat` said, so one requested row came with ~20 unrelated folders."""
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    flat = po.project_files(bridge, "usr/bin", recursive=False)
+    assert [r["path"] for r in flat["items"]] == ["/usr/bin/play", "/usr/bin/record", "/usr/bin/sh"]
+    assert [r["path"] for r in flat["folders"]] == ["/usr/bin"]
+
+    subtree = po.project_files(bridge, "usr")
+    assert [r["path"] for r in subtree["folders"]] == ["/usr", "/usr/bin", "/usr/lib"]
+    assert [r["path"] for r in subtree["items"]] == [
+        "/usr/README", "/usr/bin/play", "/usr/bin/record", "/usr/bin/sh", "/usr/lib/libc.so"]
+
+    # The root: every folder, or -- flat -- none, exactly as for a folder.
+    assert [r["path"] for r in po.project_files(bridge)["folders"]] == [
+        "/opt", "/usr", "/usr/bin", "/usr/lib"]
+    assert po.project_files(bridge, None, recursive=False)["folders"] == []
+
+
+def test_project_files_folder_rows_carry_direct_and_recursive_counts_1080(po, opened):
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    counts = {row["path"]: (row["files"], row["files_recursive"])
+              for row in po.project_files(bridge)["folders"]}
+    assert counts == {"/opt": (0, 0), "/usr": (1, 5), "/usr/bin": (3, 3), "/usr/lib": (1, 1)}
+
+    [usr_bin] = po.project_files(bridge, "usr/bin", recursive=False)["folders"]
+    assert usr_bin["files"] == 3 and "files_recursive" not in usr_bin
+
+
+def test_project_files_pages_the_files_not_the_folders_1080(po, opened):
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    page = po.project_files(bridge, "usr", limit=2)
+    assert [r["path"] for r in page["items"]] == ["/usr/README", "/usr/bin/play"]
+    assert (page["total"], page["offset"], page["limit"], page["returned"], page["has_more"]) == (
+        5, 0, 2, 2, True)
+    assert page["kind"] == "project_files"
+    assert [r["path"] for r in page["folders"]] == ["/usr", "/usr/bin", "/usr/lib"]
+
+    last = po.project_files(bridge, "usr", offset=4, limit=2)
+    assert [r["path"] for r in last["items"]] == ["/usr/lib/libc.so"]
+    assert (last["total"], last["offset"], last["returned"], last["has_more"]) == (5, 4, 1, False)
+
+    everything = po.project_files(bridge, "usr")
+    assert everything["limit"] is None and everything["returned"] == 5
+    assert everything["has_more"] is False
+
+
+def test_project_files_refuses_a_folder_that_is_not_in_the_project_1080(po, opened):
+    """#1080 review: a `--folder` naming no folder (a typo, a file's path)
+    answered `items: [], folders: []` at exit 0 -- byte-identical to an empty
+    project. It is refused, naming it and the top-level folders."""
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    with pytest.raises(RuntimeError) as typo:
+        po.project_files(bridge, "usr/bni")
+    assert str(typo.value) == (
+        "No project folder matches '/usr/bni'. Top-level folders: /opt, /usr")
+    with pytest.raises(RuntimeError) as a_file:
+        po.project_files(bridge, "usr/bin/play", recursive=False)
+    assert str(a_file.value) == (
+        "No project folder matches '/usr/bin/play' (that path is a file). "
+        "Top-level folders: /opt, /usr")
+    # An existing but EMPTY folder is a real, empty scope.
+    empty = po.project_files(bridge, "opt")
+    assert empty["items"] == [] and [r["path"] for r in empty["folders"]] == ["/opt"]
+
+
+def test_project_files_flat_scope_states_what_lies_below_1080(po, opened):
+    """#1080 review: the flat root of a project whose files all live in
+    folders is not an empty project; the envelope says what was not listed."""
+    manager, project = opened
+    _firmware_tree(project)
+    bridge = _bridge_with_rows(manager, [])
+
+    root = po.project_files(bridge, None, recursive=False)
+    assert (root["items"], root["total"], root["folders"]) == ([], 0, [])
+    assert root["below"] == {"files": 5, "folders": 4}
+    usr = po.project_files(bridge, "usr", recursive=False)
+    assert usr["total"] == 1 and usr["below"] == {"files": 4, "folders": 2}
+    assert "below" not in po.project_files(bridge, "usr")
+
+
+def test_project_files_scope_stops_at_the_folder_boundary_1080(po, opened):
+    # `/lib` must not swallow its sibling `/lib64` (a string-prefix match would).
+    manager, project = opened
+    lib, lib64 = project.add_folder("lib"), project.add_folder("lib64")
+    project.add_folder("ld", lib)
+    project.add_file("libc.so", lib)
+    project.add_file("ld-linux.so", lib64)
+    bridge = _bridge_with_rows(manager, [])
+
+    scoped = po.project_files(bridge, "lib")
+    assert [r["path"] for r in scoped["items"]] == ["/lib/libc.so"]
+    assert [(r["path"], r["files"], r["files_recursive"]) for r in scoped["folders"]] == [
+        ("/lib", 1, 1), ("/lib/ld", 0, 0)]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"offset": -1}, {"offset": True}, {"offset": 1.5},
+    {"limit": 0}, {"limit": -1}, {"limit": False}, {"limit": 0.5},
+])
+def test_project_files_refuses_paging_values_no_page_can_have_1080(po, opened, kwargs):
+    manager, project = opened
+    _firmware_tree(project)
+    name = next(iter(kwargs))
+    with pytest.raises(RuntimeError, match=f"project_files: {name} must be"):
+        po.project_files(_bridge_with_rows(manager, []), "usr", **kwargs)
 
 
 def test_project_info_and_open_handler(po, bnpr, monkeypatch):

@@ -1097,41 +1097,107 @@ def project_open(bridge: Any, path: Any) -> dict[str, Any]:
 
 
 def project_files(
-    bridge: Any, folder: Any = None, recursive: Any = True
+    bridge: Any, folder: Any = None, recursive: Any = True, *,
+    offset: int = 0, limit: int | None = None,
 ) -> dict[str, Any]:
+    """The files under *folder* (the root when None) as a paged `items` list,
+    plus the UNPAGED `folders` side list covering the same scope: the
+    requested folder and, when *recursive*, every folder below it; at the root,
+    every folder, or none when flat. Each folder row counts its direct files
+    (`files`) and, when recursive, its whole subtree (`files_recursive`).
+    A flat listing also carries `below` -- how many files and folders lie
+    under the scope and were not listed -- so the flat root of a populated
+    project is not mistaken for an empty one. A *folder* that names no folder
+    in the project is refused, not answered with an empty listing.
+    Before #1080 `folders` was every folder in the project whatever the
+    filter said, so one requested row came with hundreds of unrelated folders."""
     manager = bridge.projects
     state = manager.require()
     if folder is not None and not isinstance(folder, str):
         raise RuntimeError(
             "project_files: folder must be a path in the project or null"
         )
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise RuntimeError("project_files: offset must be a non-negative integer")
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+        raise RuntimeError("project_files: limit must be a positive integer or null")
+    # Normalised the same way `project_import`'s duplicate check is (#1074):
+    # `./usr//bin/` and `usr/bin` name the same scope.
     components = folder_components(folder)
     wanted = "/" + "/".join(components) if components else ""
+
+    def in_scope(path: str) -> bool:
+        if wanted:
+            return path == wanted or (bool(recursive) and path.startswith(wanted + "/"))
+        return bool(recursive) or not path
+
     open_targets = {
         str(row["project_file_id"]): str(row.get("target_id") or "")
         for row in _open_project_targets(bridge)
     }
     files = list(state.project.files)
+    project_folders = [(manager.folder_path(f), f) for f in state.project.folders]
+    if wanted and all(path != wanted for path, _f in project_folders):
+        # A typo or a file's path used to answer `items: [], folders: []` --
+        # exactly what an empty project answers (#1080 review).
+        is_file = any(manager.path_in_project(pf) == wanted for pf in files)
+        top = sorted(path for path, _f in project_folders if path.count("/") == 1)
+        listed = ", ".join(top[:_LISTING_CAP]) or "none"
+        if len(top) > _LISTING_CAP:
+            listed += f", ... {len(top) - _LISTING_CAP} more"
+        raise RuntimeError(
+            f"No project folder matches {wanted!r}"
+            + (" (that path is a file)" if is_file else "")
+            + f". Top-level folders: {listed}"
+        )
     index = manager.sibling_index(files)
-    rows: list[dict[str, Any]] = []
+    direct: dict[str, int] = {}
+    selected: list[tuple[str, Any]] = []
     for pf in files:
         here = manager.folder_path(getattr(pf, "folder", None))
-        if wanted and not (
-            here == wanted or (recursive and here.startswith(wanted + "/"))
-        ):
+        direct[here] = direct.get(here, 0) + 1
+        if in_scope(here):
+            selected.append((manager.path_in_project(pf), pf))
+    selected.sort(key=lambda item: item[0])
+    total = len(selected)
+    start = min(offset, total)
+    stop = total if limit is None else min(start + limit, total)
+    # Rows are built for the requested window only: `file_row` stats the blob
+    # and reads its magic, which a 450-file project must not pay per page.
+    rows = [manager.file_row(pf, open_targets, index) for _path, pf in selected[start:stop]]
+    folders: list[dict[str, Any]] = []
+    below_folders = 0
+    for path, f in project_folders:
+        if not path:
             continue
-        if not wanted and not recursive and here:
+        if not in_scope(path):
+            below_folders += (not wanted) or path.startswith(wanted + "/")
             continue
-        rows.append(manager.file_row(pf, open_targets, index))
-    rows.sort(key=lambda r: r["path"])
-    folders = sorted(
-        (
-            {"id": str(f.id), "path": manager.folder_path(f)}
-            for f in state.project.folders
-        ),
-        key=lambda r: r["path"],
-    )
-    return {"files": rows, "folders": folders}
+        row: dict[str, Any] = {"id": str(f.id), "path": path, "files": direct.get(path, 0)}
+        if recursive:
+            row["files_recursive"] = sum(
+                count for here, count in direct.items()
+                if here == path or here.startswith(path + "/"))
+        folders.append(row)
+    folders.sort(key=lambda r: r["path"])
+    result: dict[str, Any] = {
+        "kind": "project_files",
+        "items": rows,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(rows),
+        "has_more": offset + len(rows) < total,
+        "folders": folders,
+    }
+    if not recursive:
+        result["below"] = {
+            "files": sum(
+                count for here, count in direct.items()
+                if (here.startswith(wanted + "/") if wanted else bool(here))),
+            "folders": int(below_folders),
+        }
+    return result
 
 
 def folder_components(path: Any) -> list[str]:
