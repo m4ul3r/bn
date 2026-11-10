@@ -1177,7 +1177,7 @@ class TargetManager:
 
         A candidate counts when `_matching_records` would return this view
         alone for it -- the same relation, including exact-selector precedence
-        (`_prefer_exact`, #1077) and the saved-database pair rule
+        (`_exact_over_stripped`, #1077) and the saved-database pair rule
         (`_drop_saved_databases`), so every advertised selector resolves and
         the raw `hello` stays `hello` once the `hello.bndb` it saved is open
         (#996). The resolver's aliases and component suffixes are indexed once
@@ -1238,7 +1238,7 @@ class TargetManager:
                             if self._RANK[kind] > self._RANK.get(kinds.get(other), -1):
                                 kinds[other] = kind
                     matches = set(self._drop_saved_databases(
-                        self._prefer_exact(kinds), saved_pairs))
+                        self._exact_over_stripped(kinds), saved_pairs))
                 if matches == {vid}:
                     chosen = candidate
                     break
@@ -1246,34 +1246,39 @@ class TargetManager:
         return selectors
 
     # How a human selector names a record. Every alias counts equally -- view
-    # id, filename, basename, path tail and the `.bndb`-stripped forms -- so a
-    # selector matching two views is refused as ambiguous, whichever view
-    # opened first. A ranking between aliases was tried and rejected: opening
-    # a view could then silently MOVE a selector that used to be refused onto
-    # the new view (`close 5` closing the view whose id became 5, #996 review).
-    # The kind is kept for two narrow exceptions: `_drop_saved_databases`, and
-    # `_prefer_exact` (#1077) -- a project target's full file id and exact
-    # path in the project name ONE file by construction, so they outrank
-    # every weak alias (a `.bndb`-stripped core, a basename, a path tail)
-    # another view may happen to share. That precedence can move a selector
-    # only onto the file it literally spells, which is the move the user
-    # asked for; two exact matches stay ambiguous.
-    _EXACT = "exact"          # project file id, exact path in the project
-    _STRONG = "strong"        # view id, filename, basename, path tail
+    # id, basename, path tail and the `.bndb`-stripped forms -- so a selector
+    # matching two views is refused as ambiguous, whichever view opened first.
+    # A ranking between aliases was tried and rejected: opening a view could
+    # then silently MOVE a selector that used to be refused onto the new view
+    # (`close 5` closing the view whose id became 5, #996 review). The kind is
+    # kept for two narrow exceptions: `_drop_saved_databases`, and
+    # `_exact_over_stripped` (#1077) -- a spelling that names ONE file by
+    # construction (a project target's full file id or exact path in the
+    # project, a standalone view's own full filename) outranks another view's
+    # `.bndb`-stripped alias of it, which is the raw file against its own
+    # database and nothing more. It outranks nothing else: an exact match and
+    # a STRONG match of another view (a basename, a path tail) stay ambiguous,
+    # as do two exact matches, so loading a file never retargets a selector
+    # that was resolving to a different open view.
+    _EXACT = "exact"          # project file id / exact path in project; own filename
+    _STRONG = "strong"        # view id, basename, path tail, a project view's blob path
     _STRIPPED = "stripped"    # only through a `.bndb`-stripped alias
     _RANK = {_STRIPPED: 0, _STRONG: 1, _EXACT: 2}
 
-    def _prefer_exact(self, kinds: dict[str, str]) -> dict[str, str]:
-        """*kinds* narrowed to the exact matches when there are any (#1077)."""
+    def _exact_over_stripped(self, kinds: dict[str, str]) -> dict[str, str]:
+        """*kinds* without the stripped-only matches when an exact one exists
+        (#1077). Strong matches are kept: they are not outranked."""
         if any(kind == self._EXACT for kind in kinds.values()):
-            return {vid: kind for vid, kind in kinds.items() if kind == self._EXACT}
+            return {vid: kind for vid, kind in kinds.items() if kind != self._STRIPPED}
         return kinds
 
     def _aliases(self, record: TargetRecord) -> list[tuple[str, str]]:
         """Every exact-string alias of *record* with its kind."""
         aliases = [
             (record.view_id, self._STRONG),
-            (record.filename, self._STRONG),
+            # A standalone view's full filename names exactly that view. A
+            # project view's filename is an opaque blob path, an ordinary alias.
+            (record.filename, self._STRONG if record.project_file_id else self._EXACT),
             (record.basename, self._STRONG),
         ]
         # A .bndb corpus loads <binary>.bndb, but the obvious selector is
@@ -1466,11 +1471,11 @@ class TargetManager:
 
         A live full target_id outranks filename aliases, so the last-resort
         selector remains usable even with a file named after another view's ID.
-        Every other alias counts equally (see `_STRONG`), less a project
-        target's exact file id or path in the project, which outranks the weak
-        aliases of every other view (`_prefer_exact`, #1077), and less a
-        database whose own saved-from raw view also matched
-        (`_drop_saved_databases`). PinnedTarget retains its stricter
+        Every other alias counts equally (see `_STRONG`), less a `.bndb`-
+        stripped alias that an exact spelling of another view also matched
+        (`_exact_over_stripped`, #1077), and less a database whose own
+        saved-from raw view also matched (`_drop_saved_databases`).
+        PinnedTarget retains its stricter
         identity-only semantics, including when its view has disappeared.
         """
         candidate = str(selector).strip() if selector is not None else None
@@ -1483,7 +1488,7 @@ class TargetManager:
             if (kind := self._match_kind(record, selector)) is not None
         }
         if len(kinds) > 1:
-            kinds = self._prefer_exact(kinds)
+            kinds = self._exact_over_stripped(kinds)
             return [records[vid] for vid in
                     self._drop_saved_databases(kinds, self._saved_pairs(records))]
         return [records[vid] for vid in kinds]

@@ -321,6 +321,80 @@ def test_two_exact_matches_are_still_ambiguous_1077(world):
     assert world.targets.resolve(twin.id) is second
 
 
+def _project_file_at_usr_bin_app(world):
+    usr = world.project.add_folder("usr")
+    return world.project.add_file("app", world.project.add_folder("bin", usr))
+
+
+def test_loading_a_project_file_never_retargets_a_path_tail_selector_1077(world, tmp_path):
+    # Review of #1077: exact precedence must not reach past the `.bndb`-stripped
+    # alias. `usr/bin/app` resolves to an open standalone view by its path
+    # tail; loading the project file `/usr/bin/app` must not silently move that
+    # selector onto the project view (the move #996 rejected ranking for). It
+    # becomes ambiguous, exactly as before this change.
+    host = tmp_path / "host" / "usr" / "bin"
+    host.mkdir(parents=True)
+    standalone = FakeView(str(host / "app"))
+    _rows(world, standalone)
+    assert world.targets.resolve("usr/bin/app") is standalone
+
+    pf = _project_file_at_usr_bin_app(world)
+    project_view = FakeView(pf.path_on_disk, pf)
+    rows = _rows(world, standalone, project_view)
+
+    for selector in ("usr/bin/app", "/usr/bin/app", "bin/app", "app"):
+        with pytest.raises(RuntimeError, match="Ambiguous target selector"):
+            world.targets.resolve(selector)
+    # Each view keeps a selector of its own, and the listing advertises it.
+    by_view = {r["filename"]: r["selector"] for r in rows}
+    assert by_view[standalone.file.filename] == "host/usr/bin/app"
+    assert by_view[project_view.file.filename] == pf.id
+    assert world.targets.resolve("host/usr/bin/app") is standalone
+    assert world.targets.resolve(pf.id) is project_view
+
+
+def test_a_standalone_views_own_filename_is_as_exact_as_a_project_path_1077(world):
+    # A standalone view opened from the literal file `/usr/bin/app`: its full
+    # filename names exactly that view. A project file at `/usr/bin/app` is
+    # exact too, so the spelling they share is ambiguous -- never the project
+    # view by rank.
+    standalone = FakeView("/usr/bin/app")
+    _rows(world, standalone)
+    assert world.targets.resolve("/usr/bin/app") is standalone
+
+    pf = _project_file_at_usr_bin_app(world)
+    project_view = FakeView(pf.path_on_disk, pf)
+    _rows(world, standalone, project_view)
+    for selector in ("/usr/bin/app", "usr/bin/app"):
+        with pytest.raises(RuntimeError, match="Ambiguous target selector"):
+            world.targets.resolve(selector)
+    assert world.targets.resolve(pf.id) is project_view
+
+
+def test_a_selector_in_use_before_a_project_load_is_not_moved_under_a_write_1077(world, tmp_path):
+    # The same hazard through a WRITE: a caller (or a `bn target use` pin, which
+    # stores the selector string) keeps saving `-t usr/bin/app`. After the
+    # project file is loaded that save must be refused, not land on the
+    # project view -- or on anything.
+    host = tmp_path / "host" / "usr" / "bin"
+    host.mkdir(parents=True)
+    raw = host / "app"
+    raw.write_bytes(b"\x7fELF")
+    standalone = _SaveBV(str(raw), result=True, write=True)
+    _rows(world, standalone)
+    assert world.targets.resolve("usr/bin/app") is standalone
+
+    pf = _project_file_at_usr_bin_app(world)
+    project_view = FakeView(pf.path_on_disk, pf)
+    _rows(world, standalone, project_view)
+    files_before = list(world.project.files)
+
+    with pytest.raises(RuntimeError, match="Ambiguous target selector: 'usr/bin/app'"):
+        world.instance._save_database("usr/bin/app")
+    assert standalone.created_with is None and project_view.created_with is None
+    assert list(world.project.files) == files_before
+
+
 def _is_path_suffix_or_full_id(selector: str, row: dict) -> bool:
     parts = row["project_path"].strip("/").split("/")
     suffixes = {"/".join(parts[-depth:]) for depth in range(1, len(parts) + 1)}
