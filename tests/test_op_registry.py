@@ -143,7 +143,6 @@ def test_registry_covers_every_dispatch_op(op_registry):
     assert expected - REGISTRY.names() == set(), "pinned but no longer registered"
 
 
-
 def test_op_decorator_registers_and_derives_locks(op_registry):
     reg = op_registry.OpRegistry()
 
