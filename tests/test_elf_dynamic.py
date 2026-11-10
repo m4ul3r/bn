@@ -819,11 +819,22 @@ def test_parse_elf_file_rejects_fifo_without_waiting_for_a_writer(tmp_path):
         # worker is gone (an import error must not cost the whole deadline).
         deadline = time.monotonic() + _FIFO_WORKER_START_DEADLINE
         while not receiver.poll(0.5):
-            assert process.is_alive(), (
-                f"FIFO worker exited before reporting ready (exit code {process.exitcode})")
+            if not process.is_alive():
+                # Gone between two polls. It may have reported, answered and
+                # exited cleanly in that window (a descheduled parent), so
+                # only what the pipe holds decides: fall through and read it.
+                break
             assert time.monotonic() < deadline, (
                 f"FIFO worker did not start within {_FIFO_WORKER_START_DEADLINE:.0f}s")
-        assert receiver.recv() == "ready"
+        try:
+            first = receiver.recv()
+        except EOFError:
+            # A worker that died before reporting closes its end: `poll`
+            # answers True on that EOF, so the diagnosis is made here.
+            process.join(timeout=_FIFO_PARSE_TIMEOUT)
+            pytest.fail(
+                f"FIFO worker exited before reporting ready (exit code {process.exitcode})")
+        assert first == "ready"
         # The property under test: a running worker that calls `parse_elf_file`
         # on a FIFO nobody writes to gets its answer (None) within a short,
         # fixed time instead of blocking in `open()`.

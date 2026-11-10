@@ -5808,9 +5808,9 @@ class TestStringScanSeesCodeOnly1045:
         assert row["strings"][0]["inline"] is True, row
 
     def test_a_literal_holding_a_url_keeps_both_raw_operands(self, shared_bn, tmp_path):
-        # Round 5: BN renders the embedded quotes unescaped, and the regex read
-        # the URL's `//` as a comment: both operands were lost and the arity
-        # notes landed inside the literal. Base names "abc" and "x".
+        # Round 5: the literal holds embedded quotes and a URL, and the regex
+        # read the URL's `//` as a comment: both operands were lost and the
+        # arity notes landed inside the literal. Base names "abc" and "x".
         result = self._decompile_probe(shared_bn, tmp_path, (
             "#include <string.h>\n"
             "__attribute__((noinline)) int probe(const char *s) "
