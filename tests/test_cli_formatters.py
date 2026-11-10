@@ -2967,27 +2967,44 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
         "_COMPOSED_ENTRY_POINTS, or name each one in _PROBE_EXCLUSIONS with the "
         "reason it is not a payload text renderer.")
     # The other direction (#1070): a renderer the probe found by its `_render`
-    # prefix that NO CLI surface installs and NO module function reaches is
+    # prefix that NO CLI surface installs and NO live module code reaches is
     # dead code wearing a guard -- every differential below runs against it
-    # and proves nothing about any output a user gets. Derived from the
-    # module's own AST (any load of the name outside its own body counts, so a
-    # row helper composed by a listing renderer is reached) plus the CLI's,
-    # so a `_render_project_zz_text` added without a command fails here.
+    # and proves nothing about any output a user gets. `reached` is a FIXED
+    # POINT over the module's own AST, seeded with what the CLI references and
+    # what module-level statements load (tables, decorators, defaults): a
+    # function's body counts only once the function itself is reached, so a
+    # row helper composed by an installed listing renderer is reached while a
+    # renderer referenced only by another uninstalled function is not. (The
+    # first cut counted any load outside the function's own body, so a second
+    # dead function calling the orphan hid it -- #1070 review.)
     import ast
 
     tree = ast.parse(inspect.getsource(formatters))
-    reached: set[str] = set()
+
+    def loads(nodes) -> set[str]:
+        return {node.id for root in nodes for node in ast.walk(root)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+    bodies: dict[str, set[str]] = {}
+    reached = set(installed)
     for stmt in tree.body:
-        own = stmt.name if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
-        reached |= {node.id for node in ast.walk(stmt)
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
-                    and node.id != own}
-    orphans = sorted(probed - installed - reached)
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bodies[stmt.name] = loads(stmt.body)
+            # Evaluated when the module is imported, not when the function runs.
+            reached |= loads([*stmt.decorator_list, stmt.args, *filter(None, [stmt.returns])])
+        else:
+            reached |= loads([stmt])
+    frontier = set(reached)
+    while frontier:
+        new = set().union(*(bodies.get(name, ()) for name in frontier)) - reached
+        reached |= new
+        frontier = new
+    orphans = sorted(probed - reached)
     assert not orphans, (
         f"{orphans} is probed as a payload text renderer, but no CLI surface "
-        "installs it and nothing in the module calls it, so every guard that "
-        "runs against it guards no output. Install it under a command or "
-        "compose it from the renderer that owns its rows.")
+        "installs it and no reached function or module-level statement refers "
+        "to it, so every guard that runs against it guards no output. Install "
+        "it under a command or compose it from the renderer that owns its rows.")
     # The identity sweep's residue: names the package BINDS but never mentions
     # again. Round 14 probed them WRAPPED, on the claim that production reaches
     # them only as a fragment under the boundary of the renderer that composes
@@ -3054,7 +3071,14 @@ def test_every_renderer_the_cli_installs_is_in_the_population():
         "_render_target_choice", "_skew_note", "_unknown_ref_label"], (
         "the runtime oracle no longer witnesses the same set running bare, so "
         "its emptiness claims above are over different evidence than the ones "
-        f"that were checked: {sorted(live_bare)}")
+        f"that were checked: {sorted(live_bare)}. How to decide: a helper NEWLY "
+        "CALLED from a path that already runs bare (as `_escape_control_chars` "
+        "was from `_skew_note`) is added to this list with a note saying which "
+        "caller; a name that appears for any other reason means an entry point "
+        "that reaches it has no `@_discloses` boundary -- find that entry point "
+        "(the new name is the helper it calls, not the offender) and decorate "
+        "it rather than editing this list. A name that DISAPPEARS means the "
+        "driving loop stopped reaching a live surface.")
     assert {"_render_target_choice", "_render_fallback_text"} <= bare, (
         "a helper with a boundary-free production path must be probed on that "
         "surface, which is the whole point of the assertion above")
@@ -7102,7 +7126,7 @@ def test_a_well_formed_empty_container_is_never_reported_as_unusable():
 # one arrives UNCLASSIFIED and red whether or not its author ever heard of the
 # choke point, and none of the eight could have been added silently.
 #
-# Each guard must fall in one of four categories, and the category is RE-DERIVED
+# Each guard must fall in one of five categories, and the category is RE-DERIVED
 # from the module rather than asserted in prose (the `_PROBE_EXCLUSIONS`
 # discipline, applied here):
 #
@@ -7120,13 +7144,18 @@ def test_a_well_formed_empty_container_is_never_reported_as_unusable():
 #                       returned as-is, or covered because the whole payload it
 #                       was read off is dumped there. Nothing is absorbed, so
 #                       nothing needs disclosing.
-#   records_skew        the path that refused the value calls `_record_skew(...)`
-#                       itself, so the enclosing boundary's `! malformed` note
-#                       names the field exactly as `_text_value` would have.
-#                       (#1068 / #1070: `_project_link_message` filters a notes
-#                       LIST element by element, a shape the choke point's
-#                       single-key read cannot express, and records each
-#                       refusal by hand.)
+#   records_skew        the ARM that refused the value calls `_record_skew(k)`
+#                       itself, with `k` the literal key the tested value was
+#                       read from, so the enclosing boundary's `! malformed`
+#                       note names that field exactly as `_text_value` would
+#                       have. (#1068 / #1070: `_project_link_message` filters a
+#                       notes LIST element by element, a shape the choke
+#                       point's single-key read cannot express, and records
+#                       each refusal by hand.) A `_record_skew` call that merely
+#                       FOLLOWS the conditional -- the `for key in unreadable:
+#                       _record_skew(key)` replay thirteen functions end with --
+#                       or one that names another field, says nothing about
+#                       the value this guard refused, and grants nothing.
 #
 # Anything else DROPS a value the payload carried and says nothing, which is
 # #619 exactly.
@@ -7235,7 +7264,7 @@ def _string_shape_guards():
 def _classify_string_shape_guards(source):
     """Every inline `isinstance(<x>, str)` test in `source`, classified.
 
-    See `_STRING_SHAPE_GUARDS` for what the four categories mean and why the
+    See `_STRING_SHAPE_GUARDS` for what the five categories mean and why the
     population is harvested here rather than taken from the choke point's own
     call sites. Returns `{(function, tested expression): category}`, with
     `"DROPS"` for a guard that discards a value the payload carried without
@@ -7367,6 +7396,10 @@ def _classify_string_shape_guards(source):
         `return _render_fallback_text(value)`. For a ternary or a comprehension
         filter there is no fall-through to add: the other arm is the whole
         region, and a filtered-out element reaches nothing at all.
+
+        Returned as `(arm, rest)`: the refusing arm itself, and the
+        fall-through. A render anywhere in either still shows the value; a
+        `_record_skew` call only counts in the arm (see `records_skew`).
         """
         parents = {id(child): node
                    for node in ast.walk(fn) for child in ast.iter_child_nodes(node)}
@@ -7400,7 +7433,7 @@ def _classify_string_shape_guards(source):
                 if negations is None:
                     continue
                 refused = orelse if negations % 2 == 0 else body
-                return list(refused) + (following(node) if falls_through else [])
+                return list(refused), (following(node) if falls_through else [])
         return None
 
     def classify(fn, guard, expr):
@@ -7412,11 +7445,13 @@ def _classify_string_shape_guards(source):
         names = params[id(fn)]
         if expr in names and (fn.name, names.index(expr)) in routed_params:
             return "routed_in"
-        refused = drop_region(fn, guard)
-        if refused is None:
+        region = drop_region(fn, guard)
+        if region is None:
             # No conditional consumes this shape test, so which path drops the
             # value cannot be decided. Fail CLOSED rather than grant it.
             return "unstructured"
+        arm, rest = region
+        refused = arm + rest
         # The value still reaches the render ON THE PATH THAT REFUSED IT: itself,
         # or the payload it was read off being dumped whole.
         carriers = {expr}
@@ -7426,13 +7461,29 @@ def _classify_string_shape_guards(source):
                 carriers.add(ast.unparse(value.func.value))
             elif isinstance(value, ast.Subscript):
                 carriers.add(ast.unparse(value.value))
-        # A refusing path that records the skew by hand is routed, not dropped:
+        # A refusing ARM that records the skew by hand is routed, not dropped:
         # the boundary above prints the same `! malformed` note that a
-        # `_text_value` read would have produced for the field.
-        for root in refused:
+        # `_text_value` read would have produced for the field. Tied to the
+        # value the guard tested (#1070 review): the call must sit in the arm
+        # itself and name a literal key that value was read from -- the string
+        # constants of what it was bound to, or of the iterable it is the loop
+        # variable of. Any `_record_skew` call in the fall-through granted this
+        # before, so a silent drop placed above a function's closing
+        # `for key in unreadable: _record_skew(key)` replay classified safe.
+        sources = list(bound or ())
+        for node in ast.walk(fn):
+            if (isinstance(node, (ast.For, ast.comprehension))
+                    and ast.unparse(node.target) == expr):
+                sources.append(node.iter)
+        keys = {const.value for source in sources for const in ast.walk(source)
+                if isinstance(const, ast.Constant) and isinstance(const.value, str)}
+        for root in arm:
             for node in ast.walk(root):
                 if (isinstance(node, ast.Call)
-                        and ast.unparse(node.func) == "_record_skew"):
+                        and ast.unparse(node.func) == "_record_skew"
+                        and len(node.args) == 1
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value in keys):
                     return "records_skew"
         for root in refused:
             for node in ast.walk(root):
@@ -7549,6 +7600,24 @@ def test_every_string_shape_guard_either_shows_the_value_or_routes_it():
         "        else:",
         "            _record_skew('notes')",
         "    return '; '.join(notes)",
+        "",
+        "def replays(value):",
+        "    lines = []",
+        "    hint = value.get('hint')",
+        "    if isinstance(hint, str) and hint:",
+        "        lines.append(hint)",
+        "    for key in unreadable:",
+        "        _record_skew(key)",
+        "    return chr(10).join(lines)",
+        "",
+        "def records_another(value):",
+        "    notes = []",
+        "    for note in _field_list(value, 'notes'):",
+        "        if isinstance(note, str):",
+        "            notes.append(note)",
+        "        else:",
+        "            _record_skew('status')",
+        "    return '; '.join(notes)",
         ""))
     verdicts = _classify_string_shape_guards(probe)
     assert verdicts[("drops", "note", 0)] == "DROPS", (
@@ -7561,6 +7630,15 @@ def test_every_string_shape_guard_either_shows_the_value_or_routes_it():
         f"a value taken from the choke point is already disclosed: {verdicts}")
     assert verdicts[("records", "note", 0)] == "records_skew", (
         f"a refusal that records the skew itself is disclosed by the boundary: {verdicts}")
+    # The #1070 review's counterexample: the first cut granted `records_skew`
+    # for ANY `_record_skew` call in the refused region, fall-through included,
+    # so a dropped field above a function's closing replay loop classified
+    # safe. The call must be in the refusing arm and name the tested value's key.
+    assert verdicts[("replays", "hint", 0)] == "DROPS", (
+        "a `_record_skew` call that only follows the conditional records some "
+        f"other field, not the value this guard dropped: {verdicts}")
+    assert verdicts[("records_another", "note", 0)] == "DROPS", (
+        f"recording a different field does not disclose the one refused: {verdicts}")
     # And the population itself, since the categories a rule collapse would
     # empty are the ones doing the work here.
     counts = collections.Counter(guards.values())
