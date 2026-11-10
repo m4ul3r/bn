@@ -83,16 +83,59 @@ os.register_at_fork(
 )
 
 
-def refuse_raw_project_path(path: str | os.PathLike[str]) -> None:
-    """Reject standalone access to project storage, including symlink aliases."""
+def project_storage_hit(path: str | os.PathLike[str]) -> tuple[Path, Path] | None:
+    """``(spelling, project)`` when *path* lies inside a `.bnpr` -- any
+    ancestor holding `project.bnpm` -- judged on the spelling as given AND on
+    its resolved form, so a file symlink into project storage, a directory
+    symlink onto it, and a link inside the project all count. None otherwise."""
     requested = Path(path).expanduser().absolute()
     for candidate in (requested, requested.resolve()):
         for ancestor in candidate.parents:
             if (ancestor / "project.bnpm").is_file():
-                raise RuntimeError(
-                    f"Cannot load project storage as a standalone binary: {candidate}. "
-                    f"Use `bn project open {ancestor}` and `bn project load <selector>`."
-                )
+                return candidate, ancestor
+    return None
+
+
+# How each operation is refused when its path lands in project storage. Same
+# family of wording, each naming the project command that does what the
+# standalone one was asked to (#1072).
+_STORAGE_REFUSALS = {
+    "load": (
+        "Cannot load project storage as a standalone binary: {path}. "
+        "Use `bn project open {project}` and `bn project load <selector>`."
+    ),
+    "save": (
+        "Cannot save into project storage: {path} is inside {project}; use "
+        "`bn project import` to add a file or `bn project load` + `bn save` to "
+        "save a project target."
+    ),
+    "export": (
+        "Cannot export into project storage: {path} is inside {project}; use "
+        "`bn project import` to add a file to a project."
+    ),
+    "import": (
+        "Cannot import project storage: {path} is inside {project}; use "
+        "`bn project export <selector> <dest>` to copy a file out of a project first."
+    ),
+}
+
+
+def refuse_raw_project_path(
+    path: str | os.PathLike[str], operation: str = "load"
+) -> None:
+    """Reject standalone access to project storage, including symlink aliases.
+
+    *operation* picks the wording: ``load`` (a standalone open of a blob),
+    ``save`` / ``export`` (a destination inside a project), ``import`` (a
+    source inside one). Raises RuntimeError; callers that owe a structured
+    refusal wrap it (`_save_database`).
+    """
+    hit = project_storage_hit(path)
+    if hit is not None:
+        spelling, project = hit
+        raise RuntimeError(
+            _STORAGE_REFUSALS[operation].format(path=spelling, project=project)
+        )
 
 
 class LinkRecordUnreadable(RuntimeError):
@@ -946,6 +989,12 @@ def project_import(
     state = manager.require()
     if not isinstance(path, str) or not path.strip():
         raise RuntimeError("project_import: path must be the file to import")
+    # #1072: a source inside a `.bnpr` -- this project's or another's -- is a
+    # blob, reached by the project API, never copied in by path. Checked on
+    # the requested spelling (symlink aliases) AND the resolved path, before
+    # anything else -- #1079's requested-basename naming included -- runs,
+    # exactly like the duplicate-path refusal below.
+    refuse_raw_project_path(path, "import")
     if name is not None and (not isinstance(name, str) or not name.strip()):
         raise RuntimeError("project_import: name must be a non-empty string when given")
     if isinstance(name, str):
@@ -999,6 +1048,9 @@ def project_export(bridge: Any, selector: Any, dest: Any) -> dict[str, Any]:
     if not isinstance(dest, str) or not dest.strip():
         raise RuntimeError("project_export: dest must be the output path")
     out = Path(dest).expanduser().resolve()
+    # #1072: an export is a copy OUT of project storage; a destination inside
+    # a `.bnpr` would plant an unregistered file in one.
+    refuse_raw_project_path(dest, "export")
     if out.exists():
         raise RuntimeError(
             f"project_export: {out} already exists; remove it or choose another path"

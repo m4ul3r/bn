@@ -4047,6 +4047,23 @@ class BinaryNinjaBridge:
         else:
             out = filename + ".bndb"
 
+        # #1072: the load side refuses a blob inside a `.bnpr` as a standalone
+        # binary; the save side must refuse the mirror image, or a standalone
+        # target writes an unregistered `.bndb` into another project's
+        # `data/` -- a stray file project.bnpm knows nothing about. Judged on
+        # the spelling given and its resolved form (file and directory
+        # symlinks included), before anything is written. A project-backed
+        # view never reaches here: it saved through the project API above.
+        try:
+            project_ops.refuse_raw_project_path(path if path else out, "save")
+        except RuntimeError as exc:
+            raise OperationFailure(
+                "invalid_request",
+                str(exc),
+                requested={"path": out},
+                observed={"request_sent": True, "written": False},
+            ) from None
+
         # #867: REFUSE before the write, rather than disclosing after it.
         #
         # A save landing on a file another target already has open makes the
