@@ -57,12 +57,24 @@ def test_native_saved_reload_reuses_view_and_database(lane: Lane):
 
 def test_native_ambiguous_siblings_never_create_third_database(lane: Lane, tmp_path):
     try:
-        raw, _, saved = _save_raw(lane, "ambiguous-save")
+        raw, loaded, saved = _save_raw(lane, "ambiguous-save")
         exported = tmp_path / "copy.bndb"
         lane.wire("project_export", {"selector": saved["project_file_id"], "dest": str(exported)})
-        duplicate = lane.wire("project_import", {
-            "path": str(exported), "folder": "ambiguous-save", "name": raw["name"] + ".bndb",
-        })
+        # `project import` refuses a second file at an existing path-in-project
+        # (#1079), so the ambiguity is created the way a foreign writer (the BN
+        # GUI, another tool) would: directly through the native project API.
+        with pytest.raises(BridgeError, match="already exists in the project"):
+            lane.wire("project_import", {
+                "path": str(exported), "folder": "ambiguous-save", "name": raw["name"] + ".bndb",
+            })
+        created = lane.wire("py_exec", {"script": "\n".join([
+            "project = bv.file.project",
+            f"raw_pf = project.get_file_by_id({raw['id']!r})",
+            f"new = project.create_file_from_path({str(exported)!r}, raw_pf.folder,"
+            f" {raw['name'] + '.bndb'!r})",
+            "result = str(new.id)",
+        ])}, target=loaded["target"]["selector"])
+        duplicate = {"id": created["result"]}
         with pytest.raises(BridgeError, match="Ambiguous") as load_error:
             lane.project_load(raw["id"])
         assert saved["project_file_id"] in str(load_error.value)

@@ -5043,6 +5043,7 @@ class _GuardBlock:
 class _GuardFunc:
     def __init__(self, span=8):
         self.arch = "probe-arch"
+        self.start = 0
         self.basic_blocks = [_GuardBlock(0, span)]
 
 
@@ -5074,6 +5075,124 @@ def test_a_branch_free_select_is_named_in_the_output(monkeypatch):
     assert note is not None
     assert "ccmp" in note and "csel" in note
     assert "bn disasm" in note
+
+
+def _printed_commands(*texts: str, target: str = "app", instance: str = "w1") -> list[str]:
+    """Every backticked `bn …` in *texts* AFTER the CLI binds it to a routing
+    context, the way `bn decompile -i w1 -t app` prints it."""
+    import re
+
+    import bn.cli
+
+    value = bn.cli._contextualize_diagnostic_hints(
+        {"warnings": list(texts)}, target=target, instance=instance)
+    return [m.group(1) for text in value["warnings"]
+            for m in re.finditer(r"`(bn [^`]+)`", text)]
+
+
+def _assert_runs_as_printed(command: str) -> None:
+    """#1058 item 12: a printed command runs as printed or is a template. The
+    real argparse tree decides: with each `<placeholder>` standing in for a
+    value, the command must parse -- so `bn -i w1 -t app disasm` (no address)
+    and `… proto set` (no arguments) fail here exactly as they fail a paste."""
+    import shlex
+
+    import bn.cli
+
+    words = [w if not (w.startswith("<") and w.endswith(">")) else "placeholder"
+             for w in shlex.split(command)[1:]]
+    try:
+        bn.cli.build_parser().parse_args(words)
+    except SystemExit as exc:
+        raise AssertionError(f"printed command does not run as printed: {command!r}") from exc
+
+
+def test_the_select_warning_prints_a_disasm_command_that_runs_1058(monkeypatch):
+    """The command names the FUNCTION ENTRY, not a select site: `bn disasm`
+    resolves an interior address by containment and refuses one that lies in a
+    block two functions share (exit 2), which is where a select in a shared
+    tail sits. The entry always resolves and lists the same code; the sites
+    are the addresses to look for in it (#1058 review)."""
+    from bn_agent_bridge import il_format, read_decompile
+
+    listing = ["add x0, x1, x2", "csel x0, x1, x2, lt", "ret", "ccmp x0, x1, #0, ge"]
+    monkeypatch.setattr(
+        il_format, "_disasm_instruction",
+        lambda bv, addr, arch=None: ((listing[addr // 4], 4) if addr // 4 < len(listing)
+                                     else ("", 4)))
+    note = read_decompile._flattened_guard_warning(object(), _GuardFunc(16))
+    assert "at 0x4, 0xc" in note["summary"]
+    assert "`bn disasm 0x0`" in note["summary"] and "`bn disasm 0x0`" in note["detail"]
+    assert note["addresses"] == ["0x4", "0xc"]
+    # Text mode lists at most three sites; the detail says where all of them are.
+    assert "--format json" in note["detail"] and "addresses" in note["detail"]
+    commands = _printed_commands(note["summary"], note["detail"])
+    assert commands and all(c.endswith(" disasm 0x0") for c in commands), commands
+    for command in commands:
+        _assert_runs_as_printed(command)
+
+
+def test_split_and_jump_warnings_print_commands_that_run_1058():
+    import re
+
+    from bn_agent_bridge import read_decompile
+
+    bv, head, tail = _split_view(tail_mnemonics=["str"])
+    texts = [n[key] for fn in (head, tail) for n in read_decompile._split_body_notes(bv, fn)
+             for key in ("summary", "detail")]
+    assert any("`bn disasm 0x4000dc` and `bn disasm 0x4000f8`" in t for t in texts), texts
+    assert any("`bn proto set 0x4000dc '<prototype without them>'`" in t for t in texts), texts
+
+    jump_bv, func = _jump_case()
+    [row] = read_decompile._unresolved_jump_findings(jump_bv, func)
+    jump_detail = read_decompile._unresolved_jump_warning(func, row, True)["detail"]
+    texts.append(jump_detail)
+    # Both placeholders quoted: unquoted, `<callee> '<prototype>'` is a pair of
+    # shell redirections (`< callee` and `> '<prototype>'`).
+    assert "`bn proto set '<callee>' '<prototype>'`" in jump_detail
+
+    commands = _printed_commands(*texts)
+    assert commands
+    bare = [c for c in commands if re.search(r"\b(disasm|proto set|types (show|declare))$", c)]
+    assert not bare, bare
+    for command in commands:
+        _assert_runs_as_printed(command)
+
+
+def test_layout_offset_and_undefined_type_notes_print_commands_that_run_1058():
+    """#1058 review: three more texts the audit owns. The struct-layout note
+    still printed `bn proto set <addr>` with no prototype; the `__offset`
+    warning and the undefined-type note were changed but pinned by no test."""
+    import re
+
+    from bn_agent_bridge import read_decompile
+
+    bv, func, _var, _insns = _struct_assist_case()
+    layout = [w for w in read_decompile._struct_layout_warnings(bv, func)]
+    assert layout, "the #903 fixture must produce the layout note"
+    texts = [w[key] for w in layout for key in ("summary", "detail")]
+    assert any("`bn proto set 0x401000 '<full prototype>'`" in t for t in texts), texts
+
+    offset = read_decompile._offset_warning(
+        types.SimpleNamespace(get_type_by_name=lambda name: None), _offset_func(), _OFFSET_TEXT)
+    assert offset is not None
+    texts += [offset["summary"], offset["detail"]]
+    assert "`bn types declare '<declaration>'`" in offset["detail"]
+
+    rows = [{"name": "ns::Cls", "declare_command": None}]
+    undefined = read_decompile._undefined_type_note(rows, [types.SimpleNamespace(name="this")])
+    texts.append(undefined)
+    assert "`bn types declare '<declaration>'`" in undefined
+    # Prose mentions carry no backticked `bn …`, so the CLI's routing pass
+    # cannot turn them into a command missing its operands.
+    assert "`bn proto set`" not in undefined and "proto set" in undefined
+
+    commands = _printed_commands(*texts)
+    assert len(commands) >= 5, commands
+    bare = [c for c in commands if re.search(r"\b(disasm|proto set|proto get|types (show|declare))$", c)]
+    assert not bare, bare
+    for command in commands:
+        _assert_runs_as_printed(command)
 
 
 def test_the_note_is_silent_on_a_function_with_no_select(monkeypatch):
@@ -6079,7 +6198,7 @@ def test_jump_only_tail_gets_no_proto_set_advice_966():
     # The head IS called (from main), so its stray parameters keep the advice.
     head_saved = [n["detail"] for n in read_decompile._split_body_notes(bv, head)
                   if "callee-saved/link registers" in n["detail"]]
-    assert "drop them with `bn proto set`" in head_saved[0]
+    assert "drop them with `bn proto set 0x4000dc '<prototype without them>'`" in head_saved[0]
 
 
 def test_eh_fragment_chain_longer_than_three_links_966():
@@ -6116,7 +6235,7 @@ def test_an_address_taken_function_is_called_not_a_body_piece_966(returns, data_
                                   tail_refs=[], tail_data_refs=[data_ref])
     assert not read_decompile._is_eh_fragment(bv, tail)
     notes = [n["detail"] for n in read_decompile._split_body_notes(bv, tail)]
-    assert len(notes) == 1 and "drop them with `bn proto set`" in notes[0]
+    assert len(notes) == 1 and "drop them with `bn proto set 0x4000f8 '<prototype" in notes[0]
     assert "nothing calls this function" not in notes[0]
 
 
@@ -7370,6 +7489,25 @@ def test_function_info_batch_keeps_a_miss_in_place_at_the_bridge_1042(monkeypatc
     assert result["functions"][2]["info"]["function"]["name"] == "parse_file"
     assert "nosuchfn" in result["functions"][1]["error"]
     assert (result["requested"], result["resolved"]) == (3, 2)
+
+
+def test_function_info_batch_resolves_the_target_once_1058(monkeypatch):
+    """#1058 item 14: a target refusal (several targets open, unknown
+    selector) is one failure with its listing, as in `_decompile_batch`, not
+    the same refusal repeated in every row."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    calls = []
+
+    def refuse(selector):
+        calls.append(selector)
+        raise RuntimeError("Several targets are open; pass -t <selector>")
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", refuse)
+
+    with pytest.raises(RuntimeError, match="Several targets are open"):
+        instance._function_info_batch(None, ["handle", "nosuchfn", "0x402000"])
+    assert calls == [None]
 
 
 class _ProtoType:
