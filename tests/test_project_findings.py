@@ -133,6 +133,34 @@ def test_no_self_accept_and_manual_evidence_cannot_establish_acceptance(ledger):
     assert rejected["reviews"][0]["evidence"][0]["text"] == "Unsupported interpretation"
 
 
+def test_relabeled_reviewer_is_refused_the_same_typo_guard_as_self_accept_1074(ledger):
+    """User decision on #1074: a review whose reviewer label folds to an
+    EXISTING reviewer's label on this finding, but is spelled differently, is
+    refused naming the existing spelling -- the self-accept guard's rationale
+    applied to reviewer-vs-reviewer identity, not just reviewer-vs-author. An
+    exact repeat (changing one's own verdict) and a genuinely different label
+    are unaffected."""
+    first = add(ledger)
+    rejected = review(ledger, first, reviewer="peer", verdict="reject",
+                       evidence=[{"check": "note", "text": "Unsupported interpretation"}])
+    assert rejected["review_state"] == "rejected"
+    with pytest.raises(RuntimeError, match=r"Reviewer label 'Peer' matches the existing "
+                                             r"reviewer 'peer'"):
+        review(ledger, rejected, reviewer="Peer", verdict="reject",
+               evidence=[{"check": "note", "text": "Another objection"}])
+    assert len(snapshots(ledger)) == 2
+    # The same spelling may change its own verdict.
+    disputed = review(ledger, rejected, reviewer="peer", verdict="dispute",
+                      evidence=[{"check": "note", "text": "Reconsidering"}])
+    assert disputed["review_state"] == "disputed"
+    assert len(disputed["reviews"]) == 2
+    # A genuinely different label still reviews normally.
+    second = review(ledger, disputed, reviewer="reviewer-2", verdict="reject",
+                     evidence=[{"check": "note", "text": "Different objection"}])
+    assert second["reviews"][-1]["reviewer"] == "reviewer-2"
+
+
+
 @pytest.mark.parametrize("author, reviewer", [
     ("analyst", "Analyst"),
     ("analyst", "ANALYST"),

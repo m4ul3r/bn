@@ -108,6 +108,24 @@ def _same_label(a: str, b: str) -> bool:
     return fold(a) == fold(b)
 
 
+def _relabeled_reviewer(reviewer: str, reviews: list[dict]) -> str | None:
+    """The EXISTING reviewer label on *reviews* that folds the same as
+    *reviewer* but is spelled differently, or None.
+
+    Same rationale as the self-accept typo guard, no trust change: a reviewer
+    label that differs from an existing one only in case, Unicode width or
+    spacing is a typo, not a second independent reviewer -- refusing it keeps
+    one spelling per actual reviewer on a finding, the way the self-accept
+    guard keeps the author and the reviewer from being the same actor under
+    two spellings. An EXACT repeat is the ordinary "change my own verdict"
+    case `_review_state` already handles and is not refused here."""
+    return next(
+        (label for label in {review["reviewer"] for review in reviews}
+         if label != reviewer and _same_label(label, reviewer)),
+        None,
+    )
+
+
 def _integer(value: Any, label: str, minimum: int = 1) -> int:
     if type(value) is not int or value < minimum:
         raise RuntimeError(f"{label} must be an integer >= {minimum}")
@@ -636,6 +654,13 @@ def project_finding_review(bridge: Any, id: Any, document: Any, expected_revisio
     ledger = _Ledger(bridge)
     previous = ledger.mutation(id, expected_revision)
     reviewer = _text(reviewer, "reviewer", 256)
+    relabeled = _relabeled_reviewer(reviewer, previous["reviews"])
+    if relabeled is not None:
+        raise RuntimeError(
+            f"Reviewer label {reviewer!r} matches the existing reviewer {relabeled!r} on "
+            "this finding (labels are compared ignoring case, Unicode width/compatibility "
+            "forms and spacing); use that spelling to change your own verdict, or a "
+            "genuinely different label for an independent review")
     _bounded(document)
     _object(document, {"verdict", "rationale", "evidence", "replacement"}, {"verdict", "rationale", "evidence"}, "review document")
     verdict = document["verdict"]
