@@ -1978,6 +1978,170 @@ def _coercion_sites(source: str | None = None):
     return sites, raw
 
 
+def test_no_payload_container_is_coerced_outside_the_recording_helpers():
+    """THE load-bearing assertion. `_field_list`/`_field_dict` disclose by
+    construction, so "every _field_* call discloses" is close to a tautology.
+    What actually makes the choke point a choke point is that nothing coerces a
+    payload container any other way: the earlier attempts at this fix each
+    enumerated the sites they could see and left the rest silent, and a single
+    `x.get("k") or []` -- or `_as_list(vt["slots"])`, which is how a live blocker
+    hid from the first version of this check -- puts the defect straight back."""
+    sites, raw = _coercion_sites()
+    assert sites, "AST walk found no coercion sites at all -- the guard is blind"
+    assert not raw, (
+        f"{len(raw)} container coercion(s) bypass the recording helpers, so a "
+        f"malformed value there renders as empty with no disclosure: {raw[:6]}")
+
+
+def _container_key_decisions():
+    """Every place the module DECIDES something about a container field, split
+    into the ones that delegate to the choke point and the ones that re-derive
+    the answer from the raw payload.
+
+    A container key is one the module itself reads through `_field_list` /
+    `_field_dict` somewhere. Two returns: `membership` is a raw `"k" in mapping`
+    test on such a key, and `before_read` is a branch that tests a container key
+    raw EARLIER in the same function than that key's recorded read."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    RECORDERS = _RECORDERS
+    HELPERS = RECORDERS + ("_field_present", "_field_declared")
+    container_keys = {
+        a.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id in RECORDERS
+        for a in n.args[1:]
+        if isinstance(a, ast.Constant) and isinstance(a.value, str)}
+
+    def raw_key(node):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            return node.args[0].value
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)):
+            return node.slice.value
+        if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                and isinstance(node.left, ast.Constant)):
+            return node.left.value
+        return None
+
+    def answers_presence(node):
+        """Is this expression an ANSWER to "is this field there?" -- as opposed to
+        a value, or a classification of a value?
+
+        `bool(<lookup>)`, `<lookup> is None`, `<lookup> is not None` and
+        `"<key>" in <mapping>` all are. `kind in ("ctor", "dtor")` is NOT: the
+        right-hand side is a literal set of values, so it classifies a value
+        rather than testing a mapping for a field."""
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return answers_presence(node.operand)
+        if isinstance(node, ast.BoolOp):
+            return any(answers_presence(v) for v in node.values)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "bool" and node.args):
+            return raw_key(node.args[0]) is not None or answers_presence(node.args[0])
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            op, right = node.ops[0], node.comparators[0]
+            if (isinstance(op, (ast.In, ast.NotIn))
+                    and isinstance(node.left, ast.Constant)
+                    and isinstance(node.left.value, str)
+                    and not isinstance(right, (ast.Tuple, ast.List, ast.Set))):
+                return True
+            if (isinstance(op, (ast.Is, ast.IsNot)) and isinstance(right, ast.Constant)
+                    and right.value is None):
+                return raw_key(node.left) is not None
+        return False
+
+    membership, before_read, delegated = [], [], []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.name in HELPERS:
+            continue
+        # A second definition moved ONE FUNCTION AWAY. The two rules below are
+        # both intra-function and lexical, so a renderer that gates its recorded
+        # read on `_has_callees(value)` -- a helper that returns a raw presence
+        # answer -- passed both while being exactly the drift they exist to
+        # stop. The question, not the call site, is what may not be duplicated.
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Return) and node.value is not None \
+                    and answers_presence(node.value):
+                delegated.append((fn.name, ast.unparse(node)))
+        first_read: dict[str, int] = {}
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in RECORDERS):
+                for a in node.args[1:]:
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        first_read[a.value] = min(first_read.get(a.value, 1 << 30),
+                                                  node.lineno)
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                    and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                    and isinstance(node.left, ast.Constant)
+                    and node.left.value in container_keys):
+                membership.append((fn.name, ast.unparse(node)))
+            tests = ([node.test] if isinstance(node, (ast.If, ast.IfExp))
+                     else node.ifs if isinstance(node, ast.comprehension) else [])
+            for test in tests:
+                for sub in ast.walk(test):
+                    key = raw_key(sub)
+                    if key in first_read and getattr(sub, "lineno", 1 << 30) < first_read[key]:
+                        before_read.append((fn.name, ast.unparse(sub)))
+    assert container_keys, "no container key found -- the scan is blind"
+    return membership, before_read, delegated
+
+
+def test_exactly_the_choke_point_decides_what_present_means():
+    """The count-the-deciders property, and the one this PR has failed FIVE
+    rounds running -- every time by growing a SECOND place that answers a
+    question the choke point already answers, which then drifts from it.
+
+    Two questions exist and they are different: `_field_present` (did the payload
+    CLAIM anything -- an explicit null did not) and `_field_declared` (does the
+    envelope carry the key at all -- null counts, which is how you tell a paged
+    envelope from a bare list). Both live in the choke point. A renderer that
+    spells either one itself is a second definition, and it is a finding even
+    while it still agrees: round 6's blocker was `"items" in secs` agreeing with
+    nothing about an explicit null, written in the same commit as the helper.
+
+    The second half is ordering: a renderer may branch on a container key only
+    AFTER that key's recorded read, because a branch that returns or skips first
+    means the skew was never recorded and a malformed value renders as a
+    confident result. That is precisely how the class-listing count-only
+    envelope stayed silent on a falsy wrong-shaped listing.
+
+    The third half -- and the reason the first two were not enough -- is that
+    both of those rules are intra-function and lexical, so the SAME second
+    definition simply moved one function away and passed: a helper
+    `def _has_callees(value): return bool(_as_dict(value).get("callees"))`, used
+    to gate the recorded read, is a second definition of PRESENT with a name on
+    it. What may not be duplicated is the QUESTION, not the call site, so no
+    function outside the choke point may RETURN a presence answer at all."""
+    membership, before_read, delegated = _container_key_decisions()
+    assert not membership, (
+        f"{len(membership)} raw `key in mapping` test(s) on a container key -- a "
+        f"second definition of PRESENT that will drift from the helpers' one; "
+        f"call _field_declared or _field_present instead: {membership[:6]}")
+    assert not before_read, (
+        f"{len(before_read)} branch(es) decide on a container key BEFORE its "
+        f"recorded read, so a malformed value there never reaches the "
+        f"disclosure: {before_read[:6]}")
+    assert not delegated, (
+        f"{len(delegated)} function(s) outside the choke point RETURN a presence "
+        f"answer about a payload field, which is a second definition of PRESENT "
+        f"with a name on it -- the intra-function rules above cannot see it "
+        f"because it is one hop away; return _field_present/_field_declared's "
+        f"answer instead of re-deriving it: {delegated[:6]}")
+
+
 # Every spelling the guard sees, one probe module each, enumerated as DATA so the
 # claim is ASSERTED rather than described. Rounds 5 and 6 each evaded the guard
 # with a shape its prose had called covered; the table is the answer to that.
@@ -2153,7 +2317,20 @@ _MALFORMED = {
 _ELEMENT_JUNK = (None, 0, 1, True, "s", [], {}, [{"a": 1}], {"a": 1})
 
 
-# Entries excluded from the text probes, with their category and reason.
+# Excluded from the probe BY NAME, each with the reason it is not a payload TEXT
+# renderer. An exclusion that is not named here does not exist: a silent one is
+# how five live renderers left the population at round 8 and two more at round 9.
+#
+# Each entry is `(category, prose)`, and the CATEGORY IS EXECUTABLE: the test
+# below re-derives it from the live module and fails when it stops holding. That
+# is round 11's second lesson. `_go_rename_summary` sat here under "the summary
+# it builds is rendered by a renderer that is itself probed" -- a sentence that
+# is false for EVERY transform, because a transform runs before any renderer
+# exists -- and prose cannot go stale loudly. An exemption whose justification
+# is only prose is an exemption nobody re-checks.
+_EXCLUSION_CATEGORIES = ("not-callable", "takes-no-payload",
+                         "takes-more-than-a-payload",
+                         "is-a-renderer-factory", "returns-data-not-text")
 _PROBE_EXCLUSIONS = {
     "_render_paged_list_text": (
         "takes-more-than-a-payload",
@@ -2257,6 +2434,85 @@ _PROBE_EXCLUSIONS = {
 }
 
 
+def _exclusion_category_holds(name, category):
+    """Re-derive one exclusion's stated category from the LIVE module.
+
+    The whole point: a reason that stops being true fails a test instead of
+    sitting in a comment. Each category is a property of the symbol itself, so
+    nothing here consults the exclusion list to decide whether the exclusion is
+    warranted."""
+    from bn import formatters
+
+    obj = getattr(formatters, name, None)
+    if category == "not-callable":
+        return not callable(obj)
+    if not callable(obj):
+        return False
+    positional = [p for p in inspect.signature(obj).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    required = [p for p in positional if p.default is p.empty]
+    if category == "takes-more-than-a-payload":
+        return len(required) > 1
+    if category == "takes-no-payload":
+        return not required
+    if len(required) != 1:
+        return False           # the two categories below are about the RETURN
+    if category == "is-a-renderer-factory":
+        return callable(_render_or_exception(obj, "probe"))
+    if category == "returns-data-not-text":
+        out = _render_or_exception(obj, dict(_PROBE_ELEMENT))
+        # BOTH halves of the stated reason, because the second was the
+        # load-bearing one and was still prose: returning data is what makes
+        # there be no rendering to absorb, and the CLI handing the SAME RAW
+        # payload to a probed renderer is what makes the skew this helper
+        # records reach a boundary at all. Drop the second and the exclusion
+        # becomes the very thing round 11 blocked on -- a reader excused
+        # because "something else renders its output" when nothing does.
+        return (not isinstance(out, (str, Exception))
+                and _raw_payload_also_rendered(name))
+    return False
+
+
+def _raw_payload_also_rendered(name):
+    """Does the CLI hand the payload this data helper reads to a PROBED text
+    renderer in the same call?
+
+    Re-derived from the CLI's own AST: find the functions that reference the
+    helper, then the call that installs one of them as a keyword, and require
+    that call to install a `*renderer=` whose formatters symbols are all probed.
+    So if the pipe-note path ever stopped sharing its payload with the body
+    renderer, this exclusion fails instead of continuing to assert it."""
+    import ast
+    import pathlib
+
+    from bn import formatters
+
+    module = pathlib.Path(formatters.__file__).resolve()
+    probed = {label.split("(")[0] for label, _ in _probe_renderers()}
+    for path in sorted(module.parent.rglob("*.py")):
+        if path.resolve() == module:
+            continue
+        tree = ast.parse(path.read_text())
+        symbols, modules = _formatters_bindings(tree, _package_modules().get(path.resolve()))
+        users = {fn.name for fn in ast.walk(tree)
+                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and name in _formatters_refs(fn, symbols, modules)}
+        if not users:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(isinstance(inner, ast.Name) and inner.id in users
+                       for kw in node.keywords for inner in ast.walk(kw.value)):
+                continue
+            rendered = {r for kw in node.keywords
+                        if kw.arg and kw.arg.endswith("renderer")
+                        for r in _formatters_refs(kw.value, symbols, modules)}
+            if rendered and rendered <= probed:
+                return True
+    return False
+
+
 # A transform the CLI installs is NOT a renderer, and probing it as one measures
 # the harness instead of the code: it returns a DICT, so `str()` of its result
 # differs between a malformed key and an absent one for free, and a differential
@@ -2267,7 +2523,15 @@ _PROBE_EXCLUSIONS = {
 # recorder inside the renderer, long after the transform has consumed and
 # discarded the payload.
 #
-# Probe the transform together with the renderer that consumes its output.
+# The renderer each transform is paired with is DECLARED here; that this table is
+# COMPLETE is not. `_cli_installed_transforms()` reads the transform names out of
+# the CLI's own AST and the inventory test fails if one of them is missing, so a
+# new transform cannot enter the codebase unclassified. Naming one in
+# `_PROBE_EXCLUSIONS` instead is rejected outright: "the summary it builds is
+# rendered by a renderer that is itself probed" was the reason `_go_rename_summary`
+# carried, and it is FALSE for a transform -- the renderer is handed the OUTPUT,
+# never the payload, so nothing downstream can re-read what the transform
+# absorbed. That false premise was round 11's blocker.
 _COMPOSED_ENTRY_POINTS = {
     "_mutation_summary": "_render_mutation_summary_text",
     "_go_rename_summary": "_render_mutation_summary_text",
@@ -2571,6 +2835,42 @@ def _probe_tree_and_modules(source):
 
 
 @functools.lru_cache(maxsize=1)
+def _cli_installed_transforms():
+    """Every `bn.formatters` symbol the CLI installs as a RESULT TRANSFORM, read
+    out of the CLI's own AST.
+
+    A transform's output REPLACES the payload the text renderer is handed, which
+    makes it the one entry-point kind whose choke-point reads can reach no
+    `@_discloses` boundary at all. Derived rather than listed for the usual
+    reason: a table of transforms maintained beside the transforms is a
+    population taken from the thing it guards."""
+    import ast
+    import pathlib
+
+    from bn import formatters
+
+    module = pathlib.Path(formatters.__file__).resolve()
+    names: set[str] = set()
+    for path in sorted(module.parent.rglob("*.py")):
+        if path.resolve() == module:
+            continue
+        tree = ast.parse(path.read_text())
+        symbols, modules = _formatters_bindings(tree, _package_modules().get(path.resolve()))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                # `spill_status` is the transform; `spill_status_renderer` beside
+                # it is a RENDERER and is probed as one, so match the transform
+                # keyword exactly rather than by prefix.
+                if not kw.arg or ("transform" not in kw.arg
+                                  and kw.arg != "spill_status"):
+                    continue
+                names |= _formatters_refs(kw.value, symbols, modules)
+    return frozenset(names)
+
+
+@functools.lru_cache(maxsize=1)
 def _cli_invoked_formatters():
     """Every `bn.formatters` symbol the package MENTIONS, read out of its AST.
 
@@ -2630,6 +2930,197 @@ def _cli_referenced_formatters():
     `_formatters_identity_inventory`, which is what finally caught `bn.cli`'s
     re-exported `_format_operation_result`."""
     return _cli_invoked_formatters() | _formatters_identity_inventory()
+
+
+def test_every_renderer_the_cli_installs_is_in_the_population():
+    """The population's entry points come from the CLI, not from this module's
+    naming convention.
+
+    `_probe_renderers` scans `dir(formatters)` for a `_render` prefix, which is a
+    property of the thing being guarded: a live renderer spelled `_resolution_note`
+    was invisible to it, so the differential, the raise sweep and the no-mutation
+    invariant could not fail on it, and its top-level reads were mis-filed as
+    unreachable-nested. This asserts the two inventories agree, so a renderer the
+    CLI installs cannot leave the population by being named differently."""
+    from bn import formatters
+
+    installed = _cli_referenced_formatters()
+    # Anti-vacuity: a broken walk returning nothing would satisfy the subset
+    # check below without examining anything. These names are the ones the
+    # spelling rules this test exists to replace would each have missed: a note
+    # (no `_render` prefix), a steer (same, plus a REQUIRED keyword-only flag),
+    # a text slicer, a bucket splitter the CLI calls directly rather than
+    # installing under a `*_renderer=` keyword, two transforms that live in the
+    # CLI ENTRY module rather than under `commands/`, and -- the one no AST
+    # reference walk can reach at all -- `_format_operation_result`, which
+    # `bn.cli` re-exports for monkeypatching and never references by name.
+    # Only the identity sweep sees that one, and it absorbed a malformed
+    # `defined_types` silently for the whole time it was invisible.
+    assert {"_resolution_note", "_disasm_linear_steer_note", "_slice_text_lines",
+            "_xref_buckets", "_render_defuse_text", "_mutation_summary",
+            "_add_mutation_ok", "_format_operation_result"} <= installed, sorted(installed)
+    probed = {label.split("(")[0] for label, _ in _probe_renderers()}
+    missing = sorted(installed - probed - set(_PROBE_EXCLUSIONS))
+    assert not missing, (
+        f"the CLI references {missing} as payload consumer(s) the probe never "
+        "runs, so no guard below can fail on them. Probe them, compose them in "
+        "_COMPOSED_ENTRY_POINTS, or name each one in _PROBE_EXCLUSIONS with the "
+        "reason it is not a payload text renderer.")
+    # The other direction (#1070): a renderer the probe found by its `_render`
+    # prefix that NO CLI surface installs and NO live module code reaches is
+    # dead code wearing a guard -- every differential below runs against it
+    # and proves nothing about any output a user gets. `reached` is a FIXED
+    # POINT over the module's own AST, seeded with what the CLI references and
+    # what module-level statements load (tables, decorators, defaults): a
+    # function's body counts only once the function itself is reached, so a
+    # row helper composed by an installed listing renderer is reached while a
+    # renderer referenced only by another uninstalled function is not. (The
+    # first cut counted any load outside the function's own body, so a second
+    # dead function calling the orphan hid it -- #1070 review.)
+    import ast
+
+    tree = ast.parse(inspect.getsource(formatters))
+
+    def loads(nodes) -> set[str]:
+        return {node.id for root in nodes for node in ast.walk(root)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+    bodies: dict[str, set[str]] = {}
+    reached = set(installed)
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bodies[stmt.name] = loads(stmt.body)
+            # Evaluated when the module is imported, not when the function runs.
+            reached |= loads([*stmt.decorator_list, stmt.args, *filter(None, [stmt.returns])])
+        else:
+            reached |= loads([stmt])
+    frontier = set(reached)
+    while frontier:
+        new = set().union(*(bodies.get(name, ()) for name in frontier)) - reached
+        reached |= new
+        frontier = new
+    orphans = sorted(probed - reached)
+    assert not orphans, (
+        f"{orphans} is probed as a payload text renderer, but no CLI surface "
+        "installs it and no reached function or module-level statement refers "
+        "to it, so every guard that runs against it guards no output. Install "
+        "it under a command or compose it from the renderer that owns its rows.")
+    # The identity sweep's residue: names the package BINDS but never mentions
+    # again. Round 14 probed them WRAPPED, on the claim that production reaches
+    # them only as a fragment under the boundary of the renderer that composes
+    # them -- and that claim was FALSE for the one name it applied to, because
+    # `bn.cli` re-exports `_format_operation_result` so callers can reach it and
+    # one already does. The manufactured boundary then hid the absorption the
+    # widening had just uncovered: an exemption that suppresses the finding it
+    # was invented for. There is no such class any more, and this asserts it
+    # STAYS gone -- every name in the inventory is probed on the surface a
+    # caller actually gets.
+    bare = {label.split("(")[0] for label, probe in _probe_renderers()
+            if getattr(probe, "__wrapped__", None) is None}
+    wrapped = {label.split("(")[0] for label, probe in _probe_renderers()
+               if getattr(probe, "__wrapped__", None) is not None}
+    # THE property, and it is no longer asked of the set that decides it. Round
+    # 15 compared `wrapped` against `installed` -- the very set the wrap rule
+    # keys off -- so the answer was empty by construction while 19 helpers were
+    # still probed under a manufactured boundary. Round 15's repair re-pointed
+    # it at `_boundary_free_helpers`, and round 16 showed that is the SAME
+    # defect one level along: the wrap rule keys off that walk too, so
+    # `wrapped & exposed` is empty by DEFINITION and narrowing the walk to the
+    # two names below still passed.
+    #
+    # The question is therefore put to an independent oracle -- what the module
+    # ACTUALLY does at runtime (`_helpers_observed_without_a_recorder`), which
+    # no wrap rule consults. A helper the probe wrapped that is nonetheless
+    # observed running with no recorder is a manufactured disclosure, and the
+    # static walk having missed it is exactly the failure mode.
+    exposed = set(_boundary_free_helpers())
+    live_bare = set(_helpers_observed_without_a_recorder())
+    manufactured = sorted(wrapped & live_bare)
+    assert not manufactured, (
+        f"{manufactured} is probed under a boundary, and the running module "
+        "reaches it from a live entry point with NO recorder installed -- so a "
+        "skew it cannot disclose on its own surface reads as disclosed here, "
+        "and the static walk that decided to wrap it is wrong. Probe it bare "
+        "and fix the renderer.")
+    # The two oracles must agree in the direction that matters: anything seen
+    # running bare must be something the conservative walk predicted. A witness
+    # the walk did not name means the walk under-approximates, which is the only
+    # direction that lets a manufactured boundary through.
+    unpredicted = sorted(live_bare - exposed)
+    assert not unpredicted, (
+        f"{unpredicted} runs with no recorder on a live path and the static "
+        "boundary-free walk does not name it, so the walk is missing an edge "
+        "and the wrap rule above is deciding on bad information.")
+    # Anti-vacuity, because both assertions above are emptiness claims, and an
+    # emptiness claim over an oracle that witnessed nothing is free. The
+    # WITNESSES are pinned exactly -- they are what the module actually did, so
+    # a driving loop that stops reaching a live surface goes red here instead of
+    # quietly making the two checks above trivially true. Ten of the walk's 28
+    # boundary-free names are witnessed; the rest sit on branches these
+    # payloads do not open, which is the stated limit of a live witness and the
+    # reason the conservative static walk is kept beside it rather than
+    # replaced by it.
+    #
+    # #1068 (pinned under #1070): `_escape_control_chars` joined the witnesses
+    # because `_skew_note` -- itself a bare witness, it BUILDS the boundary's
+    # `! malformed` line -- now escapes the field names it prints. Same path,
+    # one more callee; the project renderers added no new bare entry point.
+    assert sorted(live_bare) == [
+        "_as_dict", "_escape_control_chars", "_field_dict", "_field_list",
+        "_operation_row", "_record_skew", "_render_fallback_text",
+        "_render_target_choice", "_skew_note", "_unknown_ref_label"], (
+        "the runtime oracle no longer witnesses the same set running bare, so "
+        "its emptiness claims above are over different evidence than the ones "
+        f"that were checked: {sorted(live_bare)}. How to decide: a helper NEWLY "
+        "CALLED from a path that already runs bare (as `_escape_control_chars` "
+        "was from `_skew_note`) is added to this list with a note saying which "
+        "caller; a name that appears for any other reason means an entry point "
+        "that reaches it has no `@_discloses` boundary -- find that entry point "
+        "(the new name is the helper it calls, not the offender) and decorate "
+        "it rather than editing this list. A name that DISAPPEARS means the "
+        "driving loop stopped reaching a live surface.")
+    assert {"_render_target_choice", "_render_fallback_text"} <= bare, (
+        "a helper with a boundary-free production path must be probed on that "
+        "surface, which is the whole point of the assertion above")
+    # A transform's output REPLACES the payload, so no downstream renderer can
+    # re-read what it absorbed: it must be COMPOSED, and it may never be waved
+    # through as an exclusion. Both halves are derived from the CLI's AST, so a
+    # new transform arrives here already unclassified rather than silently
+    # uncovered -- round 11's blocker was a transform sitting in the exclusion
+    # list under a reason that was false for its whole category.
+    transforms = set(_cli_installed_transforms())
+    assert transforms == set(_COMPOSED_ENTRY_POINTS), (
+        "the CLI installs these result transforms and _COMPOSED_ENTRY_POINTS "
+        f"declares those: {sorted(transforms)} != "
+        f"{sorted(_COMPOSED_ENTRY_POINTS)}. A transform outside the table is "
+        "probed by nothing.")
+    assert not transforms & set(_PROBE_EXCLUSIONS), (
+        f"{sorted(transforms & set(_PROBE_EXCLUSIONS))} is installed as a result "
+        "transform, so the renderer downstream of it never sees the payload it "
+        "read. It cannot be excluded on the grounds that something else renders "
+        "its output -- compose it.")
+    for transform, renderer in _COMPOSED_ENTRY_POINTS.items():
+        assert callable(getattr(formatters, transform, None)), transform
+        paired = getattr(formatters, renderer, None)
+        assert callable(paired), f"{transform} is paired with a missing {renderer}"
+        assert hasattr(paired, "__wrapped__"), (
+            f"{renderer} renders a transform's output but is no @_discloses "
+            "boundary, so the composition has no drain at all")
+    # A stale exclusion is a silent one, and prose goes stale silently by
+    # definition -- that was round 11's second finding. Every exclusion's stated
+    # CATEGORY is therefore re-derived from the live module here, so a
+    # justification that stops being true fails instead of sitting in a comment.
+    for name, (category, reason) in _PROBE_EXCLUSIONS.items():
+        assert hasattr(formatters, name), f"{name} no longer exists"
+        assert reason, f"{name} is excluded without a reason"
+        assert category in _EXCLUSION_CATEGORIES, (
+            f"{name} is excluded under {category!r}, which is not one of the "
+            f"checkable categories {_EXCLUSION_CATEGORIES}. An exclusion whose "
+            "reason cannot be re-derived is prose, and prose does not expire.")
+        assert _exclusion_category_holds(name, category), (
+            f"{name} is excluded as {category!r} and the module no longer agrees: "
+            f"{reason}. Either it became a payload text renderer and must be "
+            "probed, or its category changed and the entry must say which.")
 
 
 def _probe_renderers():
@@ -2724,8 +3215,23 @@ def _probe_renderers():
             # production. A renderer the package INVOKES has no such caller, so
             # it is probed exactly as bare as production leaves it.
             #
-            # Helpers reached without a production disclosure boundary must be
-            # probed bare; otherwise the harness would hide missing disclosures.
+            # INVOKED, not merely in the inventory: a symbol that is only BOUND
+            # (`bn.cli` re-exports `_format_operation_result` and never mentions
+            # it again) is called by nothing at that spelling, and every
+            # production path reaches it as the FRAGMENT BUILDER it is, under the
+            # boundary of the renderer that composes its row. Probing such a one
+            # bare would report an absorption no caller can see, and wrapping an
+            # invoked one would manufacture a disclosure the user never gets --
+            # the probe must call a live entry point exactly as its caller does,
+            # or it measures the harness instead of the code. Which side a name
+            # falls on is asserted in
+            # `test_every_renderer_the_cli_installs_is_in_the_population`.
+            # Wrapped only when NO production path reaches this helper without
+            # crossing a boundary (`_boundary_free_helpers`). Keying it on
+            # inventory membership was round 15's residue: it made the assertion
+            # that checks it a tautology, and it left two helpers the CLI reaches
+            # through undecorated callers probed under a disclosure production
+            # never installs.
             out.append((label, call
                         if (hasattr(fn, "__wrapped__")
                             or name in _cli_referenced_formatters()
@@ -3252,6 +3758,105 @@ def _boundary_free_helpers():
     return frozenset(exposed)
 
 
+@functools.lru_cache(maxsize=1)
+def _helpers_observed_without_a_recorder():
+    """Which module helpers actually RUN with no skew recorder installed.
+
+    The second, INDEPENDENT oracle for the same question `_boundary_free_helpers`
+    answers, and the reason the assertion that uses it is no longer empty by
+    construction. That walk is static -- decorator names and call-graph edges
+    read out of the AST -- and the probe's wrap rule KEYS OFF IT, so comparing
+    the wrapped set against it can only ever return the empty set. Round 16's
+    major: narrowing the walk to the two names its own anti-vacuity assertion
+    pins left everything passing.
+
+    This one asks the running module instead. Every module function is spied on
+    (the spy records the value of `_SKEWED_FIELDS` AT ENTRY, before the callee
+    can install its own), then every live CLI entry point is driven BARE with
+    the payloads the population discovered for it. A helper that arrives with
+    `None` there has no boundary above it on that path, whatever the AST thinks
+    -- so if the static walk silently stops naming it, the probe wraps it, and
+    this catches the manufactured disclosure the walk was supposed to prevent.
+
+    Two names are not recorded. A BOUNDARY running with no outer recorder is the
+    normal case, and so is the entry point currently being DRIVEN -- the static
+    walk records callees only, and counting the entry against itself would be a
+    disagreement the harness manufactured.
+
+    What it cannot see, stated: a helper on a branch these payloads do not
+    reach. That is why it is a CROSS-CHECK on the walk and not a replacement for
+    it -- the walk is the conservative over-approximation, this is the live
+    witness, and they are asserted to agree in the direction that matters."""
+    from bn import formatters
+
+    # Every payload is built BEFORE a spy exists, so discovery cannot be
+    # mistaken for a live call.
+    entries = sorted(_cli_referenced_formatters())
+    probes = {label.split("(")[0]: probe for label, probe in _probe_renderers()}
+    drives = []
+    for name in entries:
+        fn = getattr(formatters, name, None)
+        if not inspect.isfunction(fn):
+            continue                           # a re-exported constant
+        # The probe callable when there is one: it already supplies the
+        # renderer's flags, and the wrap rule leaves an ENTRY bare, which is
+        # precisely the surface this oracle has to drive. Otherwise call it
+        # directly -- an entry the probe excludes is still an entry the static
+        # walk starts from, and dropping it here would let the two oracles
+        # compare different populations.
+        call = probes.get(name, fn)
+        asked: set[str] = set()
+        for _ in range(4):                     # fixed point: gated keys open
+            before = frozenset(asked)
+            for filler in (None, "list", "dict"):
+                ctx = {k: copy.deepcopy(_PROBE_WELL_FORMED[filler])
+                       for k in sorted(asked)}
+                _render_or_exception(call, _KeyProbe(ctx, asked))
+            if frozenset(asked) == before:
+                break
+        for filler in ("dict", "list", None):
+            drives.append((name, call, {k: copy.deepcopy(_PROBE_WELL_FORMED[filler])
+                                        for k in sorted(asked)}))
+        # Not every entry consumes a MAPPING: the target chooser is handed the
+        # choice list itself. Driving only dict-shaped payloads left the helper
+        # under it unwitnessed, which is the shape of hole this oracle exists to
+        # refuse.
+        drives.append((name, call, {}))
+        drives.append((name, call, _PROBE_WELL_FORMED["list"]))
+        drives.append((name, call, "probe"))
+
+    observed: set[str] = set()
+    driving = [""]
+    originals = {name: getattr(formatters, name) for name in dir(formatters)
+                 if inspect.isfunction(getattr(formatters, name, None))
+                 and getattr(formatters, name).__module__ == formatters.__name__}
+
+    def spy(name, fn):
+        @functools.wraps(fn)
+        def watched(*args, **kwargs):
+            if (formatters._SKEWED_FIELDS.get() is None
+                    and getattr(fn, "__wrapped__", None) is None
+                    and name != driving[0]):
+                observed.add(name)
+            return fn(*args, **kwargs)
+        return watched
+
+    real_json = formatters.json
+    formatters.json = _QuietJson(real_json)
+    try:
+        for name, fn in originals.items():
+            setattr(formatters, name, spy(name, fn))
+        for name, call, payload in drives:
+            driving[0] = name
+            _render_or_exception(call, payload)
+            driving[0] = ""
+    finally:
+        for name, fn in originals.items():
+            setattr(formatters, name, fn)
+        formatters.json = real_json
+    return frozenset(observed)
+
+
 def _comparison_literals(fn_name):
     """The fillers for one renderer: the constants it compares against, plus the
     constants of every function it reaches. Scoping this to the renderer's OWN
@@ -3721,6 +4326,89 @@ def test_every_population_context_actually_reaches_the_read_it_was_recorded_for(
         f"cannot fail there: {unreached[:8]}")
 
 
+# The keys `_go_rename_summary` reads that are NOT counts: a kind discriminator,
+# three flags, a message and the failure listing, plus the seven keys the paired
+# renderer reads back off the summary it produced. Declared here so the runtime
+# read set below can be split, and so a NEW key has to arrive in one bucket or
+# the other deliberately.
+_GO_RENAME_NON_COUNT_READS = {
+    "kind", "committed", "preview", "success", "rolled_back", "message",
+    "results", "prototype_user_type_residue",
+    "changed_count", "verified_count", "noop_count", "failed_count",
+    # #1012: read only by the composed renderer, derived from generic result
+    # rows; never an input counter of the go-rename summary.
+    "reverted_count",
+    "measured", "dirty_after", "first_error",
+    # M-03: the paired renderer reads the split-host listing back off the
+    # summary; a listing, not a count, and absent on every `go rename`.
+    "overlapping_functions",
+    # Command-specific disclosure container, built from the captured counters.
+    "go_rename",
+    # #964: the paired renderer reads the per-type `types declare` disclosure
+    # back off the summary; a listing, not a count, and absent on every `go rename`.
+    "declared_types",
+    # #999 item 4 / #993 item 3: the paired renderer reads the `struct field
+    # set` replaced-member listing and the `class apply-types` plan back off the
+    # summary; listings, not counts, and absent on every `go rename`.
+    "replaced_members", "class_apply_types",
+    # #993 review round 2: the rolled-back declare's kept library imports.
+    "kept_library_imports",
+    # #1042 review: the paired renderer prints how a name an op was given
+    # resolved (`note: resolved …`); a listing, not a count, and absent on
+    # every `go rename`.
+    "resolved_symbol", "resolved_symbols",
+    # #997 item 2: the paired renderer reads the fall-through create warnings
+    # back off the summary; a listing, not a count, and absent on every `go rename`.
+    "fallthrough_entries",
+    # #999 item 5: the paired renderer reads the ops a --preview left out back
+    # off the summary; a listing, not a count, and absent on every `go rename`.
+    "preview_skipped",
+    # #966: deletion outcomes are a listing, not a go-rename count.
+    "function_deletions",
+    # #1068 (pinned under #1070): the paired renderer reads the `project link`
+    # and `project finding` disclosure containers back off the summary. Each is
+    # built by its OWN transform (`_project_link_summary` /
+    # `_project_finding_summary`) from counters that transform reads through
+    # `_nonnegative_count` and folds into its own `measured`; neither is an
+    # input counter of the go-rename summary, and both are absent on every
+    # `go rename`.
+    "project_link", "project_finding",
+}
+
+
+def test_every_count_the_go_rename_summary_decides_on_is_covered_by_measured():
+    """`measured` is derived from the counter reads, so a counter read OUTSIDE
+    that loop is a counter `measured` does not cover -- and a fabricated 0 from
+    such a read is this op's "nothing changed, do not save" verdict (#683).
+
+    A SET, not a number, and discovered by RUNNING the transform rather than by
+    matching its source: `_KeyProbe` reports the keys the composed entry point
+    actually asked for, so a seventh counter read appears here however it is
+    spelled -- `int(value.get(...))`, an isinstance-guarded coercion, an alias
+    hop -- and lands in neither bucket. Both injection forms round 12 used moved
+    only re-baselineable size counters before this existed.
+
+    Deliberately NOT derived from `_count_field` call sites: a population taken
+    from the choke point cannot fail on a read that skipped the choke point,
+    which is the whole defect class this file keeps re-finding."""
+    from bn import formatters
+
+    read = {key for label, _, key, _, _ in _runtime_population()
+            if label.split("(")[0] == "_go_rename_summary"}
+    counters = set(formatters._GO_RENAME_COUNTERS)
+    assert counters <= read, (
+        f"{sorted(counters - read)} is declared a `go rename` counter and the "
+        "composed transform never reads it -- the loop that decides `measured` "
+        "has stopped covering it")
+    stray = sorted(read - counters - _GO_RENAME_NON_COUNT_READS)
+    assert not stray, (
+        f"the go-rename summary reads {stray}, which is in neither "
+        "_GO_RENAME_COUNTERS nor the declared non-count reads. If it is a "
+        "counter it must be read through the loop that decides `measured`, or "
+        "an unreadable one fabricates a 0 into a DECISION key; if it is not, "
+        "add it to _GO_RENAME_NON_COUNT_READS and say why in the commit.")
+
+
 def _count_helper_sites():
     """Every `(function, literal key)` the module reads through a COUNT helper.
 
@@ -3928,6 +4616,101 @@ def test_the_function_count_line_never_states_a_count_it_could_not_read():
         quiet = formatters._render_function_count_text(payload)
         assert quiet == "Total functions: 0", (payload, quiet)
 
+
+
+# The raw numeric spellings this module still carries, MEASURED rather than
+# described. Each is a count read that does not go through `_count_field` --
+# `<payload lookup> or 0`, `.get(<literal>, 0)`, `int(<payload lookup>)` -- so
+# an unreadable value there is a fabricated number with nothing disclosed. The
+# routed audit converted the surfaces that state an ACTIONABLE number (the go
+# rename headline, the evidence card's resume offset); the rest are descriptive
+# counts on rows and summaries, and they are inventoried here so a NEW raw count
+# read arrives red instead of joining a prose claim.
+#
+# `_render_mutation_summary_text`'s `value.get('changed_count', 0)` is
+# deliberately in the residue: it reads a value the ALREADY-guarded summary
+# transform put there (`None` for a refused counter, which is why `changed=None`
+# prints), so a blanket zero-assertion would be wrong where an inventory is
+# right.
+# 49 -> 48 (#858 review r5): `_render_trace_text`'s `arg_index` was the last
+# raw numeric spelling in that renderer and now goes through `_stated_count`.
+# 48 -> 46 (#770): `_render_field_xrefs_text`'s bespoke paging footer read
+# `value.get('offset', 0)` twice (bare and `or 0`) to build its own note; the
+# renderer now delegates to `_paging_footer`, which reads all three counts
+# through the choke point, so both spellings are deliberately GONE.
+# 46 -> 45 (#795 round-4 review): `_render_function_count_text`'s
+# `value.get('count', 0)` was the widest raw count read left in the module --
+# three CLI surfaces install that renderer -- and now goes through
+# `_stated_count`.
+# 45 -> 39 (#795 round-6 review): `_render_class_list_text` stated SIX numbers
+# of its own raw -- the count-only headline, the non-class artifact share
+# beside it, and the three suppressed shares in the `hidden:` tail. The
+# headline now reads through `_stated_count` and the four cardinalities
+# through `_nonnegative_count`, so all six spellings are deliberately GONE.
+# 39 -> 38 (#795 round-7 review): the SEVENTH number in that renderer, the
+# per-ROW method count, which the round-6 repair walked past -- it rendered a
+# flag as a quantity and a container as a Python repr, undisclosed, in the
+# very renderer the round-6 major was filed against. Now `_stated_count`.
+# 38 -> 37 (#1036 item 5): `_render_orient_text`'s
+# `ea.get('analysis_cache_restored', False)` matched as a count spelling
+# (`False == 0`); the split database flags now read through `_flag_field`.
+# 37 -> 39 (#1068, pinned under #1070): `_project_link_summary` folds its four
+# counters with `counts[key] or 0` (linked/relinked/rebound) and
+# `counts['already_linked'] or 0`. Both read a LOCAL the transform already
+# guarded -- `_nonnegative_count` plus presence/skew checks leave `None` for a
+# refused counter, and any `None` makes the summary `measured: False` with
+# every derived count `None` -- so, like `changed_count` above, they are
+# residue over an already-disclosed value rather than a fabricated number.
+# The payload's own counts are never read raw.
+_RAW_COUNT_SPELLINGS = 39
+
+
+def test_the_raw_count_residue_is_exactly_this_big():
+    """The inventory, so the routed item above stops being a prose claim."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    def is_lookup(node):
+        if isinstance(node, ast.Subscript):
+            return True
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("get", "pop"))
+
+    tree = ast.parse(inspect.getsource(formatters))
+    get_zero, or_zero, int_lookup = [], [], []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and len(node.args) == 2
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == 0):
+            get_zero.append(f"{ast.unparse(node)} at line {node.lineno}")
+        if (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                and len(node.values) == 2
+                and isinstance(node.values[1], ast.Constant)
+                and node.values[1].value == 0
+                and is_lookup(node.values[0])):
+            or_zero.append(f"{ast.unparse(node)} at line {node.lineno}")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "int" and node.args
+                and is_lookup(node.args[0])):
+            int_lookup.append(f"{ast.unparse(node)} at line {node.lineno}")
+    residue = get_zero + or_zero + int_lookup
+    assert len(residue) == _RAW_COUNT_SPELLINGS, (
+        f"the module carries {len(residue)} raw count spellings "
+        f"({len(get_zero)} `get(k, 0)`, {len(or_zero)} `or 0`, "
+        f"{len(int_lookup)} `int(lookup)`), not {_RAW_COUNT_SPELLINGS}. A NEW "
+        "one is a fabricated number with nothing disclosed -- route it through "
+        "`_count_field`/`_stated_count`; one you deliberately REMOVED moves "
+        f"this constant in the same commit. Current: {sorted(residue)}")
+    # `int(<payload lookup>)` is the spelling that RAISES rather than
+    # fabricating, and the module carries none: an arriving one costs a whole
+    # render, which is the harm `_count_field` exists to end.
+    assert not int_lookup, (
+        f"a payload lookup reaches bare `int()`, which raises: {int_lookup}")
 
 
 # The declared choke-point reads neither differential reaches, each with a
@@ -6327,6 +7110,560 @@ def test_a_well_formed_empty_container_is_never_reported_as_unusable():
             f"definition={bogus!r} left no note naming the field: {out!r}")
 
 
+# THE population for the text choke point -- and it is no longer the choke
+# point's own call sites.
+#
+# Round 16's major, and this file's own earned rule turned on itself: a guard
+# whose population comes from the thing it guards cannot fail. `_TEXT_VALUE_SITES`
+# was a table of `_text_value` CALL SITES, so it could only ever cover a read
+# somebody had ALREADY routed. It reported a covered population of ONE while
+# eight live inline `isinstance(..., str)` filters each dropped a line with no
+# note, and one of them (`after_layout` on an unchanged type entry) did not
+# even drop it -- it raised AttributeError and cost the whole mutation card.
+#
+# The population here is the DEFECT'S SIGNATURE instead: every inline
+# `isinstance(<x>, str)` test the module performs, harvested from its AST. A new
+# one arrives UNCLASSIFIED and red whether or not its author ever heard of the
+# choke point, and none of the eight could have been added silently.
+#
+# Each guard must fall in one of five categories, and the category is RE-DERIVED
+# from the module rather than asserted in prose (the `_PROBE_EXCLUSIONS`
+# discipline, applied here):
+#
+#   chokepoint          the guard IS the choke point (`_text_value` itself);
+#   routed              the guarded value was produced by `_text_value` in this
+#                       same function, so the skew is already recorded;
+#   routed_in           the guarded value is a PARAMETER every module call site
+#                       hands a `_text_value` result -- directly, through a local
+#                       bound from one, or through another routed parameter
+#                       (a fixed point, so `_layout_size(before_layout)` inside
+#                       `_size_delta` counts);
+#   reaches_the_output  the value still reaches the render ON THE PATH THAT
+#                       REFUSED IT -- re-rendered (`repr`/`str`/`json.dumps`/
+#                       `_render_fallback_text`), interpolated into an f-string,
+#                       returned as-is, or covered because the whole payload it
+#                       was read off is dumped there. Nothing is absorbed, so
+#                       nothing needs disclosing.
+#   records_skew        the ARM that refused the value calls `_record_skew(k)`
+#                       itself, with `k` the literal key the tested value was
+#                       read from, so the enclosing boundary's `! malformed`
+#                       note names that field exactly as `_text_value` would
+#                       have. (#1068 / #1070: `_project_link_message` filters a
+#                       notes LIST element by element, a shape the choke
+#                       point's single-key read cannot express, and records
+#                       each refusal by hand.) A `_record_skew` call that merely
+#                       FOLLOWS the conditional -- the `for key in unreadable:
+#                       _record_skew(key)` replay thirteen functions end with --
+#                       or one that names another field, says nothing about
+#                       the value this guard refused, and grants nothing.
+#
+# Anything else DROPS a value the payload carried and says nothing, which is
+# #619 exactly.
+#
+# "On the path that refused it" is the whole of the rule, and getting it wrong
+# is how the FIRST cut of this classifier was itself empty by construction:
+# scanning the whole function for any render of the name grants
+# `x = value.get(k); if isinstance(x, str) and x: <render x>` -- the module's
+# dominant #619 shape -- a clean bill, because the only render of `x` sits in
+# the branch where `x` WAS a string. Three of the eight live drops this round
+# repaired were invisible under that reading. The drop region is now the other
+# branch plus what follows the conditional, and
+# `test_every_string_shape_guard_either_shows_the_value_or_routes_it` puts both
+# shapes to the rule on a synthetic module so the rule itself can fail.
+#
+# STATED LIMITATION, because this is a syntactic property over the module's own
+# source and an exhaustive answer for arbitrary payload shapes is not attainable
+# statically. Three things it does not do, named rather than implied:
+#
+#   * it sees a shape test spelled `isinstance(x, str)`, including one whose
+#     class is a module-level ALIAS of `str` (`_TEXT_TYPES = (str,)`, and an
+#     alias of an alias), which the classifier resolves the way
+#     `_coercion_sites` resolves a module-level `_EMPTY = []`. A test spelled
+#     `type(x) is str` or as a duck-typed `try: x.strip()` is outside it: the
+#     first is asserted absent from the module below, the second is not
+#     detectable;
+#   * the drop region is an APPROXIMATION of control flow, not a CFG: a render
+#     that follows the conditional counts as reachable from the refusing path
+#     even when some unrelated earlier branch would have returned first. That
+#     errs toward granting `reaches_the_output`, so it can over-forgive -- never
+#     over-accuse;
+#   * it decides whether the value REACHES the output, not whether what reaches
+#     it is intelligible.
+#
+# What DOES hold unconditionally is the runtime half: the container differential
+# and the raise sweeps cover every CONTAINER position the probes discover,
+# whatever spelling guards it.
+_STRING_SHAPE_GUARD_CATEGORIES = (
+    "chokepoint", "routed", "routed_in", "reaches_the_output", "records_skew")
+
+_STRING_SHAPE_GUARDS = {
+    ("_text_value", "raw", 0): "chokepoint",
+    ("_clean_prototype", "proto", 0): "routed_in",
+    ("_layout_field_count", "layout", 0): "routed_in",
+    ("_layout_field_deltas", "layout_diff", 0): "routed_in",
+    ("_layout_size", "layout", 0): "routed_in",
+    ("_unmeasured_cause", "first_error", 0): "routed_in",
+    ("_leaf_group_key", "kind", 0): "reaches_the_output",
+    ("_operation_row_text", "op", 0): "reaches_the_output",
+    ("_render_comment_text", "comment", 0): "reaches_the_output",
+    ("_render_fallback_text", "value", 0): "reaches_the_output",
+    ("_render_mutation_text", "msg", 0): "reaches_the_output",
+    ("_render_mutation_text", "msg", 1): "reaches_the_output",
+    ("_render_orient_text", "raw", 0): "reaches_the_output",
+    ("_render_proto_text", "prototype", 0): "reaches_the_output",
+    ("_render_py_exec_text", "result", 0): "reaches_the_output",
+    ("_render_read_escaped_text", "hex_str", 0): "reaches_the_output",
+    ("_render_read_text", "hex_str", 0): "reaches_the_output",
+    ("_render_sections_text", "n", 0): "reaches_the_output",
+    # #1068 (pinned under #1070): per-element filter over the `notes` list;
+    # the refusing arm calls `_record_skew("notes")`.
+    ("_project_link_message", "note", 0): "records_skew",
+    # #1037 item 1: the clip only shortens a string value; any other shape is
+    # rendered whole by the json.dumps that follows.
+    ("_render_strings_rows", "text", 0): "reaches_the_output",
+    ("_render_trace_frontiers", "reason", 0): "reaches_the_output",
+    ("_render_type_info_text", "decl", 0): "reaches_the_output",
+    ("_render_type_info_text", "layout", 0): "reaches_the_output",
+    ("render", "text", 0): "reaches_the_output",
+    ("rendered", "out", 0): "reaches_the_output",
+}
+
+
+def _negations_to(root, target, seen=0):
+    """How many `not`s wrap `target` on its path down from `root`, or None when
+    `target` is not in this subtree.
+
+    The polarity of a shape test decides WHICH branch is the one that refused
+    the value: `if isinstance(x, str):` hands the usable value to the body,
+    `if not isinstance(x, str):` hands it to everything after. Getting that
+    backwards inverts the whole question."""
+    import ast
+
+    if root is target:
+        return seen
+    for child in ast.iter_child_nodes(root):
+        deeper = seen + 1 if (isinstance(root, ast.UnaryOp)
+                              and isinstance(root.op, ast.Not)) else seen
+        found = _negations_to(child, target, deeper)
+        if found is not None:
+            return found
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _string_shape_guards():
+    """Every inline `isinstance(<x>, str)` test in the MODULE, classified."""
+    import inspect
+
+    from bn import formatters
+
+    return _classify_string_shape_guards(inspect.getsource(formatters))
+
+
+@functools.lru_cache(maxsize=4)
+def _classify_string_shape_guards(source):
+    """Every inline `isinstance(<x>, str)` test in `source`, classified.
+
+    See `_STRING_SHAPE_GUARDS` for what the five categories mean and why the
+    population is harvested here rather than taken from the choke point's own
+    call sites. Returns `{(function, tested expression): category}`, with
+    `"DROPS"` for a guard that discards a value the payload carried without
+    routing it through `_text_value` -- the #619 defect, and the only outcome
+    the test below refuses.
+
+    Takes the SOURCE rather than reading the module itself, so the rule can be
+    put to a synthetic module carrying both shapes on purpose. A classifier that
+    cannot tell a dropping filter from a showing one reports any module clean,
+    which is how the first cut of this passed while three of the eight live
+    drops it was written for sat in front of it."""
+    import ast
+
+    shows = {"repr", "str", "json.dumps", "_render_fallback_text"}
+    tree = ast.parse(source)
+    # A class held in a MODULE-LEVEL name is the same guard spelled once
+    # removed (`_TEXT_TYPES = (str,)`, then `isinstance(x, _TEXT_TYPES)`), and
+    # requiring the literal `str` put it outside the population AND outside the
+    # anti-drift assertion -- it would drop a text field with nothing in this
+    # file able to see it. Resolved the way `_coercion_sites` resolves a
+    # module-level `_EMPTY = []`: collect the names bound at module scope to
+    # `str`, or to a tuple/list containing it, and treat them as naming `str`.
+    str_aliases: set[str] = set()
+    for _ in range(4):                       # an alias of an alias
+        before = set(str_aliases)
+        for stmt in tree.body:
+            targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                       else [stmt.target] if isinstance(stmt, ast.AnnAssign)
+                       else [])
+            if not (targets and getattr(stmt, "value", None) is not None):
+                continue
+            bound = (list(stmt.value.elts)
+                     if isinstance(stmt.value, (ast.Tuple, ast.List))
+                     else [stmt.value])
+            if not any(isinstance(c, ast.Name)
+                       and (c.id == "str" or c.id in str_aliases) for c in bound):
+                continue
+            str_aliases |= {t.id for t in targets if isinstance(t, ast.Name)}
+        if before == str_aliases:
+            break
+
+    def _names_str(cls, aliases):
+        return isinstance(cls, ast.Name) and (cls.id == "str" or cls.id in aliases)
+
+    funcs = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    calls: dict[str, list] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            calls.setdefault(node.func.id, []).append(node)
+
+    def owner(node):
+        # The INNERMOST enclosing function: a guard inside `_discloses`'s
+        # `rendered` closure belongs to the closure, not to the decorator.
+        # `None` for a call outside every function body -- a decorator
+        # expression (`@_discloses(prefix=True)`) is one.
+        enclosing = [f for f in funcs if f.lineno <= node.lineno <= f.end_lineno]
+        return min(enclosing, key=lambda f: f.end_lineno - f.lineno) if enclosing else None
+
+    owner_of = {id(node): owner(node) for name in calls for node in calls[name]}
+    params = {id(f): [p.arg for p in f.args.posonlyargs + f.args.args] for f in funcs}
+
+    binds: dict[int, dict[str, list]] = {}
+    for fn in funcs:
+        table: dict[str, list] = {}
+        for node in ast.walk(fn):
+            target = value = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                target, value = node.target, node.value
+            if isinstance(target, ast.Name) and value is not None:
+                table.setdefault(target.id, []).append(value)
+        binds[id(fn)] = table
+
+    routed_params: set[tuple[str, int]] = set()
+
+    def routed(node, fn):
+        """Did this expression come out of the text choke point?"""
+        if fn is None:                          # a decorator expression
+            return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "_text_value":
+                return True
+            return any(routed(a, fn) for a in node.args)
+        if isinstance(node, ast.BoolOp):        # `after_layout or ""`
+            return routed(node.values[0], fn)
+        if isinstance(node, ast.Name):
+            bound = binds[id(fn)].get(node.id)
+            if bound:
+                return all(routed(v, fn) for v in bound)
+            names = params[id(fn)]
+            return (node.id in names
+                    and (fn.name, names.index(node.id)) in routed_params)
+        return False
+
+    # Fixed point, because routing is transitive: `_layout_size(after)` inside
+    # `_size_delta` is routed only once `_size_delta`'s own parameter is known
+    # to be. One pass would have left the layout helpers looking unrouted and
+    # this whole table unprovable.
+    for _ in range(len(funcs)):
+        before = set(routed_params)
+        for fn in funcs:
+            sites = calls.get(fn.name, ())
+            if not sites:
+                continue
+            for idx in range(len(params[id(fn)])):
+                if all(len(c.args) > idx and routed(c.args[idx], owner_of[id(c)])
+                       for c in sites):
+                    routed_params.add((fn.name, idx))
+        if routed_params == before:
+            break
+
+    def drop_region(fn, guard):
+        """The code reached on the path where the value was NOT a usable string.
+
+        THE question the first cut of this classifier did not ask, and the reason
+        it could not fail for the module's dominant #619 shape. Scanning the
+        WHOLE function for any render of the name files
+        `if isinstance(x, str) and x: lines.append(f"...{x}")` as safe -- the
+        only render of `x` is in the branch where it IS a string, and the path
+        that dropped it renders nothing at all. Under that rule, three of the
+        eight live drops this round repaired classified `reaches_the_output`,
+        and a fresh one added beside them classified safe too.
+
+        The region is the OTHER branch plus everything that follows the
+        conditional, climbing out of each enclosing block up to the function
+        body -- falling through is how a refusing path reaches a later
+        `return _render_fallback_text(value)`. For a ternary or a comprehension
+        filter there is no fall-through to add: the other arm is the whole
+        region, and a filtered-out element reaches nothing at all.
+
+        Returned as `(arm, rest)`: the refusing arm itself, and the
+        fall-through. A render anywhere in either still shows the value; a
+        `_record_skew` call only counts in the arm (see `records_skew`).
+        """
+        parents = {id(child): node
+                   for node in ast.walk(fn) for child in ast.iter_child_nodes(node)}
+
+        def following(node):
+            out, current = [], node
+            while True:
+                parent = parents.get(id(current))
+                if parent is None:
+                    return out
+                for _field, value in ast.iter_fields(parent):
+                    if isinstance(value, list) and any(v is current for v in value):
+                        index = next(i for i, v in enumerate(value) if v is current)
+                        out.extend(value[index + 1:])
+                if parent is fn:
+                    return out
+                current = parent
+
+        for node in ast.walk(fn):
+            if isinstance(node, ast.If):
+                arms = [(node.test, node.body, node.orelse, True)]
+            elif isinstance(node, ast.IfExp):
+                arms = [(node.test, [node.body], [node.orelse], False)]
+            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                arms = [(cond, [node.elt], [], False)
+                        for gen in node.generators for cond in gen.ifs]
+            else:
+                continue
+            for test, body, orelse, falls_through in arms:
+                negations = _negations_to(test, guard)
+                if negations is None:
+                    continue
+                refused = orelse if negations % 2 == 0 else body
+                return list(refused), (following(node) if falls_through else [])
+        return None
+
+    def classify(fn, guard, expr):
+        if fn.name == "_text_value":
+            return "chokepoint"
+        bound = binds[id(fn)].get(expr)
+        if bound and all(routed(v, fn) for v in bound):
+            return "routed"
+        names = params[id(fn)]
+        if expr in names and (fn.name, names.index(expr)) in routed_params:
+            return "routed_in"
+        region = drop_region(fn, guard)
+        if region is None:
+            # No conditional consumes this shape test, so which path drops the
+            # value cannot be decided. Fail CLOSED rather than grant it.
+            return "unstructured"
+        arm, rest = region
+        refused = arm + rest
+        # The value still reaches the render ON THE PATH THAT REFUSED IT: itself,
+        # or the payload it was read off being dumped whole.
+        carriers = {expr}
+        for value in bound or ():
+            if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "get"):
+                carriers.add(ast.unparse(value.func.value))
+            elif isinstance(value, ast.Subscript):
+                carriers.add(ast.unparse(value.value))
+        # A refusing ARM that records the skew by hand is routed, not dropped:
+        # the boundary above prints the same `! malformed` note that a
+        # `_text_value` read would have produced for the field. Tied to the
+        # value the guard tested (#1070 review): the call must sit in the arm
+        # itself and name a literal key that value was read from -- the string
+        # constants of what it was bound to, or of the iterable it is the loop
+        # variable of. Any `_record_skew` call in the fall-through granted this
+        # before, so a silent drop placed above a function's closing
+        # `for key in unreadable: _record_skew(key)` replay classified safe.
+        sources = list(bound or ())
+        for node in ast.walk(fn):
+            if (isinstance(node, (ast.For, ast.comprehension))
+                    and ast.unparse(node.target) == expr):
+                sources.append(node.iter)
+        keys = {const.value for source in sources for const in ast.walk(source)
+                if isinstance(const, ast.Constant) and isinstance(const.value, str)}
+        for root in arm:
+            for node in ast.walk(root):
+                if (isinstance(node, ast.Call)
+                        and ast.unparse(node.func) == "_record_skew"
+                        and len(node.args) == 1
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value in keys):
+                    return "records_skew"
+        for root in refused:
+            for node in ast.walk(root):
+                if (isinstance(node, ast.Call) and ast.unparse(node.func) in shows
+                        and any(ast.unparse(a) in carriers for a in node.args)):
+                    return "reaches_the_output"
+                if (isinstance(node, ast.FormattedValue)
+                        and ast.unparse(node.value).split("!")[0] in carriers):
+                    return "reaches_the_output"
+                if (isinstance(node, ast.Return) and node.value is not None
+                        and ast.unparse(node.value) == expr):
+                    return "reaches_the_output"
+        return "DROPS"
+
+    # EVERY guard NODE, not one per (function, expression). Keying the
+    # population by name alone silently discarded the second and later guards
+    # over the same expression -- `_render_mutation_text` tests `msg` twice --
+    # so a dropping filter placed at the discarded site left the refusal green.
+    # That is the same "cannot fail" defect as the whole-function scan it just
+    # replaced, one disguise along, so the occurrence INDEX is part of the key
+    # and the count of nodes is the count of rows.
+    guards = []
+    for node in calls.get("isinstance", ()):
+        if len(node.args) != 2:
+            continue
+        classes = node.args[1]
+        elements = (list(classes.elts)
+                    if isinstance(classes, (ast.Tuple, ast.List)) else [classes])
+        if not any(_names_str(c, str_aliases) for c in elements):
+            continue
+        guards.append((node.lineno, node.col_offset, node))
+    found: dict[tuple[str, str, int], str] = {}
+    occurrences: dict[tuple[str, str], int] = {}
+    for _line, _col, node in sorted(guards, key=lambda g: (g[0], g[1])):
+        fn = owner_of[id(node)]
+        expr = ast.unparse(node.args[0])
+        index = occurrences.get((fn.name, expr), 0)
+        occurrences[(fn.name, expr)] = index + 1
+        found[(fn.name, expr, index)] = classify(fn, node, expr)
+    return found
+
+
+def test_every_string_shape_guard_either_shows_the_value_or_routes_it():
+    """The text choke point's population, and the round-16 major it replaces.
+
+    The old table listed the module's `_text_value` CALL SITES -- the set the
+    choke point already covers -- so it was a population of size one derived
+    from the thing it guards, and it could not fail. Eight live inline
+    `isinstance(..., str)` filters were dropping a line each with no note while
+    it reported full coverage.
+
+    The population is the defect's own shape now: every inline string-shape test
+    in the module. Each must either keep the value visible on its failing path
+    or take it through the choke point, and both are re-derived from the module
+    (see `_STRING_SHAPE_GUARDS`), so a new filter that silently drops a line
+    arrives here red."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    guards = _string_shape_guards()
+    dropping = sorted(k for k, v in guards.items() if v == "DROPS")
+    assert not dropping, (
+        f"{dropping} test a value's shape and, when it is not a string, drop it "
+        "with nothing rendered and nothing recorded -- so the line comes out "
+        "byte-identical to a payload that carried no such field at all. Read it "
+        "through `_text_value` instead, or render the value you refused.")
+    assert dict(guards) == dict(_STRING_SHAPE_GUARDS), (
+        f"the module's string-shape guards are {sorted(guards.items())} and this "
+        f"table declares {sorted(_STRING_SHAPE_GUARDS.items())}. Every one is "
+        "classified by re-derivation, so a guard that changed category changed "
+        "behaviour -- say which it is now.")
+    assert set(guards.values()) <= set(_STRING_SHAPE_GUARD_CATEGORIES)
+    # ANTI-VACUITY ON THE RULE, not on the module. An emptiness claim over a
+    # classifier that grants `reaches_the_output` to everything is free, and
+    # that is precisely how the first cut of this shipped: it scanned the WHOLE
+    # function for any render of the name, so the module's dominant shape --
+    # `x = value.get(k); if isinstance(x, str) and x: <render x>` -- came out
+    # SAFE even though the path that refused `x` renders nothing at all. Three
+    # of the eight live drops this round repaired were invisible to it.
+    #
+    # Both shapes, in one synthetic module, so the rule is asked the question
+    # directly rather than inferred from the module happening to be clean.
+    probe = "\n".join((
+        "def shows(value):",
+        "    if not isinstance(value, dict):",
+        "        return _render_fallback_text(value)",
+        "    text = value.get('k')",
+        "    if isinstance(text, str) and text:",
+        "        return 'k=' + text",
+        "    return _render_fallback_text(value)",
+        "",
+        "def drops(value):",
+        "    if not isinstance(value, dict):",
+        "        return _render_fallback_text(value)",
+        "    lines = []",
+        "    note = value.get('note')",
+        "    if isinstance(note, str) and note:",
+        "        lines.append(f'note: {note}')",
+        "    return chr(10).join(lines)",
+        "",
+        "def routes(value):",
+        "    note = _text_value(value, 'note')",
+        "    if isinstance(note, str):",
+        "        return note",
+        "    return ''",
+        "",
+        "def records(value):",
+        "    notes = []",
+        "    for note in _field_list(value, 'notes'):",
+        "        if isinstance(note, str):",
+        "            notes.append(note)",
+        "        else:",
+        "            _record_skew('notes')",
+        "    return '; '.join(notes)",
+        "",
+        "def replays(value):",
+        "    lines = []",
+        "    hint = value.get('hint')",
+        "    if isinstance(hint, str) and hint:",
+        "        lines.append(hint)",
+        "    for key in unreadable:",
+        "        _record_skew(key)",
+        "    return chr(10).join(lines)",
+        "",
+        "def records_another(value):",
+        "    notes = []",
+        "    for note in _field_list(value, 'notes'):",
+        "        if isinstance(note, str):",
+        "            notes.append(note)",
+        "        else:",
+        "            _record_skew('status')",
+        "    return '; '.join(notes)",
+        ""))
+    verdicts = _classify_string_shape_guards(probe)
+    assert verdicts[("drops", "note", 0)] == "DROPS", (
+        "the classifier cannot see the module's dominant #619 shape -- a value "
+        "rendered ONLY in the branch where it was usable, and dropped in "
+        f"silence otherwise: {verdicts}")
+    assert verdicts[("shows", "text", 0)] == "reaches_the_output", (
+        f"a value the refusing path still dumps is not a drop: {verdicts}")
+    assert verdicts[("routes", "note", 0)] == "routed", (
+        f"a value taken from the choke point is already disclosed: {verdicts}")
+    assert verdicts[("records", "note", 0)] == "records_skew", (
+        f"a refusal that records the skew itself is disclosed by the boundary: {verdicts}")
+    # The #1070 review's counterexample: the first cut granted `records_skew`
+    # for ANY `_record_skew` call in the refused region, fall-through included,
+    # so a dropped field above a function's closing replay loop classified
+    # safe. The call must be in the refusing arm and name the tested value's key.
+    assert verdicts[("replays", "hint", 0)] == "DROPS", (
+        "a `_record_skew` call that only follows the conditional records some "
+        f"other field, not the value this guard dropped: {verdicts}")
+    assert verdicts[("records_another", "note", 0)] == "DROPS", (
+        f"recording a different field does not disclose the one refused: {verdicts}")
+    # And the population itself, since the categories a rule collapse would
+    # empty are the ones doing the work here.
+    counts = collections.Counter(guards.values())
+    assert counts["routed_in"] >= 5 and counts["reaches_the_output"] >= 10, counts
+    # The stated limitation, made checkable for the two spellings that ARE
+    # detectable: this harvest sees `isinstance(x, str)` with a literal class,
+    # so a module that started testing shape another way would leave the
+    # population silently. A duck-typed `try: x.strip()` remains outside it and
+    # is disclosed rather than claimed.
+    tree = ast.parse(inspect.getsource(formatters))
+    other = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Compare) and isinstance(node.left, ast.Call)
+                and ast.unparse(node.left.func) == "type"):
+            other.append(ast.unparse(node))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "isinstance" and len(node.args) == 2
+                and not isinstance(node.args[1], (ast.Name, ast.Tuple, ast.List))):
+            other.append(ast.unparse(node))
+    assert not other, (
+        f"{other} tests a value's type in a spelling this harvest cannot see, so "
+        "the population above is no longer the module's whole string-shape "
+        "surface. Spell it `isinstance(x, str)` or widen the harvest.")
+
+
 @pytest.mark.parametrize("soname", [{"name": "libc.so"}, ["libc.so"], {}, [], 0, False])
 def test_project_libs_preserves_and_discloses_malformed_sonames(soname):
     from bn import formatters
@@ -7225,9 +8562,28 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 #     were building `--offset N` out of an unreadable page position.
 #   * ITS DIFFERENTIAL, which is the part that cannot go stale:
 #     `test_no_renderer_states_a_count_it_could_not_read_as_a_real_number`
-#     harvests `(renderer, literal key)` count reads and requires the rendered
+#     harvests every `(renderer, literal key)` the module reads through a count
+#     helper, asserts that population's EXACT size, and requires the rendered
 #     BODY of an unreadable counter to match neither a real 0 nor a real 7.
-#     A trailing disclosure note cannot satisfy it.
+#     A trailing disclosure note cannot satisfy it, and every pair that leaves
+#     the differential is named with the reason it left.
+#   * THE RESIDUE INVENTORY. `test_the_raw_count_residue_is_exactly_this_big`
+#     counts the raw numeric spellings that remain -- `<lookup> or 0`,
+#     `.get(<literal>, 0)`, `int(<lookup>)` -- so a NEW raw count read arrives
+#     red instead of joining a prose claim. `_render_class_list_text` (seven)
+#     and `_render_data_symbols_text` are its largest members; these are
+#     DESCRIPTIVE row/summary counts, not numbers a caller acts on, which is
+#     why the contract above reaches the actionable ones and the inventory
+#     bounds the rest.
+#   * THE STRING-SHAPE POPULATION'S ALIAS BLINDNESS, which was the second
+#     routed item: `_classify_string_shape_guards` now resolves a module-level
+#     name bound to `str` (or to a tuple containing it), so a guard spelled
+#     `isinstance(x, _TEXT_TYPES)` is harvested and classified like any other.
+#     `test_the_string_shape_population_harvests_a_guard_named_through_an_alias`
+#     proves it on a synthetic module carrying that spelling; the old
+#     "the module may not CONTAIN this spelling" assertion is retired BY the
+#     fix. `type(x) is str` is still outside the classifier and still asserted
+#     absent; a duck-typed `try: x.strip()` remains undetectable.
 #
 # What it deliberately left, and why -- these are the two live items:
 #
@@ -7283,6 +8639,55 @@ def test_no_renderer_mutates_the_payload_it_was_handed():
 #      this file has already deleted twice; a discovered population is the
 #      routed audit's answer, and a limit that names the exact mutation to try
 #      is worth more than a fourth pin that closes one more corner of it.
+
+
+def test_the_string_shape_population_harvests_a_guard_named_through_an_alias():
+    """The classifier used to require a LITERAL `str` in the class argument, so
+    a guard spelled through a module-level alias (`_TEXT_TYPES = (str,)`;
+    `isinstance(x, _TEXT_TYPES)`) was outside the population AND outside its
+    anti-drift assertion -- it could drop a text field with nothing in this file
+    able to see it. The limitation was papered over by asserting the module does
+    not CONTAIN the spelling, which is bookkeeping for a blindness rather than a
+    fix.
+
+    Now the classifier resolves the alias, so the claim is about the RULE and is
+    put to a synthetic module that carries the spelling on purpose: the guard
+    must appear in the population, and a dropping one must classify as `DROPS`.
+    A classifier that skipped it would report that module clean.
+
+    `type(x) is str` keeps its own absence assertion below; it is still outside
+    the classifier, and a duck-typed `try: x.strip()` is not detectable at all.
+    """
+    source = (
+        "_TEXT_TYPES = (str,)\n"
+        "_ALSO_TEXT = _TEXT_TYPES\n"
+        "\n"
+        "def _render_probe(value):\n"
+        "    note = value.get('note')\n"
+        "    if isinstance(note, _TEXT_TYPES):\n"
+        "        return note\n"
+        "    return ''\n"
+        "\n"
+        "def _render_probe_alias_of_alias(value):\n"
+        "    label = value.get('label')\n"
+        "    if isinstance(label, _ALSO_TEXT):\n"
+        "        return label\n"
+        "    return ''\n"
+    )
+    guards = _classify_string_shape_guards(source)
+
+    assert ("_render_probe", "note", 0) in guards, (
+        "a guard whose class is a module-level alias of `str` is outside the "
+        f"population, so a drop behind it is invisible: {sorted(guards)}")
+    assert guards[("_render_probe", "note", 0)] == "DROPS", guards
+    assert guards[("_render_probe_alias_of_alias", "label", 0)] == "DROPS", (
+        "an alias of an alias is the same guard one hop further out")
+
+    # The literal spelling still classifies identically, so resolving aliases
+    # did not move the rule for the module's own guards.
+    literal = _classify_string_shape_guards(
+        source.replace("_TEXT_TYPES)", "str)").replace("_ALSO_TEXT)", "str)"))
+    assert literal == guards
 
 
 def test_the_paging_footer_never_states_a_resume_offset_it_could_not_derive():
@@ -7923,11 +9328,24 @@ def test_empty_results_use_one_vocabulary():
     assert _render_data_vars_text({"items": []}) == "(none)"
 
 
-def test_generic_empty_renders_use_the_shared_marker():
-    """Empty result bodies and labeled fields share the same visible marker."""
+def test_every_generic_empty_render_uses_the_shared_marker():
+    """#909: census every use of the marker and every literal that bypasses it.
+
+    The empty cases exercise the rendered result, while the source scan catches
+    a newly added renderer that spells its own ``none`` before it can be added
+    to this table. A diagnostic sentence such as ``none (offset ... is past the
+    end)`` states a reason and is not an empty-result token.
+    """
+    import ast
 
     from bn import formatters
 
+    module = ast.parse(inspect.getsource(formatters))
+    marker_uses = {
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+        and any(isinstance(child, ast.Name) and child.id == "_EMPTY_RESULT"
+                and isinstance(child.ctx, ast.Load) for child in ast.walk(node))
+    }
     page = {"items": [], "total": 0, "offset": 0, "returned": 0,
             "limit": 50, "has_more": False}
     cases = {
@@ -7947,6 +9365,9 @@ def test_generic_empty_renders_use_the_shared_marker():
         "_render_data_vars_text": ((page,), {}),
         "_render_data_symbols_text": ((page,), {}),
     }
+    assert marker_uses == cases.keys() | {"_render_record_table_text"}, (
+        "The shared empty marker has a new caller: add an empty payload and "
+        "assert what that renderer prints")
     for name, (args, kwargs) in cases.items():
         assert getattr(formatters, name)(*args, **kwargs) == formatters._EMPTY_RESULT, name
 
@@ -7956,6 +9377,34 @@ def test_generic_empty_renders_use_the_shared_marker():
         {"address": "0x1000", "record_size": 8, "ptr_fields": [], "items": []})
     assert f"markers: {formatters._EMPTY_RESULT}" in formatters._render_project_init_text(
         {"root": "/rootfs", "platform": "linux", "markers": [], "dry_run": True})
+
+    def raw_empty_literals(tree):
+        parents = {child: parent for parent in ast.walk(tree)
+                   for child in ast.iter_child_nodes(parent)}
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            value = node.value.lower()
+            if (value in {"none", "(none)"}
+                    or re.fullmatch(r"\(no [^)]+\)", value)
+                    or (re.fullmatch(r"no [a-z][\w -]*", value)
+                        and isinstance(parents.get(node), (ast.Return, ast.IfExp)))):
+                found.append((node.lineno, node.value))
+        return found
+
+    definitions = [node for node in module.body if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "_EMPTY_RESULT"
+                           for target in node.targets)]
+    assert len(definitions) == 1
+    assert definitions[0].value.value == "(none)"
+    assert raw_empty_literals(module) == [(definitions[0].lineno, formatters._EMPTY_RESULT)], (
+        "An empty token bypasses _EMPTY_RESULT/_empty_result")
+    # The scan itself must reject the shape that drifted in the integration
+    # tree, including a new branch that returns a named empty token directly.
+    for spelling in ("none", "(none)", "(no targets)", "no targets"):
+        probe = ast.parse(f"def added_renderer(value):\n    return {spelling!r}\n")
+        assert raw_empty_literals(probe) == [(2, spelling)]
 
 
 def test_record_table_renderer_falls_back_on_a_non_dict():
