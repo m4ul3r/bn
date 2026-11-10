@@ -259,6 +259,26 @@ def test_sync_refusal_restart_command_runs_for_a_dash_leading_instance_id_1075(
     assert str(raised.value).endswith(": BN_ROOTFS_MAX_WORK=4 bn session restart -- -x")
 
 
+def test_sync_refusal_names_the_restart_for_the_gui_plugin_with_no_instance_id_1096(
+    world, monkeypatch,
+):
+    """#1096 A6a: the GUI plugin bridge has no instance id, so `_restart_command`
+    returns None; before this fix the refusal then printed no advice at all.
+    It must instead tell the user to restart the application itself."""
+    w = world
+    root = _sources(w, monkeypatch)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "2")
+    w.instance.instance_id = None
+
+    with pytest.raises(RuntimeError) as raised:
+        w.ops.project_sync_libs(w.instance, root=str(root))
+
+    message = str(raised.value)
+    assert "session restart" not in message
+    assert message.endswith(
+        "starting point: restart Binary Ninja with BN_ROOTFS_MAX_WORK=4 set in its environment")
+
+
 def test_sync_cancellation_during_elf_discovery_preserves_inventory(world, monkeypatch):
     w = world
     root = _sources(w, monkeypatch)

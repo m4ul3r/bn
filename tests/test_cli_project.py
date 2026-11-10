@@ -748,6 +748,24 @@ def _sync_result(root, imported=2, skipped=0, changed=()):
     }
 
 
+def _sync_result_many(root, count):
+    """*count* distinct imported rows, for the display-cap tests (#1096 A5):
+    `_sync_result` reuses one canned row sliced down, not up."""
+    imported = [
+        {"id": f"{i:08x}-0000-4000-8000-{i:012x}", "name": f"lib{i}.so",
+         "path": f"/lib/lib{i}.so", "folder": "/lib", "description": "rootfs library",
+         "size": 100 + i, "exists_on_disk": True, "is_database": False,
+         "open_target_id": None, "sibling_database_id": None}
+        for i in range(count)
+    ]
+    return {
+        "root": root, "platform": "linux",
+        "lookup_paths": [{"path": "/lib", "source": "default"}],
+        "imported": imported, "skipped_existing": 0, "changed": [],
+        "skipped_not_elf": 0, "notes": [],
+    }
+
+
 def test_project_help_lists_rootfs_commands(capsys):
     with pytest.raises(SystemExit):
         bn.cli.main(["project", "--help"])
@@ -999,7 +1017,7 @@ def test_project_init_creates_the_cache_projects_dir_before_the_bridge_creates_1
 
     assert seen == [(True, 0o700)]
     out = capsys.readouterr().out
-    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable "
+    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable by this user "
             f"\u2192 cache fallback {fallback}") in out
 
 
@@ -1018,7 +1036,7 @@ def test_project_init_dry_run_explains_the_cache_fallback_and_creates_nothing_10
     assert bn.cli.main(["project", "init", root, "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert f"project: {fallback}  [new]" in out
-    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable "
+    assert (f"fallback: parent {os.path.dirname(preferred)} is not writable by this user "
             f"\u2192 cache fallback {fallback}") in out
     assert not cache.exists(), "--dry-run must not create the cache projects dir"
 
@@ -1026,12 +1044,46 @@ def test_project_init_dry_run_explains_the_cache_fallback_and_creates_nothing_10
     data = json.loads(capsys.readouterr().out)
     assert data["project_path"] == fallback
     assert data["fallback_from"] == os.path.dirname(preferred)
+    # A permission denial (plain `os.access` failure, no read-only mount),
+    # named distinctly from a read-only filesystem (#1096 A6b).
+    assert data["fallback_reason"] == "permission"
 
     # A writable parent is the preferred location: no fallback, no note.
     monkeypatch.setattr(bn.commands.project.os, "access", lambda p, mode: True)
     assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["project_path"] == preferred and data["fallback_from"] is None
+    assert data["fallback_reason"] is None
+
+
+def test_project_init_dry_run_fallback_note_distinguishes_a_read_only_mount_1096(
+    monkeypatch, tmp_path, capsys,
+):
+    """#1096 A6b: "is not writable" read the same for a read-only mount and a
+    permission denial, though the fix differs (remount, versus chown/chmod/run
+    as the owning user). The note, and `fallback_reason` in JSON, now say
+    which."""
+    import bn.commands.project
+    from bn import rootfs_layout
+    root = _readonly_parent_rootfs(monkeypatch, tmp_path)
+    _patch_layout(monkeypatch, root)
+    cache = _patch_projects_dir(monkeypatch, tmp_path)
+    preferred, fallback = rootfs_layout.project_location(root, str(cache))
+    real_statvfs = os.statvfs
+    unwritable = os.path.dirname(preferred)
+    monkeypatch.setattr(
+        bn.commands.project.os, "statvfs",
+        lambda p: types.SimpleNamespace(f_flag=os.ST_RDONLY) if p == unwritable
+        else real_statvfs(p))
+
+    assert bn.cli.main(["project", "init", root, "--dry-run", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["fallback_reason"] == "read_only"
+
+    assert bn.cli.main(["project", "init", root, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert (f"fallback: parent {unwritable} is on a read-only filesystem "
+            f"\u2192 cache fallback {fallback}") in out
 
 
 @pytest.mark.parametrize("obstacle", ["cache_root_is_a_file", "projects_is_a_file",
@@ -1148,6 +1200,137 @@ def test_project_init_unknown_platform_skips_sync(fake_transport, monkeypatch, t
     assert [c["op"] for c in calls] == ["project_create", "associate_project_roots"]
     assert calls[0]["params"]["rootfs"] == {"root": root, "platform": "unknown"}
     assert "libraries: not synced (platform unknown" in capsys.readouterr().out
+
+
+def _real_discovery_rootfs(monkeypatch, tmp_path, *, config_bytes=b"/lib\n"):
+    """Patch only `detect_root`; `lookup_paths`/`scan_libraries` run for real
+    against a genuine tree on disk, so a `BN_ROOTFS_*` limit set too low
+    actually refuses from inside them (#1096 A4 needs a real refusal, not a
+    mocked one)."""
+    import bn.commands.project
+    from bn import rootfs_layout
+    root = tmp_path / "rootfs"
+    (root / "lib").mkdir(parents=True)
+    (root / "lib" / "libgood.so").write_bytes(b"\x7fELF" + b"\x00" * 60)
+    (root / "etc").mkdir()
+    (root / "etc" / "ld.so.conf").write_bytes(config_bytes)
+    resolved = str(root.resolve())
+    info = rootfs_layout.RootfsInfo(resolved, "linux", ["lib", "etc/ld.so.conf"])
+    monkeypatch.setattr(bn.commands.project.rootfs_layout, "detect_root",
+                        lambda start, *, explicit=False: info)
+    return resolved
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_project_init_planner_config_limit_refusal_is_exit_2_not_a_traceback_1096(
+    monkeypatch, tmp_path, capsys, dry_run,
+):
+    """#1096 A4: `_init_plan` runs `lookup_paths`/`scan_libraries` in the CLI
+    process itself -- a real `BN_ROOTFS_*` refusal there used to surface as an
+    unhandled `RuntimeError` (exit 1, traceback). It must be a `BridgeError`
+    (exit 2) that says this is the planning step, in the CLI's own process."""
+    root = _real_discovery_rootfs(
+        monkeypatch, tmp_path, config_bytes=b"# padding line\n" * 8 + b"/opt/late\n")
+    _patch_projects_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("BN_ROOTFS_MAX_CONFIG_BYTES", "4")
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("a refused plan must not send"))
+
+    argv = ["project", "init", root] + (["--dry-run"] if dry_run else [])
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "loader config" in err and "exceeds the text limit" in err
+    # #1098 review: the generic sentence's own `` `BN_ROOTFS_*` `` substring
+    # satisfied a bare "BN_ROOTFS_" check without ever naming the variable
+    # that actually bound; pin the SPECIFIC one.
+    assert "BN_ROOTFS_MAX_CONFIG_BYTES=4" in err
+    assert "planning step" in err and "the CLI process" in err
+    assert "session restart" not in err
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_project_init_planner_work_limit_refusal_is_exit_2_not_a_traceback_1096(
+    monkeypatch, tmp_path, capsys, dry_run,
+):
+    root = _real_discovery_rootfs(monkeypatch, tmp_path)
+    _patch_projects_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "1")
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("a refused plan must not send"))
+
+    argv = ["project", "init", root] + (["--dry-run"] if dry_run else [])
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "work limit exceeded" in err and "BN_ROOTFS_MAX_WORK=1" in err
+    assert "planning step" in err and "the CLI process" in err
+    assert "session restart" not in err
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_project_init_planner_work_limit_refusal_during_detection_is_exit_2_1096(
+    monkeypatch, tmp_path, capsys, dry_run,
+):
+    """#1096 A4 (review gap): `detect_root` is itself `@_bounded` -- globbing
+    for loader markers charges work -- and runs BEFORE the lookup/scan block,
+    in its OWN standalone budget. A refusal there needs the identical
+    conversion, not just the later one; this uses the real (unmocked)
+    `detect_root` to prove it, rather than the patched-detection helper the
+    other two tests use."""
+    import bn.commands.project
+    root = tmp_path / "rootfs"
+    for d in ("bin", "sbin", "etc", "lib"):
+        (root / d).mkdir(parents=True)
+    (root / "lib" / "libgood.so").write_bytes(b"\x7fELF" + b"\x00" * 60)
+    (root / "etc" / "ld.so.conf").write_bytes(b"/lib\n")
+    _patch_projects_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("BN_ROOTFS_MAX_WORK", "1")
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("a refused plan must not send"))
+
+    argv = ["project", "init", str(root)] + (["--dry-run"] if dry_run else [])
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "work limit exceeded" in err and "BN_ROOTFS_MAX_WORK=1" in err
+    assert "planning step" in err and "the CLI process" in err
+    assert "session restart" not in err
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_project_init_planner_deadline_refusal_is_exit_2_not_a_traceback_1096(
+    monkeypatch, tmp_path, capsys, dry_run,
+):
+    """#1096 A4: the issue text calls out the deadline explicitly (#1092 made
+    it, like the work limit, reachable from the planner); same conversion,
+    same real unmocked discovery."""
+    import bn.commands.project
+    root = tmp_path / "rootfs"
+    for d in ("bin", "sbin", "etc", "lib"):
+        (root / d).mkdir(parents=True)
+    (root / "lib" / "libgood.so").write_bytes(b"\x7fELF" + b"\x00" * 60)
+    (root / "etc" / "ld.so.conf").write_bytes(b"/lib\n")
+    _patch_projects_dir(monkeypatch, tmp_path)
+    monkeypatch.setenv("BN_ROOTFS_TIMEOUT", "0.00001")
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda *a, **k: pytest.fail("a refused plan must not send"))
+
+    argv = ["project", "init", str(root)] + (["--dry-run"] if dry_run else [])
+    rc = bn.cli.main(argv)
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "discovery deadline exceeded" in err and "BN_ROOTFS_TIMEOUT" in err
+    assert "planning step" in err and "the CLI process" in err
+    assert "session restart" not in err
 
 
 def test_project_init_sync_failure_after_open_is_exit_1(
@@ -1276,6 +1459,69 @@ def test_project_libs_sync_params_and_text(fake_transport, monkeypatch, tmp_path
     assert f"rootfs: {root}  (linux)" in out
     assert "imported 1 / skipped 0 / changed 1" in out
     assert f"/lib/libc.so  ({FILE_ID_A[:8]})" in out
+
+
+def test_project_libs_sync_text_caps_the_imported_listing_1096(
+    fake_transport, monkeypatch, tmp_path, capsys,
+):
+    """#1096 A5: a real root can import hundreds of libraries; the text
+    listing used to print one line per row regardless. Capped at 20, with a
+    `+M more` tail; `--format json` stays complete."""
+    _one_instance(monkeypatch)
+    root = _rootfs(tmp_path)
+    fake_transport({"project_sync_libs": {"ok": True, "result": _sync_result_many(root, 25)}})
+
+    assert bn.cli.main(["project", "libs", "--sync"]) == 0
+    out = capsys.readouterr().out
+    for i in range(20):
+        assert f"lib{i}.so" in out
+    for i in range(20, 25):
+        assert f"lib{i}.so" not in out
+    assert "+5 more; `bn project libs` lists them" in out
+    assert "imported 25 / skipped 0 / changed 0" in out
+
+    assert bn.cli.main(["project", "libs", "--sync", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert len(data["imported"]) == 25
+    assert {row["name"] for row in data["imported"]} == {f"lib{i}.so" for i in range(25)}
+
+
+def test_project_libs_sync_text_no_tail_at_exactly_the_cap_1096(
+    fake_transport, monkeypatch, tmp_path, capsys,
+):
+    _one_instance(monkeypatch)
+    root = _rootfs(tmp_path)
+    fake_transport({"project_sync_libs": {"ok": True, "result": _sync_result_many(root, 20)}})
+
+    assert bn.cli.main(["project", "libs", "--sync"]) == 0
+    out = capsys.readouterr().out
+    assert "lib19.so" in out
+    assert "more;" not in out
+
+
+def test_project_init_text_also_caps_the_imported_listing_1096(
+    fake_transport, monkeypatch, tmp_path, capsys,
+):
+    """`project init` shares `_sync_detail_lines` with `project libs --sync`
+    (#1096 A5); the cap applies there too without separate wiring."""
+    import bn.commands.project
+    root = _rootfs(tmp_path)
+    _patch_layout(monkeypatch, root)
+    _patch_projects_dir(monkeypatch, tmp_path)
+    _one_instance(monkeypatch)
+    _capture_pins(monkeypatch)
+    fake_transport({
+        "project_create": {"ok": True, "result": _project_info(root + ".bnpr", created=True),
+                           "instance": "bridge-a"},
+        "associate_project_roots": {"ok": True, "result": {"associated": []}},
+        "project_sync_libs": {"ok": True, "result": _sync_result_many(root, 25)},
+    })
+
+    assert bn.cli.main(["project", "init", root]) == 0
+
+    out = capsys.readouterr().out
+    assert "+5 more; `bn project libs` lists them" in out
+    assert "lib24.so" not in out
 
 
 def test_project_libs_root_without_sync_is_refused(fake_transport, monkeypatch, capsys):

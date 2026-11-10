@@ -751,6 +751,35 @@ def test_work_is_charged_per_file_and_per_mib_never_per_check_1075(tmp_path: Pat
         "BN_ROOTFS_MAX_WORK=6 bn session restart w1")
 
 
+def test_gui_restart_hint_is_used_only_without_a_restart_command_1096(tmp_path: Path) -> None:
+    """#1096 A6a: the GUI plugin bridge has no instance id, so it passes
+    `restart=None`; before this it printed no advice at all. `gui_restart_hint`
+    fills that gap with an instruction shaped for "restart the application",
+    not "run this command" -- and never both at once."""
+    gui = rl.DiscoveryBudget(
+        max_work=3, timeout=30,
+        gui_restart_hint="restart Binary Ninja with {variable}={doubled} set in its environment",
+    )
+    with pytest.raises(RuntimeError) as raised:
+        gui.charge(files=4)
+    assert str(raised.value).endswith(
+        "The owning bridge reads BN_ROOTFS_MAX_WORK at start, so set it and restart; the "
+        "total needed is not known, so doubling is only a starting point: restart Binary "
+        "Ninja with BN_ROOTFS_MAX_WORK=6 set in its environment")
+
+    # A real restart command always wins over the GUI hint: they are never
+    # both applicable (headless has an instance id, the GUI plugin does not).
+    both = rl.DiscoveryBudget(
+        max_work=3, timeout=30, restart="bn session restart w1",
+        gui_restart_hint="restart Binary Ninja with {variable}={doubled} set in its environment",
+    )
+    with pytest.raises(RuntimeError) as raised:
+        both.charge(files=4)
+    assert str(raised.value).endswith(
+        "starting point: BN_ROOTFS_MAX_WORK=6 bn session restart w1")
+    assert "restart Binary Ninja" not in str(raised.value)
+
+
 def test_deadline_and_byte_refusals_name_their_knob_and_the_restart_1075(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1074,11 +1103,39 @@ def test_config_byte_limit_refuses_truncation_and_can_be_raised(
 
     with pytest.raises(
         RuntimeError,
-        match="rootfs discovery refused: loader config .* exceeds the text limit; "
-              "no inventory committed",
+        match="rootfs discovery refused: loader config .* exceeds the text limit "
+              r"\(BN_ROOTFS_MAX_CONFIG_BYTES=64\); no inventory committed",
     ):
         discover(64)
     assert _paths(discover(len(contents))) == ["/opt/late", "/lib"]
+
+
+def test_config_text_limit_names_the_aggregate_variable_when_it_binds_1098(
+    tmp_path: Path,
+) -> None:
+    """#1098 review: `_read_text`'s effective read size is `min(max_text_bytes,
+    remaining aggregate allowance)`; when the aggregate is the smaller number,
+    reading one byte past it always pushes the running total past `max_bytes`
+    first -- `_charge_work`'s own `check()` raises before `_read_text`'s "loader
+    config ... exceeds the text limit" ever runs, and that generic message
+    already names `BN_ROOTFS_MAX_BYTES` correctly (#1075). So this scenario's
+    refusal is the aggregate one, not the config-text one; the two never
+    collide, and the aggregate case needed no change here."""
+    root = tmp_path / "rootfs"
+    _elf(root, "lib/libgood.so")
+    contents = b"# padding well past a tiny aggregate allowance\n" * 4 + b"/opt/late\n"
+    _touch(root, "etc/ld.so.conf", contents)
+    assert len(contents) > 20
+    budget = rl.DiscoveryBudget(max_bytes=20, max_text_bytes=1 << 20)
+
+    with rl.discovery_budget(budget):
+        with pytest.raises(
+            RuntimeError,
+            match="rootfs discovery refused: discovery byte limit exceeded "
+                  r"\(read more than 20 bytes, BN_ROOTFS_MAX_BYTES=20\)",
+        ) as raised:
+            rl.lookup_paths(str(root), "linux")
+    assert "exceeds the text limit" not in str(raised.value)
 
 
 def test_android_loader_globs_preserve_all_alias_spellings(tmp_path: Path) -> None:
