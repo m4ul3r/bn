@@ -79,6 +79,31 @@ def test_registry_publishes_the_bridge_bn_environment_1076(monkeypatch, tmp_path
     assert {"BN_INSTANCE", "BN_TARGET"}.isdisjoint(env)
 
 
+def test_registry_never_holds_a_credential_value_1076(monkeypatch, tmp_path):
+    # A credential passed through the environment (the usual reason for that
+    # route is to keep it off the filesystem) must not land in the cache
+    # directory. The registry records that the key was SET, never its value.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    canary = "CANARY-do-not-store"
+    for key in ("BN_LICENSE", "BN_UPDATE_TOKEN", "BN_API_SECRET", "BN_PROXY_PASSWORD",
+                "BN_CLOUD_CREDENTIALS", "BN_SPILL_TOKENS"):
+        monkeypatch.setenv(key, canary)
+    monkeypatch.setenv("BN_LICENSE_FILE", "/opt/demo/license.dat")   # a path: recorded
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="env2")
+
+    inst._write_registry()
+
+    raw = inst.registry_path.read_text(encoding="utf-8")
+    assert canary not in raw
+    payload = json.loads(raw)
+    assert payload["env"]["BN_LICENSE_FILE"] == "/opt/demo/license.dat"
+    assert payload["env_withheld"] == [
+        "BN_API_SECRET", "BN_CLOUD_CREDENTIALS", "BN_LICENSE", "BN_PROXY_PASSWORD",
+        "BN_UPDATE_TOKEN",
+    ]                                      # BN_SPILL_TOKENS is CLI-only: not ours at all
+
+
 def test_registry_updates_preserve_bridge_start_time(instance, monkeypatch, tmp_path):
     module = __import__(type(instance).__module__, fromlist=["datetime"])
     instance._write_registry()

@@ -1273,8 +1273,9 @@ def _lifecycle_instance_id(verb: str, args: argparse.Namespace) -> str:
 
     `session restart` additionally refuses two DIFFERENT explicit ids (#1076):
     `bn -i a session restart b` names two bridges, and silently restarting one
-    of them is not what either name asked for. `BN_INSTANCE` is ambient, so
-    the positional wins over it as it always has.
+    of them is not what either name asked for. Every pair of ids typed on the
+    command line is compared; `BN_INSTANCE` is ambient, so the positional wins
+    over it as it always has.
     """
     positional = getattr(args, "instance_id", None)
     alias = getattr(args, "instance_id_flag", None)
@@ -1299,17 +1300,22 @@ def _lifecycle_instance_id(verb: str, args: argparse.Namespace) -> str:
             f"session {verb} requires an instance id: `bn session {verb} <id>` "
             f"(or `bn session {verb} -i/--instance <id>`). See `bn session list`."
         )
-    if verb == "restart" and positional is not None:
+    if verb == "restart":
+        # What THIS invocation typed: the positional, `--instance-id`, and
+        # `-i/--instance` only when it was on the command line (`main` records
+        # that; a value that merely equals BN_INSTANCE is still explicit, and
+        # BN_INSTANCE itself never is).
         explicit = [
-            other for other in (alias, flag)
-            if other is not None
-            and other != positional
-            and other != os.environ.get("BN_INSTANCE")
+            str(value) for value in (
+                positional, alias,
+                flag if getattr(args, "_explicit_instance", False) else None,
+            ) if value is not None
         ]
-        if explicit:
+        different = sorted(set(explicit))
+        if len(different) > 1:
             raise BridgeError(
                 f"session restart: two different instance ids were given, "
-                f"{positional!r} and {explicit[0]!r}; pass one. See `bn session list`."
+                f"{different[0]!r} and {different[1]!r}; pass one. See `bn session list`."
             )
     return str(target_id)
 
@@ -1554,6 +1560,19 @@ def _session_restart(args: argparse.Namespace) -> int:
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
     # associate an unrelated project.
+    # #1076: the new bridge starts with the BN_* settings the OLD one ran under
+    # (its registry records what it saw), and the caller's own BN_* exports win
+    # over them. Without this a restart from another shell or agent silently
+    # dropped BN_ROOTFS_MAX_WORK and friends and the refusal they fixed came
+    # back. Decided HERE, before anything is stopped: the record comes from a
+    # file, and whatever is wrong with it must surface while the old bridge is
+    # still running, never between its teardown and the spawn. A malformed
+    # record is no record (`validated_record`).
+    meta = inst.meta if isinstance(inst.meta, dict) else {}
+    env, env_report = cli.restart_environment(
+        cli.validated_record(meta.get("env")), os.environ, meta.get("env_withheld") or (),
+    )
+
     inherited_roots: list[str] = []
     if isinstance(inst.meta, dict):
         roots = inst.meta.get("project_roots")
@@ -1587,16 +1606,6 @@ def _session_restart(args: argparse.Namespace) -> int:
                     "Stop it manually and re-spawn."
                 )
 
-    # #1076: the new bridge starts with the BN_* settings the OLD one ran under
-    # (its registry records what it saw), and the caller's own BN_* exports win
-    # over them. Without this a restart from another shell or agent silently
-    # dropped BN_ROOTFS_MAX_WORK and friends and the refusal they fixed came
-    # back. Read from the record captured before teardown: the registry file is
-    # gone by now.
-    recorded_env = inst.meta.get("env") if isinstance(inst.meta, dict) else None
-    env, env_report = cli.restart_environment(
-        recorded_env if isinstance(recorded_env, dict) else None, os.environ
-    )
     instance = cli.spawn_instance(resolved_id, env=env)
     # Reload targets without associating the restart command's cwd.
     #

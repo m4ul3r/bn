@@ -47,17 +47,73 @@ CLI_ONLY_KEYS = frozenset({
 _NEVER_REPLAYED = CLI_ONLY_KEYS | {"BN_CACHE_DIR"}
 
 
+# A credential is passed through the environment to keep it OFF the filesystem,
+# so its value is never written into the registry (review of #1076): the
+# licence text itself, and any key whose name says it carries a secret.
+# `BN_LICENSE_FILE` is a path, not a credential, and is recorded like any other
+# setting. The registry publishes the NAMES of the keys withheld, so a restart
+# can say what it could not carry instead of silently dropping it.
+_CREDENTIAL_KEYS = frozenset({"BN_LICENSE"})
+_CREDENTIAL_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
 def _bridge_setting(key: str) -> bool:
     return key.startswith("BN_") and key not in CLI_ONLY_KEYS
 
 
+def is_credential_key(key: str) -> bool:
+    upper = key.upper()
+    return upper in _CREDENTIAL_KEYS or any(marker in upper for marker in _CREDENTIAL_MARKERS)
+
+
 def recorded_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    """The ``BN_*`` settings of *environ* a bridge publishes in its registry."""
-    return {key: value for key, value in environ.items() if _bridge_setting(key)}
+    """The ``BN_*`` settings of *environ* a bridge publishes in its registry:
+    every bridge setting except a credential, whose value is never stored."""
+    return {
+        key: value for key, value in environ.items()
+        if _bridge_setting(key) and not is_credential_key(key)
+    }
+
+
+def withheld_keys(environ: Mapping[str, str]) -> list[str]:
+    """Names of the credential keys set in *environ* whose values
+    `recorded_environment` withheld. Names only."""
+    return sorted(
+        key for key in environ if _bridge_setting(key) and is_credential_key(key)
+    )
+
+
+def _well_formed_key(key: Any) -> bool:
+    return isinstance(key, str) and key.startswith("BN_") and "\0" not in key and "=" not in key
+
+
+def validated_record(raw: Any) -> dict[str, str] | None:
+    """*raw* as a recorded environment, or None when it is not one.
+
+    The registry is a file: anything may be in it. A record is usable only as
+    a whole -- every key a ``BN_`` name, every value a string, no NUL (and no
+    ``=`` in a name) -- because one bad entry reaching ``Popen(env=...)`` fails
+    the spawn AFTER the old bridge is gone. A record that fails is no record,
+    exactly like a registry written before the field existed."""
+    if not isinstance(raw, dict):
+        return None
+    for key, value in raw.items():
+        if not _well_formed_key(key) or not isinstance(value, str) or "\0" in value:
+            return None
+    return dict(raw)
+
+
+def validated_withheld(raw: Any) -> list[str]:
+    """The withheld-key names of a registry entry; anything malformed is
+    dropped, since a name that cannot be trusted is not worth printing."""
+    if not isinstance(raw, list):
+        return []
+    return sorted({key for key in raw if _well_formed_key(key)})
 
 
 def restart_environment(
-    recorded: Mapping[str, str] | None, caller: Mapping[str, str]
+    recorded: Mapping[str, str] | None, caller: Mapping[str, str],
+    withheld: Any = (),
 ) -> tuple[dict[str, str], dict[str, Any]]:
     """The environment a restarted bridge starts with, and what changed.
 
@@ -67,10 +123,15 @@ def restart_environment(
     Everything that is not a bridge setting is the caller's, as it always
     was. The report names each key by what happened to it: ``replayed``
     (record only), ``overridden`` (both, caller's value differs), ``added``
-    (caller only); a key equal on both sides is not a change. ``recorded`` is
-    False for a registry written before the bridge published its
-    environment, in which case nothing is replayed and the result is exactly
-    the caller's environment.
+    (caller only); a key equal on both sides is not a change.
+    ``not_recorded`` names each credential key the old bridge had set (its
+    value was never stored, see `withheld_keys`) that the caller does not
+    export: the one thing a restart cannot carry. A withheld key the caller
+    does export is passed through and not reported -- there is nothing to
+    compare it with. ``recorded`` is False for a registry written before the
+    bridge published its environment, or whose record is malformed
+    (`validated_record`), in which case nothing is replayed and the result is
+    exactly the caller's environment.
     """
     env = dict(caller)
     report: dict[str, Any] = {
@@ -78,9 +139,11 @@ def restart_environment(
         "replayed": [],
         "overridden": [],
         "added": [],
+        "not_recorded": [],
     }
     if recorded is None:
         return env, report
+    withheld_names = set(validated_withheld(list(withheld)))
     for key in sorted(recorded):
         if not key.startswith("BN_") or key in _NEVER_REPLAYED:
             continue
@@ -91,6 +154,11 @@ def restart_environment(
             report["overridden"].append(key)
     report["added"] = sorted(
         key for key in caller
-        if key.startswith("BN_") and key not in recorded and key not in _NEVER_REPLAYED
+        if key.startswith("BN_") and key not in recorded
+        and key not in _NEVER_REPLAYED and key not in withheld_names
+    )
+    report["not_recorded"] = sorted(
+        key for key in withheld_names
+        if key not in caller and key not in recorded and key not in _NEVER_REPLAYED
     )
     return env, report

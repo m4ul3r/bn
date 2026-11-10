@@ -6661,6 +6661,7 @@ def test_session_restart_caller_bn_env_overrides_the_record_1076(
         "replayed": ["BN_ROOTFS_TIMEOUT"],
         "overridden": ["BN_ROOTFS_MAX_WORK"],
         "added": ["BN_IDLE_TIMEOUT"],
+        "not_recorded": [],
     }
 
 
@@ -6776,3 +6777,120 @@ def test_session_restart_requires_an_instance_id_1076(monkeypatch, tmp_path, cap
     assert rc == 2
     assert "instance id" in capsys.readouterr().err.lower()
     assert not popen_calls                 # the sticky pin never names the victim
+
+
+# --- review round: malformed records, credentials, explicit-id conflicts -------
+
+
+@pytest.mark.parametrize("record", [
+    {"BN_ROOTFS_TIMEOUT": 5},                       # a value Popen cannot take
+    {"BN_ROOTFS_TIMEOUT": None},
+    {"BN_ROOTFS_TIMEOUT": "9", "NOT_OURS": "1"},    # a key outside the BN_ namespace
+    {"BN_ROOTFS\x00TIMEOUT": "9"},
+    {"BN_ROOTFS_TIMEOUT": "9\x00"},
+    {5: "9"},
+])
+def test_session_restart_treats_a_malformed_recorded_env_as_missing_1076(
+    monkeypatch, tmp_path, capsys, record
+):
+    # The registry is a file anyone with the cache can edit. A value that is not
+    # a string used to reach Popen(env=...) AFTER the old bridge was stopped:
+    # a TypeError, and no bridge at all. A record that is not `str -> str` over
+    # BN_* names is no record: the caller's environment, and the note.
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {"env": record})
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    assert popen_calls[0]["env"] == {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    assert all(isinstance(k, str) and isinstance(v, str)
+               for k, v in popen_calls[0]["env"].items())
+    assert "env: no recorded environment" in capsys.readouterr().out
+
+
+def test_session_restart_decides_the_environment_before_stopping_anything_1076(
+    monkeypatch, tmp_path, capsys
+):
+    # Whatever can go wrong with the record must go wrong while the old bridge
+    # is still running.
+    from bn.transport import BridgeError
+
+    popen_calls = _restart_env_fixture(
+        monkeypatch, tmp_path, {"env": {"BN_ROOTFS_MAX_WORK": "2000000"}})
+    sent = []
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda op, **kw: sent.append(op) or {"ok": True, "result": {}})
+
+    def refuse(*args, **kwargs):
+        raise BridgeError("the record cannot be used")
+
+    monkeypatch.setattr(bn.cli, "restart_environment", refuse)
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 2
+    assert "shutdown" not in sent and not popen_calls
+
+
+def test_session_restart_names_a_withheld_credential_it_could_not_carry_1076(
+    monkeypatch, tmp_path, capsys
+):
+    # The bridge never records a credential's VALUE, only that the key was set.
+    # A restart from a shell without it says so; one that exports it passes it
+    # through like any other caller key, silently.
+    meta = {"env": {"BN_ROOTFS_MAX_WORK": "2000000"},
+            "env_withheld": ["BN_LICENSE", "BN_UPDATE_TOKEN"]}
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, meta)
+    monkeypatch.setenv("BN_UPDATE_TOKEN", "caller-value")
+
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    env = popen_calls[0]["env"]
+    assert "BN_LICENSE" not in env and env["BN_UPDATE_TOKEN"] == "caller-value"
+    out = capsys.readouterr().out
+    assert out.splitlines()[-1] == (
+        "env: replayed BN_ROOTFS_MAX_WORK; not recorded: BN_LICENSE (re-export it)")
+    assert "caller-value" not in out and "BN_UPDATE_TOKEN" not in out
+
+    assert bn.cli.main(["session", "restart", "env-1", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["env"] == {
+        "recorded": True, "replayed": ["BN_ROOTFS_MAX_WORK"], "overridden": [],
+        "added": [], "not_recorded": ["BN_LICENSE"],
+    }
+
+
+@pytest.mark.parametrize("argv, ambient", [
+    (["-i", "other-2", "session", "restart", "env-1"], "other-2"),      # -i equals BN_INSTANCE
+    (["-i", "other-2", "session", "restart", "--instance-id", "env-1"], None),
+    (["session", "restart", "env-1", "--instance-id", "other-2"], None),
+])
+def test_session_restart_refuses_every_pair_of_different_explicit_ids_1076(
+    monkeypatch, tmp_path, capsys, argv, ambient
+):
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {"env": {}})
+    if ambient is not None:
+        monkeypatch.setenv("BN_INSTANCE", ambient)
+    assert bn.cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert "two different instance ids" in err and "env-1" in err and "other-2" in err
+    assert not popen_calls
+
+
+def test_session_restart_ambient_instance_does_not_conflict_with_the_positional_1076(
+    monkeypatch, tmp_path, capsys
+):
+    # BN_INSTANCE is ambient, not something this invocation typed.
+    popen_calls = _restart_env_fixture(monkeypatch, tmp_path, {"env": {}})
+    monkeypatch.setenv("BN_INSTANCE", "other-2")
+    assert bn.cli.main(["session", "restart", "env-1"]) == 0
+    assert len(popen_calls) == 1
+
+
+def test_restart_env_line_escapes_key_names_1076():
+    from bn.formatters import _render_session_start_text
+
+    text = _render_session_start_text({
+        "instance_id": "env-1", "pid": 1, "socket_path": "/tmp/s", "restarted": True,
+        "loaded": [],
+        "env": {"recorded": True, "replayed": ["BN_OK", "BN_X\x1b[31mRED\nforged: line"],
+                "overridden": [], "added": [], "not_recorded": ["BN_T\x1bK"]},
+    })
+    assert "\x1b" not in text
+    assert text.splitlines()[-1].startswith("env: replayed BN_OK, BN_X")
+    assert not any(line.startswith("forged:") for line in text.splitlines())
