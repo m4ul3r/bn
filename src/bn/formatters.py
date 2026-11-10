@@ -6617,14 +6617,16 @@ def command_routing(*, target: str | None, instance: str | None) -> Iterator[Non
 
 def _bn_command(*words: str) -> str:
     """A runnable `bn ...` command line for *words*, carrying the routing bound
-    by `command_routing` (none outside it)."""
+    by `command_routing` (none outside it). The routing flags come from
+    `target_hint` so an id or selector starting with `-` is attached
+    (`--instance=-x`, `--target=-y`) rather than read as the next option
+    (#1058 item 13)."""
     target, instance = _COMMAND_ROUTING.get()
     flags: list[str] = []
     if instance:
-        flags += ["-i", shlex.quote(instance)]
+        flags.append(instance_option(instance))
     if target:
-        flags += (["-t", shlex.quote(target)] if not target.startswith("-")
-                  else [shlex.quote(f"--target={target}")])
+        flags.append(target_option(target))
     return " ".join(["bn", *flags, *(shlex.quote(w) for w in words)])
 
 

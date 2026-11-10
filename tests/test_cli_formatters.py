@@ -10462,3 +10462,24 @@ def test_proto_text_prints_entry_value_and_undefined_type_notes_1013():
     })
     assert "\n\nnote: At 2 of 2 direct call sites ..." in text
     assert "\n\nnote: run `bn types declare 'struct `ns::Cls`;'` first." in text
+
+
+@pytest.mark.parametrize("instance,target,flags", [
+    ("-weird", "app", "--instance=-weird -t app"),
+    ("w1", "-local", "-i w1 --target=-local"),
+    ("-weird", "-local", "--instance=-weird --target=-local"),
+    ("w1", "app", "-i w1 -t app"),
+])
+def test_bn_command_attaches_dash_leading_routing_values_1058(instance, target, flags):
+    """#1058 item 13: the `strings` clip's `bn read …` carried `-i -weird`,
+    which the parser reads as `-i` with no value. Both routing flags now come
+    from `target_hint`, so a dash-leading id or selector is attached."""
+    import shlex
+
+    from bn import formatters
+
+    with formatters.command_routing(target=target, instance=instance):
+        command = formatters._bn_command("read", "0x7000", "318", "--encoding", "escaped")
+    assert command == f"bn {flags} read 0x7000 318 --encoding escaped"
+    parsed = bn.cli.build_parser().parse_args(shlex.split(command)[1:])
+    assert (parsed.instance, parsed.target) == (instance, target)
