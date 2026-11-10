@@ -1720,10 +1720,15 @@ def _render_project_init_text(value: Any) -> str:
         f"\tplatform: {_escape_control_chars(value.get('platform', '<unknown>'))}  (markers: {markers})",
     ]
     path = _escape_control_chars(value.get("project_path", "<unknown>"))
+    fallback_from = _text_value(value, "fallback_from")
+    fallback_note = (f"fallback: parent {_escape_control_chars(fallback_from)} is not writable "
+                     f"\u2192 cache fallback {path}") if fallback_from else None
     dry_run = _flag_field(value, "dry_run")
     if dry_run is True:
         state = "exists" if _flag_field(value, "project_exists") else "new"
         lines.append(f"project: {path}  [{state}]")
+        if fallback_note:
+            lines.append(fallback_note)
         lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
         lines.append(f"candidate libraries: {_stated_count(value, 'candidate_libraries')}")
         for note in _field_list(value, "notes"):
@@ -1741,6 +1746,8 @@ def _render_project_init_text(value: Any) -> str:
     instance = value.get("instance")
     lines.insert(0, f"project: {path}  [{state}]"
                  + (f"  instance: {_escape_control_chars(instance)}" if instance else ""))
+    if fallback_note:
+        lines.insert(1, fallback_note)
     sync = _field_dict(value, "sync")
     if sync:
         lines.extend(_lookup_path_lines(_field_list(sync, "lookup_paths")))
@@ -1750,8 +1757,12 @@ def _render_project_init_text(value: Any) -> str:
         lines.extend(_lookup_path_lines(_field_list(value, "lookup_paths")))
         error = _text_value(value, "sync_error")
         if error:
+            # The inventory was not updated (a new project is empty), so the
+            # next step is the sync itself, not `bn project files` (#1075).
             lines.append(f"libraries: sync FAILED -- {_escape_control_chars(error)}")
-        elif value.get("platform") == "unknown":
+            lines.append("retry: `bn project libs --sync` once the cause is fixed")
+            return "\n".join(lines)
+        if value.get("platform") == "unknown":
             lines.append("libraries: not synced (platform unknown: no loader lookup paths)")
         else:
             lines.append("libraries: not synced (--no-libs); `bn project libs --sync` imports them")
